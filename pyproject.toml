@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 weatherquant-collect = "weatherquant.data.worker:worker_main"
+weatherquant-research = "weatherquant.cli:main"
 
 [project.optional-dependencies]
 # Filled in after the official-SDK audit (docs/open-source-review.md).

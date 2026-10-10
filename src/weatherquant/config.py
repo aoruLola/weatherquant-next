@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     legacy_db_path: Path = Path("../backend/data/weatherquant.duckdb")
     raw_dir: Path = Path("data/raw")
 
+    # Research runs in its OWN file. The collector's schema and lock must never
+    # be touched by a research backfill, and research tables are re-derived
+    # often enough that sharing a file with the order-book history would be a
+    # poor trade. See weatherquant.storage.research.
+    research_db_path: Path = Path("data/research/weather-research.duckdb")
+    research_raw_dir: Path = Path("data/research/raw")
+
     # --- market definition -------------------------------------------------
     station: str = "KLGA"
     """ICAO station the markets resolve on. Not KNYC - see docs/open-source-review.md §5.3."""
