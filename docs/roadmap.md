@@ -162,7 +162,7 @@
 | 阶段 | 状态 |
 |---|---|
 | **P0** 数据模型 / 存储 / 定价不变量 / 只读迁移接口 / 审计 | ✅ **已完成** |
-| **P1-0** 真实采集器 / Docker / CI-CD / 部署文档 | ✅ **已完成**（293 测试通过，85% 覆盖，ruff 无告警；Docker 与 CI 待外部执行，见下） |
+| **P1-0** 真实采集器 / Docker / CI-CD / 部署文档 | ✅ **已完成**（295 测试通过，85% 覆盖，ruff 无告警；`ci.yml` 已在 GitHub Actions 执行并全绿，含镜像构建与容器启动验证；`release.yml` 与 Unraid 部署待执行，见下） |
 | **P1 续** 采集器持续运行 + ECMWF/GFS 基线 + 样本外评估 + 行级迁移 | ⬜ 未开始 |
 | **P2** Paper trading + 风险限制 | ⬜ 未开始 |
 | **P3** 多城市 | ⬜ 未开始 |
@@ -179,14 +179,31 @@
 | CI/CD | `.github/workflows/ci.yml`（仅测试构建）、`release.yml`（测试→构建→启动验证→发布 SHA→移动 stable） |
 | 持久化 | 单实例租约、批量事务、定期 checkpoint、按日 Parquet、**自校验一致性备份** |
 | 恢复 | 断线重连、优雅退出、异常隔离、**数据缺口记录**（启动/崩溃/更新/关停） |
-| 测试 | 293 项（P0 152 + 采集器 141），完全离线；`scripts/soak_test.py` 做故障注入浸泡 |
+| 测试 | 295 项（P0 152 + 采集器 143），完全离线；`scripts/soak_test.py` 做故障注入浸泡 |
 
-**尚未验证的部分**（本机无 Docker、无可推送远端、无 NAS 权限）：
+**已由 GitHub Actions 实际验证**（`ci.yml`，run `38048156329`，全绿）：
 
-- `Dockerfile` **未实际构建** —— 但构建序列已用 `uv` 本地逐步验证：仅
-  `pyproject.toml + uv.lock` 的依赖层同步成功，随后 `--no-editable` 打包安装成功，
-  `.sql` 迁移随 wheel 进入 site-packages 并可加载，`weatherquant-collect` 控制台入口生成。
-- GitHub Actions **未在 CI 执行** —— YAML 已 `yaml.safe_load` 校验。
+- `ruff 0.17.0` + **295 项 pytest** 在 Linux 上通过
+- `linux/amd64` 镜像**构建成功**
+- 容器**启动成功**，2 秒内写出心跳；健康检查、非 root（uid 1000）、
+  `docker stop -t 60` 优雅停止、**重启后数据库完好**，全部通过
+
+CI 首轮暴露并修复了 **5 个本机发现不了的问题**（本机无 Docker，`.gitignore` 的
+副作用也只在全新 checkout 上才显现）：
+
+| # | CI 暴露的问题 | 修复 |
+|---|---|---|
+| 1 | ruff 在 CI 上把 `weatherquant` 判为第三方，`I001` 失败（本地同版本同字节却通过） | 显式 `known-first-party = ["weatherquant"]` |
+| 2 | `.gitignore` 的 `data/` 无锚点，**11 个采集器模块整个没被提交** | 改为 `/data/` |
+| 3 | bind mount 覆盖镜像内的 chown，容器以 uid 10000 之外的用户写 `/data` 失败 | CI 侧 `chown` + 启动前置可写性预检（给出可操作的错误信息） |
+| 4 | 该补丁把 release 专用的 `$DATA` 塞进 `ci.yml`，`set -u` 直接中止 | 各工作流各用各的变量 |
+| 5 | Dockerfile 用 uid **10001**，而 compose/文档/CI 全是 **1000** | 统一为 1000；错误信息改为读取真实 uid，不再硬编码 |
+
+**尚未验证的部分**（本机无 Docker、无 NAS 权限）：
+
+- **`release.yml` 未触发过** —— 需要打一个 `v*` tag 才会执行（它的
+  `needs: verify` 门禁、GHCR 推送、`stable` 移动都还没跑过）。
+- **`docker/compose.unraid.yaml` 未在 Unraid 上运行**。
 - **Unraid 未部署** —— 见 `docs/unraid-collector-deployment.md` §11.2 的 18 项验收清单。
 
 ### P1-0 浸泡测试发现并修复的缺陷

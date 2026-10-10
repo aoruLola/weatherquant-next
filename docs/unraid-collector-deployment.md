@@ -6,13 +6,14 @@ WeatherQuant Next 采集器 · Compose Manager Plus · GHCR
 >
 > | 类别 | 状态 |
 > |---|---|
-> | 采集器进程本地实测 | ✅ 已验证（见文末 §10 的实测数字） |
-> | 单元/集成测试 | ✅ 259 项通过，`ruff` 无告警 |
-> | Dockerfile 语法与内容 | ⚠️ **本机无 Docker，未实际构建** |
-> | GitHub Actions 工作流 | ⚠️ YAML 已校验，**未在 CI 中执行** |
+> | 采集器进程本地实测 | ✅ 已验证（见文末 §12 的实测数字） |
+> | 单元/集成测试 | ✅ 295 项通过，`ruff` 无告警 |
+> | **Dockerfile 构建与容器启动** | ✅ **GitHub Actions 已执行**：镜像构建成功、2s 内写出心跳、非 root、优雅停止、重启后数据库完好 |
+> | GitHub Actions `ci.yml` | ✅ **已执行并全绿**（ruff 0.17.0 + 295 测试 + 镜像构建 + 容器健康检查） |
+> | GitHub Actions `release.yml` | ⚠️ YAML 已校验，**未触发过**（需打 `v*` tag） |
 > | **Unraid 上的真实部署** | ❌ **未部署 —— 我没有 NAS 访问权限** |
 >
-> 下面标 `[待NAS验证]` 的步骤是给你执行的，不是我做过的。§10 会把"我验证了什么"
+> 下面标 `[待NAS验证]` 的步骤是给你执行的，不是我做过的。§11 会把"我验证了什么"
 > 和"你需要验证什么"分开列清楚。
 
 ---
@@ -500,8 +501,13 @@ print('code supports  :', __import__('glob').glob('/app/.venv/lib/python3.12/sit
 | F | 发布 `sha-*` 标签 + 移动 `stable` | `release.yml` → `publish` |
 | G | 重启后数据库不被重新初始化 | `release.yml` 的重启检查 |
 
-> **这些都还没跑过** —— 本机没有 Docker，也没有可推送的 git 远端。
-> 工作流 YAML 已用 `yaml.safe_load` 校验通过，但**未在 CI 中执行**。
+> **`ci.yml` 已实际执行并全绿**（run `38048156329`）：A–D 项全部通过。
+> 它首轮暴露了 5 个本机发现不了的问题（ruff first-party 判定差异、`.gitignore`
+> 的 `data/` 吞掉整个采集器包、bind mount 属主、`$DATA` 未定义、Dockerfile uid
+> 10001 与别处的 1000 不一致），均已修复。
+>
+> **`release.yml` 的 E–G 项仍未执行** —— 需要打一个 `v*` tag 才会触发。
+> 以及 **compose 与 Unraid 从未在真实 NAS 上运行过**。
 
 ---
 
