@@ -55,7 +55,10 @@ class Settings(BaseSettings):
 
     # --- forecasts ---------------------------------------------------------
     ecmwf_model_id: str = "ecmwf_ifs025"
-    gfs_model_id: str = "gfs"
+    # A bare `gfs` is rejected by Open-Meteo (400 "Cannot initialize
+    # MultiDomains..."); the working ids are `gfs_seamless` and `gfs_global`.
+    # Verified 2026-10-10 - see docs/weather-data-sources.md.
+    gfs_model_id: str = "gfs_seamless"
     model_lag_hours: float = Field(
         default=6.0,
         ge=0.0,

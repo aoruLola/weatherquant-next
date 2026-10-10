@@ -117,6 +117,8 @@ class RateLimitRegistry:
             "clob_book": SlidingWindowLimiter("clob_book", 1500, 10.0),
             "clob_books_batch": SlidingWindowLimiter("clob_books_batch", 500, 10.0),
             "data_prices_history": SlidingWindowLimiter("data_prices_history", 200, 10.0),
+            # Open-Meteo: <=1 req/s advised, 10,000/day free tier.
+            "open_meteo": SlidingWindowLimiter("open_meteo", 6, 10.0),
         }
         self._lock = threading.Lock()
 

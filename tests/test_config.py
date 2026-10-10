@@ -19,7 +19,9 @@ def test_defaults_are_the_verified_values() -> None:
     assert s.station == "KLGA"
     assert s.market_timezone == "America/New_York"
     assert s.ecmwf_model_id == "ecmwf_ifs025"
-    assert s.gfs_model_id == "gfs"
+    # A bare `gfs` is rejected by Open-Meteo with HTTP 400; see
+    # docs/weather-data-sources.md for the live check that established this.
+    assert s.gfs_model_id == "gfs_seamless"
     # Weather category taker rate per docs.polymarket.com/trading/fees.
     assert s.weather_fee_rate == pytest.approx(0.05)
     assert s.execution_buffer_fraction == pytest.approx(0.005)

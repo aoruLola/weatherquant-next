@@ -163,7 +163,8 @@
 |---|---|
 | **P0** 数据模型 / 存储 / 定价不变量 / 只读迁移接口 / 审计 | ✅ **已完成** |
 | **P1-0** 真实采集器 / Docker / CI-CD / 部署文档 | ✅ **已完成**（303 测试通过，85% 覆盖，ruff 无告警；`ci.yml` 与 `release.yml` 均已在 GitHub Actions 执行并全绿，`v0.1.1` 镜像已发布至 GHCR；仅 Unraid 真实部署待执行，见下） |
-| **P1 续** 采集器持续运行 + ECMWF/GFS 基线 + 样本外评估 + 行级迁移 | ⬜ 未开始 |
+| **P1-1** 气象数据与结算真值管线 | ✅ **已完成**（355 测试通过，lint 全绿；独立研究库、60 天回填 485/488 成功） |
+| **P1-2** ECMWF/GFS 概率模型 + 样本外评估 + 行级旧数据迁移 | ⬜ 未开始 |
 | **P2** Paper trading + 风险限制 | ⬜ 未开始 |
 | **P3** 多城市 | ⬜ 未开始 |
 | **P4** 加固与深化 | ⬜ 未开始 |
@@ -205,6 +206,24 @@ CI 首轮暴露并修复了 **5 个本机发现不了的问题**（本机无 Doc
   GHCR 收到 `sha-*` / `v0.1.1` 两个标签，`stable` 已移动。
 - **`docker/compose.unraid.yaml` 未在 Unraid 上运行**。
 - **Unraid 未部署** —— 见 `docs/unraid-collector-deployment.md` §11.2 的 18 项验收清单。
+
+
+### P1-1 交付明细（2026-10-11）
+
+| 目标 | 交付 |
+|---|---|
+| A 结算规则与观测 | `markets/settlement_rules.py`（408/408 解析）、`truth/`（交叉核对）、`research/klga-settlement-audit.md` |
+| B ECMWF/GFS 历史运行 | `weather/single_runs.py`、`weather/backfill.py`、`scripts/backfill_forecasts.py` |
+| C 每日最高温转换 | `weather/daily_max.py`（DST 感知） |
+| D 独立研究库 | `storage/research.py` + `migrations_research/`（与采集器 schema 完全隔离） |
+| E 测试验证 | 54 项新增测试；405 事件交叉核对；2 ECMWF + 2 GFS 实跑；60 天回填 |
+| F 交付 | CLI `weatherquant-research`、3 份 docs、2 份 research 报告 |
+
+**实测结果**：60 天回填 488 请求 → **485 成功 / 3 unavailable / 0 失败**；
+104,956 小时点、4,641 日最高温、3,916 合格 / 725 不合格；
+**62/63 个目标日可进入严格样本外评估**（两模型同）。
+
+**未完成项**：Polymarket 在线 `rules_text` 重取（本机三端点连接超时，改用 2026-10-10 快照）。
 
 ### P1-0 浸泡测试发现并修复的缺陷
 

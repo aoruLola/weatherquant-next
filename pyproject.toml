@@ -68,6 +68,10 @@ known-first-party = ["weatherquant"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E402"]
+# This script emits Chinese markdown. Fullwidth punctuation (：，（）×｜) is
+# correct typography there, not an ASCII look-alike typo - RUF001 exists to
+# catch characters that *resemble* ASCII, which is exactly wrong for CJK prose.
+"scripts/forecast_coverage.py" = ["RUF001"]
 
 [tool.ruff.format]
 quote-style = "double"
