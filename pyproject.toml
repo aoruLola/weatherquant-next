@@ -1,6 +1,6 @@
 [project]
 name = "weatherquant-next"
-version = "0.1.0"
+version = "0.1.1"
 description = "WeatherQuant Next - reproducible quantitative research core for Polymarket weather prediction markets"
 readme = "README.md"
 requires-python = ">=3.12"
