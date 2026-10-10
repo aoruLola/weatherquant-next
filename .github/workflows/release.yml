@@ -80,7 +80,7 @@ jobs:
           # inside the image - so the host directory must match first.
           sudo chown -R 1000:1000 "$DATA"
 
-          docker run -d --name wq-release             -v "$DATA:/data"             -e WQ_DB_PATH=/data/weatherquant.duckdb             -e WQ_RAW_DIR=/data/raw             -e WQ_LOG_LEVEL=INFO             weatherquant-next:release-candidate
+          docker run -d --name wq-release             -v "$DATA:/data"             -e WQ_DB_PATH=/data/weatherquant.duckdb             -e WQ_RAW_DIR=/data/raw             -e WQ_LOG_LEVEL=INFO             -e WQ_DISK_WARN_PERCENT=10             -e WQ_DISK_CRITICAL_PERCENT=3             weatherquant-next:release-candidate
 
           echo "waiting for heartbeat..."
           for i in $(seq 1 90); do
@@ -107,17 +107,22 @@ jobs:
           # must happen only after the collector has released its
           # single-instance lock. Doing it while the writer is live would be
           # refused with exit 4 and fail the job for the wrong reason.
+          # NOTE: the image sets ENTRYPOINT ["weatherquant-collect"], so any
+          # command meant for a different program needs --entrypoint. Without it
+          # `python -c ...` is passed to weatherquant-collect as its own argv and
+          # the collector exits 2 on an argparse error. tests/test_workflows.py
+          # asserts this for every docker run in both workflows.
           echo "--- collected real public data ---"
-          docker run --rm -v "$DATA:/data" weatherquant-next:release-candidate             python -c "import duckdb,sys; con=duckdb.connect('/data/weatherquant.duckdb',read_only=True); m=con.execute('SELECT COUNT(*) FROM markets').fetchone()[0]; b=con.execute('SELECT COUNT(*) FROM order_books').fetchone()[0]; con.close(); print(f'markets={m} books={b}'); sys.exit(0 if (m>=1 and b>=1) else 'collector produced no data - refusing to publish')"
+          docker run --rm --entrypoint python -v "$DATA:/data" weatherquant-next:release-candidate -c "import duckdb,sys; con=duckdb.connect('/data/weatherquant.duckdb',read_only=True); m=con.execute('SELECT COUNT(*) FROM markets').fetchone()[0]; b=con.execute('SELECT COUNT(*) FROM order_books').fetchone()[0]; con.close(); print(f'markets={m} books={b}'); sys.exit(0 if (m>=1 and b>=1) else 'collector produced no data - refusing to publish')"
 
           echo "--- restart must NOT reinitialise the database ---"
           before=$(stat -c %s "$DATA/weatherquant.duckdb")
-          docker run --rm -v "$DATA:/data" weatherquant-next:release-candidate             python -c "import duckdb,sys; c=duckdb.connect('/data/weatherquant.duckdb',read_only=True); n=c.execute('SELECT COUNT(*) FROM schema_migrations').fetchone()[0]; m=c.execute('SELECT COUNT(*) FROM markets').fetchone()[0]; c.close(); print(f'migrations={n} markets={m}'); sys.exit(0 if (n>=4 and m>=1) else 'database was reinitialised - refusing to publish')"
+          docker run --rm --entrypoint python -v "$DATA:/data" weatherquant-next:release-candidate -c "import duckdb,sys; c=duckdb.connect('/data/weatherquant.duckdb',read_only=True); n=c.execute('SELECT COUNT(*) FROM schema_migrations').fetchone()[0]; m=c.execute('SELECT COUNT(*) FROM markets').fetchone()[0]; c.close(); print(f'migrations={n} markets={m}'); sys.exit(0 if (n>=4 and m>=1) else 'database was reinitialised - refusing to publish')"
           after=$(stat -c %s "$DATA/weatherquant.duckdb")
           echo "size before=$before after=$after"
 
           echo "--- a fresh start must not wipe what was collected ---"
-          docker run --rm -v "$DATA:/data" weatherquant-next:release-candidate             python -c "import duckdb,sys; c=duckdb.connect('/data/weatherquant.duckdb',read_only=True); b=c.execute('SELECT COUNT(*) FROM order_books').fetchone()[0]; c.close(); print('order_books after restart:', b); sys.exit(0 if b>=1 else 'rows lost on restart')"
+          docker run --rm --entrypoint python -v "$DATA:/data" weatherquant-next:release-candidate -c "import duckdb,sys; c=duckdb.connect('/data/weatherquant.duckdb',read_only=True); b=c.execute('SELECT COUNT(*) FROM order_books').fetchone()[0]; c.close(); print('order_books after restart:', b); sys.exit(0 if b>=1 else 'rows lost on restart')"
 
           docker rm wq-release || true
 

@@ -21,6 +21,14 @@ from pathlib import Path
 
 HEARTBEAT_PATH = Path(os.environ.get("WQ_HEARTBEAT_PATH", "/data/health/heartbeat.json"))
 
+# Disk thresholds are deployment configuration, not constants: "15% free" is
+# 150 GB on a 1 TB NAS but only ~10 GB on a CI runner, and hosted runners ship
+# nearly full by default. A workflow that overrides these is declaring its own
+# environment's expectations - it is not weakening what the collector reports -
+# so the defaults stay conservative for the deployment that actually matters.
+DISK_WARN_PERCENT = float(os.environ.get("WQ_DISK_WARN_PERCENT", "15"))
+DISK_CRITICAL_PERCENT = float(os.environ.get("WQ_DISK_CRITICAL_PERCENT", "5"))
+
 
 def main() -> int:
     # Import lazily so a broken package still produces a readable message.
@@ -31,7 +39,11 @@ def main() -> int:
         return 1
 
     try:
-        verdict = evaluate_health(HEARTBEAT_PATH)
+        verdict = evaluate_health(
+            HEARTBEAT_PATH,
+            disk_free_warn_percent=DISK_WARN_PERCENT,
+            disk_free_critical_percent=DISK_CRITICAL_PERCENT,
+        )
     except Exception as exc:
         print(f"healthcheck: probe failed: {exc}", file=sys.stderr)
         return 1

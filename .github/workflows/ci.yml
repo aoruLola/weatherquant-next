@@ -78,6 +78,8 @@ jobs:
             -v "$RUNNER_TEMP/wq-data:/data" \
             -e WQ_DB_PATH=/data/weatherquant.duckdb \
             -e WQ_RAW_DIR=/data/raw \
+            -e WQ_DISK_WARN_PERCENT=10 \
+            -e WQ_DISK_CRITICAL_PERCENT=3 \
             weatherquant-next:ci
 
           echo "waiting for the collector to publish a heartbeat..."
