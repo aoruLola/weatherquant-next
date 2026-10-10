@@ -47,8 +47,8 @@ RUN uv sync --frozen --no-dev --no-editable \
 # ---------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
-RUN groupadd --gid 10001 wq \
-    && useradd --uid 10001 --gid wq --no-create-home --home-dir /app --shell /usr/sbin/nologin wq
+RUN groupadd --gid 1000 wq \
+    && useradd --uid 1000 --gid wq --no-create-home --home-dir /app --shell /usr/sbin/nologin wq
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \

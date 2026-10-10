@@ -207,12 +207,13 @@ class CollectorWorker:
         # here with an actionable message beats a PermissionError traceback deep
         # inside pathlib when the collector starts on a fresh NAS.
         if not self._data_dir_writable(settings.db_path.parent):
+            uid, gid = os.getuid(), os.getgid()
             message = (
-                f"data directory {settings.db_path.parent} is not writable by uid "
-                f"{os.getuid()}. The image runs as uid 1000; chown the host "
-                f"directory to 1000:1000, or set `user:` in the compose file to "
-                f"match the directory's owner. See docs/unraid-collector-"
-                f"deployment.md section 1."
+                f"data directory {settings.db_path.parent} is not writable by uid {uid}. "
+                f"A bind mount hides whatever chown the image did, so the host directory "
+                f"has to match this uid: `chown -R {uid}:{gid} <host data dir>`, or set "
+                f"`user:` in the compose file to the uid that owns it. "
+                f"See docs/unraid-collector-deployment.md section 1."
             )
             log.error(message)
             self._status = HealthStatus.FATAL
