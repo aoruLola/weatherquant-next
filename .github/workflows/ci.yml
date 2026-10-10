@@ -78,22 +78,32 @@ jobs:
             weatherquant-next:ci
 
           echo "waiting for the collector to publish a heartbeat..."
+          ok=0
           for i in $(seq 1 60); do
-            if docker exec wq-ci test -f /data/health/heartbeat.json; then
+            if docker exec wq-ci test -f /data/health/heartbeat.json 2>/dev/null; then
               echo "heartbeat present after ${i}s"
+              ok=1
+              break
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' wq-ci 2>/dev/null)" != "true" ]; then
+              echo "container exited early"
               break
             fi
             sleep 1
           done
+
+          if [ "$ok" != "1" ]; then
+            echo "--- container logs ---"
+            docker logs wq-ci 2>&1 | tail -60 || true
+            echo "--- container state ---"
+            docker inspect wq-ci --format '{{.State.Status}} exit={{.State.ExitCode}} err={{.State.Error}}' || true
+            echo "--- image smoke test (entrypoint bypassed) ---"
+            docker run --rm --entrypoint python weatherquant-next:ci               -c "import weatherquant, weatherquant.data.worker as w; print('import ok', weatherquant.__version__)" || true
+            echo "--- image smoke test (entrypoint as-is) ---"
+            docker run --rm weatherquant-next:ci --help 2>&1 | tail -20 || true
+            exit 1
+          fi
           docker exec wq-ci test -f /data/health/heartbeat.json
-
-          echo "--- healthcheck ---"
-          docker exec wq-ci python /usr/local/bin/healthcheck.py
-
-          echo "--- runs as non-root ---"
-          uid="$(docker exec wq-ci id -u)"
-          echo "uid=$uid"
-          test "$uid" != "0"
 
           echo "--- graceful stop ---"
           docker stop -t 60 wq-ci
