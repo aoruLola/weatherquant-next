@@ -57,6 +57,14 @@ ignore = [
     "SIM108", # ternaries are often less readable than the branch
 ]
 
+# Declare first-party explicitly rather than relying on ruff inferring it from
+# `src`. The inference resolved differently between a Windows checkout and the
+# CI runner: CI treated `weatherquant` as third-party, collapsed the blank line
+# after `import pytest`, and failed I001 on six test files while the identical
+# bytes passed locally. Naming the package removes the ambiguity.
+[tool.ruff.lint.isort]
+known-first-party = ["weatherquant"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E402"]
 
