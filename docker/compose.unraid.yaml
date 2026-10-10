@@ -16,7 +16,10 @@
 #      against a 5s flush plus a 300s checkpoint on a busy filesystem.
 
 x-common: &common
-  image: ghcr.io/REPLACE_ME/weatherquant-next:stable
+  # Published by .github/workflows/release.yml. `stable` tracks the newest tag
+  # that passed the full verify job; the immutable `sha-<commit>` tag is what
+  # you pin to when rolling back (see docs/... §10).
+  image: ghcr.io/aorulola/weatherquant-next:stable
   container_name: weatherquant-collector
   restart: unless-stopped
   stop_grace_period: 60s

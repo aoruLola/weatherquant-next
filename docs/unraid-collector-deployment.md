@@ -7,10 +7,10 @@ WeatherQuant Next 采集器 · Compose Manager Plus · GHCR
 > | 类别 | 状态 |
 > |---|---|
 > | 采集器进程本地实测 | ✅ 已验证（见文末 §12 的实测数字） |
-> | 单元/集成测试 | ✅ 295 项通过，`ruff` 无告警 |
+> | 单元/集成测试 | ✅ 303 项通过，`ruff` 无告警 |
 > | **Dockerfile 构建与容器启动** | ✅ **GitHub Actions 已执行**：镜像构建成功、2s 内写出心跳、非 root、优雅停止、重启后数据库完好 |
-> | GitHub Actions `ci.yml` | ✅ **已执行并全绿**（ruff 0.17.0 + 295 测试 + 镜像构建 + 容器健康检查） |
-> | GitHub Actions `release.yml` | ⚠️ YAML 已校验，**未触发过**（需打 `v*` tag） |
+> | GitHub Actions `ci.yml` | ✅ **已执行并全绿**（ruff 0.17.0 + 303 测试 + 镜像构建 + 容器健康检查） |
+> | GitHub Actions `release.yml` | ✅ **`v0.1.1` 已执行并发布成功**（run `38063764541`：verify + publish 双绿） |
 > | **Unraid 上的真实部署** | ❌ **未部署 —— 我没有 NAS 访问权限** |
 >
 > 下面标 `[待NAS验证]` 的步骤是给你执行的，不是我做过的。§11 会把"我验证了什么"
@@ -168,9 +168,10 @@ echo '<PAT>' | docker login ghcr.io -u '<你的GitHub用户名>' --password-stdi
 
 1. Unraid Web UI → **Apps → Compose Manager Plus → Add Compose Stack**
 2. **Name**: `weatherquant-next`
-3. 把 `docker/compose.unraid.yaml` 的内容粘进编辑器，然后**必须**替换：
-   - `image: ghcr.io/REPLACE_ME/weatherquant-next:stable`
-     → `ghcr.io/<owner>/<repo>:stable`
+3. 把 `docker/compose.unraid.yaml` 的内容粘进编辑器。
+   `image:` **已经填好**，指向已发布的镜像：
+   `ghcr.io/aorulola/weatherquant-next:stable`
+   （不可变版本用 `sha-5410c75d584771b4477de07f4b1d7b83b764bfe1`，回滚见 §10）
 4. 确认 `volumes` 指向你的 appdata 路径
 5. **Apply / Start**
 

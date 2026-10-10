@@ -138,8 +138,8 @@ uv run ruff check .
 | 数据缺口记录 | ✅ | 浸泡确认重启/崩溃后 gap 被记录并关闭 |
 | `Dockerfile`（多阶段 / uv / 非 root / HEALTHCHECK） | ✅ | **GitHub Actions 实际构建并运行通过**（`build-image` job） |
 | `docker/compose.unraid.yaml` | ⚠️ 已写 | YAML 校验通过，**未在 Unraid 上运行** |
-| GitHub Actions `ci.yml` | ✅ | **已执行并全绿**：ruff 0.17.0 + 295 测试 + 镜像构建 + 容器启动/健康检查/非 root/优雅停止/重启后数据库完好 |
-| GitHub Actions `release.yml` | ⚠️ 已写 | YAML 校验通过，**未触发过**（需打 `v*` tag） |
+| GitHub Actions `ci.yml` | ✅ | **已执行并全绿**：ruff 0.17.0 + 303 测试 + 镜像构建 + 容器启动/健康检查/非 root/优雅停止/重启后数据库完好 |
+| GitHub Actions `release.yml` | ✅ | **`v0.1.1` 已发布成功**：verify 全绿 → GHCR 推送 → `stable` 已移动 |
 | 部署文档 | ✅ | `docs/unraid-collector-deployment.md` |
 | **Unraid NAS 真实部署** | ❌ **未做** | **无 NAS 访问权限** |
 | 概率模型（ECMWF/GFS/融合/校准） | ❌ 未实现 — P1 续 | |
