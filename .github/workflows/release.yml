@@ -76,9 +76,9 @@ jobs:
           set -euo pipefail
           DATA="$RUNNER_TEMP/wq-data"
           mkdir -p "$DATA"
-          # The image runs as uid 1000 and a bind mount masks the image's
-          # own chown, so the host directory must match before the container starts.
-          sudo chown -R 1000:1000 "${RUNNER_TEMP%/tmp}/wq-data" 2>/dev/null \n            || sudo chown -R 1000:1000 "$DATA" 2>/dev/null \n            || sudo chown -R 1000:1000 "$DATA"
+          # The image runs as uid 1000, and a bind mount masks the chown done
+          # inside the image - so the host directory must match first.
+          sudo chown -R 1000:1000 "$DATA"
 
           docker run -d --name wq-release             -v "$DATA:/data"             -e WQ_DB_PATH=/data/weatherquant.duckdb             -e WQ_RAW_DIR=/data/raw             -e WQ_LOG_LEVEL=INFO             weatherquant-next:release-candidate
 
