@@ -17,8 +17,8 @@ htmlcov/
 *.duckdb
 *.duckdb.wal
 *.parquet
-data/
-!data/.gitkeep
+/data/
+!/data/.gitkeep
 *.db
 
 # Legacy snapshot used only for read-only inspection
