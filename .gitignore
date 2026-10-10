@@ -1,0 +1,25 @@
+# Environments / caches
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.pytest_tmp/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local secrets and env
+.env
+.env.local
+
+# Data products - never commit payloads or databases
+*.duckdb
+*.duckdb.wal
+*.parquet
+data/
+!data/.gitkeep
+*.db
+
+# Legacy snapshot used only for read-only inspection
+.audit-out/

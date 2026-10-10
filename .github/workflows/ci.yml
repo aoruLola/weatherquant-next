@@ -1,0 +1,97 @@
+# Development CI: test and build only.
+#
+# This workflow deliberately never pushes an image. Publishing is reserved for
+# the release workflow, so an ordinary commit to a development branch can never
+# move the tag the NAS pulls - which is the whole point of separating them.
+
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+  actions: write   # Docker layer cache (cache-to: type=gha)
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Pytest
+        run: uv run pytest -q --cov=weatherquant --cov-report=term-missing
+
+  build-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: weatherquant-next:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Container starts and reports health
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/wq-data"
+          docker run -d --name wq-ci \
+            -v "$RUNNER_TEMP/wq-data:/data" \
+            -e WQ_DB_PATH=/data/weatherquant.duckdb \
+            -e WQ_RAW_DIR=/data/raw \
+            weatherquant-next:ci
+
+          echo "waiting for the collector to publish a heartbeat..."
+          for i in $(seq 1 60); do
+            if docker exec wq-ci test -f /data/health/heartbeat.json; then
+              echo "heartbeat present after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          docker exec wq-ci test -f /data/health/heartbeat.json
+
+          echo "--- healthcheck ---"
+          docker exec wq-ci python /usr/local/bin/healthcheck.py
+
+          echo "--- runs as non-root ---"
+          uid="$(docker exec wq-ci id -u)"
+          echo "uid=$uid"
+          test "$uid" != "0"
+
+          echo "--- graceful stop ---"
+          docker stop -t 60 wq-ci
+          docker logs wq-ci 2>&1 | tail -20
+
+          echo "--- database survived the restart ---"
+          test -f "$RUNNER_TEMP/wq-data/weatherquant.duckdb"
+          docker rm wq-ci

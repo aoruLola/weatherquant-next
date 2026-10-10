@@ -1,0 +1,20 @@
+# Normalise to LF on commit, on every platform.
+#
+# The image is built on Linux CI and on the NAS. A Dockerfile or a YAML `run:`
+# block checked out with CRLF can break on line continuations, and the diff
+# becomes noise whenever someone on Windows touches a file. Forcing LF at the
+# boundary keeps the repository identical no matter who committed it.
+* text=auto eol=lf
+
+# Binary assets must never be line-converted.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.whl  binary
+*.duckdb binary
+*.parquet binary

@@ -1,0 +1,58 @@
+# WeatherQuant Next - Unraid Compose Manager Plus stack
+#
+# See docs/unraid-collector-deployment.md for the full walkthrough. This file
+# is the artefact that file documents; they are written to be used together.
+#
+# Three properties are deliberate and easy to break by editing:
+#
+#   1. NO `ports:`. The collector makes outbound requests only. Publishing a
+#      port would expose the DuckDB file's directory through no service at all.
+#   2. ONE replica, enforced by the single-instance lock as well as by compose.
+#      Two writers against one DuckDB file is the failure mode the lock exists
+#      to prevent; the lock is the real guard, this is the first line.
+#   3. `stop_grace_period` above the collector's flush interval. SIGTERM must
+#      reach the process and be allowed to flush, checkpoint and release the
+#      lock before the container is killed. Docker's default 10s is tight
+#      against a 5s flush plus a 300s checkpoint on a busy filesystem.
+
+x-common: &common
+  image: ghcr.io/REPLACE_ME/weatherquant-next:stable
+  container_name: weatherquant-collector
+  restart: unless-stopped
+  stop_grace_period: 60s
+  user: "1000:1000"
+  environment:
+    TZ: UTC
+    WQ_DB_PATH: /data/weatherquant.duckdb
+    WQ_RAW_DIR: /data/raw
+    WQ_LOG_LEVEL: INFO
+    # Build provenance, stamped by CI. Shown in the heartbeat and in
+    # collector_runs so "which version produced this row?" is always answerable.
+    GIT_SHA: ${GIT_SHA:-unknown}
+    IMAGE_TAG: ${IMAGE_TAG:-stable}
+  volumes:
+    - /mnt/user/appdata/weatherquant-next:/data
+  healthcheck:
+    test: ["CMD", "python", "/usr/local/bin/healthcheck.py"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 90s
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  collector:
+    <<: *common
+
+# Backups are performed *by the collector itself* (see
+# docs/unraid-collector-deployment.md §9): the database file is locked for the
+# writer's whole life, so an external process cannot take a consistent copy of
+# it. The collector flushes, checkpoints, replays into a second database inside
+# one transaction, then re-opens the result read-only and compares row counts
+# before publishing it under backups/.
+#
+# Moving that copy off the NAS is a separate schedule - see §9.3 in the guide.

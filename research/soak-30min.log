@@ -1,0 +1,108 @@
+soak: 30 minutes over C:\Users\Lola\AppData\Local\Temp\wq-soak-30
+  phase A healthy     539s
+  phase B outage      216s
+  phase C crash       745s (SIGKILL at 410s)
+  phase D restart     180s
+  phase E graceful    120s (clean --once exit)
+
+==============================================================================
+SOAK TEST REPORT
+==============================================================================
+
+--- A healthy collection ---
+  duration                540s
+  samples                 269
+  books (peak)            796
+  price points (peak)    8235
+  db size (peak)         7180 KiB
+  raw archive (peak)     7086 KiB
+  restarts                  1
+  forced kills              0
+
+--- B network outage ---
+  duration                216s
+  samples                 108
+  books (peak)            796
+  price points (peak)    8235
+  db size (peak)        13580 KiB
+  raw archive (peak)     7458 KiB
+  restarts                  1
+  forced kills              0
+
+--- C recovery + crash ---
+  duration                410s
+  samples                 206
+  books (peak)            577
+  price points (peak)    6026
+  db size (peak)        17676 KiB
+  raw archive (peak)    12782 KiB
+  restarts                  1
+  forced kills              1
+  event: forced SIGKILL at +410s
+
+--- D post-crash restart ---
+  duration                180s
+  samples                  90
+  books (peak)            577
+  price points (peak)    6026
+  db size (peak)        24844 KiB
+  raw archive (peak)    14363 KiB
+  restarts                  1
+  forced kills              0
+
+--- E graceful exit ---
+  duration                 68s
+  samples                  35
+  books (peak)            232
+  price points (peak)     970
+  db size (peak)        26124 KiB
+  raw archive (peak)    15555 KiB
+  restarts                  1
+  forced kills              0
+  event: process exited early with code 0
+
+--- overall ---
+  books rows (cumulative)      796
+  price points (cumulative)    8235
+  websocket reconnects         7
+  error count                  1
+  failed REST requests         6
+  max upstream contact age     31s
+  heartbeat statuses seen      {'healthy': 706, 'stopped': 2}
+  final health verdict         stopped (exit 0): ('clean shutdown in progress',)
+  table row counts             {'markets': 58, 'order_books': 1723, 'price_history': 15953, 'collector_runs': 5, 'collection_gaps': 5}
+  collection gap reasons       ['start_after_restart']
+  collector run statuses       ['running', 'running', 'running', 'running', 'stopped']
+  runs marked stopped          1
+  gaps still open              0
+
+--- log tail ---
+  2026-10-10 15:20:10,526 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=105783254475122750247792181720023164881944755950989960131104882259251974718004 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:10,921 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=14095670685827287051343279356352231454550338620886365006521896481104120793270 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:11,306 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=86599732453656309272656469441790444124796641747424616262453709413972056133507 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:11,709 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=63072380478353703442666566839771284710015199427478350521798215951476235737937 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:12,104 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=5394849338413803115992178209761105628283974390055010517406011096369528026233 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:12,492 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=103188154707339598365426811406837035629283317277783158953542234386857134719932 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:12,877 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=100284280374171336893057897950059959504923508634059173003299468503562713426140 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:13,271 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=50170710470105462322725053486224452243875969248991058587730159808873183778020 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:13,679 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=22515894835028691162768915402208979933011451400241863993817040600958527684285 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:14,072 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=55757155916105194017914217452643247305152657382886235638606745958787659183577 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:14,478 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=40944226891403114417392638976631930164356147515724983007909427344603768756592 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:14,870 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=107086812594700900738817810301522473367854576480444870866153261235988829466721 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:15,262 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=113575439750846375499221553825511306031811847562876829092624827027616112364326 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:15,655 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=105759861876618222427446052634451280313419840123072855294367863588811895290935 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:16,055 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=73863604006093935480602289196254105276371729772867236895648985397168444529476 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:16,441 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=47421479088065677957678657291586085067759342008587271620846591136787547014990 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:16,836 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=24878468093560855368952027951884566367434856302188220138221432226495766416367 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:17,239 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=57751914388398931565112884096163924745967488183579343447817903775439099076810 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:17,622 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=33195880506351367246192908130532469480649642686314341120175249119180549288186 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:18,018 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=106863411417679921347628446010184524124252308279733159340037909098177496268541 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:18,427 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=7313955174561774293066411353223805981671071587947411282351918499103449972317 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:18,825 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=32975424017473854319914659009634865796096138054356827975886973345514203846382 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:19,235 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=106599990391625036297242998419557291570239625931076154297559705922113123067551 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:19,631 INFO httpx: HTTP Request: GET https://clob.polymarket.com/book?token_id=49433936421001703294047467411316916425587793454586614116672432476650786666448 "HTTP/1.1 200 OK"
+  2026-10-10 15:20:20,879 INFO weatherquant.data.writer: closed 1 gap(s) left open by a previous run
+
+==============================================================================
+RESULT: PASSED
+==============================================================================

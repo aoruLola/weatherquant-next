@@ -1,0 +1,25 @@
+# Build context hygiene: everything below makes the image larger or leaks
+# local state into it. The database must never be baked in.
+.git
+.github
+.venv
+.pytest_cache
+.pytest_tmp
+.ruff_cache
+__pycache__
+*.py[cod]
+*.egg-info
+.coverage
+htmlcov
+docs
+research
+tests
+scripts
+docker/compose.*.yaml
+data
+*.duckdb
+*.duckdb.wal
+*.parquet
+.env
+.env.local
+.audit-out

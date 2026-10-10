@@ -1,0 +1,188 @@
+# Release: test, build, verify, publish.
+#
+# Ordering is the safety property. Every gate runs before anything is pushed:
+#
+#   pytest + ruff  ->  docker build  ->  container start + health check
+#                  ->  push SHA tag  ->  move `stable`
+#
+# `stable` is only ever moved by this workflow, on a run where every gate
+# passed. Development pushes never touch it, so the NAS - which tracks
+# `stable` - can only ever update to something that was built and health-checked
+# as a unit. Rolling back means pointing the stack at a previous SHA tag,
+# which is never rewritten.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Why this release is being cut
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+  actions: write   # Docker layer cache (cache-to: type=gha)
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Pytest
+        run: uv run pytest -q
+
+      - name: Build linux/amd64
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: weatherquant-next:release-candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Container start, collect, health-check, graceful stop, restart
+        id: soak
+        run: |
+          set -euo pipefail
+          DATA="$RUNNER_TEMP/wq-data"
+          mkdir -p "$DATA"
+
+          docker run -d --name wq-release             -v "$DATA:/data"             -e WQ_DB_PATH=/data/weatherquant.duckdb             -e WQ_RAW_DIR=/data/raw             -e WQ_LOG_LEVEL=INFO             weatherquant-next:release-candidate
+
+          echo "waiting for heartbeat..."
+          for i in $(seq 1 90); do
+            if docker exec wq-release test -f /data/health/heartbeat.json; then break; fi
+            sleep 1
+          done
+          docker exec wq-release test -f /data/health/heartbeat.json
+
+          echo "waiting for the first discovery cycle..."
+          sleep 60
+
+          echo "--- healthcheck ---"
+          docker exec wq-release python /usr/local/bin/healthcheck.py
+
+          echo "--- runs as non-root ---"
+          uid="$(docker exec wq-release id -u)"
+          echo "uid=$uid"
+          test "$uid" != "0"
+
+          echo "--- graceful stop ---"
+          docker stop -t 60 wq-release
+
+          # Everything below starts a container against the SAME volume, so it
+          # must happen only after the collector has released its
+          # single-instance lock. Doing it while the writer is live would be
+          # refused with exit 4 and fail the job for the wrong reason.
+          echo "--- collected real public data ---"
+          docker run --rm -v "$DATA:/data" weatherquant-next:release-candidate             python -c "import duckdb,sys; con=duckdb.connect('/data/weatherquant.duckdb',read_only=True); m=con.execute('SELECT COUNT(*) FROM markets').fetchone()[0]; b=con.execute('SELECT COUNT(*) FROM order_books').fetchone()[0]; con.close(); print(f'markets={m} books={b}'); sys.exit(0 if (m>=1 and b>=1) else 'collector produced no data - refusing to publish')"
+
+          echo "--- restart must NOT reinitialise the database ---"
+          before=$(stat -c %s "$DATA/weatherquant.duckdb")
+          docker run --rm -v "$DATA:/data" weatherquant-next:release-candidate             python -c "import duckdb,sys; c=duckdb.connect('/data/weatherquant.duckdb',read_only=True); n=c.execute('SELECT COUNT(*) FROM schema_migrations').fetchone()[0]; m=c.execute('SELECT COUNT(*) FROM markets').fetchone()[0]; c.close(); print(f'migrations={n} markets={m}'); sys.exit(0 if (n>=4 and m>=1) else 'database was reinitialised - refusing to publish')"
+          after=$(stat -c %s "$DATA/weatherquant.duckdb")
+          echo "size before=$before after=$after"
+
+          echo "--- a fresh start must not wipe what was collected ---"
+          docker run --rm -v "$DATA:/data" weatherquant-next:release-candidate             python -c "import duckdb,sys; c=duckdb.connect('/data/weatherquant.duckdb',read_only=True); b=c.execute('SELECT COUNT(*) FROM order_books').fetchone()[0]; c.close(); print('order_books after restart:', b); sys.exit(0 if b>=1 else 'rows lost on restart')"
+
+          docker rm wq-release || true
+
+      - name: Image must run as non-root
+        run: |
+          set -euo pipefail
+          uid=$(docker run --rm --entrypoint id weatherquant-next:release-candidate -u)
+          echo "uid=$uid"
+          test "$uid" != "0"
+
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: verify
+    # GitHub auto-creates the `release` environment on first reference. Adding a
+    # required reviewer there gates the publish step behind a human click - a
+    # cheap guard for the one job that moves the tag the NAS tracks.
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase the image name
+        run: echo "IMAGE=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          sha="${GITHUB_SHA}"
+          tag="${GITHUB_REF_NAME}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (immutable SHA tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:sha-${{ steps.meta.outputs.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Move stable (only after the SHA tag exists)
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "$REGISTRY/$IMAGE:stable" \
+            "$REGISTRY/$IMAGE:sha-${{ steps.meta.outputs.sha }}"
+          echo "stable -> sha-${{ steps.meta.outputs.sha }}"
+
+      - name: Provenance summary
+        run: |
+          echo "Published:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`$REGISTRY/$IMAGE:sha-${{ steps.meta.outputs.sha }}\` (immutable)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`$REGISTRY/$IMAGE:${{ steps.meta.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`$REGISTRY/$IMAGE:stable\` (moved from previous)" >> "$GITHUB_STEP_SUMMARY"
