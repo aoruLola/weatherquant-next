@@ -35,6 +35,7 @@ import threading
 import time
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from weatherquant import __version__
@@ -165,12 +166,60 @@ class CollectorWorker:
         self._ws_endpoint = ""
         self._status = HealthStatus.STARTING
 
+
+    @staticmethod
+    def _data_dir_writable(directory: Path) -> bool:
+        """True if we can create files under ``directory``.
+
+        Checked explicitly rather than left to fail mid-startup, because the
+        failure mode is a bind mount owned by another uid - a deployment
+        mistake, not a code bug, and the message has to say so.
+        """
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            probe = directory / ".write-probe"
+            probe.touch()
+            probe.unlink()
+        except OSError:
+            return False
+        return True
+
+    def _publish_safe(self, heartbeat_path: Path) -> None:
+        """Best-effort heartbeat so the probe reports *why* startup failed."""
+        try:
+            publisher = HeartbeatWriter(heartbeat_path)
+        except OSError:
+            return
+        try:
+            self._publish(publisher, None)
+        except Exception:
+            log.debug("could not publish startup failure heartbeat", exc_info=True)
+
     # -- entry point -------------------------------------------------------
 
     def run(self) -> int:
         settings = self.settings
         settings.db_path.parent.mkdir(parents=True, exist_ok=True)
         heartbeat_path = settings.db_path.parent / "health" / "heartbeat.json"
+
+        # Pre-flight: the data directory is a bind mount, so the image's own
+        # `chown` is masked by whatever the host directory is owned by. Failing
+        # here with an actionable message beats a PermissionError traceback deep
+        # inside pathlib when the collector starts on a fresh NAS.
+        if not self._data_dir_writable(settings.db_path.parent):
+            message = (
+                f"data directory {settings.db_path.parent} is not writable by uid "
+                f"{os.getuid()}. The image runs as uid 1000; chown the host "
+                f"directory to 1000:1000, or set `user:` in the compose file to "
+                f"match the directory's owner. See docs/unraid-collector-"
+                f"deployment.md section 1."
+            )
+            log.error(message)
+            self._status = HealthStatus.FATAL
+            self._fatal = message
+            self._publish_safe(heartbeat_path)
+            return ExitCode.BAD_CONFIG
+
         publisher = HeartbeatWriter(heartbeat_path)
 
         lock = SingleInstanceLock(
