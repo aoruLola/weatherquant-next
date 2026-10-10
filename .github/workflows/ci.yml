@@ -34,7 +34,14 @@ jobs:
         run: uv sync --frozen --group dev
 
       - name: Ruff
-        run: uv run ruff check .
+        run: |
+          uv run ruff --version
+          if ! uv run ruff check . ; then
+            echo ""
+            echo "--- ruff's intended fix (diff) ---"
+            uv run ruff check . --diff || true
+            exit 1
+          fi
 
       - name: Pytest
         run: uv run pytest -q --cov=weatherquant --cov-report=term-missing
