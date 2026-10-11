@@ -444,6 +444,34 @@ def test_the_health_file_is_written_so_the_probe_never_opens_the_database(tmp_pa
     assert verdict.status in {"healthy", "degraded"}
 
 
+def test_starting_alone_publishes_a_heartbeat(tmp_path, archive, models_dir, monkeypatch) -> None:
+    """Liveness must not wait on the first cycle's network I/O.
+
+    Found in CI: the first cycle fetches forecasts before writing anything, so
+    the probe read "not started" for as long as the upstream took to answer -
+    a liveness signal reporting a third party's latency. `start()` writes it,
+    and so does the top of every cycle.
+    """
+    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    shadow = _settings(tmp_path, archive, models_dir)
+    runner = ShadowRunner(
+        RunnerConfig(
+            settings=Settings(),
+            shadow=shadow,
+            thresholds=load_thresholds(THRESHOLDS_PATH),
+        ),
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
+    _RUNNERS.append(runner)
+    runner.start()  # no cycle yet
+
+    path = shadow.shadow_health_dir / "heartbeat.json"
+    assert path.exists(), "start() did not publish a heartbeat"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["status"] == "running"
+    assert payload["run_id"] == runner.run_id
+
+
 def test_a_missing_heartbeat_is_starting_not_unhealthy() -> None:
     from weatherquant.shadow.health import evaluate_shadow_health
 

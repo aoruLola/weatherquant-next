@@ -256,6 +256,11 @@ class ShadowRunner:
         self._started_at = now
         self._persist_forecasts(now)
         log.info("shadow started run_id=%s models=%s", self.run_id, ", ".join(loaded))
+        # Published before the first cycle, not after it. The first cycle does
+        # network I/O, and a heartbeat that only appears once a forecast has
+        # been fetched reports "not started" for as long as the upstream takes
+        # - which is a liveness signal reading the latency of a third party.
+        self._write_heartbeat(status="running")
         return self.run_id
 
     def stop(self, reason: str = "requested") -> None:
@@ -347,6 +352,11 @@ class ShadowRunner:
         assert self.store is not None and self.forecast is not None
         started = self.clock()
         stats = CycleStats(cycle_id=uuid.uuid4().hex[:16], started_at=started)
+        # Rewritten at the TOP as well as the bottom. Phase 2 makes network
+        # calls, so a cycle can be in flight for as long as an upstream takes
+        # to answer; without this the probe would read "stale" about a process
+        # that is perfectly alive and simply waiting.
+        self._write_heartbeat(status="running")
 
         # Phase 1: ingest, atomically with its offsets.
         tail = self.tailer.poll()

@@ -97,13 +97,21 @@ jobs:
             -e WQ_DISK_CRITICAL_PERCENT=3 \
             weatherquant-shadow:ci
 
-          # Health must come up without anyone opening the database.
-          for i in $(seq 1 30); do
-            if docker exec shadow-ci python /usr/local/bin/healthcheck.py; then
+          # Wait for the heartbeat FILE, not for exit code 0: the probe exits 0
+          # for "starting" too, so looping on it stops before the engine has
+          # written anything - which is how the first run passed its health
+          # step and then failed the very next assertion.
+          for i in $(seq 1 60); do
+            if docker exec shadow-ci test -f /data/health/heartbeat.json; then
               break
             fi
             sleep 2
           done
+          docker exec shadow-ci test -f /data/health/heartbeat.json
+          echo "heartbeat present"
+
+          # Now the probe itself; healthy or degraded both exit 0, and either
+          # means the engine is up and reporting.
           docker exec shadow-ci python /usr/local/bin/healthcheck.py
           echo "health OK"
 
