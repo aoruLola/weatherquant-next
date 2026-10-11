@@ -177,8 +177,9 @@ uv run ruff check .
 | 数据库独立性（按名拒绝采集器库与研究库） | ✅ | 同上 |
 | 端到端：归档 → 决策 → 报告；重启不重复 | ✅ | `tests/test_shadow_runner.py` |
 | Shadow CLI（init / run / report / status） | ✅ | 同上 |
-| `Dockerfile.shadow` + compose + 探针 | ⚠️ 已写 | **本机无 Docker，未构建** |
-| `shadow-ci.yml` / `shadow-release.yml` | ⚠️ 已写 | **未在 GitHub Actions 执行** |
+| `Dockerfile.shadow` + compose + 探针 | ✅ | **`shadow-ci.yml` @ `3f5bed6` Linux Runner 构建并跑通 9 项容器检查** |
+| `shadow-ci.yml` | ✅ | **已执行并全绿**（build / 启动 / 非 root / 健康 / 权限 / 只读挂载 / 单实例退出码 4 / SIGTERM / 库完好） |
+| `shadow-release.yml` | ⚠️ 已写 | 未执行 —— 需推 `shadow-v*` tag，属发布动作，待批准 |
 | 三份影子文档 | ✅ | `docs/shadow-{engine,risk-rules,unraid-deployment}.md` |
 | 验证报告（区分已执行 / 未执行） | ✅ | `research/shadow-validation.md` |
 | NAS 24 小时部署 | ❌ **未做** | **无 NAS 访问权限** |

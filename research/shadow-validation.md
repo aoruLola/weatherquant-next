@@ -49,9 +49,9 @@
 | 项 | 结果 |
 |---|---|
 | `uv run ruff check .` | **All checks passed**（0 告警） |
-| `uv run pytest -q` | **611 passed, 3 skipped** |
+| `uv run pytest -q` | **613 passed, 3 skipped** |
 | 交付前基线 | 420 passed, 1 skipped |
-| 净新增 | **+191 例**，全部为影子相关 |
+| 净新增 | **+193 例**，全部为影子相关 |
 
 3 个 skip 全部来自 `tests/test_workflows.py` 的参数化用例 ——
 `test_data_checks_run_after_the_collector_stops` 对"不含 `SELECT COUNT(*)`"
@@ -66,7 +66,7 @@
 | `test_shadow_forecast.py`（30） | 只请求已过去的 issue 时次、12h 可发布、未来/过旧/零小时拒绝、fusion 同次对齐与无共同时次即拒绝、失败 1h 冷却重试而 unavailable 永不重问、预算限制、持久化回读不重抓、严格回测规则与实盘规则分产 |
 | `test_shadow_decision.py`（52） | 5 态可达、16 原因齐全且无 `generic_error`、因果序、主原因稳定、买入走 ask / 卖出走 bid、手算成本与 edge 比对、单边盘口按方向分别处理、交叉盘双拒、时钟闸门（未来 venue / 收到晚于决策 / 时钟倒挂 / 无 venue 时间戳）、工件晚于决策即拒、深度/最小手数/部分成交、多原因并存 |
 | `test_shadow_storage.py`（21） | 迁移有序幂等、篡改即拒、**按名拒绝采集器库与研究库**、单实例租约与释放、市场/盘口/质量事件幂等、括号 first-write-wins、盘口不倒退、**事务失败则效果与偏移同归于尽**、UTC 会话 |
-| `test_shadow_runner.py`（27） | 端到端归档→决策→报告、状态与原因白名单、**只读归档字节不变**、重启不回放不重复、重启后新增行被拾取、CANDIDATE 中断可见、第二实例被拒、心跳写出且探针不碰库、报告字段齐全且无虚假收益、CLI init/report、**单调时钟回归测试** |
+| `test_shadow_runner.py`（29） | 端到端归档→决策→报告、状态与原因白名单、**只读归档字节不变**、重启不回放不重复、重启后新增行被拾取、CANDIDATE 中断可见、第二实例被拒、心跳写出且探针不碰库、报告字段齐全且无虚假收益、CLI init/report、**单调时钟回归测试** |
 
 ### 2.2 静态结构检查
 
@@ -207,30 +207,48 @@ NO_TRADE         22   primary_reason MARKET_CLOSED           22
 
 ---
 
-## 4. Docker 镜像构建结果
+## 4. Docker 镜像构建结果（已在 Linux Runner 实际执行）
 
-**未执行。** 本机没有 Docker：
+**本机仍无 Docker**（`docker: command not found`），构建与容器验收全部由
+GitHub Actions 的 `shadow-ci.yml` 在 Linux Runner 上完成。
 
-```
-$ docker version      -> docker: command not found
-$ (PowerShell) Get-Command docker -> docker not on PATH
-```
+**最终结果：`3f5bed6` 全部通过。**
 
-这与采集器阶段的记录一致（`scripts/soak_test.py` 头部即写明
-"Docker is not available on this machine"）。
-
-| 项 | 状态 |
+| 检查 | 结果 |
 |---|---|
-| `Dockerfile.shadow` | ✅ 已写：多阶段、uv、非 root uid 1000、内置工件与阈值、`/collector-raw` 只读挂载点、无 EXPOSE、`ENTRYPOINT ["weatherquant-shadow"]` + `CMD ["run"]` |
-| `docker/compose.shadow.unraid.yaml` | ✅ 已写：无端口、单实例、`:ro` 挂载采集器 `raw/`、独立主机目录、`no-new-privileges`、日志轮转 |
-| `docker/healthcheck_shadow.py` | ✅ 已写：只读心跳文件，不打开 DuckDB |
-| 实际构建 / 容器启动 / 非 root / 健康 / 权限 / 重启保留 / 单实例 / 只读挂载 / SIGTERM | ⚠️ **全部未执行**，已逐条写入 `shadow-ci.yml` 待 GitHub Actions 首次运行 |
+| `shadow-tests`（6 个影子测试文件 + Ruff + 工件存在性） | ✅ success |
+| `Build (no push)` — `Dockerfile.shadow`，linux/amd64 | ✅ success |
+| `Container starts and reports health` | ✅ success |
+| `Runs as a non-root user` | ✅ success |
+| `Data directory is writable by the container user` | ✅ success |
+| `Read-only collector mount cannot be written through` | ✅ success |
+| `Single-instance lease refuses a second writer with exit code 4` | ✅ success |
+| `SIGTERM is handled gracefully and state survives a restart` | ✅ success |
+| `The shadow database is a real shadow database` | ✅ success |
+| `shadow-ci-never-publishes` | ✅ success |
+| **采集器 `ci.yml`（lint-and-test + build-image）** | ✅ success —— **每一条提交上都绿** |
 
-`tests/test_workflows.py` 已在本地跑过并覆盖新工作流的文本不变量
-（`--entrypoint`、`docker stop` 顺序、`WQ_DISK_WARN_PERCENT`、
-采集器 `Dockerfile` 的 `ENTRYPOINT` 未被改动）。
+**失败从未触发发布**（Task 6 第 6 项，实证）：
 
----
+- `shadow-ci` 前后失败 3 次；
+- `shadow-release.yml` **运行次数 = 0**（无 `shadow-v*` tag 被推送）；
+- 远端 tag 只有 `v0.1.0` / `v0.1.1`（采集器的），本次未新增任何 tag；
+- 采集器 `release.yml` 最后一次运行是 **2026-10-10**，`:stable` 未被移动；
+- 结构性原因：`shadow-ci` 的 `permissions` 只有 `contents: read` +
+  `actions: write`，**没有 `packages: write`**，且无 `docker/login-action`、
+  `push: false` —— 即使全部检查被删掉，它也发不出镜像。
+
+### 4.1 三次失败：每次都是工作流或探针的问题，不是镜像的问题
+
+| # | 失败步骤 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | `Container starts and reports health` | 探针归档在目录 `chown 1000:1000` **之后**创建；本作业以 uid 1001 运行，已经交出去的目录写不进去 → `Permission denied` | 先写文件，再 chown |
+| 1b | `shadow-ci-never-publishes` | 守卫在本文件里搜索自己刚写下的字符串，唯一的匹配就是它自己的 `grep` | 过滤掉含 `grep -nE` 的行 |
+| 2 | `Data directory is writable` | 心跳**只在周期末尾**写，而首个周期先去 Open-Meteo 抓预报；探针等的是别人家的延迟。同时等待循环把退出码 0 当成功，而探针对 `starting` 也返回 0，于是它在自己等待的条件上提前退出 | `start()` 即写心跳，周期**开头**再写一次；CI 改为等**文件存在** |
+| 3 | `Single-instance lease ... exit code 4` | `--once` 用宽泛的 `except Exception` 包住 `start()`，把有文档的拒绝码 4 吞成了通用失败码 1 | 先捕获 `LockError` 返回 4；新增回归测试 |
+| 3b | （预防性）宿主读取心跳 | `mkstemp` 建出 0600，`os.replace` 沿用该权限 → 只有引擎自己的 uid 能读 | 写完后 `chmod 0644`；心跳本来就是给别人的 |
+
+**五处修复各带回归测试或工作流自检**，全部在 `613 passed` 之内。
 
 ## 5. 执行中发现并修复的缺陷
 
@@ -330,10 +348,10 @@ $ (PowerShell) Get-Command docker -> docker not on PATH
 
 | 项 | 原因 | 何时可执行 |
 |---|---|---|
-| Docker 镜像构建 | 本机无 Docker | push 后由 `shadow-ci.yml` 执行 |
-| 容器启动 / 非 root / 健康 / 数据目录权限 / 重启保留 / 单实例 / 只读挂载 / SIGTERM | 同上 | 同上 |
-| GitHub Actions 全流程 | 未 push | push 后 `shadow-ci.yml`；发 tag `shadow-v*` 后 `shadow-release.yml` |
-| GHCR 发布 `weatherquant-next-shadow` | 同上 | 同上 |
+| ~~Docker 镜像构建~~ | ✅ **已执行** —— `shadow-ci.yml` @ `3f5bed6` success | 见 §4 |
+| ~~容器启动 / 非 root / 健康 / 权限 / 重启保留 / 单实例 / 只读挂载 / SIGTERM~~ | ✅ **已执行** —— 9 项全部 success | 见 §4 |
+| ~~GitHub Actions 全流程（shadow-ci）~~ | ✅ **已执行** | 见 §4 |
+| GHCR 发布 `weatherquant-next-shadow` | **未执行** —— 本轮未推送 `shadow-v*` tag，属发布动作，待批准 | `git tag shadow-v0.1.0 && git push origin shadow-v0.1.0` |
 | **NAS 首次部署** | **无 NAS 访问权限** | 按 `docs/shadow-unraid-deployment.md` §5 |
 | **NAS 连续 24 小时运行** | 同上 | 部署后 |
 | **7 天影子观察** | 同上 | 24 小时验收通过后 |
@@ -360,14 +378,14 @@ $ (PowerShell) Get-Command docker -> docker not on PATH
 | 1 | 模型样本外**优于市场** | ❌ **不满足** —— Brier 1.49 vs 1.03。影子跑出 ACCEPT 并不能改变这一点 |
 | 2 | NAS 连续 ≥24 小时运行 | ❌ 未执行 |
 | 3 | NAS 连续 7 天影子观察 | ❌ 未执行 |
-| 4 | Docker 镜像通过全部容器验收 | ❌ 未执行 |
+| 4 | Docker 镜像通过全部容器验收 | ✅ **满足** —— `shadow-ci.yml` @ `3f5bed6`，9 项容器检查全绿 |
 | 5 | 可解释的拒绝原因分布（无 `generic_error`） | ✅ 满足（真实数据 7 类原因，0 类含糊） |
 | 6 | 时间一致、成本一致、可审计 | ✅ 满足（含 5.1 缺陷修复与回归测试） |
 | 7 | 不污染生产 Collector | ✅ 本机已证（字节级）；NAS 待验 |
 | 8 | 阈值未对同一样本拟合 | ✅ 满足（先验设定；v2 修正依据为上游行为实测） |
 | 9 | 持仓账本 / 模拟成交 | 本轮**明确不做** |
 
-**结论：第 1、2、3、4 条未满足，不得开启模拟成交或持仓账本。**
+**结论：第 1、2、3 条未满足，不得开启模拟成交或持仓账本。**
 
 第 1 条尤其不能靠延长影子观察解决 —— 影子能证明链路正确，**不能让模型变准**。
 样本外是否优于市场是 P1 遗留的独立问题，需要新的模型工作而不是新的运行时间。
@@ -393,7 +411,7 @@ $ (PowerShell) Get-Command docker -> docker not on PATH
 # 1. 离线
 uv sync --group dev
 uv run ruff check .
-uv run pytest -q                       # 611 passed, 3 skipped
+uv run pytest -q                       # 613 passed, 3 skipped
 
 # 2. 模型工件（已提交于 models/，可重跑）
 uv run weatherquant-research fit-models --cutoff 2026-10-08 --version v1 --pin
