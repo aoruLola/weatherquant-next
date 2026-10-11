@@ -43,9 +43,12 @@ __all__ = [
     "FillPlan",
     "build_fill_plan",
     "edge_usd_per_share",
+    "edge_usd_per_share_sell",
     "execution_buffer_usd",
+    "execution_cost",
     "expected_net_profit_usd",
     "expected_net_profit_usd_per_share",
+    "expected_net_profit_usd_sell",
     "taker_fee_usd",
 ]
 
@@ -165,6 +168,17 @@ class ExecutionCost(BaseModel):
     @property
     def fill_cost_usd_per_share(self) -> float:
         return self.fill_cost_usd / self.filled_shares
+
+    @property
+    def net_proceeds_usd(self) -> float:
+        """``fill - fees - buffer``: what a *sale* of these shares nets.
+
+        The mirror image of :attr:`total_cost_usd` over the same three terms.
+        Deriving both from one decomposition is what makes it impossible for a
+        fee to be charged on a buy and forgotten on a sale, or counted twice
+        on either.
+        """
+        return self.fill_cost_usd - self.fees_usd - self.execution_buffer_usd
 
     @model_validator(mode="after")
     def _check(self) -> ExecutionCost:
@@ -341,3 +355,61 @@ def edge_usd_per_share(*, q: float, filled_shares: float, cost: ExecutionCost) -
     positive after costs - it is not a claim that the trade is profitable.
     """
     return expected_net_profit_usd_per_share(q=q, filled_shares=filled_shares, cost=cost)
+
+
+def execution_cost(fill: FillPlan, *, fee_rate: float | None, buffer_fraction: float) -> ExecutionCost:
+    """Compose the three cost terms for a plan, in one place.
+
+    Kept here rather than left to each caller because "add the fee, then add
+    the buffer, then forget the fee" is a failure mode that looks exactly like
+    a strategy with a positive edge.
+    """
+    if fill.filled_shares <= 0.0:
+        raise ExecutionRefused("NO_LIQUIDITY", "cannot cost a fill that filled nothing")
+    price = fill.avg_price_usd_per_share
+    assert price is not None  # guaranteed by FillPlan when filled_shares > 0
+    return ExecutionCost(
+        filled_shares=fill.filled_shares,
+        fill_cost_usd=fill.fill_cost_usd,
+        fees_usd=taker_fee_usd(
+            filled_shares=fill.filled_shares,
+            price_usd_per_share=price,
+            fee_rate=fee_rate,
+        ),
+        execution_buffer_usd=execution_buffer_usd(
+            fill_cost_usd=fill.fill_cost_usd,
+            buffer_fraction=buffer_fraction,
+        ),
+    )
+
+
+def expected_net_profit_usd_sell(
+    *, q: float, filled_shares: float, cost: ExecutionCost
+) -> float:
+    """``E[profit]`` from *selling* ``filled_shares`` YES at this book.
+
+    Selling YES means taking the proceeds now and owing a $1 payout on every
+    share if YES wins::
+
+        net = proceeds - fees - buffer        (certain, today)
+        if YES wins: net -= shares            (the payout)
+        E[net] = (proceeds - fees - buffer) - q * shares
+               = cost.net_proceeds_usd - q * filled_shares
+
+    Equivalent to buying NO at the same book, priced from the **bid** side,
+    which is the side a seller actually hits. Using the ask here - or the
+    midpoint - would value the trade against prices nobody would pay.
+    """
+    if not 0.0 <= q <= 1.0:
+        raise ValueError(f"q must be a probability in [0, 1], got {q}")
+    if filled_shares < 0.0:
+        raise ValueError(f"filled_shares must be >= 0, got {filled_shares}")
+    return cost.net_proceeds_usd - q * filled_shares
+
+
+def edge_usd_per_share_sell(*, q: float, filled_shares: float, cost: ExecutionCost) -> float:
+    """Sell-side edge, USD per share. Positive means the model thinks the bid
+    is higher than YES is worth - not that the trade would have profited."""
+    if filled_shares <= 0.0:
+        raise ValueError(f"filled_shares must be > 0, got {filled_shares}")
+    return expected_net_profit_usd_sell(q=q, filled_shares=filled_shares, cost=cost) / filled_shares

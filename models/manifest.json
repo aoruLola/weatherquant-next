@@ -1,0 +1,10 @@
+{
+  "pinned": {
+    "calibrated": "v1",
+    "ecmwf_raw": "v1",
+    "fusion": "v1",
+    "gfs_raw": "v1"
+  },
+  "pinned_at_utc": "2026-10-11T13:36:54.981309+00:00",
+  "spec_version": 1
+}

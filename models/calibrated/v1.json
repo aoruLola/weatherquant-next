@@ -1,0 +1,29 @@
+{
+  "bias_f": 0.6066803699897224,
+  "counts_by_lead": {
+    "0-24h": 58,
+    "120h+": 54,
+    "24-48h": 58,
+    "48-72h": 57,
+    "72-120h": 56
+  },
+  "created_at_utc": "2026-10-11T13:36:54.967869+00:00",
+  "fit_notes": [],
+  "min_samples_per_bucket": 5,
+  "model_name": "calibrated",
+  "model_version": "v1",
+  "n_dates": 58,
+  "n_pairs": 1946,
+  "sigma_by_lead": {
+    "0-24h": 1.9236837113923133,
+    "120h+": 4.149514126515122,
+    "24-48h": 2.153278357064085,
+    "48-72h": 2.6685408367436354,
+    "72-120h": 2.7521585020588013
+  },
+  "source_data_hash": "835c0b60505f7d739d53936b44eee8085cee671725b161fb56d9ba902e1ec284",
+  "spec_version": 1,
+  "train_end": "2026-10-08",
+  "train_start": "2026-08-12",
+  "training_cutoff_utc": "2026-10-08T00:00:00+00:00"
+}

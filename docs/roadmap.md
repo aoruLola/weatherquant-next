@@ -103,9 +103,43 @@
 
 ---
 
+## P2-0 — Shadow Trading Engine（决策观察，本轮）
+
+**与 P2 的关系**：P2-0 是 P2 的**前置观察阶段**。P2 假设"模型样本外有效"，
+而 P1-2 的结论恰恰是**尚未证明**（模型 Brier 1.49 vs 市场 1.03）。在那之前
+直接上模拟账本，等于把一个未经证明的信号变成持仓记录。P2-0 回答的是更前面的
+问题：**在真实实时数据上，这套链路能否做出时间一致、成本一致、可审计的决策？**
+
+**前提**：P1-0/1-1/1-2 已完成。
+
+| # | 任务 | 说明 | 验收 |
+|---|---|---|---|
+| S-1 | 只读行情输入适配器 | 尾随采集器 `raw/*.jsonl`；半行不读、偏移与效果同事务、损坏留痕 | `tests/test_shadow_ingest.py` |
+| S-2 | 事件分类 | 快照 / 增量 / 成交 / 元数据四类，**增量永不成为盘口** | 有断言 |
+| S-3 | 实时天气推断 | 复用 `SingleRunsClient` + `aggregate_daily_max`；`publishable_at = run+12h` | `tests/test_shadow_forecast.py` |
+| S-4 | 模型工件 | 拟合 → 冻结 → manifest 固定；截止日期防未来泄漏 | `tests/test_shadow_models.py` |
+| S-5 | Edge 计算 | **必须**复用 `execution/pricing.py`；卖出侧从 bid 走 | 手算值比对 |
+| S-6 | 决策状态机 | 5 态 + 16 原因 + 因果序主原因；缺 `generic_error` | `tests/test_shadow_decision.py` |
+| S-7 | 风险闸门 | 版本化 JSON，先验设定，**不拟合样本** | `configs/shadow-thresholds.json` |
+| S-8 | 独立 Shadow 数据库 | 第三个文件 + 第三个迁移目录；按名拒绝他库 | `tests/test_shadow_storage.py` |
+| S-9 | CLI 报告 | 四区块分离；`equity_curve` 恒为 `null` | `weatherquant-shadow report` |
+| S-10 | Docker / CI | `Dockerfile.shadow` + 两份 workflow，**不动采集器发布** | ⚠️ 本机无 Docker，未执行 |
+| S-11 | 文档 | `shadow-engine` / `shadow-risk-rules` / `shadow-unraid-deployment` | ✅ |
+| S-12 | 验证报告 | 区分**已执行**与**未执行** | `research/shadow-validation.md` |
+
+**S-6 与 R-2 的关系**：P2-0 只做**观察**，不建账本。闸门、流动性拒绝、
+阈值不做同样本拟合这三条，在 P2-0 就已经落地并可测试 —— P2 复用它们。
+
+**本阶段仍禁止**：真实下单、钱包、私钥、Dashboard、**自动虚拟下单与持仓账本**。
+
+---
+
 ## P2 — Paper Trading Engine 与风险
 
 **前提**：P1 已证明模型样本外有效，且**不以回测收益作未来保证**。
+（**当前不满足** —— 见 `research/baseline-comparison.md`。P2-0 的 24 小时与
+7 天影子观察是进入 P2 的运行稳定性依据，但**它不会让模型变好**：模型是否
+优于市场仍是 P1 未回答的问题。）
 
 | # | 任务 | 说明 | 验收 |
 |---|---|---|---|
@@ -165,7 +199,8 @@
 | **P1-0** 真实采集器 / Docker / CI-CD / 部署文档 | ✅ **已完成**（303 测试通过，85% 覆盖，ruff 无告警；`ci.yml` 与 `release.yml` 均已在 GitHub Actions 执行并全绿，`v0.1.1` 镜像已发布至 GHCR；仅 Unraid 真实部署待执行，见下） |
 | **P1-1** 气象数据与结算真值管线 | ✅ **已完成**（355 测试通过，lint 全绿；独立研究库、60 天回填 485/488 成功） |
 | **P1-2** ECMWF/GFS 概率模型 + 样本外评估 + 市场基线 | ✅ **已完成**（420 测试通过，lint 全绿）；行级旧数据迁移 ⬜ 未开始 |
-| **P2** Paper trading + 风险限制 | ⬜ 未开始 |
+| **P2-0** Shadow 决策观察引擎 | ✅ **已完成**（570 测试通过，lint 全绿）；Docker 构建与 NAS 24h 部署 ⬜ 未执行，见 `research/shadow-validation.md` |
+| **P2** Paper trading + 风险限制 | ⬜ 未开始（前提"模型样本外有效"**当前不满足**） |
 | **P3** 多城市 | ⬜ 未开始 |
 | **P4** 加固与深化 | ⬜ 未开始 |
 | Dashboard / 真实下单 | ⛔ 规范禁止 |

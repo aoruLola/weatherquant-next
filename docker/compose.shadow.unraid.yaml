@@ -1,0 +1,88 @@
+# WeatherQuant Next - shadow engine, Unraid Compose Manager Plus stack
+#
+# The companion to docs/shadow-unraid-deployment.md; the two are written to be
+# used together. The collector's stack (compose.unraid.yaml) is untouched by
+# this file and they never share a service name, an image tag or a data
+# directory.
+#
+# Five properties are deliberate and easy to break by editing:
+#
+#   1. NO `ports:`. The shadow makes outbound calls (Open-Meteo) and reads a
+#      mounted file. It serves nothing, so there is nothing to publish.
+#   2. ONE replica, enforced by the single-instance lock as well as by compose.
+#      Two shadows on one DuckDB is exactly what the `.shadow.lock` lease
+#      exists to refuse - with exit code 4, which is a *successful* refusal,
+#      not a crash.
+#   3. The collector's archive is mounted **read-only** at /collector-raw.
+#      This is the whole of the shadow's view of market data. It cannot write
+#      the collector's files, cannot open the collector's DuckDB (it never
+#      points at one), and the mount proves it rather than trusting it.
+#   4. The shadow's own data lives in its *own* host directory. Never point
+#      both containers at /mnt/user/appdata/weatherquant-next: the collector
+#      holds that directory's lock for its whole life, and the second writer
+#      would be refused - or worse, two different engines would share a
+#      directory whose layout neither expects.
+#   5. `stop_grace_period` above the loop period, so SIGTERM reaches the
+#      process and it can finish its cycle, commit the batch, rewrite the
+#      heartbeat and release the lease before the container is killed.
+#
+# Image tags: `shadow-stable` tracks the newest tag that passed the shadow
+# verify job; `sha-<commit>` is the immutable rollback target. The shadow has
+# its own workflow and its own tag namespace - it can never move the
+# collector's `stable`.
+
+x-common: &common
+  image: ghcr.io/aorulola/weatherquant-next-shadow:shadow-stable
+  container_name: weatherquant-shadow
+  restart: unless-stopped
+  stop_grace_period: 60s
+  user: "1000:1000"
+  security_opt:
+    - no-new-privileges:true
+  environment:
+    TZ: UTC
+    # The shadow's own database and health file.
+    WQ_SHADOW_DB_PATH: /data/shadow/shadow.duckdb
+    WQ_SHADOW_HEALTH_DIR: /data/health
+    # Baked into the image: which model decides, and which gates apply.
+    WQ_SHADOW_MODELS_DIR: /app/models
+    WQ_SHADOW_THRESHOLDS_PATH: /app/configs/shadow-thresholds.json
+    # The read-only mount below. NOT the collector's DuckDB - the shadow reads
+    # complete JSONL lines and never opens another engine's file.
+    WQ_COLLECTOR_RAW_DIR: /collector-raw
+    WQ_LOG_LEVEL: INFO
+    GIT_SHA: ${GIT_SHA:-unknown}
+    IMAGE_TAG: ${IMAGE_TAG:-shadow-stable}
+    # Outbound access to Open-Meteo. If the NAS reaches it through a proxy,
+    # uncomment and set - httpx honours the standard variables.
+    # HTTPS_PROXY: http://proxy:3128
+    # HTTP_PROXY: http://proxy:3128
+    # NO_PROXY: localhost,127.0.0.1
+  volumes:
+    # The shadow's own directory: shadow.duckdb, health/, and (if you choose
+    # to override the baked models) models/.
+    - /mnt/user/appdata/weatherquant-shadow:/data
+    # The collector's archive, READ-ONLY. Path is relative to the same
+    # Compose Manager Plus stack folder as the collector stack.
+    - /mnt/user/appdata/weatherquant-next/raw:/collector-raw:ro
+  healthcheck:
+    test: ["CMD", "python", "/usr/local/bin/healthcheck.py"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 60s
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  shadow:
+    <<: *common
+
+# Restart policy and health are handled above. Nothing here opens a port, and
+# nothing here depends on the collector's container being up - the shadow
+# degrades to COLLECTOR_DISCONNECTED and keeps running, which is the correct
+# behaviour: an outage of the feed is data the engine should report, not a
+# reason for it to exit.

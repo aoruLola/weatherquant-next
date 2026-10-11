@@ -1,0 +1,59 @@
+{
+  "_readme": [
+    "Risk gates for the shadow engine. Every value carries its own rationale, and",
+    "the whole file carries a version, because a threshold that can be changed",
+    "without changing a version cannot be audited after the fact.",
+    "",
+    "These were set A PRIORI from the published fee schedule and the collector's",
+    "poll cadence - not fitted to any sample of decisions. Re-tuning them on the",
+    "same outcomes they will later be judged against is how a strategy is",
+    "invented rather than found, so a change here must bump `version` and be",
+    "reviewed against docs/shadow-risk-rules.md."
+  ],
+  "version": "v2",
+  "set_at_utc": "2026-10-11T15:40:00+00:00",
+  "basis": "a priori: Polymarket published fee schedule + the collector's MEASURED per-token refresh cadence; never fitted to observed decisions",
+  "corrected_from": {
+    "version": "v1",
+    "what_changed": "max_snapshot_age_ms 15000 -> 90000",
+    "why": "v1 was derived from an incorrect premise: it assumed the collector re-polled each book every 5s. Measuring the real archive (2026-10-11, 66 tokens, 387 observations over 13 minutes) gives a per-token refresh gap of min 11.1s, p50 37.9s, p90 157.3s - because the worker sweeps tokens sequentially under a 45s per-cycle budget. At 15s, more than half of a perfectly healthy book would be judged stale by construction, so the gate would have refused everything regardless of the market. This is a correction of a wrong measurement, not a relaxation in response to outcomes: no decision had been observed when it was made.",
+    "measured_at_utc": "2026-10-11T15:35:00+00:00"
+  },
+  "thresholds": {
+    "min_net_edge_usd_per_share": {
+      "value": 0.02,
+      "unit": "USD per share",
+      "rationale": "The weather taker fee peaks at 0.05 * 0.25 = 0.0125 per share at p=0.5, and the execution buffer adds 0.5% of notional (0.005 at p=1). A floor of 0.02 clears worst-case documented costs with 0.0025 to spare, before any claim about model skill. Below this the model has to be right more often than the fee schedule alone already eats."
+    },
+    "max_snapshot_age_ms": {
+      "value": 90000,
+      "unit": "ms",
+      "rationale": "Two collector sweeps. The measured per-token refresh gap is p50 37.9s (real archive, 2026-10-11) under a 45s per-cycle budget, so 90s admits the newest book the collector can produce while still refusing one that is two refreshes behind - which means that token is no longer being watched at all. Below one sweep (45s) the gate would fire on healthy books; a book older than 90s is not a live market, it is a record of a market we stopped watching."
+    },
+    "max_forecast_age_hours": {
+      "value": 30.0,
+      "unit": "hours since run initialisation",
+      "rationale": "A run is publishable 12h after initialisation (single_runs PUBLISHABLE_LAG_HOURS) and runs issue every 6h, so a healthy engine sees runs aged 12-18h. 30h tolerates two missed cycles of upstream outage without admitting a run so old the lead-time bucket it prices has moved."
+    },
+    "proposed_shares": {
+      "value": 100.0,
+      "unit": "shares",
+      "rationale": "Large enough that a thin book shows up as a partial fill rather than filling instantly and hiding its own emptiness; small enough that depth is never the binding constraint on a market that has any. Shadow only - no order is ever placed and no capital exists."
+    },
+    "require_complete_fill": {
+      "value": true,
+      "unit": "boolean",
+      "rationale": "A partial fill is not a smaller trade, it is a different trade: the unfilled remainder would have to be repriced against a book we just drove through. Refusing it keeps every ACCEPT interpretable."
+    },
+    "min_depth_usd": {
+      "value": 25.0,
+      "unit": "USD notional on the traded side",
+      "rationale": "A second, independent liquidity floor expressed in dollars rather than shares, so that a book resting entirely at 1c cannot pass a share-count check while being worth almost nothing."
+    },
+    "max_decision_latency_ms": {
+      "value": 5000,
+      "unit": "ms",
+      "rationale": "Reporting threshold only, not a gate. Above it the P95 latency metric flags the cycle as degraded so a slow evaluator is visible before it becomes an accuracy problem."
+    }
+  }
+}

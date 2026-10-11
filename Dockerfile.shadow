@@ -1,0 +1,90 @@
+# syntax=docker/dockerfile:1.7
+#
+# WeatherQuant Next shadow engine image.
+#
+# A *separate* file rather than another stage in the collector's Dockerfile.
+# That is a deliberate isolation choice, not an oversight: the collector's
+# build steps contain no `target:`, so they build the last stage - appending a
+# stage would silently change what `release.yml` publishes to the tag the NAS
+# pulls. Two files make it structurally impossible for a shadow change to move
+# the collector's image.
+#
+# Choices worth knowing before you change them:
+#
+#   * Model artifacts are **baked in** from `models/`. A pinned image then
+#     carries pinned parameters, so "which model decided this" is answered by
+#     the image tag alone. `WQ_SHADOW_MODELS_DIR` can be overridden with a
+#     mounted directory to use artifacts fitted elsewhere, without a rebuild.
+#   * The risk gates are baked from `configs/shadow-thresholds.json` for the
+#     same reason: a threshold that lives on the volume could be widened
+#     without anything in the image changing.
+#   * `/collector-raw` is created but never written: it is the mount point for
+#     the collector's archive, mounted read-only by the compose file.
+#   * No EXPOSE. The shadow makes outbound calls (Open-Meteo) and reads a
+#     mounted file; it serves nothing.
+#   * No wallet, no key material, no order client anywhere in the image. That
+#     is not a configuration - the package has no such code path.
+
+ARG PYTHON_VERSION=3.12
+
+# ---------------------------------------------------------------------------
+FROM ghcr.io/astral-sh/uv:0.13.0 AS uv
+
+# ---------------------------------------------------------------------------
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+COPY --from=uv /uv /uvx /usr/local/bin/
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/app/.venv
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+COPY src ./src
+RUN uv sync --frozen --no-dev --no-editable \
+    && /app/.venv/bin/python -c "import weatherquant; print('weatherquant', weatherquant.__version__)"
+
+# ---------------------------------------------------------------------------
+FROM python:${PYTHON_VERSION}-slim AS runtime
+
+RUN groupadd --gid 1000 wq \
+    && useradd --uid 1000 --gid wq --no-create-home --home-dir /app --shell /usr/sbin/nologin wq
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TZ=UTC \
+    WQ_SHADOW_DB_PATH=/data/shadow/shadow.duckdb \
+    WQ_SHADOW_HEALTH_DIR=/data/health \
+    WQ_SHADOW_THRESHOLDS_PATH=/app/configs/shadow-thresholds.json \
+    WQ_SHADOW_MODELS_DIR=/app/models \
+    WQ_COLLECTOR_RAW_DIR=/collector-raw
+
+WORKDIR /app
+
+COPY --from=builder /app/.venv /app/.venv
+
+# Versioned inputs that must travel with the code, not with the volume.
+COPY --chown=wq:wq configs ./configs
+COPY --chown=wq:wq models ./models
+COPY --chown=wq:wq docker/healthcheck_shadow.py /usr/local/bin/healthcheck.py
+
+# /data is the shadow's own directory (its DuckDB and health file).
+# /collector-raw is the collector's archive, mounted READ-ONLY at run time.
+RUN mkdir -p /data /collector-raw && chown wq:wq /data /collector-raw
+
+USER wq
+VOLUME ["/data"]
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["python", "/usr/local/bin/healthcheck.py"]
+
+# No shell form: PID 1 is the shadow engine, so SIGTERM reaches it directly and
+# the graceful-shutdown path runs instead of being swallowed by an intermediary.
+ENTRYPOINT ["weatherquant-shadow"]
+CMD ["run"]

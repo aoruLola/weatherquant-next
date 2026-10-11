@@ -1,0 +1,207 @@
+# Development CI for the shadow engine: test and build only.
+#
+# Deliberately never pushes an image. Publishing is reserved for
+# shadow-release.yml, so an ordinary commit cannot move `shadow-stable` - and
+# this workflow cannot move the *collector's* tags either, because it builds
+# `Dockerfile.shadow` under a different name and has no GHCR login at all.
+#
+# The container checks below are the offline acceptance list from the spec:
+# non-root, health, data-directory permissions, restart retention, the
+# single-instance lease, a read-only collector mount, and SIGTERM.
+
+name: shadow-ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+  actions: write   # Docker layer cache (cache-to: type=gha)
+
+jobs:
+  shadow-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Pytest (shadow modules)
+        run: uv run pytest -q tests/test_shadow_models.py tests/test_shadow_storage.py tests/test_shadow_ingest.py tests/test_shadow_forecast.py tests/test_shadow_decision.py tests/test_shadow_runner.py
+
+      - name: Model artifacts are present and pinned
+        run: |
+          test -f models/manifest.json
+          uv run python -c "from weatherquant.models.artifacts import load_manifest; print(load_manifest('models'))"
+
+  build-shadow-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: shadow-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.shadow
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: weatherquant-shadow:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Container starts and reports health
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/shadow-data" "$RUNNER_TEMP/collector-raw/gamma"
+          # The image runs as uid 1000 and a bind mount masks the chown done
+          # inside it, so the host directory must match first.
+          sudo chown -R 1000:1000 "$RUNNER_TEMP/shadow-data" "$RUNNER_TEMP/collector-raw"
+
+          # A minimal read-only archive for the shadow to tail. Envelope shape
+          # matches data/archive.py exactly.
+          printf '%s\n' '{"archive_seq":1,"source":"gamma","received_at_utc":"2026-10-11T12:00:00+00:00","venue_ts_utc":null,"venue_ts_origin":"missing","quality":"ok","run_id":"ci","payload":{"id":"ci-event","title":"probe","markets":[]}}' \
+            > "$RUNNER_TEMP/collector-raw/gamma/2026-10-11.jsonl"
+          sudo chown 1000:1000 "$RUNNER_TEMP/collector-raw/gamma/2026-10-11.jsonl"
+
+          docker run -d --name shadow-ci \
+            -v "$RUNNER_TEMP/shadow-data:/data" \
+            -v "$RUNNER_TEMP/collector-raw:/collector-raw:ro" \
+            -e WQ_SHADOW_HEALTH_DIR=/data/health \
+            -e WQ_DISK_WARN_PERCENT=10 \
+            -e WQ_DISK_CRITICAL_PERCENT=3 \
+            weatherquant-shadow:ci
+
+          # Health must come up without anyone opening the database.
+          for i in $(seq 1 30); do
+            if docker exec shadow-ci python /usr/local/bin/healthcheck.py; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec shadow-ci python /usr/local/bin/healthcheck.py
+          echo "health OK"
+
+      - name: Runs as a non-root user
+        run: |
+          set -euo pipefail
+          uid=$(docker exec shadow-ci id -u)
+          echo "uid=$uid"
+          test "$uid" != "0"
+
+      - name: Data directory is writable by the container user
+        run: |
+          set -euo pipefail
+          docker exec shadow-ci sh -c 'touch /data/.write-probe && rm /data/.write-probe'
+          test -f "$RUNNER_TEMP/shadow-data/health/heartbeat.json"
+
+      - name: Read-only collector mount cannot be written through
+        run: |
+          set -euo pipefail
+          before=$(sha256sum "$RUNNER_TEMP/collector-raw/gamma/2026-10-11.jsonl")
+          if docker exec shadow-ci sh -c 'echo nope >> /collector-raw/gamma/2026-10-11.jsonl' 2>/dev/null; then
+            echo "wrote to a read-only mount" >&2
+            exit 1
+          fi
+          after=$(sha256sum "$RUNNER_TEMP/collector-raw/gamma/2026-10-11.jsonl")
+          test "$before" = "$after"
+          echo "collector archive untouched"
+
+      - name: Single-instance lease refuses a second writer with exit code 4
+        run: |
+          set -euo pipefail
+          set +e
+          docker run --rm \
+            -v "$RUNNER_TEMP/shadow-data:/data" \
+            -v "$RUNNER_TEMP/collector-raw:/collector-raw:ro" \
+            -e WQ_SHADOW_HEALTH_DIR=/data/health \
+            -e WQ_DISK_WARN_PERCENT=10 \
+            weatherquant-shadow:ci run --once
+          code=$?
+          set -e
+          echo "second instance exit code: $code"
+          test "$code" -eq 4
+
+      - name: SIGTERM is handled gracefully and state survives a restart
+        run: |
+          set -euo pipefail
+          docker stop -t 60 shadow-ci
+          test -f "$RUNNER_TEMP/shadow-data/shadow/shadow.duckdb"
+          status=$(python3 -c "import json;print(json.load(open('$RUNNER_TEMP/shadow-data/health/heartbeat.json'))['status'])")
+          echo "status after stop: $status"
+          test "$status" = "stopped" -o "$status" = "failed"
+
+          # Restart against the same volume: the database must still be there.
+          docker run -d --name shadow-restart \
+            -v "$RUNNER_TEMP/shadow-data:/data" \
+            -v "$RUNNER_TEMP/collector-raw:/collector-raw:ro" \
+            -e WQ_SHADOW_HEALTH_DIR=/data/health \
+            -e WQ_DISK_WARN_PERCENT=10 \
+            weatherquant-shadow:ci
+          sleep 5
+          docker exec shadow-restart python /usr/local/bin/healthcheck.py
+
+      - name: The shadow database is a real shadow database
+        run: |
+          set -euo pipefail
+          docker stop -t 60 shadow-restart
+          docker run --rm --entrypoint python \
+            -v "$RUNNER_TEMP/shadow-data:/data" \
+            -e WQ_SHADOW_DB_PATH=/data/shadow/shadow.duckdb \
+            weatherquant-shadow:ci -c "
+          import duckdb, sys
+          con = duckdb.connect('/data/shadow/shadow.duckdb', read_only=True)
+          tables = {r[0] for r in con.execute(\"SELECT table_name FROM information_schema.tables WHERE table_schema='main'\").fetchall()}
+          con.close()
+          required = {'shadow_decisions', 'market_catalog', 'ingest_checkpoints'}
+          missing = required - tables
+          if missing:
+              print('missing tables:', missing, file=sys.stderr)
+              sys.exit(1)
+          print('tables OK:', sorted(tables))
+          "
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker logs shadow-ci || true
+
+  # Development CI builds but never publishes. This job asserts that of the
+  # file itself, so an accidental login step fails loudly instead of quietly
+  # moving a tag the NAS pulls.
+  shadow-ci-never-publishes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: No registry login in the development workflow
+        run: |
+          set -euo pipefail
+          if grep -q "docker/login-action" .github/workflows/shadow-ci.yml; then
+            echo "shadow-ci must not publish anything" >&2
+            exit 1
+          fi
+          if grep -q "push: true" .github/workflows/shadow-ci.yml; then
+            echo "shadow-ci must not push an image" >&2
+            exit 1
+          fi

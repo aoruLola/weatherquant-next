@@ -1,0 +1,214 @@
+# Publish the shadow engine image.
+#
+# This workflow can only ever touch `ghcr.io/aorulola/weatherquant-next-shadow`.
+# It has its own tag namespace (`shadow-v*`), its own mutable pointer
+# (`shadow-stable`), and it never writes `aorulola/weatherquant-next` - which is
+# the tag the collector's stack pulls. A shadow release cannot move the
+# collector, and the collector's release cannot move the shadow: two workflows,
+# two image names, two tag namespaces, one `release` environment gate each.
+#
+# Tags produced, all of them on the -shadow package only:
+#   sha-<full commit sha>   immutable; the rollback target
+#   shadow-vX.Y.Z           the release
+#   shadow-stable           mutable pointer, moved only here, only after verify
+
+name: shadow-release
+
+on:
+  push:
+    tags: ["shadow-v*"]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why is this being released manually?"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  actions: write
+
+concurrency:
+  group: shadow-release
+  cancel-in-progress: false   # never interrupt a release mid-publish
+
+env:
+  REGISTRY: ghcr.io
+  # Deliberately NOT github.repository: that resolves to the collector's image
+  # name, and publishing a shadow build to it would move the tag the NAS pulls.
+  IMAGE_NAME: ${{ github.repository }}-shadow
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Pytest
+        run: uv run pytest -q
+
+      - name: Model manifest pins every model the shadow runs
+        run: |
+          set -euo pipefail
+          uv run python - <<'PY'
+          from weatherquant.models.artifacts import load_manifest
+          from weatherquant.shadow.config import ShadowSettings
+          pinned = load_manifest(ShadowSettings().shadow_models_dir)
+          wanted = set(ShadowSettings().model_names)
+          missing = wanted - set(pinned)
+          assert not missing, f"unpinned model(s): {sorted(missing)}"
+          print("pinned:", pinned)
+          PY
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.shadow
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: weatherquant-shadow:release-candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Container runs, is non-root, is healthy, and refuses a second writer
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/shadow-data" "$RUNNER_TEMP/collector-raw/gamma"
+          sudo chown -R 1000:1000 "$RUNNER_TEMP/shadow-data" "$RUNNER_TEMP/collector-raw"
+          printf '%s\n' '{"archive_seq":1,"source":"gamma","received_at_utc":"2026-10-11T12:00:00+00:00","venue_ts_utc":null,"venue_ts_origin":"missing","quality":"ok","run_id":"release","payload":{"id":"rel-event","title":"probe","markets":[]}}' \
+            > "$RUNNER_TEMP/collector-raw/gamma/2026-10-11.jsonl"
+          sudo chown 1000:1000 "$RUNNER_TEMP/collector-raw/gamma/2026-10-11.jsonl"
+
+          docker run -d --name shadow-rel \
+            -v "$RUNNER_TEMP/shadow-data:/data" \
+            -v "$RUNNER_TEMP/collector-raw:/collector-raw:ro" \
+            -e WQ_SHADOW_HEALTH_DIR=/data/health \
+            -e WQ_DISK_WARN_PERCENT=10 \
+            -e WQ_DISK_CRITICAL_PERCENT=3 \
+            weatherquant-shadow:release-candidate
+
+          for i in $(seq 1 30); do
+            docker exec shadow-rel python /usr/local/bin/healthcheck.py && break
+            sleep 2
+          done
+          docker exec shadow-rel python /usr/local/bin/healthcheck.py
+
+          uid=$(docker exec shadow-rel id -u)
+          echo "uid=$uid"
+          test "$uid" != "0"
+
+          docker exec shadow-rel sh -c 'touch /data/.write-probe && rm /data/.write-probe'
+
+          # Second writer must be refused with the lock's exit code.
+          set +e
+          docker run --rm \
+            -v "$RUNNER_TEMP/shadow-data:/data" \
+            -v "$RUNNER_TEMP/collector-raw:/collector-raw:ro" \
+            -e WQ_SHADOW_HEALTH_DIR=/data/health \
+            -e WQ_DISK_WARN_PERCENT=10 \
+            weatherquant-shadow:release-candidate run --once
+          code=$?
+          set -e
+          echo "second instance exit code: $code"
+          test "$code" -eq 4
+
+      - name: SIGTERM then restart keeps the data
+        run: |
+          set -euo pipefail
+          docker stop -t 60 shadow-rel
+          test -f "$RUNNER_TEMP/shadow-data/shadow/shadow.duckdb"
+
+      - name: The persisted database is a shadow database with rows in it
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint python \
+            -v "$RUNNER_TEMP/shadow-data:/data" \
+            weatherquant-shadow:release-candidate -c "
+          import duckdb, sys
+          con = duckdb.connect('/data/shadow/shadow.duckdb', read_only=True)
+          n_runs = con.execute('SELECT COUNT(*) FROM shadow_runs').fetchone()[0]
+          tables = {r[0] for r in con.execute(\"SELECT table_name FROM information_schema.tables WHERE table_schema='main'\").fetchall()}
+          con.close()
+          assert n_runs >= 1, 'no shadow_runs row survived the restart'
+          required = {'shadow_decisions', 'market_catalog', 'ingest_checkpoints', 'model_versions'}
+          missing = required - tables
+          assert not missing, f'missing tables: {sorted(missing)}'
+          print('rows OK, tables:', sorted(tables))
+          "
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker logs shadow-rel || true
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release   # gated behind a required reviewer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase the image name
+        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=ref,event=tag
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.shadow
+          platforms: linux/amd64
+          push: true
+          provenance: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Move the shadow-stable pointer
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME}"
+          sha="sha-${GITHUB_SHA}"
+          docker buildx imagetools create \
+            -t "${REGISTRY}/${IMAGE_NAME}:shadow-stable" \
+            "${REGISTRY}/${IMAGE_NAME}:${sha}"
+          echo "shadow-stable -> ${sha} (released as ${ref})"

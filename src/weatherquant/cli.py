@@ -8,6 +8,7 @@ Nothing here writes to the collector's database or to the legacy database.
     weatherquant-research extract-legacy [--legacy PATH]
     weatherquant-research crosscheck
     weatherquant-research rules [--event-id ID] [--source NAME]
+    weatherquant-research fit-models --cutoff YYYY-MM-DD [--pin]
     weatherquant-research report [--json]
 """
 
@@ -139,6 +140,75 @@ def cmd_rules(settings: Settings, args: argparse.Namespace) -> int:
         if detail and args.verbose:
             print(f"{'':>10}  {detail}")
     print(f"\n{len(rows)} event(s)")
+    return 0
+
+
+def cmd_fit_models(settings: Settings, args: argparse.Namespace) -> int:
+    """Fit the four baselines and freeze them as versioned artifacts.
+
+    The cutoff is mandatory. A fit that defaulted to "everything in the
+    database" would have a training window nobody chose, and the shadow engine
+    would then load parameters fitted on data that includes the very day it is
+    asked to decide about.
+    """
+    from datetime import date as _date
+
+    from weatherquant.models.factory import FIT_SPECS, fit_models
+
+    try:
+        cutoff = _date.fromisoformat(args.cutoff)
+    except ValueError as exc:
+        print(f"invalid --cutoff {args.cutoff!r}: {exc}", file=sys.stderr)
+        return 2
+
+    names = None
+    if args.models:
+        names = [n.strip() for n in args.models.split(",") if n.strip()]
+        unknown = [n for n in names if n not in FIT_SPECS]
+        if unknown:
+            print(f"unknown model(s): {unknown}; known: {sorted(FIT_SPECS)}", file=sys.stderr)
+            return 2
+
+    from weatherquant.shadow.config import ShadowSettings
+
+    models_dir = Path(args.out) if args.out else ShadowSettings().shadow_models_dir
+    version = args.version or f"cut-{cutoff.isoformat()}"
+
+    if not settings.research_db_path.exists():
+        print(f"research database not found: {settings.research_db_path}", file=sys.stderr)
+        return 2
+
+    with _db(settings) as db:
+        try:
+            artifacts, problems = fit_models(
+                db.con,
+                cutoff=cutoff,
+                models_dir=models_dir,
+                version=version,
+                models=names,
+                observation_rule=args.observation_rule,
+                pin=args.pin,
+            )
+        except FileExistsError as exc:
+            print(
+                f"{exc}\nmodel versions are immutable; choose a new --version",
+                file=sys.stderr,
+            )
+            return 3
+
+    for artifact in artifacts:
+        print(f"{artifact.model_name}@{artifact.model_version}")
+        print(f"  cutoff      {artifact.training_cutoff_utc.date()}  pairs={artifact.n_pairs}  dates={artifact.n_dates}")
+        print(f"  bias        {artifact.bias_f:+.4f} F")
+        print(f"  sigma       {artifact.sigma_by_lead}")
+        print(f"  source hash {artifact.source_data_hash[:16]}…")
+        for note in problems.get(artifact.model_name, []):
+            print(f"  note        {note}")
+    print(f"\nwritten to {models_dir}")
+    if args.pin:
+        print(f"pinned in {models_dir / 'manifest.json'}")
+    else:
+        print("not pinned; pass --pin to make these the versions the shadow loads")
     return 0
 
 
@@ -318,6 +388,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("fit-models", help="fit the baselines and freeze them as versioned artifacts")
+    p.add_argument("--cutoff", required=True, help="last target date the fit may see (YYYY-MM-DD)")
+    p.add_argument("--version", help="artifact version (default: cut-<cutoff>)")
+    p.add_argument("--out", help="models directory (default: <project>/models, committed and baked)")
+    p.add_argument("--models", help=f"comma-separated subset of {', '.join(['ecmwf_raw', 'gfs_raw', 'fusion', 'calibrated'])}")
+    p.add_argument("--observation-rule", default="max of all readings")
+    p.add_argument("--pin", action="store_true", help="write manifest.json so the shadow loads these")
+
     p = sub.add_parser("report", help="data-quality report")
     p.add_argument("--json", action="store_true")
     return parser
@@ -338,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         "extract-legacy": cmd_extract_legacy,
         "crosscheck": cmd_crosscheck,
         "rules": cmd_rules,
+        "fit-models": cmd_fit_models,
         "report": cmd_report,
     }
     return handlers[args.command](settings, args)
