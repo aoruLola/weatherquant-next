@@ -82,9 +82,18 @@ def cmd_run(settings: Settings, shadow: ShadowSettings, args: argparse.Namespace
     runner = ShadowRunner(config)
 
     if getattr(args, "once", False):
+        from weatherquant.data.lock import LockError
+
         try:
             runner.start()
             stats = runner.cycle()
+        except LockError as exc:
+            # Exit code 4 is the documented single-instance refusal, and
+            # `--once` is exactly how an operator (and CI) probes for it.
+            # Falling through to the generic handler below would report 1,
+            # which reads as a crash rather than as a correct refusal.
+            print(f"refused: {exc}", file=sys.stderr)
+            return 4
         except Exception as exc:
             print(f"cycle failed: {exc}", file=sys.stderr)
             runner.close(status="failed", reason=str(exc))

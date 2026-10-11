@@ -472,6 +472,38 @@ def test_starting_alone_publishes_a_heartbeat(tmp_path, archive, models_dir, mon
     assert payload["run_id"] == runner.run_id
 
 
+def test_once_returns_exit_code_4_when_the_lease_is_held(tmp_path, archive, models_dir) -> None:
+    """The single-instance refusal has to survive `--once`.
+
+    `--once` wraps start() in a broad `except Exception`, which turned the
+    documented refusal (exit 4) into a generic failure (exit 1) - so the very
+    command an operator and CI use to probe for the lock reported a crash
+    instead of a correct refusal.
+    """
+    from weatherquant.data.lock import SingleInstanceLock
+    from weatherquant.shadow.cli import main
+
+    shadow = _settings(tmp_path, archive, models_dir)
+    lock_path = shadow.shadow_db_path.parent / ".shadow.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Held by a live pid with a fresh heartbeat: not reclaimable.
+    holder = SingleInstanceLock(lock_path, run_id="someone-else", hostname="other-host")
+    holder.acquire()
+    try:
+        code = main(
+            [
+                "--db", str(shadow.shadow_db_path),
+                "--raw", str(shadow.collector_raw_dir),
+                "--models", str(shadow.shadow_models_dir),
+                "run", "--once",
+            ]
+        )
+        assert code == 4, f"expected the single-instance refusal code, got {code}"
+    finally:
+        holder.release()
+
+
 def test_a_missing_heartbeat_is_starting_not_unhealthy() -> None:
     from weatherquant.shadow.health import evaluate_shadow_health
 
