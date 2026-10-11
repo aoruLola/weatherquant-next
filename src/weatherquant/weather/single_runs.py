@@ -253,6 +253,11 @@ class SingleRunsClient:
 
     def fetch(self, model: str, run_time_utc: datetime) -> RunFetch:
         """Fetch one run. Never raises for an unavailable run - that is a result."""
+        # Resolve the alias once and store the id the API actually served.
+        # Storing the alias instead leaves rows keyed `gfs` while every query
+        # uses `gfs_seamless`, so the whole GFS baseline scores nothing - which
+        # is exactly what the first baseline report showed.
+        resolved = MODEL_IDS.get(model, model)
         url, params = self.build_url(model, run_time_utc)
         fetched_at = datetime.now(tz=UTC)
         try:
@@ -267,7 +272,7 @@ class SingleRunsClient:
             detail = exc.detail
             unavailable = "not available" in detail or "must not be set" in detail
             return RunFetch(
-                model=model,
+                model=resolved,
                 run_time_utc=run_time_utc,
                 status="unavailable" if unavailable else "failed",
                 http_status=400,
@@ -276,7 +281,7 @@ class SingleRunsClient:
             )
         except Exception as exc:
             return RunFetch(
-                model=model,
+                model=resolved,
                 run_time_utc=run_time_utc,
                 status="failed",
                 error_text=str(exc)[:500],
@@ -287,7 +292,7 @@ class SingleRunsClient:
             # 404 from this endpoint is not used; kept for symmetry with other
             # clients. Open-Meteo reports unavailability as 400.
             return RunFetch(
-                model=model, run_time_utc=run_time_utc, status="unavailable",
+                model=resolved, run_time_utc=run_time_utc, status="unavailable",
                 http_status=404, error_text="not found", fetched_at_utc=fetched_at,
             )
 
@@ -299,11 +304,11 @@ class SingleRunsClient:
             if isinstance(payload, dict):
                 error = str(payload.get("reason") or payload.get("error") or "")[:500] or None
             return RunFetch(
-                model=model, run_time_utc=run_time_utc, status="unavailable",
+                model=resolved, run_time_utc=run_time_utc, status="unavailable",
                 error_text=error, fetched_at_utc=fetched_at,
             )
 
-        result = parse_run_response(payload, model=model)
+        result = parse_run_response(payload, model=resolved)
         result.fetched_at_utc = fetched_at
         result.raw_path = self._store_raw(model, run_time_utc, payload)
         return result
