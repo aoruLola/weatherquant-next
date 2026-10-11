@@ -94,10 +94,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/shadow-data" "$RUNNER_TEMP/collector-raw/gamma"
-          sudo chown -R 1000:1000 "$RUNNER_TEMP/shadow-data" "$RUNNER_TEMP/collector-raw"
+
+          # Written BEFORE the chown. This job runs as uid 1001 and a directory
+          # handed to uid 1000 is no longer one it can create files in - the
+          # exact failure that stopped the first release attempt. The same fix
+          # landed in shadow-ci.yml; the two blocks are copies of each other,
+          # which is why it had to be applied twice.
           printf '%s\n' '{"archive_seq":1,"source":"gamma","received_at_utc":"2026-10-11T12:00:00+00:00","venue_ts_utc":null,"venue_ts_origin":"missing","quality":"ok","run_id":"release","payload":{"id":"rel-event","title":"probe","markets":[]}}' \
             > "$RUNNER_TEMP/collector-raw/gamma/2026-10-11.jsonl"
-          sudo chown 1000:1000 "$RUNNER_TEMP/collector-raw/gamma/2026-10-11.jsonl"
+
+          sudo chown -R 1000:1000 "$RUNNER_TEMP/shadow-data" "$RUNNER_TEMP/collector-raw"
 
           docker run -d --name shadow-rel \
             -v "$RUNNER_TEMP/shadow-data:/data" \
@@ -107,10 +113,16 @@ jobs:
             -e WQ_DISK_CRITICAL_PERCENT=3 \
             weatherquant-shadow:release-candidate
 
-          for i in $(seq 1 30); do
-            docker exec shadow-rel python /usr/local/bin/healthcheck.py && break
+          # Wait for the heartbeat FILE, not for exit code 0: the probe exits 0
+          # for "starting" as well as "healthy", so looping on it stops before
+          # the engine has written anything.
+          for i in $(seq 1 60); do
+            if docker exec shadow-rel test -f /data/health/heartbeat.json; then
+              break
+            fi
             sleep 2
           done
+          docker exec shadow-rel test -f /data/health/heartbeat.json
           docker exec shadow-rel python /usr/local/bin/healthcheck.py
 
           uid=$(docker exec shadow-rel id -u)
