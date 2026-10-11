@@ -289,24 +289,38 @@ def _point_forecasts(
         pairs, own_problems = loaded[source]
         return [dict(p, point=p["predicted_max_f"]) for p in pairs], own_problems
 
-    # Fusion: mean of every model's forecast for the date.
-    by_date: dict[date, dict] = {}
+    # Fusion: mean across models at the SAME run time.
+    #
+    # Keyed on (target_date, run_time), not on the date alone. Collapsing to
+    # one forecast per date would give the fusion baseline ~1 row per date while
+    # the raw baselines score every run - two different sample sizes being
+    # compared as if they were the same experiment. ECMWF and GFS both issue at
+    # 00/06/12/18Z, so their run times line up and the intersection is clean.
+    by_key: dict[tuple, dict] = {}
     for model in models:
         if model not in loaded:
             continue
         pairs, _ = loaded[model]
         for p in pairs:
-            slot = by_date.setdefault(p["target_date"], {"values": [], "base": p})
+            key = (p["target_date"], p["run_time_utc"])
+            slot = by_key.setdefault(key, {"values": [], "base": p, "models": set()})
             slot["values"].append(p["predicted_max_f"])
+            slot["models"].add(model)
+
     out = []
-    for target_date, slot in sorted(by_date.items()):
+    partial = 0
+    for _key, slot in sorted(by_key.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        if len(slot["models"]) < len(models):
+            partial += 1
+            continue  # a fusion of one model is not a fusion
         merged = dict(slot["base"])
         merged["point"] = sum(slot["values"]) / len(slot["values"])
-        if len(slot["values"]) < len(models):
-            problems.append(
-                f"{target_date}: fusion used {len(slot['values'])}/{len(models)} models"
-            )
         out.append(merged)
+
+    if partial:
+        problems.append(
+            f"fusion skipped {partial} run(s) present in only one of {len(models)} models"
+        )
     if not out:
         problems.append(f"no data for source {source!r}")
     return out, problems
