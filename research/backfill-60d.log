@@ -23,3 +23,5 @@ run slots   : 242 (484 requests planned)
   [ 340/484] gfs            2026-09-05T06:00Z ok   pts=240 nulls=0
   [ 360/484] gfs            2026-09-10T06:00Z ok   pts=240 nulls=0
   [ 380/484] gfs            2026-09-15T06:00Z ok   pts=240 nulls=0
+  [ 400/484] gfs            2026-09-20T06:00Z ok   pts=240 nulls=0
+  [ 420/484] gfs            2026-09-25T06:00Z ok   pts=240 nulls=0

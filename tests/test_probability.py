@@ -274,12 +274,41 @@ def test_the_half_degree_widening_reaches_the_probability() -> None:
 
 
 def test_bias_shifts_probability_in_the_expected_direction() -> None:
+    """Direction of the shift, checked against hand-computed values.
+
+    The point forecast must sit *off* the bracket centre. At the centre the
+    normal distribution is symmetric, so +bias and -bias give exactly the same
+    probability (CI caught this: 0.1359 > 0.1359). Above the centre, a cold
+    correction moves mass *into* the bracket and raises its probability.
+    """
+    b = Bracket(label="70-71", kind=BracketKind.RANGE, low=70.0, high=71.0)
+    sigma = 2.0
+    predicted = 71.0  # above the widened bracket's centre of 70.5
+
+    cold = bracket_probability(predicted, b, model=_model(bias=-3.0, sigma=sigma), lead_hours=12.0)
+    hot = bracket_probability(predicted, b, model=_model(bias=3.0, sigma=sigma), lead_hours=12.0)
+
+    # Hand-derived: widened bracket is [69.5, 71.5).
+    #   cold -> corrected 68 -> Phi(1.75) - Phi(0.75)
+    #   hot  -> corrected 74 -> Phi(-1.25) - Phi(-2.25)
+    from statistics import NormalDist
+
+    nd = NormalDist(0.0, 1.0)
+    expected_cold = nd.cdf(1.75) - nd.cdf(0.75)
+    expected_hot = nd.cdf(-1.25) - nd.cdf(-2.25)
+
+    assert cold == pytest.approx(expected_cold, abs=1e-9)
+    assert hot == pytest.approx(expected_hot, abs=1e-9)
+    assert cold > hot, "a cold correction moves mass into a bracket above the forecast"
+    assert expected_cold > expected_hot
+
+
+def test_at_the_bracket_centre_a_symmetric_bias_gives_equal_probability() -> None:
+    """The symmetry CI's failing assertion exposed, recorded as the rule it is."""
     b = Bracket(label="70-71", kind=BracketKind.RANGE, low=70.0, high=71.0)
     cold = bracket_probability(70.5, b, model=_model(bias=-3.0, sigma=2.0), lead_hours=12.0)
     hot = bracket_probability(70.5, b, model=_model(bias=3.0, sigma=2.0), lead_hours=12.0)
-    # A model that runs cold needs the observation shifted down, so a bracket
-    # at the forecast becomes less likely after correction.
-    assert cold > hot
+    assert cold == pytest.approx(hot, abs=1e-12)
 
 
 def test_no_sigma_means_no_probability() -> None:
