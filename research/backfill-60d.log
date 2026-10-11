@@ -1,50 +1,9 @@
 research db : data\research\weather-research.duckdb
 models      : ['ecmwf_ifs025', 'gfs']
-window      : 2026-08-11 .. 2026-10-10
-run slots   : 244 (488 requests planned)
-  [  20/488] ecmwf_ifs025   2026-08-15T18:00Z ok   pts=240 nulls=93
-  [  40/488] ecmwf_ifs025   2026-08-20T18:00Z ok   pts=240 nulls=93
-  [  60/488] ecmwf_ifs025   2026-08-25T18:00Z ok   pts=240 nulls=93
-  [  80/488] ecmwf_ifs025   2026-08-30T18:00Z ok   pts=240 nulls=93
-  [ 100/488] ecmwf_ifs025   2026-09-04T18:00Z ok   pts=240 nulls=93
-  [ 120/488] ecmwf_ifs025   2026-09-09T18:00Z ok   pts=240 nulls=93
-  [ 140/488] ecmwf_ifs025   2026-09-14T18:00Z ok   pts=240 nulls=93
-  [ 160/488] ecmwf_ifs025   2026-09-19T18:00Z ok   pts=240 nulls=93
-  [ 180/488] ecmwf_ifs025   2026-09-24T18:00Z ok   pts=240 nulls=93
-  [ 200/488] ecmwf_ifs025   2026-09-29T18:00Z ok   pts=240 nulls=93
-  [ 220/488] ecmwf_ifs025   2026-10-04T18:00Z ok   pts=240 nulls=93
-  [ 240/488] ecmwf_ifs025   2026-10-09T18:00Z ok   pts=240 nulls=93
-  [ 243/488] ecmwf_ifs025   2026-10-10T12:00Z unav pts=0 nulls=0
-  [ 244/488] ecmwf_ifs025   2026-10-10T18:00Z unav pts=0 nulls=0
-  [ 260/488] gfs            2026-08-14T18:00Z ok   pts=240 nulls=0
-  [ 280/488] gfs            2026-08-19T18:00Z ok   pts=240 nulls=0
-  [ 300/488] gfs            2026-08-24T18:00Z ok   pts=240 nulls=0
-  [ 320/488] gfs            2026-08-29T18:00Z ok   pts=240 nulls=0
-  [ 340/488] gfs            2026-09-03T18:00Z ok   pts=240 nulls=0
-  [ 360/488] gfs            2026-09-08T18:00Z ok   pts=240 nulls=0
-  [ 380/488] gfs            2026-09-13T18:00Z ok   pts=240 nulls=0
-  [ 400/488] gfs            2026-09-18T18:00Z ok   pts=240 nulls=0
-  [ 420/488] gfs            2026-09-23T18:00Z ok   pts=240 nulls=0
-  [ 440/488] gfs            2026-09-28T18:00Z ok   pts=240 nulls=0
-  [ 460/488] gfs            2026-10-03T18:00Z ok   pts=240 nulls=0
-  [ 480/488] gfs            2026-10-08T18:00Z ok   pts=240 nulls=0
-  [ 488/488] gfs            2026-10-10T18:00Z unav pts=0 nulls=0
-
-backfill finished in 1700s
-  runs_ok              485
-  runs_unavailable     3
-  runs_failed          0
-  hourly_rows          104956
-  daily_rows           4641
-  pip_eligible         3916
-  pip_ineligible       725
-
-  table counts:
-    forecast_daily_max         4641
-    forecast_hourly            104956
-    forecast_runs              488
-    klga_daily_max             2200
-    point_in_time              4641
-    research_runs              2
-    settlement_outcome         3723
-    settlement_rules           408
+window      : 2026-08-12 .. 2026-10-11
+run slots   : 242 (484 requests planned)
+  [  20/484] ecmwf_ifs025   2026-08-16T18:00Z ok   pts=240 nulls=93
+  [  40/484] ecmwf_ifs025   2026-08-21T18:00Z ok   pts=240 nulls=93
+  [  60/484] ecmwf_ifs025   2026-08-26T18:00Z ok   pts=240 nulls=93
+  [  80/484] ecmwf_ifs025   2026-08-31T18:00Z ok   pts=240 nulls=93
+  [ 100/484] ecmwf_ifs025   2026-09-05T18:00Z ok   pts=240 nulls=93

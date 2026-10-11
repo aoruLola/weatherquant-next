@@ -412,3 +412,82 @@ def test_probabilities_are_individually_valid() -> None:
     )
     for p in dist.probabilities:
         assert 0.0 <= p.probability <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Unit safety - the bug that made the first backfill unusable
+# ---------------------------------------------------------------------------
+
+
+def test_a_celsius_payload_is_refused_rather_than_stored_as_fahrenheit() -> None:
+    """Storing degC in a `*_f` column makes every residual ~50 degrees wrong.
+
+    The failure is invisible in the data: the series looks plausible, and the
+    damage only surfaces as an absurd score. So the unit is asserted from the
+    response's hourly_units, and a mismatch fails the fetch.
+    """
+    from weatherquant.weather.single_runs import parse_run_response
+
+    base = {
+        "latitude": 40.75,
+        "longitude": -74.0,
+        "utc_offset_seconds": 0,
+        "hourly": {
+            "time": ["2026-10-10T00:00", "2026-10-10T01:00"],
+            "temperature_2m": [16.9, 16.4],
+        },
+        "hourly_units": {"time": "iso8601", "temperature_2m": "°C"},
+    }
+    result = parse_run_response(base, model="ecmwf_ifs025")
+    assert result.status == "failed"
+    assert "degF" in (result.error_text or "")
+    assert result.n_points == 0 or result.hourly == []
+
+
+def test_a_fahrenheit_payload_is_accepted() -> None:
+    from weatherquant.weather.single_runs import parse_run_response
+
+    payload = {
+        "latitude": 40.75,
+        "longitude": -74.0,
+        "utc_offset_seconds": 0,
+        "hourly": {
+            "time": ["2026-10-10T00:00", "2026-10-10T01:00"],
+            "temperature_2m": [62.5, 61.6],
+        },
+        "hourly_units": {"time": "iso8601", "temperature_2m": "°F"},
+    }
+    result = parse_run_response(payload, model="ecmwf_ifs025")
+    assert result.status == "ok"
+    assert result.temperature_unit is not None and "F" in result.temperature_unit
+    assert [p.temperature_2m for p in result.hourly] == [62.5, 61.6]
+
+
+def test_the_run_time_is_taken_from_the_first_stamp() -> None:
+    from weatherquant.weather.single_runs import parse_run_response
+
+    payload = {
+        "utc_offset_seconds": 0,
+        "hourly": {
+            "time": ["2026-10-10T06:00", "2026-10-10T07:00"],
+            "temperature_2m": [60.0, 61.0],
+        },
+        "hourly_units": {"temperature_2m": "°F"},
+    }
+    result = parse_run_response(payload, model="gfs")
+    assert result.run_time_utc is not None
+    assert result.run_time_utc.isoformat().startswith("2026-10-10T06:00")
+
+
+def test_a_local_timezone_offset_is_converted_back_to_utc() -> None:
+    """With timezone=America/New_York the stamps are local; offset recovers UTC."""
+    from weatherquant.weather.single_runs import parse_run_response
+
+    payload = {
+        "utc_offset_seconds": -14400,  # EDT
+        "hourly": {"time": ["2026-10-10T02:00"], "temperature_2m": [60.0]},
+        "hourly_units": {"temperature_2m": "°F"},
+    }
+    result = parse_run_response(payload, model="gfs")
+    assert result.run_time_utc is not None
+    assert result.run_time_utc.hour == 6, "02:00 EDT is 06:00 UTC"

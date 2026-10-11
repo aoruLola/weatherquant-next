@@ -88,6 +88,7 @@ class RunFetch:
     grid_latitude: float | None = None
     grid_longitude: float | None = None
     utc_offset_seconds: int | None = None
+    temperature_unit: str | None = None   # from hourly_units.temperature_2m
     payload_sha256: str | None = None
     raw_path: str | None = None
     n_null: int = 0
@@ -144,15 +145,31 @@ def parse_run_response(
     grid_lat = payload.get("latitude")
     grid_lon = payload.get("longitude")
 
+    units = payload.get("hourly_units") or {}
+    declared_unit = str(units.get("temperature_2m") or "")
+
     result = RunFetch(
         model=model,
         run_time_utc=None,
         status="ok",
+        temperature_unit=declared_unit or None,
         grid_latitude=float(grid_lat) if grid_lat is not None else None,
         grid_longitude=float(grid_lon) if grid_lon is not None else None,
         utc_offset_seconds=offset,
         payload_sha256=canonical_payload_hash(payload),
     )
+
+    # The unit is *asserted*, not assumed. Storing a Celsius series in a column
+    # named `*_f` makes every residual ~50 degrees wrong, which is invisible in
+    # the data and shows up only as an absurd score - exactly what happened on
+    # the first run of this pipeline before this check existed.
+    if declared_unit and "F" not in declared_unit:
+        result.status = "failed"
+        result.error_text = (
+            f"upstream returned {declared_unit!r} but this pipeline stores degF; "
+            "temperature_unit=fahrenheit was requested and not honoured"
+        )
+        return result
 
     if not times:
         result.status = "failed"
@@ -226,6 +243,11 @@ class SingleRunsClient:
             # America%252FNew_York and a 400 "Invalid timezone".
             "timezone": self.timezone_name,
             "forecast_hours": str(self.forecast_hours),
+            # Ask for Fahrenheit so the payload matches the unit every column
+            # in this project is named after. The response does NOT echo a
+            # top-level temperature_unit, so the authoritative confirmation is
+            # hourly_units.temperature_2m, asserted in parse_run_response.
+            "temperature_unit": "fahrenheit",
         }
         return BASE_URL, params
 
