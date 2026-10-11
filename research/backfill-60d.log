@@ -1,0 +1,5 @@
+research db : data\research\weather-research.duckdb
+models      : ['ecmwf_ifs025', 'gfs']
+window      : 2026-08-12 .. 2026-10-11
+run slots   : 242 (484 requests planned)
+  [  20/484] ecmwf_ifs025   2026-08-16T18:00Z ok   pts=240 nulls=93
