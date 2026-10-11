@@ -75,15 +75,19 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/shadow-data" "$RUNNER_TEMP/collector-raw/gamma"
-          # The image runs as uid 1000 and a bind mount masks the chown done
-          # inside it, so the host directory must match first.
-          sudo chown -R 1000:1000 "$RUNNER_TEMP/shadow-data" "$RUNNER_TEMP/collector-raw"
 
           # A minimal read-only archive for the shadow to tail. Envelope shape
           # matches data/archive.py exactly.
+          #
+          # Written BEFORE the chown. This job runs as uid 1001 and a directory
+          # handed to uid 1000 is no longer one it can create files in - which
+          # is exactly how the first run of this workflow failed. The image runs
+          # as uid 1000 and a bind mount masks the chown done inside it, so the
+          # host paths still have to be re-owned afterwards.
           printf '%s\n' '{"archive_seq":1,"source":"gamma","received_at_utc":"2026-10-11T12:00:00+00:00","venue_ts_utc":null,"venue_ts_origin":"missing","quality":"ok","run_id":"ci","payload":{"id":"ci-event","title":"probe","markets":[]}}' \
             > "$RUNNER_TEMP/collector-raw/gamma/2026-10-11.jsonl"
-          sudo chown 1000:1000 "$RUNNER_TEMP/collector-raw/gamma/2026-10-11.jsonl"
+
+          sudo chown -R 1000:1000 "$RUNNER_TEMP/shadow-data" "$RUNNER_TEMP/collector-raw"
 
           docker run -d --name shadow-ci \
             -v "$RUNNER_TEMP/shadow-data:/data" \
@@ -197,11 +201,15 @@ jobs:
       - name: No registry login in the development workflow
         run: |
           set -euo pipefail
-          if grep -q "docker/login-action" .github/workflows/shadow-ci.yml; then
-            echo "shadow-ci must not publish anything" >&2
+          # Searching this file for a string you have just written down finds
+          # nothing but your own check - that is how the first run of this job
+          # failed. Lines that ARE this check carry "grep -nE" and are dropped
+          # before anything is judged.
+          hits=$(grep -nE "uses: docker/login-action|push: true|packages: write|imagetools create" \
+                   .github/workflows/shadow-ci.yml | grep -v "grep -nE" || true)
+          if [ -n "$hits" ]; then
+            echo "shadow-ci must not publish anything:" >&2
+            echo "$hits" >&2
             exit 1
           fi
-          if grep -q "push: true" .github/workflows/shadow-ci.yml; then
-            echo "shadow-ci must not push an image" >&2
-            exit 1
-          fi
+          echo "no publish capability: no login, no push:true, no packages:write, no tag move"
