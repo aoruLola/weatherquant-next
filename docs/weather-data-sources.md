@@ -185,18 +185,39 @@ GHCN-Daily `TMAX` 为 **0.1 °C** 整数（如 `"  256"` = 25.6 °C）；LCD 为
 **⇒ 结算级复核应取 GHCN-Daily / SOD 的日聚合值，而不是对逐时 `TMP` 取 max。**
 逐时 max 只能作诊断口径——这与 §3 交叉核对里 `hourly_metar` 低 1°F 的现象同源。
 
-### 2.5 Polymarket 规则原文
+### 2.5 Polymarket 规则原文 [已验证]
 
-**本轮无法从在线 API 取得**：`gamma-api` / `clob` / `data-api` 三个端点在本机
-**全部连接超时**（`ConnectTimeout`，多次重试，与调研代理 1 小时内的记录一致）。
+网络恢复后**已成功取得在线规则**，并与旧库快照逐字节比对：
 
-规则文本改用**昨日（2026-10-10）采集的旧库快照**（408 事件，408/408 解析成功），
-见 [`settlement-verification.md`](settlement-verification.md) §1。
+| 来源 | event_id | rules_len | SHA-256 前缀 |
+|---|---|---:|---|
+| **在线** `series_slug=nyc-daily-weather` | `1158124` | 2366 | `91e41742fa3a965f` |
+| **旧库快照**（2026-10-10） | `1158124` | 2366 | `91e41742fa3a965f` |
 
-**待网络恢复后重取**（三条 URL 见 `research/noaa-klga-observations.md` 附录）：
-`?tag_id=84&closed=false`、`?tag_id=84&closed=true`、`/v2/resolutions?condition=`。
+**完全一致 —— 规则未发生漂移**，快照可作为权威依据。
 
-> 这是本轮**唯一未完成的在线核实**。其余数据源（Open-Meteo、NCEI、GHCN）均已实测。
+在线规则（节选，逐字）：
+
+> This market will resolve to the temperature range that contains the highest temperature
+> recorded by NOAA at the LaGuardia Airport Station in degrees Fahrenheit on 10 Oct '26.
+>
+> The resolution source for this market will be information from NOAA, specifically the highest
+> reading under the "Temp" column for all times on this day, available here:
+> `https://www.weather.gov/wrh/timeseries?site=klga`
+>
+> This market will resolve off of the Hourly Data provided using the "Show Hourly Data" button.
+>
+> If NOAA data for the observation date is unavailable by 11:59 PM ET on the day following the
+> observation date, the Weather Underground Daily Observations table will be used...
+
+**发现路径**：`series_slug=nyc-daily-weather` 是精确入口。
+**`tag_id=84`（Weather）不可单独使用** —— 实测该标签下混入了年度气温排名、
+NASA GISS 指数、甚至"太空数据中心"等非目标市场。P1-0 采集器已用 series 主路径 + tag 兜底，
+本节验证了该设计正确。
+
+**结算接口**：`GET /v2/resolutions?condition=<conditionId>` 返回
+`status="resolved"`、`was_disputed`、`proposed_price`（实测 200）。
+已结算市场 `outcomePrices` 为 `["0","1"]`。
 
 ## 3. 尚未确认 / 待补
 
@@ -205,7 +226,7 @@ GHCN-Daily `TMAX` 为 **0.1 °C** 整数（如 `"  256"` = 25.6 °C）；LCD 为
 | NOAA 列名与单位 | ✅ **已实测**：列是 `TMP` 不是 `Temp`，单位 °C×10 + 质量码（§2.3） |
 | 官方日最高温产品 | ✅ **已实测**：**GHCN-Daily `TMAX`** 覆盖到 2026-10-07，是结算期唯一可用主源；LCD/global-hourly 冻结在 2025-08-27（§2.2） |
 | 各源"一天"的定义 | ✅ **已实测**：global-hourly=UTC、LCD=LST 固定、GHCN=LST 日历日、IEM 取决于 `tz=`（§2.4） |
-| **Polymarket 在线规则原文** | ❌ **未取得** —— gamma/clob/data 三端点本机全部 `ConnectTimeout`；改用 2026-10-10 旧库快照（408/408 解析）。**待网络恢复后重取** |
+| Polymarket 在线规则原文 | ✅ **已取得并核验**：在线 SHA 与旧库快照**逐字节一致**，规则未漂移（§2.5） |
 | IEM ASOS 逐时 max 与 GHCN 日最高的差 | ⚠️ 已知低 0.5–1.1 °C（10 天样本），未做全量比对 |
 | Open-Meteo run 的精确首发时刻 | 未确定（需轮询），故 `publishable_at` 只能估算 |
 | `ecmwf_ifs025` 06Z/18Z 尾部 null 的成因 | 未确定；只记录现象，不推断 |
