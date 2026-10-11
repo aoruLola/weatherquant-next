@@ -37,6 +37,8 @@ class ExtractionStats:
     events_rules_parsed: int = 0
     settlement_outcomes: int = 0
     daily_maxima: int = 0
+    market_prices: int = 0
+    market_tokens: int = 0
     skipped_tables: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
 
@@ -46,6 +48,8 @@ class ExtractionStats:
             "events_rules_parsed": self.events_rules_parsed,
             "settlement_outcomes": self.settlement_outcomes,
             "daily_maxima": self.daily_maxima,
+            "market_prices": self.market_prices,
+            "market_tokens": self.market_tokens,
             "problems": self.problems,
         }
 
@@ -68,9 +72,10 @@ def extract_from_legacy(
         _extract_rules(research_con, src, stats)
         _extract_outcomes(research_con, src, stats)
         _extract_daily_maxima(research_con, src, stats)
+        _extract_prices(research_con, src, stats)
         stats.skipped_tables = sorted(
             set(_legacy_tables(src))
-            - {"events", "markets", "settlements", "daily_observations"}
+            - {"events", "markets", "settlements", "daily_observations", "price_history"}
         )
     finally:
         src.close()
@@ -241,3 +246,61 @@ def _extract_daily_maxima(dst, src, stats: ExtractionStats) -> None:
         payload,
     )
     stats.daily_maxima = len(payload)
+
+
+# ---------------------------------------------------------------------------
+# E. Market prices - the market baseline's raw material
+# ---------------------------------------------------------------------------
+
+
+def _extract_prices(dst, src, stats: ExtractionStats) -> None:
+    """Copy the mid-price series and the bracket->token map.
+
+    Mids are what the market believed, which is the quantity the market
+    baseline scores. They are never executable and nothing downstream may
+    treat them as such.
+    """
+    tokens = src.execute(
+        """
+        SELECT market_id, event_id, target_date, bracket_label, token_yes, token_no
+        FROM markets WHERE target_date IS NOT NULL
+        """
+    ).fetchall()
+    payload_tokens = []
+    seen: set[tuple[str, str]] = set()
+    for market_id, event_id, target_date, label, token_yes, token_no in tokens:
+        for token, is_yes in ((token_yes, True), (token_no, False)):
+            if not token or (market_id, token) in seen:
+                continue
+            seen.add((market_id, token))
+            payload_tokens.append((event_id, target_date, market_id, label, token, is_yes))
+    if payload_tokens:
+        dst.executemany(
+            "INSERT INTO market_tokens VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT (market_id, token_id) DO UPDATE SET "
+            "  event_id=excluded.event_id, target_date=excluded.target_date,"
+            "  bracket_label=excluded.bracket_label, is_yes_token=excluded.is_yes_token",
+            payload_tokens,
+        )
+
+    prices = src.execute(
+        "SELECT market_id, token_id, ts, mid, fetched_at FROM price_history WHERE mid IS NOT NULL"
+    ).fetchall()
+    payload = [
+        (m, t, ts, mid, "legacy_price_history", fetched)
+        for m, t, ts, mid, fetched in prices
+        if mid is not None and 0.0 <= float(mid) <= 1.0
+    ]
+    if payload:
+        dst.executemany(
+            "INSERT INTO market_price_history (market_id, token_id, ts, mid_usd_per_share,"
+            " source, fetched_at_utc) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT DO NOTHING",
+            payload,
+        )
+    stats.market_prices = len(payload)
+    stats.market_tokens = len(payload_tokens)
+
+
+def _legacy_tables_v2(con) -> list[str]:  # pragma: no cover - kept for symmetry
+    return _legacy_tables(con)

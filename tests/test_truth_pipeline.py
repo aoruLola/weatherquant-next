@@ -64,7 +64,8 @@ CREATE TABLE events (
 CREATE TABLE markets (
     market_id VARCHAR, event_id VARCHAR, bracket_label VARCHAR,
     bracket_low DOUBLE, bracket_high DOUBLE, target_date DATE,
-    parse_status VARCHAR, active BOOLEAN, closed BOOLEAN
+    parse_status VARCHAR, active BOOLEAN, closed BOOLEAN,
+    token_yes VARCHAR, token_no VARCHAR
 );
 CREATE TABLE settlements (
     market_id VARCHAR, event_id VARCHAR, yes_price DOUBLE,
@@ -74,6 +75,10 @@ CREATE TABLE daily_observations (
     station VARCHAR, target_date DATE, max_temp_f DOUBLE,
     n_readings INTEGER, rule VARCHAR, source VARCHAR,
     computed_at TIMESTAMPTZ, is_official BOOLEAN
+);
+CREATE TABLE price_history (
+    market_id VARCHAR, token_id VARCHAR, ts TIMESTAMPTZ,
+    mid DOUBLE, fetched_at TIMESTAMPTZ
 );
 -- The old system's conclusions. They must be *present* for the test to prove
 -- they are skipped, not merely absent from the source.
@@ -118,8 +123,9 @@ def _build_legacy(path: Path) -> None:
         winning = winner
         for label, low, high in brackets:
             market_id = f"{event_id}-{label}"
-            con.execute("INSERT INTO markets VALUES (?,?,?,?,?,?,?,True,False)", [
+            con.execute("INSERT INTO markets (market_id, event_id, bracket_label, bracket_low, bracket_high, target_date, parse_status, active, closed, token_yes, token_no) VALUES (?,?,?,?,?,?,?,True,False,?,?)", [
                 market_id, event_id, label, low, high, _DAY2, "ok",
+                f"tokY-{event_id}-{label}", f"tokN-{event_id}-{label}",
             ])
             con.execute("INSERT INTO settlements VALUES (?,?,?,?,?,?)", [
                 market_id, event_id, 1.0 if label == winning else 0.0, NOW, True, 95.0,
@@ -128,12 +134,20 @@ def _build_legacy(path: Path) -> None:
     # Markets for evt-noaa: winner 90-91, observation will be 91 (match).
     for label, low, high in [("90-91°F", 90.0, 91.0), ("92-93°F", 92.0, 93.0)]:
         market_id = f"evt-noaa-{label}"
-        con.execute("INSERT INTO markets VALUES (?,?,?,?,?,?,?,True,False)", [
+        con.execute("INSERT INTO markets (market_id, event_id, bracket_label, bracket_low, bracket_high, target_date, parse_status, active, closed, token_yes, token_no) VALUES (?,?,?,?,?,?,?,True,False,?,?)", [
             market_id, "evt-noaa", label, low, high, _DAY1, "ok",
+            f"tokY-{label}", f"tokN-{label}",
         ])
         con.execute("INSERT INTO settlements VALUES (?,?,?,?,?,?)", [
             market_id, "evt-noaa", 1.0 if label == "90-91°F" else 0.0, NOW, True, 91.0,
         ])
+
+    for market_id in ("evt-noaa-90-91°F", "evt-arch-90-91°F", "evt-main-95°F or below"):
+        for hours in (1, 2):
+            con.execute("INSERT INTO price_history VALUES (?,?,?,?,?)", [
+                market_id, f"tok-{hours}", datetime(2026, 9, 9, hours, 0, tzinfo=UTC),
+                0.5, NOW,
+            ])
 
     for day, all_readings, hourly in ((_DAY1, 91.0, 91.0), (_DAY2, 95.0, 95.0)):
         con.execute("INSERT INTO daily_observations VALUES (?,?,?,?,?,?,?,False)", [
