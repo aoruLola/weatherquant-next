@@ -75,6 +75,7 @@ class ResilientHttp:
         self.requests_failed = 0
         self.retries_performed = 0
         self.rate_limit_waits = 0
+        self.timeouts = 0
 
     # -- public ------------------------------------------------------------
 
@@ -85,6 +86,8 @@ class ResilientHttp:
         params: Mapping[str, Any] | None = None,
         limiter: str | None = None,
         allow_not_found: bool = False,
+        timeout_seconds: float | None = None,
+        retries: int | None = None,
     ) -> Any:
         """GET a JSON body.
 
@@ -94,6 +97,13 @@ class ResilientHttp:
         conversation, not a transport failure, and counting it as one would trip
         the health probe's consecutive-failure rule on a perfectly healthy
         collector.
+
+        ``timeout_seconds`` and ``retries`` override the client defaults for
+        **this call only**. The book poll passes both so that a single request
+        cannot outlive the sweep's budget: the defaults are tuned for
+        one-off calls, not for one call inside a 45-second loop that also owns
+        the heartbeat. Omitting them keeps the default behaviour exactly as it
+        was.
         """
         return self._request_json(
             "GET",
@@ -101,6 +111,8 @@ class ResilientHttp:
             params=params,
             limiter=limiter,
             allow_not_found=allow_not_found,
+            timeout_seconds=timeout_seconds,
+            retries=retries,
         )
 
     def post_json(
@@ -141,12 +153,19 @@ class ResilientHttp:
         json_body: Any = None,
         limiter: str | None = None,
         allow_not_found: bool = False,
+        timeout_seconds: float | None = None,
+        retries: int | None = None,
     ) -> Any:
         bucket = self._limiter(limiter)
         last_error = "unknown"
         sleep_after = 0.0
+        # Per-call overrides. `attempts` is the whole point: a caller with a
+        # deadline asks for fewer of them, and the budget maths downstream
+        # relies on that number being the one actually used.
+        attempt_budget = self.retries if retries is None else max(0, int(retries))
+        request_timeout = timeout_seconds
 
-        for attempt in range(self.retries + 1):
+        for attempt in range(attempt_budget + 1):
             if attempt:
                 # Jitter keeps a fleet of retrying workers from resynchronising
                 # into a thundering herd against the same endpoint.
@@ -169,12 +188,18 @@ class ResilientHttp:
 
             try:
                 if method == "GET":
-                    response = self._client.get(url, params=params)
+                    response = self._client.get(url, params=params, timeout=request_timeout)
                 else:
-                    response = self._client.post(url, json=json_body)
+                    response = self._client.post(url, json=json_body, timeout=request_timeout)
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 self.requests_failed += 1
+                if isinstance(exc, httpx.TimeoutException):
+                    # Counted separately from transport failures: a timeout is
+                    # "the far end was too slow", which is the number the
+                    # budget exists to bound, and lumping it in with a refused
+                    # connection would hide exactly that.
+                    self.timeouts += 1
                 continue
 
             if response.status_code == 429:
@@ -215,7 +240,7 @@ class ResilientHttp:
             return payload
 
         self.requests_failed += 1
-        raise HttpStatusError(url, self.retries + 1, last_error)
+        raise HttpStatusError(url, attempt_budget + 1, last_error)
 
 
 def _parse_retry_after(value: str | None) -> float:

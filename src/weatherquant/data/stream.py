@@ -75,6 +75,16 @@ class MarketStream(threading.Thread):
         self.endpoint = endpoint
         self._asset_ids = asset_ids
         self._assets: list[str] = []
+        # Drops happen on this (producer) thread and are read by the worker's
+        # thread for the heartbeat, so the counter is guarded. A plain int
+        # increment across threads is not something to rely on for a number
+        # that will be published and compared.
+        self._drop_lock = threading.Lock()
+        self._frames_dropped = 0
+        # Only the first drop and then every DROP_LOG_INTERVAL frames: one
+        # WARNING per dropped frame turns a backlog into megabytes of identical
+        # lines and buries everything else the collector has to say.
+        self._drop_log_interval = 500
         # NOTE: not `_stop`. `Thread._stop` is an internal *method*; storing an
         # Event in an attribute with that name shadows it and makes
         # `Thread.join()` raise `TypeError: 'Event' object is not callable`,
@@ -200,8 +210,29 @@ class MarketStream(threading.Thread):
             except queue.Full:
                 # Dropping frames under backpressure is correct: the REST poll
                 # still guarantees a depth snapshot, and blocking the read loop
-                # would make things worse.
-                log.warning("stream queue full; dropping frame")
+                # would make things worse. What is *not* correct is logging
+                # once per drop - that is the log storm this counter replaces.
+                self._note_drop()
+
+    def _note_drop(self) -> int:
+        """Count a dropped frame; log the first and then every Nth.
+
+        Split out from the recv loop so it can be tested directly: a full queue
+        needs a 20 000-frame backlog to occur naturally, which is not something
+        a unit test should have to construct. Returns the running total.
+        """
+        with self._drop_lock:
+            self._frames_dropped += 1
+            dropped = self._frames_dropped
+        if dropped == 1 or dropped % self._drop_log_interval == 0:
+            log.warning("stream queue full; dropped %d frame(s) so far", dropped)
+        return dropped
+
+    @property
+    def frames_dropped(self) -> int:
+        """Frames discarded because the queue was full. Read from any thread."""
+        with self._drop_lock:
+            return self._frames_dropped
 
     async def _ping_loop(self, ws: Any) -> None:
         """Send the protocol's application-level PING at the documented interval."""

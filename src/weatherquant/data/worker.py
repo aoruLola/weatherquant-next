@@ -34,6 +34,7 @@ import socket
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -155,6 +156,7 @@ class CollectorWorker:
         self._last_rest_failed = 0
         self._last_retries = 0
         self._last_rate_waits = 0
+        self._last_timeouts = 0
         self._archive_records = 0
         self._books: dict[str, str] = {}  # token_id -> market_id
         # Tokens the venue says have no orderbook (archived markets). Re-asking
@@ -164,6 +166,26 @@ class CollectorWorker:
         self._ws_connected = False
         self._ws_last_message: datetime | None = None
         self._ws_endpoint = ""
+
+        # --- polling fairness and cost -----------------------------------
+        # Where the last sweep stopped. Without this the budget always cuts
+        # the tail of the same list, and the same handful of tokens are
+        # deferred forever while the aggregate looks healthy.
+        self._poll_cursor = 0
+        self._poll_budget_exceeded = 0
+        self._poll_deferred = 0
+        self._last_poll_budget_note = -1e18
+        # Recent request latencies (request-start -> response received), bounded
+        # so the heartbeat cannot grow with the run.
+        self._rest_latencies: deque[float] = deque(maxlen=200)
+        self._last_sweep_latency_ms: dict[str, Any] | None = None
+        # When each token was last seen. Answers "which token is being starved"
+        # without re-reading the archive.
+        self._last_polled_at: dict[str, datetime] = {}
+        # High-water mark of the stream queue, sampled by the consumer.
+        self._ws_queue_high_water = 0
+        self._frames_dropped = 0
+        self._stream: Any = None
         self._status = HealthStatus.STARTING
 
 
@@ -372,6 +394,10 @@ class CollectorWorker:
     # -- main loop ---------------------------------------------------------
 
     def _loop(self, http, discovery, stream, publisher, archive) -> None:
+        # Held so the drain and the heartbeat can read the producer's drop
+        # counter: it lives on the stream thread, and the only safe place to
+        # sample it from is here, on the consumer.
+        self._stream = stream
         cycles = 0
         while not self.shutdown.requested():
             now = time.monotonic()
@@ -383,21 +409,38 @@ class CollectorWorker:
             # looks identical to a dead one. Tick first, then work.
             if now - self._last_heartbeat_mono >= self.heartbeat_seconds:
                 self._publish(publisher, http)
+
+            # Drain the stream BEFORE the poll as well as after it. The producer
+            # runs on its own thread and this one blocks inside REST, so the
+            # queue only grows while a sweep is in flight; draining on both
+            # sides bounds the backlog to one sweep instead of a sweep plus a
+            # whole tick. Rest does not stop WS - it just delays it by the
+            # sweep, which is exactly what the budget exists to keep short.
+            self._drain_stream(archive)
+
             if now - self._last_book_poll_mono >= self.book_poll_seconds:
                 self._last_book_poll_mono = now
                 self._poll_books(http)
+                # After the sweep, on a *fresh* clock. The original second
+                # check compared `now` - captured before all of this - against
+                # a timestamp the first branch had just written, so it could
+                # never be true and the post-work safety net was dead code.
+                if time.monotonic() - self._last_heartbeat_mono >= self.heartbeat_seconds:
+                    self._publish(publisher, http)
+
             if now - self._last_discovery_mono >= self.discovery_seconds:
                 self._last_discovery_mono = now
                 self._run_discovery(discovery, archive)
             if now - self._last_integrity_mono >= self.integrity_seconds:
                 self._last_integrity_mono = now
                 self._run_integrity()
-            if now - self._last_heartbeat_mono >= self.heartbeat_seconds:
-                self._publish(publisher, http)
+
+            self._drain_stream(archive)
             if self._writer is not None and self._writer.pending_rows:
                 self._writer.flush_if_due()
                 self._writer.checkpoint_if_due()
-            self._drain_stream(archive)
+            if time.monotonic() - self._last_heartbeat_mono >= self.heartbeat_seconds:
+                self._publish(publisher, http)
             self._maybe_daily_jobs()
 
             if self.once and cycles >= 3:
@@ -466,27 +509,89 @@ class CollectorWorker:
     # request retrying against an unreachable network, 66 tokens could otherwise
     # take tens of minutes inside a single blocking loop.
     POLL_BUDGET_SECONDS = 45.0
+    # Never hand a token less than this, even with a second left on the budget.
+    # A 100 ms timeout against a slow-but-alive endpoint would turn ordinary
+    # latency into a failed request; a bounded overshoot of a couple of seconds
+    # is the cheaper mistake.
+    POLL_TIMEOUT_FLOOR_SECONDS = 2.0
+    # Budget exhaustion is normal under load and must not spam the log: the
+    # first occurrence and then one every five minutes, with the running total
+    # in both the log line and the collector_events row.
+    POLL_BUDGET_NOTE_INTERVAL_SECONDS = 300.0
+
+    def _book_request_budget(self, deadline: float) -> tuple[float, int]:
+        """``(timeout_seconds, retries)`` for one fetch inside the sweep.
+
+        The defaults (20 s, 4 attempts) are tuned for a one-off call. Inside a
+        loop that also owns the heartbeat they are not safe: five attempts
+        against an unreachable host is ~110 s of wall time, which is two and a
+        half times the whole budget for a *single token*.
+
+        So the remaining budget is divided honestly: the timeout never exceeds
+        what is left, and a second attempt is allowed only when the pair
+        provably fits inside it. When it does not, the sweep's own cadence -
+        another pass in ``book_poll_seconds`` - is the retry, which costs the
+        loop nothing.
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 0.0, 0
+        timeout = max(
+            self.POLL_TIMEOUT_FLOOR_SECONDS,
+            min(self.settings.http_timeout_seconds, remaining),
+        )
+        retries = 1 if remaining >= 2 * timeout + 1.0 else 0
+        return timeout, retries
+
+    def _rotated_books(self) -> list[tuple[str, str]]:
+        """Start each sweep where the last one stopped.
+
+        ``self._books`` is a dict, so a budget cut always drops the *tail* -
+        the same tokens, in the same order, every cycle. That is starvation
+        with a perfectly healthy-looking aggregate: most tokens refresh on
+        time while a handful never do. Rotating the start position by one each
+        sweep spreads the truncation across the whole set instead.
+        """
+        items = list(self._books.items())
+        if not items:
+            return items
+        start = self._poll_cursor % len(items)
+        # Advance by one, not to the end: successive sweeps then step through
+        # the list, and every token eventually sits at the front when the
+        # budget is still open.
+        self._poll_cursor = (start + 1) % len(items)
+        return items[start:] + items[:start]
 
     def _poll_books(self, http: ResilientHttp | None) -> None:
         if self._writer is None or self._archive is None or http is None or not self._books:
             return
         ok = failed = 0
         cycle_started = time.monotonic()
-        for token_id, market_id in list(self._books.items()):
+        deadline = cycle_started + self.POLL_BUDGET_SECONDS
+        attempted = 0
+        latencies: list[float] = []
+
+        for token_id, market_id in self._rotated_books():
             if token_id in self._no_book:
                 continue
             if self.shutdown.requested():
                 break
-            if time.monotonic() - cycle_started > self.POLL_BUDGET_SECONDS:
+            if time.monotonic() >= deadline:
                 # Defer the remainder to the next tick rather than blocking the
-                # heartbeat. Nothing is lost: the same tokens come round again.
-                log.debug(
-                    "book poll budget exhausted after %.0fs; %d token(s) deferred",
-                    time.monotonic() - cycle_started,
-                    len(self._books),
-                )
+                # heartbeat. Nothing is lost: the rotated start means the next
+                # sweep picks up here instead of starting over from the head.
+                eligible = sum(1 for t, _ in self._books.items() if t not in self._no_book)
+                deferred = max(0, eligible - attempted)
+                self._poll_budget_exceeded += 1
+                self._poll_deferred += deferred
+                self._note_poll_budget(time.monotonic() - cycle_started, deferred)
                 break
-            fetched_at = datetime.now(tz=UTC)
+
+            timeout_seconds, retries = self._book_request_budget(deadline)
+            # Marked before the request: this is when we *asked*. The value
+            # that goes into the archive and the row is taken after the
+            # response, and the difference is the latency this sweep records.
+            request_started = datetime.now(tz=UTC)
             try:
                 # Fetch the raw payload first: the archive stores it verbatim,
                 # and only then is it parsed into a row.
@@ -495,7 +600,11 @@ class CollectorWorker:
                     params={"token_id": token_id},
                     limiter="clob_book",
                     allow_not_found=True,
+                    timeout_seconds=timeout_seconds,
+                    retries=retries,
                 )
+                received_at = datetime.now(tz=UTC)
+                attempted += 1
                 if payload is None:
                     # "No orderbook exists for this token" - a definitive answer
                     # about an archived market, not an upstream failure. Remember
@@ -509,21 +618,29 @@ class CollectorWorker:
                     payload,
                     token_id=token_id,
                     market_id=market_id,
-                    fetched_at_utc=fetched_at,
+                    fetched_at_utc=received_at,
                     run_id=self.run_id,
                 )
             except Exception as exc:
                 failed += 1
+                attempted += 1
                 self.stats.rest_requests_failed += 1
                 self._note_error(f"book {token_id[:12]}: {exc}")
                 log.debug("book fetch failed for %s: %s", token_id[:12], exc)
                 continue
 
+            latency_ms = (received_at - request_started).total_seconds() * 1000.0
+            latencies.append(latency_ms)
+            self._rest_latencies.append(latency_ms)
+            # Per-token so "which token has not been seen lately" is answerable
+            # from the heartbeat rather than only from the archive.
+            self._last_polled_at[token_id] = received_at
+
             self._archive.append(
                 ArchiveRecord(
                     source="rest",
                     payload=payload,
-                    received_at_utc=fetched_at,
+                    received_at_utc=received_at,
                     venue_ts_utc=snapshot.venue_ts,
                     quality=snapshot.quality,
                     run_id=self.run_id,
@@ -548,26 +665,55 @@ class CollectorWorker:
                     (
                         market_id,
                         token_id,
-                        fetched_at,
+                        received_at,
                         mid,
                         "rest",
-                        fetched_at,
+                        received_at,
                         snapshot.venue_ts_origin,
                         self.run_id,
                     )
                 )
                 self.stats.price_points_inserted += 1
-                self._last_data_change = fetched_at
+                self._last_data_change = received_at
                 # The REST poll is the authoritative snapshot. Keeping its
                 # midpoint gives every stream update something to be checked
                 # against, which is what turns "two sources" into "two sources
                 # that agree".
-                self._last_rest_mid[token_id] = (fetched_at, mid)
+                self._last_rest_mid[token_id] = (received_at, mid)
 
         if failed:
             self._rest_consecutive_failures = max(self._rest_consecutive_failures, failed)
+        if latencies:
+            self._last_sweep_latency_ms = _latency_summary(latencies)
         self._writer.flush_if_due()
         log.debug("book poll: %d ok, %d failed", ok, failed)
+
+    def _note_poll_budget(self, elapsed: float, deferred: int) -> None:
+        """Record that the sweep ran out of budget, without a log storm.
+
+        Budget exhaustion is a *normal* outcome of a full token set and is the
+        thing the rotation exists to spread around, so it is a counter first
+        and a log line second - the first, and then one every five minutes.
+        """
+        now = time.monotonic()
+        if (
+            now - self._last_poll_budget_note >= self.POLL_BUDGET_NOTE_INTERVAL_SECONDS
+            or self._poll_budget_exceeded == 1
+        ):
+            self._last_poll_budget_note = now
+            log.warning(
+                "book poll budget exhausted after %.1fs; %d token(s) deferred "
+                "(total %d sweep(s), %d deferral(s))",
+                elapsed,
+                deferred,
+                self._poll_budget_exceeded,
+                self._poll_deferred,
+            )
+            self._event(
+                "warning",
+                "poll_budget",
+                f"budget exhausted after {elapsed:.1f}s; {deferred} token(s) deferred",
+            )
 
 
     # How far apart the stream and the poll may be before we call it a
@@ -679,6 +825,15 @@ class CollectorWorker:
                 log.warning("backup failed: %s", exc)
 
     def _drain_stream(self, archive: RawArchive | None) -> None:
+        # Sampled *before* the writer guard: queue depth is a property of the
+        # producer and this thread, and is worth reporting even when there is
+        # nothing to write - a full queue with no writer is still a full queue.
+        depth = self._ws_queue.qsize()
+        if depth > self._ws_queue_high_water:
+            self._ws_queue_high_water = depth
+        if self._stream is not None:
+            self._frames_dropped = self._stream.frames_dropped
+
         if self._writer is None or archive is None:
             return
         drained = 0
@@ -728,6 +883,65 @@ class CollectorWorker:
             self._writer.log_event(level, kind, message, details)
         except Exception:
             log.debug("could not persist event", exc_info=True)
+
+    def _telemetry(self) -> dict[str, Any]:
+        """Rolling operational numbers published alongside the heartbeat.
+
+        Every member answers a question the lifetime counters cannot: how slow
+        REST is *right now*, whether the sweep is running out of budget, whether
+        the stream queue is outgrowing the drain, and which token has gone
+        longest unseen. Empty sub-mappings mean "not measured yet", which is a
+        different claim from zero.
+
+        The queue is sampled here as well as on the drain: this is the moment
+        the number is *published*, and sampling only on the drain would report
+        a depth that has already been emptied.
+        """
+        depth = self._ws_queue.qsize()
+        if depth > self._ws_queue_high_water:
+            self._ws_queue_high_water = depth
+
+        return {
+            "rest_latency_last_sweep_ms": self._last_sweep_latency_ms,
+            "rest_latency_recent_ms": _latency_summary(list(self._rest_latencies)),
+            "rest_timeouts": self._last_timeouts,
+            "poll_budget": {
+                "budget_seconds": self.POLL_BUDGET_SECONDS,
+                "exceeded": self._poll_budget_exceeded,
+                "deferred_tokens": self._poll_deferred,
+            },
+            "ws_queue": {
+                "depth": depth,
+                "high_water": self._ws_queue_high_water,
+                "capacity": self._ws_queue.maxsize,
+                "frames_dropped": self._frames_dropped,
+            },
+            "per_token_book_age_ms": self._per_token_book_age(),
+        }
+
+    def _per_token_book_age(self) -> dict[str, Any] | None:
+        """How stale each token's newest book is, right now.
+
+        Rotation is meant to make the *refresh gap* uniform; this shows whether
+        the *age* actually converged. The oldest token is named, because a
+        uniform p95 with one token an hour behind is still starvation.
+        """
+        if not self._last_polled_at:
+            return None
+        now = datetime.now(tz=UTC)
+        ages = {
+            token: (now - seen).total_seconds() * 1000.0
+            for token, seen in self._last_polled_at.items()
+        }
+        values = list(ages.values())
+        oldest = max(ages, key=ages.get)
+        return {
+            "tokens": len(values),
+            "max_ms": round(max(values), 1),
+            "p95_ms": round(_percentile(values, 95), 1),
+            "median_ms": round(_percentile(values, 50), 1),
+            "oldest_token": oldest[:24],
+        }
 
     def _note_error(self, message: str) -> None:
         self._last_error = message[:500]
@@ -786,6 +1000,7 @@ class CollectorWorker:
             self._last_rest_failed = http.requests_failed
             self._last_retries = http.retries_performed
             self._last_rate_waits = http.rate_limit_waits
+            self._last_timeouts = getattr(http, "timeouts", 0)
         contact = self._last_contact
         rest_ok = self._last_rest_ok
         rest_failed = self._last_rest_failed
@@ -852,6 +1067,7 @@ class CollectorWorker:
             last_error_utc=self._last_error_at,
             last_error=self._last_error,
             fatal_error=self._fatal,
+            telemetry=self._telemetry(),
         )
         try:
             publisher.write(heartbeat)
@@ -894,6 +1110,42 @@ def _tokens_of(market_rows: list[tuple]) -> list[tuple[str, str]]:
             if token:
                 pairs.append((token, market_id))
     return pairs
+
+
+def _percentile(values: list[float], p: float) -> float | None:
+    """Linear-interpolated percentile; ``None`` for an empty sample.
+
+    Reported as ``None`` rather than 0: no samples is not the same as
+    instantaneous, and a zero here would read as "requests are free".
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 1:
+        return ordered[0]
+    rank = (p / 100.0) * (n - 1)
+    low = int(rank)
+    high = min(low + 1, n - 1)
+    weight = rank - low
+    return ordered[low] * (1 - weight) + ordered[high] * weight
+
+
+def _latency_summary(values: list[float]) -> dict[str, Any]:
+    """Percentiles of one sweep's request latencies, for the heartbeat.
+
+    Bounded by the caller's deque: this is a rolling view of recent cost, not
+    a lifetime aggregate that only ever worsens.
+    """
+    if not values:
+        return {"n": 0}
+    return {
+        "n": len(values),
+        "p50_ms": round(_percentile(values, 50), 1),
+        "p95_ms": round(_percentile(values, 95), 1),
+        "p99_ms": round(_percentile(values, 99), 1),
+        "max_ms": round(max(values), 1),
+    }
 
 
 def _is_one_sided(quality: str) -> bool:

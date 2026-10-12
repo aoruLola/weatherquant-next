@@ -128,6 +128,16 @@ class Heartbeat:
     last_error: str | None = None
     fatal_error: str | None = None
 
+    # Rolling operational telemetry. Kept as one nested mapping rather than
+    # promoted to top-level fields because its members are heterogeneous - a
+    # latency percentiles dict, a queue depth, a drop counter - and because
+    # adding to it must not require touching this schema every time. Nested
+    # values are encoded by `to_dict` like any other dict.
+    #
+    # Empty when the engine has not yet measured anything, which is a
+    # different statement from "zero" and must not be conflated with it.
+    telemetry: dict[str, Any] = field(default_factory=dict)
+
     def to_dict(self) -> dict[str, Any]:
         def enc(value: Any) -> Any:
             if isinstance(value, datetime):

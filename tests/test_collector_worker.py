@@ -71,10 +71,15 @@ class FakeHttp:
         self.retries_performed = 0
         self.rate_limit_waits = 0
         self.calls: list[str] = []
+        self.request_options: list[dict] = []
 
     def get_json(self, url: str, *, params: Any = None, limiter: str | None = None,
-                 allow_not_found: bool = False) -> Any:
+                 allow_not_found: bool = False, **options: Any) -> Any:
+        # `options` carries the per-call timeout/retries the sweep passes down.
+        # Kept so a test can assert what the budget actually handed the client,
+        # rather than only that the client was called.
         self.calls.append(url)
+        self.request_options.append(dict(options))
         self.last_contact_utc = datetime.now(tz=UTC)
         self.requests_ok += 1
         if "/events/" in url:
