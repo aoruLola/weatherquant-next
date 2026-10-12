@@ -577,6 +577,99 @@ def test_a_failing_report_never_stops_the_engine(tmp_path, archive, models_dir, 
     assert row and row[0][1] == "warning", "the failure must leave a trace"
 
 
+def test_the_engine_publishes_the_detail_snapshots_the_dashboard_reads(
+    tmp_path, archive, models_dir, monkeypatch
+) -> None:
+    """The three row-level snapshots, produced by the engine's own connection.
+
+    This is the half the dashboard contract could not test from its side: the
+    producer proved it could build the files, and the API proved it could read
+    them, but only the runner can open ``shadow.duckdb`` - so if the runner
+    never calls the producer, both of those stay green over a dashboard that
+    permanently says ``unavailable``. Same lesson as the checkpoint defect:
+    drive the runner, not the helper.
+    """
+    import itertools
+
+    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    counter = itertools.count(start=1)
+    shadow = _settings(tmp_path, archive, models_dir)
+    runner = ShadowRunner(
+        RunnerConfig(
+            settings=Settings(),
+            shadow=shadow,
+            thresholds=load_thresholds(THRESHOLDS_PATH),
+        ),
+        clock=lambda: NOW + timedelta(seconds=next(counter)),
+    )
+    _RUNNERS.append(runner)
+    runner.start()
+    runner.cycle()
+
+    directory = shadow.shadow_report_path.parent
+    payloads = {}
+    for name in ("recent-decisions.json", "market-snapshot.json", "forecast-snapshot.json"):
+        path = directory / name
+        assert path.exists(), f"the engine did not publish {name}"
+        payloads[name] = json.loads(path.read_text(encoding="utf-8"))
+
+    for name, payload in payloads.items():
+        assert payload["schema_version"] == 1, name
+        assert payload["generated_at_utc"], name
+        assert payload["source_service"] == "weatherquant-shadow", name
+        assert payload["stale_after_seconds"] > 0, name
+        assert payload["source_version"], f"{name} carries no version to trace it to"
+
+    decisions = payloads["recent-decisions.json"]["data"]["decisions"]
+    assert decisions, "the detail snapshot exists but is empty after a real cycle"
+    assert payloads["recent-decisions.json"]["data"]["window"] <= 500
+    # LIVE and REPLAY must be distinguishable per row, never by inference.
+    assert all(row["mode"] in {"LIVE", "REPLAY"} for row in decisions)
+    stamps = [row["decided_at_utc"] for row in decisions]
+    assert stamps == sorted(stamps, reverse=True), "rows must be newest first"
+
+    markets = payloads["market-snapshot.json"]["data"]["markets"]
+    assert markets, "no market reached the model-vs-market snapshot"
+    assert payloads["forecast-snapshot.json"]["data"]["distributions"] is not None
+
+
+def test_a_failing_detail_publisher_never_stops_the_engine(
+    tmp_path, archive, models_dir, monkeypatch
+) -> None:
+    """Detail rows are not the mission either - and must not cost us the report.
+
+    The two publications are deliberately separate try blocks: a malformed
+    decision row should cost the dashboard its detail view, not its aggregates.
+    """
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "publish_detail_snapshots", _boom)
+
+    shadow = _settings(tmp_path, archive, models_dir)
+    runner = ShadowRunner(
+        RunnerConfig(
+            settings=Settings(),
+            shadow=shadow,
+            thresholds=load_thresholds(THRESHOLDS_PATH),
+        ),
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
+    _RUNNERS.append(runner)
+    runner.start()
+    stats = runner.cycle()  # must not raise
+
+    assert stats.decisions > 0, "the engine stopped evaluating when a detail snapshot failed"
+    assert path_exists(shadow.shadow_report_path), "a detail failure also cost us the report"
+    assert not path_exists(shadow.shadow_report_path.parent / "market-snapshot.json")
+    row = runner.db.con.execute(
+        "SELECT kind, severity FROM data_quality_events WHERE kind = 'detail_publish_failed'"
+    ).fetchall()
+    assert row and row[0][1] == "warning", "the failure must leave a trace"
+
+
 def path_exists(path) -> bool:
     from pathlib import Path as _P
 

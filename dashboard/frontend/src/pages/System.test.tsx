@@ -47,6 +47,23 @@ function renderPage() {
 }
 
 describe('System page', () => {
+  it('shows the shadow database size and version the new heartbeat carries', async () => {
+    const fixture = systemFixture({
+      shadow: { ...shadowHealth, app_version: '0.1.2', db_bytes: 734_003_200 },
+      storage: {
+        ...systemFixture().storage,
+        shadow_db_bytes: 734_003_200,
+      },
+      notes: ['趋势线仅覆盖本 Dashboard 进程启动后的观测窗口，不是历史全量'],
+    })
+    mockFetch({ '/api/v1/system': envelopeOf(fixture) })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('Shadow 数据库')).toBeInTheDocument())
+    expect(screen.getByText('700 MB')).toBeInTheDocument()
+    expect(screen.queryByText(/Shadow 数据库大小/)).not.toBeInTheDocument()
+    expect(screen.getByText(/v0\.1\.2/)).toBeInTheDocument()
+  })
+
   it('shows the WS queue numbers the new collector publishes', async () => {
     mockFetch({ '/api/v1/system': envelopeOf(systemFixture()) })
     renderPage()

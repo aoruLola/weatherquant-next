@@ -58,7 +58,7 @@ CREATE TABLE model_predictions (
     model_name VARCHAR, model_version VARCHAR, target_date DATE,
     event_id VARCHAR, probabilities_json VARCHAR, predicted_max_f DOUBLE,
     forecast_run_time_utc TIMESTAMPTZ, training_cutoff_utc TIMESTAMPTZ,
-    forecast_received_at_utc TIMESTAMPTZ, station VARCHAR, bracket_label VARCHAR
+    forecast_received_at_utc TIMESTAMPTZ, station VARCHAR
 );
 """
 
@@ -98,11 +98,14 @@ def shadow_con(tmp_path: Path):
         "INSERT INTO rejection_reasons VALUES (?,?,?,?)",
         [("d2", 0, "EDGE_BELOW_THRESHOLD", True), ("d2", 1, "INSUFFICIENT_LIQUIDITY", False)],
     )
+    # Column list mirrors src/weatherquant/storage/migrations_shadow/
+    # 0001_shadow_schema.sql - a fixture that invents columns the real
+    # database does not have is how a query passes here and fails in production.
     con.executemany(
-        "INSERT INTO model_predictions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO model_predictions VALUES (?,?,?,?,?,?,?,?,?,?)",
         [
-            ("calibrated", "v1", target, "event-1", json.dumps({"81°F": 0.41, "80°F or below": 0.59}), 81.2, now - timedelta(hours=6), datetime(2026, 9, 1, tzinfo=UTC), now - timedelta(hours=6), "KLGA", "81°F"),
-            ("gfs_raw", "v1", target, "event-1", json.dumps({"81°F": 0.38, "80°F or below": 0.62}), 80.9, now - timedelta(hours=6), datetime(2026, 9, 1, tzinfo=UTC), now - timedelta(hours=6), "KLGA", "81°F"),
+            ("calibrated", "v1", target, "event-1", json.dumps({"81°F": 0.41, "80°F or below": 0.59}), 81.2, now - timedelta(hours=6), datetime(2026, 9, 1, tzinfo=UTC), now - timedelta(hours=6), "KLGA"),
+            ("gfs_raw", "v1", target, "event-1", json.dumps({"81°F": 0.38, "80°F or below": 0.62}), 80.9, now - timedelta(hours=6), datetime(2026, 9, 1, tzinfo=UTC), now - timedelta(hours=6), "KLGA"),
         ],
     )
     yield con

@@ -1,7 +1,11 @@
 # P2-1 Unified Dashboard — 交付报告
 
 日期：2026-10-12 · 分支：`feat/p2-1-dashboard`（基于 `main@1e7e9d3` =
-Collector v0.1.2 = Shadow v0.1.1）· PR #1 · CI 全绿 · 未发布、未部署
+Collector v0.1.2 = Shadow v0.1.1）· PR #1 · CI 全绿
+
+> **2026-10-13 后记**：`dashboard-v0.1.0` 标签**已经触发** `dashboard-release`
+> 并成功发布（run 38238793816，4m22s）；镜像已在 NAS 上运行。下面 §9 的
+> “尚未触发”是发布前写的，保留原文以记录当时的决定。
 
 ---
 

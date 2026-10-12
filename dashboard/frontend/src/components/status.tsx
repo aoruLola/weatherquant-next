@@ -20,7 +20,8 @@ const TONE_CLASS: Record<Tone, string> = {
 function toneFor(value: string | null | undefined): Tone {
   const v = (value ?? '').toLowerCase()
   if (['healthy', 'live', 'fresh', 'ok', 'connected', 'running'].includes(v)) return 'accent'
-  if (['degraded', 'stale', 'replay', 'starting', 'warn', 'one_sided'].includes(v)) return 'warn'
+  if (['degraded', 'stale', 'replay', 'starting', 'warn', 'one_sided', 'expired'].includes(v))
+    return 'warn'
   if (['unhealthy', 'fatal', 'corrupt', 'down', 'failed', 'error'].includes(v)) return 'danger'
   if (['stopped', 'stopped_clean'].includes(v)) return 'muted'
   return 'muted'

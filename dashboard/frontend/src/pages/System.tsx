@@ -235,7 +235,11 @@ export default function System() {
               <div className="space-y-4">
                 <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
                   <MetricTile label="模式 mode" value={(shadow?.mode ?? '—').toUpperCase()} sub={`configured ${shadow?.configured_mode ?? '—'}`} />
-                  <MetricTile label="运行时间" value={fmtAgeShort(shadow?.uptime_seconds)} sub={`cycles ${fmtInt(shadow?.cycles ?? 0)}`} />
+                  <MetricTile
+                    label="运行时间"
+                    value={fmtAgeShort(shadow?.uptime_seconds)}
+                    sub={`v${shadow?.app_version ?? '—'} · cycles ${fmtInt(shadow?.cycles ?? 0)}`}
+                  />
                   <MetricTile label="当前周期" value={fmtInt((lastCycle as any)?.decisions ?? 0)} sub={`评估 · 耗时 ${fmtInt((lastCycle as any)?.duration_ms)} ms`} />
                   <MetricTile label="归档行读取" value={fmtInt((lastCycle as any)?.lines_read ?? 0)} sub={`books ${fmtInt((lastCycle as any)?.books ?? 0)} · markets ${fmtInt((lastCycle as any)?.markets ?? 0)}`} />
                   <MetricTile label="最近决策" value={fmtAge(shadow?.last_decision_age_seconds)} sub="last_decision_at" />
@@ -274,9 +278,9 @@ export default function System() {
                     sub="shadow 视角"
                   />
                   <MetricTile
-                    label="数据库大小"
-                    value="N/A"
-                    sub="Shadow 心跳未提供该字段（暂未接入）"
+                    label="Shadow 数据库"
+                    value={shadow?.db_bytes != null ? fmtBytes(shadow.db_bytes) : 'N/A'}
+                    sub={shadow?.db_bytes != null ? 'shadow.duckdb' : 'Shadow 心跳未提供该字段（暂未接入）'}
                   />
                 </div>
 

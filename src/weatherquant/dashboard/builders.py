@@ -53,6 +53,7 @@ from weatherquant.dashboard.trends import COLLECTOR_COUNTER_KEYS, TrendBuffer
 from weatherquant.data.heartbeat import evaluate_health, read_heartbeat
 from weatherquant.markets.models import Side
 from weatherquant.shadow.health import evaluate_shadow_health
+from weatherquant.weather.daily_max import local_day_bounds_utc
 
 __all__ = [
     "DashboardState",
@@ -249,6 +250,9 @@ def shadow_health(state: DashboardState, now: datetime) -> tuple[ShadowHealthDat
         stop_reason=payload.get("stop_reason"),
         disk_free_percent=_num(disk.get("free_percent")) if disk else None,
         last_cycle=cycle,
+        app_version=payload.get("app_version"),
+        image_tag=payload.get("image_tag"),
+        db_bytes=_int(payload.get("db_bytes")),
     )
     if verdict.status == "unhealthy":
         data.reason = "; ".join(verdict.reasons) or None
@@ -323,6 +327,21 @@ def _book_quote(observation, now: datetime, book_stale_seconds: float) -> BookQu
     )
 
 
+def _target_day_ended(target_date: date | None, now: datetime) -> bool:
+    """Has this market's civil day in New York already finished?
+
+    The answer must come from the market's own timezone, not from the
+    dashboard host's clock: a machine in UTC+8 crosses midnight twelve hours
+    before New York does, and a label that fires early is a label nobody can
+    trust. ``local_day_bounds_utc`` is the same helper the settlement path
+    uses, so "the day ended" means the same thing everywhere.
+    """
+    if target_date is None:
+        return False
+    _start, end = local_day_bounds_utc(target_date)
+    return now >= end
+
+
 def _summary_from_catalog(
     market,
     book: BookQuote | None,
@@ -330,11 +349,13 @@ def _summary_from_catalog(
     *,
     model_reason: str,
 ) -> MarketSummary:
+    target = market.target_date if isinstance(market.target_date, date) else None
     return MarketSummary(
         market_id=market.market_id,
         event_id=market.event_id,
         question=market.question,
-        target_date=market.target_date if isinstance(market.target_date, date) else None,
+        target_date=target,
+        target_day_ended=_target_day_ended(target, now),
         bracket_label=market.bracket_label,
         bracket_low=market.bracket.low if market.bracket else None,
         bracket_high=market.bracket.high if market.bracket else None,
@@ -386,12 +407,14 @@ def _producer_markets(payload: dict[str, Any], now: datetime, book_stale_seconds
                 reason=book_raw.get("reason"),
             )
         model_prob = _num(entry.get("model_probability"))
+        target = _parse_date(entry.get("target_date"))
         items.append(
             MarketSummary(
                 market_id=str(entry.get("market_id") or ""),
                 event_id=entry.get("event_id"),
                 question=str(entry.get("question") or ""),
-                target_date=_parse_date(entry.get("target_date")),
+                target_date=target,
+                target_day_ended=_target_day_ended(target, now),
                 bracket_label=str(entry.get("bracket_label") or ""),
                 bracket_low=_num(entry.get("bracket_low")),
                 bracket_high=_num(entry.get("bracket_high")),
@@ -975,8 +998,15 @@ def _system_health(
         "collector_db_bytes": collector.db_bytes,
         "collector_raw_bytes": collector.raw_bytes,
         "disk_free_percent": collector.disk_free_percent,
-        "shadow_db_bytes": None,
-        "shadow_db_reason": "shadow heartbeat does not report a database size (暂未接入)",
+        "shadow_db_bytes": shadow.db_bytes,
+        # Absent until the shadow heartbeat carries the field. Saying
+        # "暂未接入" while a number is on screen would be the lie the note
+        # exists to prevent, so the reason only appears with a null.
+        "shadow_db_reason": (
+            None
+            if shadow.db_bytes is not None
+            else "shadow heartbeat does not report a database size (暂未接入)"
+        ),
     }
 
     recent_errors: list[dict[str, Any]] = []
@@ -1026,21 +1056,29 @@ def system(state: DashboardState, now: datetime) -> tuple[SystemData, Freshness]
         "collector_raw_bytes": collector.raw_bytes,
         "disk_free_percent": collector.disk_free_percent,
         "disk_total_bytes": collector.disk_total_bytes,
-        "shadow_db_bytes": None,
+        "shadow_db_bytes": shadow.db_bytes,
     }
 
-    # The WS-queue note is conditional: Collector >= v0.1.2 publishes the
-    # numbers in heartbeat.telemetry, and claiming "暂未接入" while they are
-    # on screen would be a lie the System page immediately contradicts.
-    notes = [
-        "Shadow 数据库大小：Shadow 心跳未包含该字段（暂未接入）",
-        "趋势线仅覆盖本 Dashboard 进程启动后的观测窗口，不是历史全量",
-    ]
+    # Both notes are conditional: Collector >= v0.1.2 publishes the queue in
+    # heartbeat.telemetry, and a Shadow built after the field landed publishes
+    # db_bytes. Claiming "暂未接入" next to a number that is on screen would be
+    # a lie the page immediately contradicts.
     ws_queue = collector.telemetry.get("ws_queue") if collector.present else None
-    if not isinstance(ws_queue, dict) or not ws_queue:
-        notes.insert(
-            0, "WS 队列长度 / 高水位 / 丢帧：Collector 心跳未包含该字段（暂未接入）"
+    notes = [
+        note
+        for note, missing in (
+            (
+                "WS 队列长度 / 高水位 / 丢帧：Collector 心跳未包含该字段（暂未接入）",
+                not isinstance(ws_queue, dict) or not ws_queue,
+            ),
+            (
+                "Shadow 数据库大小：Shadow 心跳未包含该字段（暂未接入）",
+                shadow.db_bytes is None,
+            ),
         )
+        if missing
+    ]
+    notes.append("趋势线仅覆盖本 Dashboard 进程启动后的观测窗口，不是历史全量")
     unavailable: list[str] = []
     if metrics.trend_window_seconds is None:
         unavailable.append("trends (still collecting samples)")

@@ -152,6 +152,67 @@ export default function Decisions() {
         />
       </div>
 
+      {/*
+        How many *independent* observations the ACCEPT total actually holds.
+        The engine re-evaluates every open market every cycle, so the raw
+        count is a count of evaluations - showing it alone is how a shadow
+        log starts to sound like a track record.
+      */}
+      {totals?.accept_scope ? (
+        <Card
+          testId="accept-scope"
+          className="mb-4"
+          title="ACCEPT 的独立度"
+          hint={String(totals.accept_scope.note ?? '')}
+          bodyClassName="p-3.5"
+        >
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+            <StatCard
+              testId="stat-accept-observations"
+              label="ACCEPT 观测次数"
+              value={fmtInt(totals.accept_scope.accepted_observations ?? 0)}
+              tone="accent"
+              sub="每个周期各记一次"
+            />
+            <StatCard
+              testId="stat-accept-markets"
+              label="独立市场"
+              value={fmtInt(totals.accept_scope.accepted_distinct_markets ?? 0)}
+              sub="distinct market_id"
+            />
+            <StatCard
+              testId="stat-accept-tokens"
+              label="独立 Token"
+              value={fmtInt(totals.accept_scope.accepted_distinct_tokens ?? 0)}
+              sub="distinct token_yes"
+            />
+            <StatCard
+              testId="stat-accept-repeats"
+              label="重复周期信号"
+              value={fmtInt(totals.accept_scope.accepted_repeats ?? 0)}
+              tone="warn"
+              sub="同一市场同方向的再次计数"
+            />
+            <StatCard
+              testId="stat-accept-models"
+              label="产生决策的模型"
+              value={fmtInt(totals.accept_scope.models_with_decisions ?? 0)}
+              sub={`独立目标日 ${fmtInt(totals.accept_scope.accepted_distinct_target_dates ?? 0)}`}
+            />
+          </div>
+        </Card>
+      ) : (
+        totals && (
+          <Card testId="accept-scope-unavailable" className="mb-4" title="ACCEPT 的独立度">
+            <EmptyState
+              title="不可用"
+              reason="当前 Shadow report 未包含 accept_scope 维度（需要含该字段的版本）"
+              testId="accept-scope-reason"
+            />
+          </Card>
+        )
+      )}
+
       {!totals && (
         <div className="mb-4">
           <Banner tone="danger" title="决策聚合不可用" testId="totals-missing">

@@ -316,6 +316,52 @@ def test_stale_book_is_marked_stale_not_quoted_as_live(tmp_path: Path, settings_
         assert stale_only["total"] >= 1
 
 
+def _markets_for_target_date(root: Path, settings_for, target: str) -> list[dict]:
+    """Build a one-event archive whose event date is ``target``, return the list."""
+    now = utcnow()
+    build_tree(root, archive=False)
+    gamma = gamma_event(now=now, target=target)
+    write_jsonl(
+        root / "collector" / "raw" / "gamma" / f"{now.date().isoformat()}.jsonl",
+        [envelope("gamma", gamma, now=now - timedelta(seconds=20), seq=1)],
+    )
+    write_jsonl(
+        root / "collector" / "raw" / "rest" / f"{now.date().isoformat()}.jsonl",
+        [
+            envelope(
+                "rest",
+                rest_book("tok-81-yes", now=now - timedelta(seconds=5)),
+                now=now - timedelta(seconds=5),
+                seq=2,
+            )
+        ],
+    )
+    app = create_app(settings_for(root))
+    with TestClient(app) as client:
+        return client.get("/api/v1/markets").json()["data"]["items"]
+
+
+def test_a_market_is_marked_once_its_new_york_day_has_ended(tmp_path: Path, settings_for) -> None:
+    """`target_day_ended` comes from the market's timezone, not the host's.
+
+    The dashboard host and the market both have a date at 3am, and they are
+    not the same date. A card that decides "expired" from the host clock would
+    flip twelve hours early on a UTC+8 machine - early enough that the label
+    stops meaning anything.
+    """
+    ended = _markets_for_target_date(
+        tmp_path / "ended", settings_for, (utcnow() - timedelta(days=3)).date().isoformat()
+    )
+    assert ended, "no market came back for the past target date"
+    assert all(m["target_day_ended"] for m in ended)
+
+    current = _markets_for_target_date(
+        tmp_path / "current", settings_for, (utcnow() + timedelta(days=3)).date().isoformat()
+    )
+    assert current, "no market came back for the future target date"
+    assert not any(m["target_day_ended"] for m in current)
+
+
 def test_market_decision_filter_needs_the_producer(tmp_path: Path, settings_for) -> None:
     """Markets whose LATEST decision is X - honestly empty without a producer."""
     root = build_tree(tmp_path, producer_snapshots=True)
@@ -502,6 +548,34 @@ def test_legacy_collector_without_telemetry_keeps_the_absence_note(
         assert health["telemetry"] == {}
         system = client.get("/api/v1/system").json()["data"]
         assert "WS 队列" in " ".join(system["notes"])
+
+
+def test_shadow_identity_and_db_size_reach_every_layer(tmp_path: Path, settings_for) -> None:
+    """A Shadow built with the identity fields must surface them, not "暂未接入".
+
+    The mirror image of the telemetry test: the dashboard cannot open the
+    shadow's database (the engine holds an exclusive lease), so the size has
+    to arrive on the heartbeat - and every layer that claims to show it has to
+    carry the number through rather than fall back to the absence note.
+    """
+    payload = shadow_heartbeat(now=utcnow(), app_version="0.1.2", image_tag="sha-abc", db_bytes=734_003_200)
+    root = build_tree(tmp_path, shadow=payload)
+    app = create_app(settings_for(root))
+    with TestClient(app) as client:
+        health = client.get("/api/v1/shadow/health").json()["data"]
+        assert health["app_version"] == "0.1.2"
+        assert health["image_tag"] == "sha-abc"
+        assert health["db_bytes"] == 734_003_200
+
+        overview = client.get("/api/v1/overview").json()["data"]
+        assert overview["system_health"]["storage"]["shadow_db_bytes"] == 734_003_200
+        assert overview["system_health"]["storage"]["shadow_db_reason"] is None
+
+        system = client.get("/api/v1/system").json()["data"]
+        assert system["storage"]["shadow_db_bytes"] == 734_003_200
+        assert "Shadow 数据库大小" not in " ".join(system["notes"]), (
+            "the absence note must not sit next to the number"
+        )
 
 
 def test_trend_sampling_picks_up_telemetry() -> None:

@@ -144,7 +144,7 @@ export default function Overview() {
               sub={
                 shadow?.present === false
                   ? shadow.reason
-                  : `${fmtInt(shadow?.cycles)} 周期 · 模型 ${shadow?.primary_model ?? '—'}`
+                  : `v${shadow?.app_version ?? '—'} · ${fmtInt(shadow?.cycles)} 周期 · 模型 ${shadow?.primary_model ?? '—'}`
               }
             />
             <StatCard
@@ -399,8 +399,15 @@ export default function Overview() {
                     <div>Collector DB：{fmtBytes(sys.storage?.collector_db_bytes)}</div>
                     <div>原始归档：{fmtBytes(sys.storage?.collector_raw_bytes)}</div>
                     <div>
-                      Shadow DB：暂未接入{' '}
-                      <span className="opacity-70">（心跳未提供该字段）</span>
+                      Shadow DB：
+                      {sys.storage?.shadow_db_bytes != null ? (
+                        fmtBytes(sys.storage.shadow_db_bytes)
+                      ) : (
+                        <>
+                          暂未接入{' '}
+                          <span className="opacity-70">（心跳未提供该字段）</span>
+                        </>
+                      )}
                     </div>
                   </div>
 

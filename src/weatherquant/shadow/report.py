@@ -115,6 +115,8 @@ def build_report(con, *, now: datetime | None = None, horizon_days: int = 7) -> 
             "primary_reasons": reasons,
             "all_reasons": all_reasons,
             "p95_decision_latency_ms": latency,
+            "by_model": _by_model(con),
+            "accept_scope": _accept_scope(con),
         },
         "theoretical_edge": edge,
         "prediction_quality": _prediction_quality(con, now),
@@ -172,6 +174,66 @@ def _by_mode(con) -> dict[str, dict[str, Any]]:
         if state == "ACCEPT":
             entry["accepted"] += int(n)
     return dict(sorted(out.items()))
+
+
+def _by_model(con) -> dict[str, dict[str, Any]]:
+    """State counts per model, so a decision total can never be read as if
+    every model contributed the same number of judgements."""
+    out: dict[str, dict[str, Any]] = {}
+    for model, state, n in con.execute(
+        "SELECT COALESCE(model_name, 'unknown'), state, COUNT(*) "
+        "FROM shadow_decisions GROUP BY 1, 2"
+    ).fetchall():
+        out.setdefault(str(model), {})[str(state)] = int(n)
+    return dict(sorted(out.items()))
+
+
+def _accept_scope(con) -> dict[str, Any]:
+    """How many *independent* observations an ACCEPT total actually contains.
+
+    The engine re-evaluates every open market on every cycle, so a single
+    opportunity that stays open for an hour is recorded dozens of times. The
+    raw ACCEPT count is a number of **observations**, not of opportunities -
+    reporting it alone is how a shadow log starts to sound like a track
+    record. Everything here is counted to make that distinction checkable.
+
+    Token is the decided market's ``token_yes``: a buy_yes and a sell_yes on
+    the same bracket are two reads of the same book, not two instruments.
+    """
+    obs, markets, pairs, target_dates = con.execute(
+        """
+        SELECT COUNT(*),
+               COUNT(DISTINCT market_id),
+               COUNT(DISTINCT market_id || '|' || COALESCE(direction, '')),
+               COUNT(DISTINCT target_date)
+        FROM shadow_decisions WHERE state = 'ACCEPT'
+        """
+    ).fetchone()
+    tokens = _one(
+        con,
+        "SELECT COUNT(DISTINCT c.token_yes) FROM shadow_decisions d "
+        "JOIN market_catalog c ON c.market_id = d.market_id "
+        "WHERE d.state = 'ACCEPT' AND c.token_yes IS NOT NULL",
+    )
+    model_count = _one(con, "SELECT COUNT(DISTINCT model_name) FROM shadow_decisions") or 0
+    observations = int(obs or 0)
+    distinct_pairs = int(pairs or 0)
+    return {
+        "accepted_observations": observations,
+        "accepted_distinct_markets": int(markets or 0),
+        "accepted_distinct_tokens": int(tokens or 0),
+        "accepted_distinct_target_dates": int(target_dates or 0),
+        "accepted_distinct_market_directions": distinct_pairs,
+        "accepted_repeats": max(observations - distinct_pairs, 0),
+        "models_with_decisions": int(model_count),
+        "window": "cumulative for the current run",
+        "note": (
+            "an ACCEPT is one evaluation of one market in one cycle, not one "
+            "opportunity: the same bracket is counted again on every later "
+            "cycle in which it still passes, so accepted_observations >= "
+            "accepted_distinct_markets by construction"
+        ),
+    }
 
 
 def _edge_stats(con) -> dict[str, Any]:
@@ -273,14 +335,11 @@ def _coverage(con, now: datetime, *, horizon_days: int) -> dict[str, Any]:
     for _market_id, token in token_rows:
         if token and _one(con, "SELECT token_id FROM token_books WHERE token_id = ?", [token]):
             with_book += 1
-    fresh = (
-        _one(
-            con,
-            "SELECT COUNT(*) FROM token_books WHERE shadow_received_at_utc >= ?",
-            [now],
-        )
-        or 0
-    )
+    # How many tokens have ever had a book recorded. This used to filter on
+    # `shadow_received_at_utc >= now`, which can only ever match a row stamped
+    # in the future - so the field read 0 forever while every book on screen
+    # was seconds old. "Total" is what the name says, so that is what it is.
+    books_total = _one(con, "SELECT COUNT(*) FROM token_books") or 0
     return {
         "open_target_dates": [str(d) for d in open_targets],
         "models_tracked": sorted(models),
@@ -290,7 +349,7 @@ def _coverage(con, now: datetime, *, horizon_days: int) -> dict[str, Any]:
         "open_markets": len(token_rows),
         "open_markets_with_a_book": with_book,
         "orderbook_coverage": (with_book / len(token_rows)) if token_rows else None,
-        "books_total": fresh,
+        "books_total": books_total,
         "note": (
             "coverage counts whether an input exists at all; it says nothing "
             "about whether the input is any good"

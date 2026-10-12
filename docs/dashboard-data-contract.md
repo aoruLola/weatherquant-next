@@ -79,7 +79,13 @@ Shadow 一样只记录不使用。**
 
 ---
 
-## 2. Dashboard 已定义、等待生产者发布的快照
+## 2. Dashboard 已定义、生产者已发布的快照
+
+> **状态：已接入。** `weatherquant.shadow.runner._publish_report()` 在
+> `publish_report_snapshot(...)` 之后调用 `publish_detail_snapshots(...)`：
+> 同一连接、同一节流（`shadow_report_seconds`），**独立的 try 块**——明细失败
+> 只记一条 `detail_publish_failed` 质量事件，报告照常发布，引擎照常运行。
+> 生产是否点亮取决于生产 Shadow 镜像是否包含该提交（见 §4）。
 
 三个文件都发布到 **Shadow 数据目录的 `reports/`**（即现有 report.json 旁）：
 
@@ -176,67 +182,83 @@ point-in-time：只携带当时的 run 与训练截止，不允许出现"已知�
 | 决策聚合、LIVE/REPLAY 拆分、拒绝原因 | ✅ 可用* | *需 Shadow ≥ report 快照机制 |
 | 市场目录 + 盘口 bid/ask/深度/新鲜度 | ✅ 可用 | 归档有界 tail |
 | 模型列表、覆盖率、观测缺失说明 | ✅ 可用 | report |
-| 模型概率 / 理论 Edge（逐市场） | ⏳ 待集成 | market-snapshot |
-| 决策行级明细 | ⏳ 待集成 | recent-decisions |
-| 温度桶概率分布 | ⏳ 待集成 | forecast-snapshot |
+| 模型概率 / 理论 Edge（逐市场） | ✅ 已接入* | market-snapshot；*需生产 Shadow 镜像含接入提交 |
+| 决策行级明细 | ✅ 已接入* | recent-decisions |
+| 温度桶概率分布 | ✅ 已接入* | forecast-snapshot |
 | 实际观测 / 官方结算 | ❌ 不接入 | 属研究管线回溯评分，决策时点禁止视为已知 |
 | WS 队列长度/高水位/丢帧 | ✅ 可用（Collector ≥ v0.1.2） | 心跳 `telemetry.ws_queue{depth, high_water, capacity, frames_dropped}`；旧版无字段时 UI 显示"暂未接入" |
-| Shadow 数据库大小 | ❌ 心跳无此字段 | 同上 |
+| Shadow 数据库大小 / 版本 | ✅ 可用* | 心跳 `db_bytes` / `app_version` / `image_tag`；旧版无字段时 UI 显示"暂未接入" |
+| ACCEPT 独立度（独立市场 / Token / 重复周期） | ✅ 可用* | report `decisions.accept_scope`；*同上 |
+| 目标日是否已结束（纽约自然日） | ✅ 可用 | `MarketSummary.target_day_ended`，由 `local_day_bounds_utc` 判定，**不是**宿主机时钟 |
 | 收益曲线 | ❌ 结构性禁止 | report 恒为 null，UI 原样传递 |
 
 ---
 
-## 4. 集成契约（Shadow 侧，~10 行，待协调执行）
+## 4. 集成契约（Shadow 侧）——已执行
 
-生产者已实现并通过契约测试（`dashboard/tests/test_producer.py`：
-信封字段、行窗口、book/概率拼装、原子发布、以及**产出直接喂回 API 的端到端
-一致性**）。集成只差在引擎里调用一次——调用点在 `shadow/runner.py`
-（另一会话可能正在改动的文件，因此本分支**不改**）：
+**状态：已合入 `shadow/runner.py`。** 调用点在 `_publish_report()`，
+在 `publish_report_snapshot(...)` 之后、**独立的 try 块**里：
 
 ```python
-# weatherquant.shadow.runner._publish_report()，在 publish_report_snapshot(...)
-# 之后（同一连接、同一节流）追加：
-from weatherquant.dashboard.producer import publish_detail_snapshots
-
-publish_detail_snapshots(
-    self.db.con,                              # 引擎已持有的连接，绝不新开
-    directory=self.shadow.shadow_report_path.parent,   # <shadow>/reports/
-    run_id=self.run_id or "",
-    source_version=_app_version(),
-    primary_model=self.shadow.shadow_primary_model,
-    now=now,
-)
+try:
+    publish_detail_snapshots(
+        self.db.con,                                    # 引擎已持有的连接，绝不新开
+        directory=self.shadow.shadow_report_path.parent,  # <shadow>/reports/
+        run_id=self.run_id or "",
+        source_version=_app_version(),
+        primary_model=self.shadow.shadow_primary_model,
+        now=now,
+        stale_after_seconds=self.shadow.shadow_report_stale_seconds,
+    )
+except Exception as exc:
+    log.warning("could not publish the detail snapshots: %s", exc)
+    self.store.record_quality([QualityEvent(kind="detail_publish_failed", ...)])
 ```
 
 要点：
 
-- 失败必须 log-and-swallow（快照失败不能拖垮引擎），与 report 的处理一致；
-- 节流可与 report 共用（60s），或单独 30s（决策页希望更热）；
+- 失败 log-and-swallow 且**不带走报告**（两个独立 try）；
+- 节流与 report 共用 `shadow_report_seconds`（默认 60s）；
 - 引擎不认识 Dashboard 的 HTTP，只认识这一个目录——单向、只读、可审计。
 
-### 集成条件（Definition of Done）
+### 接入过程暴露的缺陷（值得记住的一条）
 
-逐市场**模型概率**、**理论 Edge**、**决策明细**三块 UI 从 `unavailable` 变为
-实时数据，当且仅当以下条件全部满足：
+生产者自带的 `dashboard/tests/test_producer.py` **自造了一张 `model_predictions` 表**，
+比真实 schema 多一列 `bracket_label`。`build_forecasts_snapshot` 因此查了一个
+真实数据库里不存在的列——**生产者测试全绿，而这条查询在真库上第一次跑就 Binder Error**。
+夹具已改为镜像 `migrations_shadow/0001_shadow_schema.sql`，并由新增的
+`tests/test_shadow_runner.py::test_the_engine_publishes_the_detail_snapshots_the_dashboard_reads`
+（**驱动 Runner** 而非驱动 helper）守住。
 
-1. Shadow 会话把上面的 `publish_detail_snapshots(...)` 调用合入
-   `shadow/runner.py`（与 `_publish_report` 同连接、同节流、失败仅告警）；
-2. 发布目录是 `WQ_SHADOW_REPORT_PATH` 所在的 `reports/`（Dashboard 的
-   `shadow/reports` 只读挂载已就位，无需改 compose）；
-3. 三个文件满足 §0 信封（`schema_version=1`、`generated_at_utc`、
+这与 checkpoint 缺陷（`research/shadow-validation.md` §11.4）是同一类错误：
+**测试替生产代码做了它该做的那一步，于是在生产坏掉时依然全绿。**
+
+### 仍然成立的集成条件（Definition of Done）
+
+UI 从 `unavailable` 变为实时数据，需要以下条件**全部**满足：
+
+1. ✅ `publish_detail_snapshots(...)` 已合入 `shadow/runner.py`（同连接、同节流、失败仅告警）；
+2. ✅ 发布目录是 `shadow_report_path` 所在的 `reports/`（Dashboard 的 `shadow/reports`
+   只读挂载已就位，无需改 compose）；
+3. ✅ 三个文件满足 §0 信封（`schema_version=1`、`generated_at_utc`、
    `stale_after_seconds`、原子 rename）；
-4. `recent-decisions` 按 `decided_at_utc` 倒序、窗口 ≤500 行、`mode` 必填；
-5. `market-snapshot` 的 `model_probability` 必须来自**决策引擎实际读取的**
+4. ✅ `recent-decisions` 按 `decided_at_utc` 倒序、窗口 ≤500 行、`mode` 必填；
+5. ✅ `market-snapshot` 的 `model_probability` 必须来自**决策引擎实际读取的**
    那一行 primary-model 预测（同一 `forecast_run_time_utc`），否则 Dashboard
    展示的概率会与决策依据不一致——这是契约里唯一会造成"两个真相"的字段；
-6. Dashboard 侧无需改动：适配器与测试
+6. ✅ Dashboard **适配器**无需改动：`market-snapshot → 归档 tail`、
+   `recent-decisions → 不可用` 的优先级读取已就位，
    `test_api_consumes_producer_output_end_to_end`（显式断言概率 / Edge /
    决策明细三层贯通）在文件出现时自动转为 `fresh`。
 
-集成后 Dashboard **零改动**自动点亮三个页面的明细部分（适配器按
-`market-snapshot → 归档 tail`、`recent-decisions → 不可用` 的优先级读取，
-`dashboard/tests/test_producer.py::test_api_consumes_producer_output_end_to_end`
-证明两端一致）。
+> **代码合入 ≠ 生产点亮。** 上面六条全部满足的是**源码**；生产 Shadow 容器跑的仍是
+> `shadow-v0.1.2`（`b60bbd8`，早于本集成）。在用含本提交的源码重建并替换 Shadow
+> 镜像之前，Dashboard 会继续如实显示 `unavailable` + 原因——这是设计内降级，
+> 不是故障。影响范围与回滚见 `docs/p2-0.1-audit.md` §7。
+
+同一轮里 Dashboard 还新增了三样**不属于**本节集成的东西（它们各自有字段、
+有测试，且不依赖上面任何一条）：Shadow 的 `app_version`/`db_bytes`、
+`decisions.accept_scope`、`MarketSummary.target_day_ended`。
 
 ## 5. HTTP API 映射（消费者侧）
 

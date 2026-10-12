@@ -106,6 +106,17 @@ export const shadowReport: ShadowReport = {
     replay_accepted: 0,
     primary_reasons: { EDGE_BELOW_THRESHOLD: 30 },
     window: 'cumulative for the current run',
+    accept_scope: {
+      accepted_observations: 3,
+      accepted_distinct_markets: 1,
+      accepted_distinct_tokens: 1,
+      accepted_distinct_target_dates: 1,
+      accepted_distinct_market_directions: 1,
+      accepted_repeats: 2,
+      models_with_decisions: 2,
+      window: 'cumulative for the current run',
+      note: 'an ACCEPT is one evaluation of one market in one cycle, not one opportunity',
+    },
   },
   coverage: {
     open_markets: 33,
@@ -179,6 +190,7 @@ export function marketFixture(overrides: Partial<MarketSummary> = {}): MarketSum
     closed: false,
     accepting_orders: true,
     tradeable: true,
+    target_day_ended: false,
     token_yes: 'tok-81-yes',
     book: {
       available: true,
