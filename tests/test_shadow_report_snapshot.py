@@ -37,9 +37,14 @@ REAL_NOW = datetime.now(tz=UTC)
 THRESHOLDS = Path(__file__).resolve().parents[1] / "configs" / "shadow-thresholds.json"
 
 
-def _report() -> dict:
+def _report(generated_at: datetime | None = None) -> dict:
+    """A plausible report. Defaults to the wall clock, because that is what the
+    engine stamps - a fixed constant drifts into the future and then reads as
+    "fresh" however old it actually is. Tests that need a specific instant pass
+    it."""
+    stamp = (generated_at or datetime.now(tz=UTC)).isoformat()
     return {
-        "generated_at_utc": NOW.isoformat(),
+        "generated_at_utc": stamp,
         "run": {"run_id": "abc", "status": "running"},
         "decisions": {"evaluated": 12, "by_state": {"ACCEPT": 1}},
         "equity_curve": None,
@@ -51,7 +56,7 @@ def _report() -> dict:
 
 def test_a_snapshot_carries_its_own_freshness_fields(tmp_path) -> None:
     path = tmp_path / "reports" / "report.json"
-    payload = publish_report_snapshot(path, _report(), stale_after_seconds=300, now=NOW)
+    payload = publish_report_snapshot(path, _report(NOW), stale_after_seconds=300, now=NOW)
 
     assert payload["schema_version"] == SNAPSHOT_SCHEMA_VERSION
     assert payload["source"] == "shadow-main"
@@ -70,7 +75,7 @@ def test_the_generation_time_is_when_the_numbers_were_computed(tmp_path) -> None
     data, so the timestamp comes from the report the engine built.
     """
     path = tmp_path / "r.json"
-    report = _report()
+    report = _report(NOW)
     publish_report_snapshot(path, report, stale_after_seconds=60, now=NOW + timedelta(seconds=50))
     loaded = load_report_snapshot(path)
     assert loaded["generated_at_utc"] == NOW.isoformat()
@@ -113,7 +118,7 @@ def test_missing_corrupt_and_wrong_documents_all_read_as_none(tmp_path) -> None:
 
 def test_staleness_goes_from_fresh_to_expired_exactly_at_the_window(tmp_path) -> None:
     path = tmp_path / "r.json"
-    publish_report_snapshot(path, _report(), stale_after_seconds=300, now=NOW)
+    publish_report_snapshot(path, _report(NOW), stale_after_seconds=300, now=NOW)
 
     fresh, age, past = snapshot_staleness(load_report_snapshot(path), now=NOW + timedelta(seconds=299))
     assert fresh is False and age == pytest.approx(299) and past == 0

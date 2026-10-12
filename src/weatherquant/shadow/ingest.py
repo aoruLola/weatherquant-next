@@ -120,6 +120,11 @@ class TailResult:
     book_updates: list[BookObservation]
     notes: list[tuple[EventKind, str]]
     checkpoints: dict[str, Checkpoint]
+    # Per-source "newest archive date seen", returned rather than applied.
+    # `poll` must not move *any* of this tailer's own state: the caller adopts
+    # both maps together, and only once the transaction that carries them has
+    # committed. See `ArchiveTailer.adopt`.
+    file_dates: dict[str, date]
 
 
 class ArchiveTailer:
@@ -195,6 +200,7 @@ class ArchiveTailer:
         book_updates: list[BookObservation] = []
         notes: list[tuple[EventKind, str]] = []
         advanced: dict[str, Checkpoint] = {}
+        advanced_dates: dict[str, date] = {}
 
         for path, source in self._files():
             key = str(path)
@@ -297,7 +303,7 @@ class ArchiveTailer:
                 )
                 parsed_date = _parse_date(path.name)
                 if parsed_date is not None:
-                    self._note_gap(source, parsed_date, quality)
+                    self._note_gap(source, parsed_date, quality, advanced_dates)
             elif existing is None or was_truncated:
                 # Two cases share this: a brand-new file that needs an entry
                 # (or it would be re-scanned as new on every poll), and a
@@ -313,7 +319,25 @@ class ArchiveTailer:
             book_updates=book_updates,
             notes=notes,
             checkpoints=advanced,
+            file_dates=advanced_dates,
         )
+
+    def adopt(self, checkpoints: dict[str, Checkpoint], file_dates: dict[str, date] | None = None) -> None:
+        """Take ownership of offsets the caller has just committed.
+
+        This is the only place the tailer's own state moves, and it is called
+        *after* the DuckDB transaction that wrote the same offsets has
+        committed. Updating inside `poll` would advance memory for effects the
+        database never saw: a rolled-back batch would then be skipped on the
+        next cycle, and the lines it covered would be lost silently.
+
+        Commit first, adopt second. A failure between them re-reads a batch,
+        which is recoverable; adopting before the commit loses one, which is
+        not.
+        """
+        self.checkpoints.update(checkpoints)
+        if file_dates:
+            self.last_file_date.update(file_dates)
 
     # -- internals ----------------------------------------------------------
 
@@ -521,9 +545,17 @@ class ArchiveTailer:
         )
         return snapshots, [detail for _kind, detail in ws_notes]
 
-    def _note_gap(self, source: str, day: date, quality: list[QualityEvent]) -> None:
-        """Record whole missing days in a source's archive, never a silent jump."""
-        previous = self.last_file_date.get(source)
+    def _note_gap(
+        self, source: str, day: date, quality: list[QualityEvent], pending: dict[str, date]
+    ) -> None:
+        """Record whole missing days in a source's archive, never a silent jump.
+
+        Reads the last *committed* date (or one already advanced by this
+        poll) and writes to ``pending`` - never to ``self.last_file_date``.
+        If the caller's transaction rolls back, ``pending`` is discarded and
+        the next poll re-derives the same gap instead of having lost it.
+        """
+        previous = pending.get(source, self.last_file_date.get(source))
         if previous is not None and (day - previous).days > 1:
             n_missing = (day - previous).days - 1
             first = previous + timedelta(days=1)
@@ -541,7 +573,7 @@ class ArchiveTailer:
                 )
             )
         if previous is None or day > previous:
-            self.last_file_date[source] = day
+            pending[source] = day
 
 
 def _is_truncated(path: Path, offset: int) -> bool:

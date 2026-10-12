@@ -375,6 +375,18 @@ class ShadowRunner:
             checkpoints=tail.checkpoints,
             quality=tail.quality,
         )
+        # Adopt only once the transaction above has committed. `poll` is
+        # deliberately read-only with respect to this tailer: if the batch had
+        # advanced memory and then rolled back, the next cycle would resume
+        # past lines the database never stored - silently losing them. Getting
+        # this the wrong way round re-reads a batch, which is recoverable;
+        # getting it the other way round loses one, which is not.
+        #
+        # Without this line the tailer re-read from its original offset every
+        # cycle, which is the production symptom: checkpoints written but never
+        # taken up in memory, `collector_last_seen` frozen, and every historical
+        # line consumed again while `shadow_received_at` kept moving forward.
+        self.tailer.adopt(tail.checkpoints, tail.file_dates)
         stats.lines_read = tail.stats.lines_read
         stats.books = len(tail.book_updates)
         stats.markets = len(flat_markets)
