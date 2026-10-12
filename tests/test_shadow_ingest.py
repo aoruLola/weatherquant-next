@@ -51,9 +51,16 @@ def _rows(checkpoints: dict[str, Checkpoint]) -> list[tuple]:
     ]
 
 
-def _merge(tailer: ArchiveTailer, result) -> None:
-    """Apply what a cycle would have committed, so the next poll sees it."""
-    tailer.checkpoints.update(result.checkpoints)
+def _commit(tailer: ArchiveTailer, result) -> None:
+    """Stand in for the runner: commit the batch, then adopt its offsets.
+
+    Not a convenience helper - it is the production sequence, and the first
+    version of this file updated only ``checkpoints``. That let every test in
+    here pass while the runner adopted nothing at all, which is how the re-read
+    defect reached production behind a green suite. Whatever this does, the
+    runner must do, and vice versa.
+    """
+    tailer.adopt(result.checkpoints, result.file_dates)
 
 
 # --- complete lines --------------------------------------------------------
@@ -77,7 +84,7 @@ def test_a_half_written_line_is_not_consumed(tmp_path) -> None:
     # Appending the terminator makes exactly one more line available.
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(",}\n")
-    _merge(tailer, first)
+    _commit(tailer, first)
     second = tailer.poll()
     assert second.stats.lines_read == 1
     assert second.stats.lines_malformed == 1  # it claims to be JSON but is not
@@ -94,7 +101,7 @@ def test_a_restarted_tailer_does_not_reprocess_lines(tmp_path) -> None:
     tailer = _tailer(tmp_path)
     first = tailer.poll()
     assert first.stats.lines_read == 3
-    _merge(tailer, first)
+    _commit(tailer, first)
 
     restarted = _reload(tailer)
     second = restarted.poll()
@@ -105,7 +112,7 @@ def test_a_restarted_tailer_does_not_reprocess_lines(tmp_path) -> None:
 def test_new_lines_after_a_restart_are_picked_up(tmp_path) -> None:
     write_lines(tmp_path, "gamma", TARGET_DATE, [archive_line(1, "gamma", gamma_event())])
     tailer = _tailer(tmp_path)
-    _merge(tailer, tailer.poll())
+    _commit(tailer, tailer.poll())
 
     write_lines(tmp_path, "gamma", TARGET_DATE, [archive_line(2, "gamma", gamma_event())])
     restarted = _reload(tailer)
@@ -124,7 +131,7 @@ def test_truncation_is_recorded_and_the_tail_restarts_from_zero(tmp_path) -> Non
         [archive_line(i, "gamma", gamma_event()) for i in range(1, 6)],
     )
     tailer = _tailer(tmp_path)
-    _merge(tailer, tailer.poll())
+    _commit(tailer, tailer.poll())
 
     # The collector (or a rotation) replaced the file wholesale.
     path.write_text(archive_line(1, "gamma", gamma_event()) + "\n", encoding="utf-8")
@@ -136,7 +143,7 @@ def test_truncation_is_recorded_and_the_tail_restarts_from_zero(tmp_path) -> Non
     assert result.stats.lines_read == 1  # re-read from byte 0, not from the old offset
 
     # The rewound offset is persisted, so the same shrink is not re-reported.
-    _merge(restarted, result)
+    _commit(restarted, result)
     again = restarted.poll()
     assert "archive_file_truncated" not in {q.kind for q in again.quality}
 
@@ -144,7 +151,7 @@ def test_truncation_is_recorded_and_the_tail_restarts_from_zero(tmp_path) -> Non
 def test_a_missing_checkpointed_file_is_an_error_not_a_silence(tmp_path) -> None:
     path = write_lines(tmp_path, "gamma", TARGET_DATE, [archive_line(1, "gamma", gamma_event())])
     tailer = _tailer(tmp_path)
-    _merge(tailer, tailer.poll())
+    _commit(tailer, tailer.poll())
 
     path.unlink()
     restarted = _reload(tailer)
@@ -164,7 +171,7 @@ def test_a_malformed_complete_line_is_recorded_and_skipped_forward(tmp_path) -> 
     assert result.stats.lines_malformed == 1
     assert [q.kind for q in result.quality] == ["archive_line_malformed"]
 
-    _merge(tailer, result)
+    _commit(tailer, result)
     assert _tailer_replay_is_empty(tailer)
 
 
@@ -175,7 +182,7 @@ def _tailer_replay_is_empty(tailer: ArchiveTailer) -> bool:
 def test_whole_missing_days_between_files_are_a_recorded_gap(tmp_path) -> None:
     write_lines(tmp_path, "rest", date(2026, 10, 1), [archive_line(1, "rest", {"a": 1})])
     tailer = _tailer(tmp_path)
-    _merge(tailer, tailer.poll())
+    _commit(tailer, tailer.poll())
 
     write_lines(tmp_path, "rest", date(2026, 10, 5), [archive_line(2, "rest", {"a": 2})])
     result = tailer.poll()
