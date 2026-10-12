@@ -1,0 +1,185 @@
+# Development CI for the dashboard: test and build only.
+#
+# Deliberately never pushes an image - publishing is reserved for
+# dashboard-release.yml, so an ordinary commit cannot move `dashboard-stable`,
+# and this workflow cannot move the collector's `stable` or the shadow's
+# `shadow-stable` either: it has no GHCR login and no packages:write.
+#
+# Docker acceptance lives in ONE shared script (scripts/dashboard_docker_accept.sh)
+# used by both this workflow and the release, so the two check lists cannot
+# drift apart - the failure mode that already bit shadow-release once.
+
+name: dashboard-ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+  actions: write   # Docker layer cache (cache-to: type=gha)
+
+jobs:
+  dashboard-backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies (dev + dashboard group)
+        run: uv sync --frozen --group dev --group dashboard
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Pytest (dashboard API + producer contract)
+        run: uv run pytest -q dashboard/tests
+
+      - name: Pytest (repository invariants, including the dashboard workflows)
+        run: uv run pytest -q tests/test_workflows.py tests/test_dashboard_ci.py
+
+  dashboard-frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: dashboard/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/frontend/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests (vitest)
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  dashboard-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: dashboard-backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies (the API server Playwright drives)
+        run: uv sync --frozen --group dev --group dashboard
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/frontend/package-lock.json
+
+      - name: Install frontend deps and build
+        working-directory: dashboard/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Generate fixture dataset
+        run: uv run python dashboard/fixtures/generate.py
+
+      - name: Install Playwright Chromium
+        working-directory: dashboard/frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser acceptance (1440 / 768 / 375)
+        working-directory: dashboard/frontend
+        run: npx playwright test
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-screenshots
+          path: dashboard/screenshots/
+          if-no-files-found: warn
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-playwright-report
+          path: |
+            dashboard/frontend/test-results/
+            dashboard/frontend/playwright-report/
+          if-no-files-found: ignore
+
+  build-dashboard-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [dashboard-backend, dashboard-frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dashboard
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: weatherquant-dashboard:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Container acceptance (shared script)
+        run: bash scripts/dashboard_docker_accept.sh weatherquant-dashboard:ci
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker logs wq-dashboard-accept || true
+
+  # Development CI must be structurally unable to publish anything. The check
+  # searches this file itself, so an accidental login or push step fails loudly
+  # instead of quietly moving a tag the NAS pulls.
+  dashboard-ci-never-publishes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: No registry capability in the development workflow
+        run: |
+          set -euo pipefail
+          hits=$(grep -nE "uses: docker/login-action|push: true|packages: write|imagetools create" \
+                   .github/workflows/dashboard-ci.yml | grep -v "grep -nE" || true)
+          if [ -n "$hits" ]; then
+            echo "dashboard-ci must not publish anything:" >&2
+            echo "$hits" >&2
+            exit 1
+          fi
+          echo "no publish capability: no login, no push:true, no packages:write, no tag move"
