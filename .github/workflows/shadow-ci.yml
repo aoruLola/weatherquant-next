@@ -157,7 +157,10 @@ jobs:
           after=$(docker exec shadow-ci python -c "import json;print(json.load(open('/data/health/heartbeat.json'))['updated_at_utc'])")
           echo "heartbeat before: $before"
           echo "heartbeat after : $after"
-          test "$after" != "$before", "the engine stopped writing while report was being called"
+          if [ "$after" = "$before" ]; then
+            echo "the engine stopped writing while report was being called" >&2
+            exit 1
+          fi
 
           # And the snapshot really is a file on the shared volume, readable
           # from the host (mkstemp would otherwise leave it 0600).
