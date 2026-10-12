@@ -600,3 +600,68 @@ SKIPPED [3] tests	est_workflows.py:113: workflow performs no database verificati
 以及"CI 失败不触发发布"。
 
 ---
+
+## 10. 修复：report 与运行中的引擎争抢 DuckDB
+
+### 10.1 问题
+
+`weatherquant-shadow report` 无条件执行 `ShadowDatabase(path).__enter__()`，
+即以**读写**方式打开 `shadow.duckdb`。而主进程对该文件持有整个生命周期的排他
+租约，**DuckDB 连只读都不允许第二个进程打开**（本项目早有记录：旧库在采集进程
+运行时 `connect(read_only=True)` 报 `another program is using it`）。
+
+后果是反直觉的：**运维在引擎运行中最需要的那条命令，恰好是唯一跑不起来的那条。**
+
+### 10.2 修复：把"读"的位置换掉
+
+不是解锁，而是让读发生在别处：
+
+```
+主进程（已有连接）──算──► /data/reports/report.json（原子替换）──► report CLI 读
+```
+
+| 环节 | 实现 |
+|---|---|
+| 谁算 | **主进程**，用它**已经打开**的连接，从不新开第二个 |
+| 何时算 | `start()` 立即一次（启动即可读），之后每 `shadow_report_seconds`（60s）一次 |
+| 何时 | **周期末尾、事务提交之后** —— 读到的永远是已落库状态 |
+| 怎么写 | `shadow/publish.py::atomic_write_json`：临时文件 + `fsync` + `os.replace` + `chmod 644` |
+| 写失败 | 记 `report_publish_failed`(warning) 并**继续** —— 报告不是任务 |
+| 谁读 | CLI 默认读快照；`--offline` / 显式 `--db` 才直接开库 |
+| 快照过期 | 仍打印，但标 `EXPIRED` / `"stale": true`，附 `generated_at_utc`、`expires_at_utc`、`age_seconds` |
+
+**离线能力保留**：引擎已停时 `report --offline` 直接读库；若库被占用，
+返回**退出码 3** 并给出指路信息（而不是抛栈）。退出码约定：
+`0` 成功 · `2` 库与快照都没有 · `3` 库被占用。
+
+**共享原语**：心跳与报告快照共用 `publish.atomic_write_json`。
+单独留一份十五行复制体正是本轮 CI 检查漂移的方式（见 §4.1），
+不再复制第二次。
+
+### 10.3 验证
+
+**离线（630 passed, 3 skipped，Ruff 全绿）** —— 新增 17 例：
+
+- `tests/test_shadow_report_snapshot.py`（15）：
+  - 快照带 `schema_version` / `generated_at_utc` / `expires_at_utc` / `stale_after_seconds`；
+  - **生成时间取自报告本身**（算出来的时刻，不是文件落盘时刻）；
+  - 原子替换：无残留 `.tmp`，内容完整可解析；
+  - 缺失 / 损坏 / 非报告文档 → 一律读作 `None`；
+  - 新鲜度在窗口边界精确翻转；**时间戳不可解析 → 判为过期而非新鲜**；
+  - **把 `ShadowDatabase` 换成会抛异常的实现，CLI 仍然成功** —— 这是"不碰库"的直接证据；
+  - `--offline` 强制读库并忽略快照；库被占用 → 退出码 3 + 说明；
+  - 过期快照仍打印但标 `EXPIRED`。
+- `tests/test_shadow_runner.py`（+2）：
+  - `start()` 后即有快照，且覆盖本周期的结果（测试用**前进时钟**，
+    否则节流会永远判定"还没到期"，断言测到的是节流而不是引擎）；
+  - **报告抛异常时引擎照常完成本周期**，并留下 `report_publish_failed` 警告。
+
+**Docker 并发验收（`shadow-ci.yml` 新增步骤，Linux Runner）**：
+
+在引擎持续运行时连续调用 `report --json` 与文本模式**各 10 次**，断言：
+全部成功、`source == shadow-main`、带 `generated_at_utc`、文本含 `[snapshot]`、
+**期间心跳 `updated_at_utc` 仍在前进**、宿主能读到
+`$RUNNER_TEMP/shadow-data/reports/report.json`（证明0644 而非 0600）。
+
+**未修改任何 Shadow 阈值、模型或交易逻辑**：
+`configs/shadow-thresholds.json` 与 `models/` 在本修复中零改动。

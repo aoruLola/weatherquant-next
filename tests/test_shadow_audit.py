@@ -96,6 +96,8 @@ def _runner(root: Path, raw: Path, models: Path) -> ShadowRunner:
         shadow_db_path=root / "shadow" / "shadow.duckdb",
         shadow_models_dir=models,
         shadow_health_dir=root / "health",
+        shadow_report_path=root / "reports" / "report.json",
+        shadow_report_seconds=0.01,
         shadow_thresholds_path=str(THRESHOLDS_PATH),
         collector_raw_dir=raw,
         shadow_model_names="ecmwf_raw,calibrated",

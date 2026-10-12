@@ -337,6 +337,61 @@ CLI：`weatherquant-shadow report [--json]`。四个区块**分开**，不混成
 
 ---
 
+### 8.1 报告从快照读，不打开数据库
+
+**问题**：影子主进程对 `shadow.duckdb` 持有排他租约，而 **DuckDB 连只读都不允许
+第二个进程打开**（本项目早有教训：旧库在 `quant.cli collect` 运行时连
+`connect(read_only=True)` 都报 `another program is using it`）。于是
+`weatherquant-shadow report` —— 运维在引擎**运行中**最需要的那条命令 —— 恰好是
+唯一跑不起来的那条。
+
+**修复是把"读"的位置换掉**，不是去解锁：
+
+```
+引擎（已有连接）──算──► /data/reports/report.json（原子替换）──► report CLI 读
+```
+
+| | |
+|---|---|
+| 谁写 | **主进程**，用它**已经打开**的连接，从不再开第二个 |
+| 何时写 | `start()` 立即一次，之后每 `shadow_report_seconds`（默认 60s）一次 |
+| 怎么写 | 临时文件 + `os.replace` 原子替换，`fsync` 后 `chmod 644`（`mkstemp` 默认 0600，不放宽则只有写者自己能读） |
+| 何时算 | **周期末尾、提交之后** —— 读到的永远是已落库的状态 |
+| 写失败 | 记 `report_publish_failed`（warning）并继续 —— **报告不是任务，报告失败不能停引擎** |
+
+CLI 默认读快照，**带 `--json`**，输出含：
+
+```
+generated_at_utc   数字是何时算出来的（不是文件何时写的）
+expires_at_utc     generated + stale_after_seconds
+stale / age_seconds / seconds_past_expiry
+source             shadow-main | offline-db
+```
+
+文本模式额外打印 `[snapshot]` 块；**过期仍会打印**，只是标 `EXPIRED` 并说明
+"这些数字描述的是过去" —— 一份带警告的过期报告，好过一份没有。
+
+**离线能力保留**：`report --offline`（或显式给 `--db`）直接开库，用于引擎已停、
+没有快照的场景。若此时库被占用，返回**退出码 3** 并说明原因，而不是抛栈：
+
+```
+cannot open ...duckdb: ...
+The shadow engine holds an exclusive lease on that file while it runs, and DuckDB
+blocks other processes even read-only. Drop --offline (and --db) to read the
+snapshot the engine publishes at /data/reports/report.json
+```
+
+退出码：`0` 成功 · `2` 库与快照都没有 · `3` 库被占用。
+
+共享原语在 `shadow/publish.py`（`atomic_write_json`）—— 心跳与报告快照共用一份
+实现，因为"两份十五行的复制体"正是本轮 CI 检查漂移的方式。
+
+**Docker 验收**：`shadow-ci.yml` 在引擎持续运行时连续调用 report 10 次
+（`--json` 与文本各一次），断言全部成功、`source == shadow-main`、心跳
+`updated_at_utc` 期间仍然前进、宿主能读到 `/data/reports/report.json`。
+
+---
+
 ## 9. 运行调度（`shadow/runner.py`）
 
 一个周期四个阶段，顺序有承载力：

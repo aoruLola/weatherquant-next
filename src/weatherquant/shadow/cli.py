@@ -20,7 +20,12 @@ from pathlib import Path
 
 from weatherquant.config import Settings
 from weatherquant.shadow.config import ShadowSettings, load_thresholds
-from weatherquant.shadow.report import build_report, format_report
+from weatherquant.shadow.report import (
+    build_report,
+    format_report,
+    load_report_snapshot,
+    snapshot_staleness,
+)
 from weatherquant.storage.shadow import ShadowDatabase
 
 
@@ -106,15 +111,87 @@ def cmd_run(settings: Settings, shadow: ShadowSettings, args: argparse.Namespace
 
 
 def cmd_report(settings: Settings, shadow: ShadowSettings, args: argparse.Namespace) -> int:
+    """Report from the published snapshot; the database only when offline.
+
+    The engine holds an exclusive lease on shadow.duckdb for its whole life,
+    and DuckDB refuses a second process the file *at all* - read-only
+    included. So the default path never opens it: the engine computes the
+    report from the connection it already has and swaps a JSON file into
+    place, and this command reads that.
+
+    `--offline` (or an explicit `--db`) forces the direct read, which is the
+    right thing when nothing is running and there is no snapshot to hand.
+    """
+    explicit_db = getattr(args, "db", None) is not None
+    if args.offline or explicit_db:
+        return _report_from_database(shadow, args, forced=args.offline or explicit_db)
+
+    snapshot = load_report_snapshot(shadow.shadow_report_path)
+    if snapshot is None:
+        # Nothing published yet: the engine may simply not have started, in
+        # which case the database is free and a direct read is correct.
+        return _report_from_database(shadow, args, forced=False)
+
+    stale, age, past_expiry = snapshot_staleness(snapshot)
+    if args.json:
+        payload = dict(snapshot)
+        payload["stale"] = stale
+        payload["age_seconds"] = None if age is None else round(age, 3)
+        payload["seconds_past_expiry"] = None if past_expiry is None else round(past_expiry, 3)
+        payload["snapshot_path"] = str(shadow.shadow_report_path)
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    else:
+        print(format_report(snapshot))
+        _print_freshness(snapshot, stale, age, past_expiry, shadow.shadow_report_path)
+    return 0
+
+
+def _print_freshness(
+    snapshot: dict, stale: bool, age: float | None, past: float | None, path: Path
+) -> None:
+    generated = snapshot.get("generated_at_utc", "unknown")
+    print(f"\n[snapshot] {path}")
+    print(f"  generated at  {generated}")
+    if age is None:
+        print("  WARNING        generated_at_utc is missing or unparseable - age unknown")
+    elif stale:
+        print(
+            f"  EXPIRED        {age:.0f}s old, {past:.0f}s past the "
+            f"{snapshot.get('stale_after_seconds', '?')}s freshness window"
+        )
+        print("                 these numbers describe the past; the engine may have moved on")
+    else:
+        print(f"  fresh          {age:.0f}s old")
+
+
+def _report_from_database(shadow: ShadowSettings, args: argparse.Namespace, *, forced: bool) -> int:
+    """Direct read. Only correct when nothing else holds the file."""
     if not shadow.shadow_db_path.exists():
         print(f"no shadow database at {shadow.shadow_db_path}", file=sys.stderr)
+        if not forced:
+            print("and no published snapshot to read instead", file=sys.stderr)
         return 2
-    with ShadowDatabase(shadow.shadow_db_path) as db:
-        report = build_report(db.con, horizon_days=args.horizon)
+    try:
+        with ShadowDatabase(shadow.shadow_db_path) as db:
+            report = build_report(db.con, horizon_days=args.horizon)
+    except Exception as exc:
+        print(f"cannot open {shadow.shadow_db_path}: {exc}", file=sys.stderr)
+        print(
+            "The shadow engine holds an exclusive lease on that file while it "
+            "runs, and DuckDB blocks other processes even read-only. Drop "
+            "--offline (and --db) to read the snapshot the engine publishes "
+            "at " + str(shadow.shadow_report_path),
+            file=sys.stderr,
+        )
+        return 3
     if args.json:
-        print(json.dumps(report, indent=2, sort_keys=True, default=str))
+        payload = dict(report)
+        payload["source"] = "offline-db"
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
     else:
         print(format_report(report))
+        print()
+        print("[source] offline database read (no snapshot was used)")
     return 0
 
 
@@ -152,9 +229,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--once", action="store_true", help="run a single cycle and exit")
     p.add_argument("--log-level", default="INFO")
 
-    p = sub.add_parser("report", help="metrics from the shadow database")
+    p = sub.add_parser(
+        "report",
+        help="metrics from the snapshot the engine publishes (never the live database)",
+    )
     p.add_argument("--json", action="store_true")
     p.add_argument("--horizon", type=int, default=7)
+    p.add_argument(
+        "--offline",
+        action="store_true",
+        help="read shadow.duckdb directly. Only works when the engine is stopped; "
+        "while it runs, DuckDB refuses the file to any other process.",
+    )
 
     p = sub.add_parser("status", help="health summary; exit code matches the probe")
     p.add_argument("--json", action="store_true")

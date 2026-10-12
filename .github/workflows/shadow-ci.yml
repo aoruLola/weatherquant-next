@@ -128,6 +128,43 @@ jobs:
           docker exec shadow-ci sh -c 'touch /data/.write-probe && rm /data/.write-probe'
           test -f "$RUNNER_TEMP/shadow-data/health/heartbeat.json"
 
+      - name: Report is callable while the engine holds the database
+        run: |
+          set -euo pipefail
+          # The bug this guards: `report` used to open shadow.duckdb itself,
+          # and DuckDB refuses the file to a second process even read-only -
+          # so the one command an operator runs WHILE the engine is up was the
+          # one command that could not run. Ten calls, against a live engine,
+          # must all succeed.
+          before=$(docker exec shadow-ci python -c "import json;print(json.load(open('/data/health/heartbeat.json'))['updated_at_utc'])")
+
+          for i in $(seq 1 10); do
+            docker exec shadow-ci weatherquant-shadow report --json > "$RUNNER_TEMP/report.$i.json"
+            docker exec shadow-ci weatherquant-shadow report > "$RUNNER_TEMP/report.$i.txt"
+            python3 -c "
+          import json, sys
+          d = json.load(open('$RUNNER_TEMP/report.$i.json'))
+          assert d.get('generated_at_utc'), 'snapshot has no generation time'
+          assert d.get('source') == 'shadow-main', 'expected the published snapshot, got ' + str(d.get('source'))
+          assert 'decisions' in d, 'no decisions block'
+          print('  call $i ok: generated=%s evaluated=%s stale=%s' % (
+              d['generated_at_utc'], d['decisions']['evaluated'], d.get('stale')))
+          "
+          done
+
+          # The engine must have kept working throughout: heartbeat advances.
+          sleep 12
+          after=$(docker exec shadow-ci python -c "import json;print(json.load(open('/data/health/heartbeat.json'))['updated_at_utc'])")
+          echo "heartbeat before: $before"
+          echo "heartbeat after : $after"
+          test "$after" != "$before", "the engine stopped writing while report was being called"
+
+          # And the snapshot really is a file on the shared volume, readable
+          # from the host (mkstemp would otherwise leave it 0600).
+          test -f "$RUNNER_TEMP/shadow-data/reports/report.json"
+          python3 -c "import json; json.load(open('$RUNNER_TEMP/shadow-data/reports/report.json'))"
+          echo "host can read the published snapshot"
+
       - name: Read-only collector mount cannot be written through
         run: |
           set -euo pipefail

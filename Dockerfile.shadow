@@ -61,6 +61,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
     TZ=UTC \
     WQ_SHADOW_DB_PATH=/data/shadow/shadow.duckdb \
     WQ_SHADOW_HEALTH_DIR=/data/health \
+    WQ_SHADOW_REPORT_PATH=/data/reports/report.json \
     WQ_SHADOW_THRESHOLDS_PATH=/app/configs/shadow-thresholds.json \
     WQ_SHADOW_MODELS_DIR=/app/models \
     WQ_COLLECTOR_RAW_DIR=/collector-raw

@@ -23,14 +23,14 @@ A ``fatal_error`` is unhealthy regardless of freshness.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
-import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from weatherquant.shadow.publish import atomic_write_json
 
 __all__ = ["HealthVerdict", "evaluate_shadow_health", "write_heartbeat"]
 
@@ -50,30 +50,13 @@ class HealthVerdict:
 
 
 def write_heartbeat(path: str | Path, payload: dict[str, Any]) -> None:
-    """Write atomically: a reader never sees a half-written file.
+    """Publish the heartbeat. Atomic, and readable by whoever is checking it.
 
-    Then widened to 0644. ``mkstemp`` creates the temporary file 0600 and
-    ``os.replace`` carries that mode onto the target, so without this the
-    heartbeat is readable only by the engine's own uid - and the whole point
-    of the file is that something *else* can read it: the container probe from
-    inside, and an operator or CI job from the host. Nothing in the payload is
-    secret (run id, pid, counters, disk headroom), so a private health file
-    would be privacy without a beneficiary.
+    The mechanics live in :func:`weatherquant.shadow.publish.atomic_write_json`
+    - this shares them with the report snapshot rather than keeping a second
+    copy that can drift.
     """
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    blob = json.dumps(payload, sort_keys=True, default=str)
-    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=target.name, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(blob)
-        os.replace(tmp_name, target)
-        with contextlib.suppress(OSError):
-            os.chmod(target, 0o644)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    atomic_write_json(path, payload)
 
 
 def evaluate_shadow_health(

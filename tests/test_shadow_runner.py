@@ -133,6 +133,13 @@ def _settings(tmp_path: Path, archive: Path, models_dir: Path) -> ShadowSettings
         shadow_db_path=tmp_path / "shadow" / "shadow.duckdb",
         shadow_models_dir=models_dir,
         shadow_health_dir=tmp_path / "health",
+        # Kept inside tmp_path: a report written to the repo's own data/ would
+        # let one test read another's snapshot, which is exactly the coupling
+        # the snapshot exists to avoid at runtime.
+        shadow_report_path=tmp_path / "reports" / "report.json",
+        # Every cycle republishes, so a test (and CI) sees a snapshot that
+        # reflects the work just done rather than the state before it.
+        shadow_report_seconds=0.01,
         shadow_thresholds_path=str(THRESHOLDS_PATH),
         collector_raw_dir=archive,
         shadow_model_names="ecmwf_raw,calibrated",
@@ -502,6 +509,78 @@ def test_once_returns_exit_code_4_when_the_lease_is_held(tmp_path, archive, mode
         assert code == 4, f"expected the single-instance refusal code, got {code}"
     finally:
         holder.release()
+
+
+def test_the_engine_publishes_a_report_snapshot(tmp_path, archive, models_dir, monkeypatch) -> None:
+    """A snapshot exists before the first cycle finishes, from the engine's own
+    connection - which is the only side that can open the file at all.
+
+    The clock advances: publication is throttled against it, so a frozen clock
+    would leave the snapshot describing the state *before* any work was done
+    and the assertion below would be measuring the throttle, not the engine.
+    """
+    import itertools
+
+    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    counter = itertools.count(start=1)
+    shadow = _settings(tmp_path, archive, models_dir)
+    runner = ShadowRunner(
+        RunnerConfig(
+            settings=Settings(),
+            shadow=shadow,
+            thresholds=load_thresholds(THRESHOLDS_PATH),
+        ),
+        clock=lambda: NOW + timedelta(seconds=next(counter)),
+    )
+    _RUNNERS.append(runner)
+    runner.start()
+    runner.cycle()
+
+    path = shadow.shadow_report_path
+    assert path.exists(), "the engine did not publish a report snapshot"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["source"] == "shadow-main"
+    assert payload["schema_version"] == 1
+    assert payload["generated_at_utc"]
+    assert payload["expires_at_utc"]
+    assert payload["decisions"]["evaluated"] > 0, "the snapshot predates the cycle it should cover"
+    assert "stale_after_seconds" in payload
+
+
+def test_a_failing_report_never_stops_the_engine(tmp_path, archive, models_dir, monkeypatch) -> None:
+    """Reporting is not the mission. A report that raises is logged and dropped."""
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "publish_report_snapshot", _boom)
+
+    shadow = _settings(tmp_path, archive, models_dir)
+    runner = ShadowRunner(
+        RunnerConfig(
+            settings=Settings(),
+            shadow=shadow,
+            thresholds=load_thresholds(THRESHOLDS_PATH),
+        ),
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
+    _RUNNERS.append(runner)
+    runner.start()
+    stats = runner.cycle()  # must not raise
+
+    assert stats.decisions > 0, "the engine stopped evaluating when the report failed"
+    assert not path_exists(shadow.shadow_report_path)
+    row = runner.db.con.execute(
+        "SELECT kind, severity FROM data_quality_events WHERE kind = 'report_publish_failed'"
+    ).fetchall()
+    assert row and row[0][1] == "warning", "the failure must leave a trace"
+
+
+def path_exists(path) -> bool:
+    from pathlib import Path as _P
+
+    return _P(path).exists()
 
 
 def test_a_missing_heartbeat_is_starting_not_unhealthy() -> None:

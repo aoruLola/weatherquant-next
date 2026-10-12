@@ -44,6 +44,10 @@ x-common: &common
     # The shadow's own database and health file.
     WQ_SHADOW_DB_PATH: /data/shadow/shadow.duckdb
     WQ_SHADOW_HEALTH_DIR: /data/health
+    # The engine publishes the report here from its own connection. Readers -
+    # the CLI, an operator, a script - read this file and never open DuckDB,
+    # which they cannot while the engine holds its exclusive lease.
+    WQ_SHADOW_REPORT_PATH: /data/reports/report.json
     # Baked into the image: which model decides, and which gates apply.
     WQ_SHADOW_MODELS_DIR: /app/models
     WQ_SHADOW_THRESHOLDS_PATH: /app/configs/shadow-thresholds.json

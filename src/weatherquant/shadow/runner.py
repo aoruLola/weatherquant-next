@@ -53,6 +53,7 @@ from weatherquant.shadow.forecast import ForecastCache
 from weatherquant.shadow.health import disk_free_percent, write_heartbeat
 from weatherquant.shadow.inference import PredictionResult, Predictor, prediction_rows
 from weatherquant.shadow.ingest import ArchiveTailer, QualityEvent
+from weatherquant.shadow.report import build_report, publish_report_snapshot
 from weatherquant.shadow.state import ShadowState
 from weatherquant.shadow.store import ShadowStore
 from weatherquant.storage.shadow import ShadowDatabase
@@ -163,6 +164,7 @@ class ShadowRunner:
         self._stop = False
         self._next_forecast_refresh = datetime.min.replace(tzinfo=UTC)
         self._next_metrics = datetime.min.replace(tzinfo=UTC)
+        self._next_report = datetime.min.replace(tzinfo=UTC)
         self._forecast_backoff = 0.0
         self._last_decision_at: datetime | None = None
         self._last_cycle: CycleStats | None = None
@@ -261,6 +263,7 @@ class ShadowRunner:
         # been fetched reports "not started" for as long as the upstream takes
         # - which is a liveness signal reading the latency of a third party.
         self._write_heartbeat(status="running")
+        self._publish_report()
         return self.run_id
 
     def stop(self, reason: str = "requested") -> None:
@@ -426,6 +429,8 @@ class ShadowRunner:
                 metrics=metrics,
             )
 
+        self._publish_report()
+
         stats.duration_ms = int((self.clock() - started).total_seconds() * 1000)
         self._last_cycle = stats
         self._cycles += 1
@@ -476,6 +481,52 @@ class ShadowRunner:
         run_rows, daily_rows = self.forecast.rows_for_persistence()
         with self.db.transaction():
             self.store.save_forecasts(run_rows, daily_rows)
+
+    def _publish_report(self) -> None:
+        """Compute a report from the connection we already hold, then swap it in.
+
+        The engine's DuckDB file is leased to this process for its whole life
+        and DuckDB refuses any *other* process the file, read-only included -
+        so an operator running `weatherquant-shadow report` against a live
+        engine used to collide with it. Publishing a snapshot moves the read
+        off the database entirely.
+
+        Built here rather than by the CLI because this is the only side that
+        can open the file, and throttled so a report is not recomputed on
+        every tick.
+
+        A failure here is logged and swallowed: reporting is not the mission,
+        and a malformed row must not be able to stop the engine from running.
+        """
+        if self.store is None:
+            return
+        now = self.clock()
+        if now < self._next_report:
+            return
+        # Advanced before the work: a report that raises must not be retried
+        # on the very next tick.
+        self._next_report = now + timedelta(seconds=self.shadow.shadow_report_seconds)
+        try:
+            report = build_report(self.db.con, now=now)
+            publish_report_snapshot(
+                self.shadow.shadow_report_path,
+                report,
+                stale_after_seconds=self.shadow.shadow_report_stale_seconds,
+                now=now,
+            )
+        except Exception as exc:
+            log.warning("could not publish the report snapshot: %s", exc)
+            self.store.record_quality(
+                [
+                    QualityEvent(
+                        kind="report_publish_failed",
+                        severity="warning",
+                        detail=f"{type(exc).__name__}: {exc}",
+                        ts_utc=now,
+                    )
+                ],
+                run_id=self.run_id or "",
+            )
 
     def _decision_instant(self) -> datetime:
         """The instant decisions are judged against.

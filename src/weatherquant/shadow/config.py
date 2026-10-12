@@ -42,6 +42,13 @@ class ShadowSettings(BaseSettings):
     shadow_health_dir: Path = Path("data/shadow/health")
     shadow_thresholds_path: Path = Path("configs/shadow-thresholds.json")
 
+    # Where the engine publishes the report it computes from its OWN connection.
+    # Readers take this snapshot instead of opening DuckDB: the engine holds an
+    # exclusive lease for its whole life, and DuckDB blocks a second process
+    # from opening the file at all - read-only included. The container sets
+    # this to /data/reports/report.json.
+    shadow_report_path: Path = Path("data/shadow/reports/report.json")
+
     # Model artifacts live in a *committed* directory, not under data/: an
     # artifact that ships with the code is one whose version can be reviewed in
     # the same diff as the code that reads it, and one the image can bake in so
@@ -84,6 +91,19 @@ class ShadowSettings(BaseSettings):
         default=600.0, gt=0, description="How often to look for newly publishable runs."
     )
     shadow_metrics_seconds: float = Field(default=300.0, gt=0, description="Metric snapshot period.")
+    shadow_report_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description="How often the report snapshot is recomputed and republished. "
+        "Uses the connection already open - it never opens a second one.",
+    )
+    shadow_report_stale_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description="A snapshot older than this is printed with an expiry notice. "
+        "The report is still shown: a stale answer is more useful than none, "
+        "provided it says so.",
+    )
     shadow_collector_silence_seconds: float = Field(
         default=900.0,
         gt=0,

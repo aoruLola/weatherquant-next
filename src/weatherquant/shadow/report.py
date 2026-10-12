@@ -23,10 +23,20 @@ could emit.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
-__all__ = ["build_report", "format_report"]
+from weatherquant.shadow.publish import atomic_write_json
+
+__all__ = [
+    "SNAPSHOT_SCHEMA_VERSION",
+    "build_report",
+    "format_report",
+    "load_report_snapshot",
+    "publish_report_snapshot",
+    "snapshot_staleness",
+]
 
 
 def build_report(con, *, now: datetime | None = None, horizon_days: int = 7) -> dict[str, Any]:
@@ -498,3 +508,101 @@ def _pct(value) -> str:
 
 def dumps(report: dict[str, Any]) -> str:
     return json.dumps(report, indent=2, sort_keys=True, default=str)
+
+
+# --- the published snapshot ------------------------------------------------
+#
+# The engine holds an exclusive lease on shadow.duckdb for its whole life, and
+# DuckDB refuses a second process the file even read-only. So `report` reads a
+# snapshot this module writes from the connection that is already open - and
+# `--offline` still opens the database directly for the case where nothing is
+# running and there is no snapshot to read.
+
+SNAPSHOT_SCHEMA_VERSION = 1
+
+
+def publish_report_snapshot(
+    path: str | Path,
+    report: dict[str, Any],
+    *,
+    stale_after_seconds: float,
+    source: str = "shadow-main",
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Compute-once, publish atomically. Returns what was written.
+
+    The report is built by the caller from the *existing* connection, so this
+    function never touches DuckDB - it only lays the freshness fields over the
+    top and swaps the file into place.
+
+    ``generated_at_utc`` comes from the report itself, so the timestamp a
+    reader sees is when the numbers were computed, not when the file happened
+    to be written.
+    """
+    now = now or datetime.now(tz=UTC)
+    generated = report.get("generated_at_utc")
+    if not generated:
+        generated = now.isoformat()
+        report = {**report, "generated_at_utc": generated}
+    try:
+        generated_at = datetime.fromisoformat(str(generated))
+        if generated_at.tzinfo is None:
+            generated_at = generated_at.replace(tzinfo=UTC)
+    except ValueError:
+        generated_at = now
+
+    payload = {
+        **report,
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "source": source,
+        "stale_after_seconds": stale_after_seconds,
+        "expires_at_utc": (generated_at + timedelta(seconds=stale_after_seconds)).isoformat(),
+    }
+    atomic_write_json(path, payload)
+    return payload
+
+
+def load_report_snapshot(path: str | Path) -> dict[str, Any] | None:
+    """Read a published snapshot, or ``None`` when there is nothing to read.
+
+    ``None`` covers absent, unreadable and unparseable alike: the caller's
+    question is "is there a snapshot?", and distinguishing the three would
+    only change which fallback message it prints.
+    """
+    target = Path(path)
+    if not target.exists():
+        return None
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or "decisions" not in payload:
+        return None
+    return payload
+
+
+def snapshot_staleness(
+    payload: dict[str, Any], *, now: datetime | None = None
+) -> tuple[bool, float | None, float | None]:
+    """``(stale, age_seconds, seconds_past_expiry)`` for a loaded snapshot.
+
+    All three are ``None``-tolerant: a snapshot without a parseable
+    ``generated_at_utc`` is reported as stale with an unknown age rather than
+    as fresh - a timestamp we cannot read is not evidence of recency.
+    """
+    now = now or datetime.now(tz=UTC)
+    try:
+        generated = datetime.fromisoformat(str(payload.get("generated_at_utc")))
+    except (TypeError, ValueError):
+        return True, None, None
+    if generated.tzinfo is None:
+        generated = generated.replace(tzinfo=UTC)
+
+    age = (now - generated).total_seconds()
+    window = payload.get("stale_after_seconds")
+    try:
+        window_f = float(window)
+    except (TypeError, ValueError):
+        window_f = 300.0
+    past = age - window_f
+    return past > 0, age, (past if past > 0 else 0.0)

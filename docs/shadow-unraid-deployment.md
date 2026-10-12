@@ -139,6 +139,21 @@ docker exec weatherquant-shadow weatherquant-shadow report
 docker exec weatherquant-shadow weatherquant-shadow report --json | jq '.decisions'
 ```
 
+`report` **不打开数据库** —— 引擎用它自己已有的连接把报告算好，原子发布在
+`/data/reports/report.json`（`WQ_SHADOW_REPORT_PATH`），CLI 只读那个文件。
+引擎运行期间直接开 DuckDB 会被文件锁拒绝，这是设计而非故障；
+确实要直接读库（引擎已停）时用 `report --offline`。
+
+宿主侧直接看快照：
+
+```bash
+jq '{generated_at_utc, expires_at_utc, source, evaluated: .decisions.evaluated}' \
+  /mnt/user/appdata/weatherquant-shadow/reports/report.json
+```
+
+`generated_at_utc` 超过 `expires_at_utc` 后，文本输出标 `EXPIRED`、JSON 里
+`stale: true` —— 过期报告仍然打印，但必须带着这个标记读。
+
 ### 5.1 24 小时验收清单
 
 部署后**先连续运行至少 24 小时**，逐项确认：
@@ -157,7 +172,8 @@ docker exec weatherquant-shadow weatherquant-shadow report --json | jq '.decisio
 | 10 | 非 root | `docker exec weatherquant-shadow id -u` → `1000` |
 | 11 | 只读挂载 | `docker exec weatherquant-shadow sh -c 'echo x >> /collector-raw/gamma/'$(date -u +%F)'.jsonl'` → 必须失败 |
 | 12 | 无端口 | `docker ps` 该容器无 `PORTS` |
-| 13 | **模式分离** | `report` 里 `ACCEPT live / replay` 的 **live 必须 > 0**；若采集器已停，`live_accepted` 必须为 **0**（见 §5.3） |
+| 13 | **报告不碰库** | 引擎运行中连续调用 `report --json` **10 次全部成功**，且期间心跳 `updated_at_utc` 仍在前进 |
+| 14 | **模式分离** | `report` 里 `ACCEPT live / replay` 的 **live 必须 > 0**；若采集器已停，`live_accepted` 必须为 **0**（见 §5.3） |
 
 验收清单 6 与 7 是**最容易被忽略也最重要**的两条：一个静默的输入故障
 如果被记成"发现机会"，整个系统的结论就都不可信了。
