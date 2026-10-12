@@ -130,6 +130,55 @@ def test_acceptance_script_is_valid_bash() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_acceptance_docker_heredocs_forward_stdin() -> None:
+    """`docker exec` silently drops stdin unless `-i` is given.
+
+    The first CI run shipped exactly that bug: `docker exec ... python -`
+    with a heredoc, the container's python read EOF, exited 0, and every
+    assertion inside it - envelope shape, fixture stamp, database invisibility
+    - never executed while the job stayed green. Any inline python fed by a
+    heredoc through docker exec must request stdin explicitly.
+    """
+    lines = ACCEPT.read_text(encoding="utf-8").splitlines()
+    heredoc_lines = [line for line in lines if "<<'PY'" in line]
+    assert heredoc_lines, "the acceptance script no longer runs inline assertions?"
+    for line in heredoc_lines:
+        if "docker exec" in line:
+            assert "docker exec -i" in line, (
+                "docker exec heredoc without -i drops stdin; the assertions "
+                f"would silently not run: {line.strip()}"
+            )
+    # ... and none may regress back to a bare `docker exec <c> python -`.
+    offenders = [
+        f"{n}: {line.strip()}"
+        for n, line in enumerate(lines, start=1)
+        if not line.strip().startswith("#")
+        and re.search(r"docker exec(?! -i)\s+\S+.*\bpython -", line)
+    ]
+    assert not offenders, "docker exec feeding `python -` without -i:\n" + "\n".join(offenders)
+
+
+def test_acceptance_proves_inline_assertions_ran() -> None:
+    """Exit code 0 is not evidence that a heredoc executed.
+
+    Each docker-inline block must print a marker AND the script must grep for
+    it afterwards, so an empty run fails loudly instead of passing.
+    """
+    text = ACCEPT.read_text(encoding="utf-8")
+    docker_heredocs = [
+        line for line in text.splitlines() if "<<'PY'" in line and "docker exec" in line
+    ]
+    assert len(docker_heredocs) >= 2, "expected the API and database-visibility blocks"
+    # proof-of-execution greps for every docker-inline block
+    assert 'grep -q "API OK"' in text, "API envelope block leaves no proof it ran"
+    assert 'grep -q "no .duckdb anywhere"' in text, (
+        "database-visibility block leaves no proof it ran"
+    )
+    assert "echo \"$api_out\"" in text and "echo \"$db_out\"" in text, (
+        "the blocks' output must reach the CI log for review"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dockerfile
 # ---------------------------------------------------------------------------
