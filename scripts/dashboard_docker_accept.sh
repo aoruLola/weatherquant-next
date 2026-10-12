@@ -25,7 +25,10 @@ WORK="$(mktemp -d)"
 
 cleanup() {
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  rm -rf "$WORK"
+  # The sources were chowned to uid 1000 for the container; the runner may
+  # not own them any more, and a failing EXIT trap would fail a run whose
+  # acceptance actually passed. Best effort, never the verdict.
+  rm -rf "$WORK" 2>/dev/null || sudo rm -rf "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
 
