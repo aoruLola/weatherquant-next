@@ -121,7 +121,7 @@ def build_report(con, *, now: datetime | None = None, horizon_days: int = 7) -> 
         "theoretical_edge": edge,
         "prediction_quality": _prediction_quality(con, now),
         "liquidity": _liquidity(con),
-        "coverage": _coverage(con, now, horizon_days=horizon_days),
+        "coverage": _coverage(con, horizon_days=horizon_days),
         "data_quality": _data_quality(con),
         "warnings": _warnings(decision_counts, by_mode),
         "equity_curve": None,
@@ -308,7 +308,7 @@ def _liquidity(con) -> dict[str, Any]:
     }
 
 
-def _coverage(con, now: datetime, *, horizon_days: int) -> dict[str, Any]:
+def _coverage(con, *, horizon_days: int) -> dict[str, Any]:
     open_targets = [
         r[0]
         for r in con.execute(
