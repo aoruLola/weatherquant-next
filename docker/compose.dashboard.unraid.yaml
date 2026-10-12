@@ -1,0 +1,91 @@
+# WeatherQuant Next - dashboard, Unraid Compose Manager Plus stack.
+#
+# The companion to docs/dashboard-unraid-deployment.md; the two are written to
+# be used together. The collector's and shadow's stacks are untouched by this
+# file and never share a service name, image tag or data directory with it.
+#
+# Properties that are deliberate and easy to break by editing:
+#
+#   1. READ-ONLY subdirectory mounts only: health/ and raw/ and reports/ -
+#      never the whole data directory, never a .duckdb file. The dashboard
+#      cannot open the production databases because it is not shown one; the
+#      mount proves it rather than trusting it.
+#   2. Port 8787 is for the trusted LAN. To pin it to the NAS address instead
+#      of every interface, change the left side: "192.168.1.20:8787:8787".
+#      This version has NO authentication - do not port-forward it to the
+#      internet (see docs/dashboard-unraid-deployment.md §6).
+#   3. One container, one process: the API serves the built frontend. No node,
+#      no Docker socket, no Docker CLI, no credentials, no wallet - structurally
+#      none of those exist in the image.
+#   4. `user: "1000:1000"` matches the NAS directories so the read-only mounts
+#      are readable without loosening permissions.
+#   5. The dashboard's healthcheck liveness is its own HTTP endpoint; a dead
+#      collector must NOT restart the dashboard (it is the thing explaining
+#      the outage). Source freshness is shown by the UI, not by the probe.
+#
+# Image tags: `dashboard-stable` tracks the newest dashboard tag that passed
+# its verify job; `sha-<commit>` is the immutable rollback target. The
+# dashboard has its own workflow and its own tag namespace - it can never move
+# the collector's `stable` or the shadow's `shadow-stable`.
+
+x-common: &common
+  # Pinned by commit, on purpose: the release workflow publishes the immutable
+  # sha-<commit> tag, and a floating tag in production is the rollback hazard
+  # that pin prevents. Set DASHBOARD_SHA in this stack's .env to the verified
+  # release commit (docs/dashboard-unraid-deployment.md §3) - compose refuses
+  # to start without it rather than silently pulling something else.
+  image: ghcr.io/aorulola/weatherquant-next-dashboard:sha-${DASHBOARD_SHA:?set DASHBOARD_SHA in the stack .env to the released commit}
+  container_name: weatherquant-dashboard
+  restart: unless-stopped
+  stop_grace_period: 20s
+  user: "1000:1000"
+  security_opt:
+    - no-new-privileges:true
+  environment:
+    TZ: UTC
+    # Read-only sources. Each is a subdirectory mount below - no database is
+    # visible to this container at all.
+    WQ_COLLECTOR_DATA_DIR: /sources/collector
+    WQ_SHADOW_DATA_DIR: /sources/shadow
+    # Built frontend, baked into the image.
+    WQ_STATIC_DIR: /app/static
+    # "live" in production. Set to "fixture" ONLY for demos; the UI then shows
+    # a permanent FIXTURE banner so sample data can never pass as real.
+    WQ_DATASET: live
+    GIT_SHA: ${GIT_SHA:-unknown}
+    IMAGE_TAG: ${IMAGE_TAG:-dashboard-stable}
+  ports:
+    # Trusted LAN only. Optional hardening: replace with
+    #   - "192.168.x.x:8787:8787"   (the NAS's own LAN address)
+    - "8787:8787"
+  volumes:
+    # Collector: heartbeat + raw archive (for the market/orderbook tail).
+    - /mnt/user/appdata/weatherquant-next/health:/sources/collector/health:ro
+    - /mnt/user/appdata/weatherquant-next/raw:/sources/collector/raw:ro
+    # Shadow: heartbeat + published report/detail snapshots.
+    - /mnt/user/appdata/weatherquant-shadow/health:/sources/shadow/health:ro
+    - /mnt/user/appdata/weatherquant-shadow/reports:/sources/shadow/reports:ro
+  healthcheck:
+    test: ["CMD", "python", "/usr/local/bin/healthcheck.py"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 20s
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  dashboard:
+    <<: *common
+
+# Notes:
+# - `/mnt/user/appdata/weatherquant-shadow/reports` must exist before first
+#   start (mkdir -p it) or create it empty; the shadow engine publishes
+#   report.json there while it runs. A missing file is shown as MISSING by the
+#   UI - that is the designed degradation, not a failure.
+# - This stack has no dependency on the other two containers: if the collector
+#   or the shadow is down, the dashboard still starts and explains why.
+# - Stop order does not matter; the dashboard only reads.

@@ -23,3 +23,13 @@ data
 .env
 .env.local
 .audit-out
+
+# Frontend build inputs/outputs: the dashboard image rebuilds these in its own
+# node stage, and shipping a host node_modules/ into the context would dwarf
+# everything else.
+node_modules
+dashboard/frontend/dist
+dashboard/frontend/test-results
+dashboard/frontend/playwright-report
+dashboard/screenshots
+dashboard/fixtures/data
