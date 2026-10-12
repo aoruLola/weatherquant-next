@@ -665,3 +665,70 @@ SKIPPED [3] tests	est_workflows.py:113: workflow performs no database verificati
 
 **未修改任何 Shadow 阈值、模型或交易逻辑**：
 `configs/shadow-thresholds.json` 与 `models/` 在本修复中零改动。
+
+---
+
+## 11. 热修复：检查点未在周期之间推进（P1 生产缺陷）
+
+### 11.1 缺陷
+
+`ArchiveTailer.poll()` 依据 `self.checkpoints` 读取并返回新的 offsets，
+但**从不写回** `self.checkpoints`；`ShadowRunner.cycle()` 把它们持久化到 DuckDB，
+也**从未接管进内存**。结果：**每个周期都从字节 0 重读整段归档**。
+
+### 11.2 生产症状
+
+值得注意的是它**不像丢数据**，而像"读得很多" —— 这正是它能躲在绿灯后面的原因：
+
+| 信号 | 实测 |
+|---|---|
+| `collector_last_seen_utc` | 冻结 ~10 分钟，而采集器归档只落后 3.7 秒 |
+| `latest_orderbook_read_utc` | 持续前进 —— `shadow_received_at` 是"现在"，所以**读取**看起来健康 |
+| `latest_orderbook_venue_utc` | 固定在旧值 —— 最新的行从未被真正接管 |
+| 决策 | 大量 `STALE_ORDERBOOK`，因为场地时间戳从不刷新 |
+
+### 11.3 修复：先提交，后接管
+
+`poll()` 对尾随器自身状态改为**只读**；新增 `ArchiveTailer.adopt()`，
+由 Runner 在 `commit_batch` **提交成功之后**调用。顺序是重点：
+
+| 顺序 | 后果 |
+|---|---|
+| **内存先行** | 回滚的批次**永久丢失** —— 库里没有那些行，而尾随器已经越过了它们。**这是丢数据。** |
+| **提交先行** | 回滚的批次下一轮重读。**这是可恢复的。** |
+
+缺口检测一并迁移：`_note_gap` 改为读**已提交**日期、写入随 offsets 返回的
+pending map。回滚周期于是重新推导同一个缺口，而不是发出一条数据库从未见过的事件。
+
+### 11.4 测试覆盖缺口（本缺陷能存活的真正原因）
+
+早期 ingest 测试**直接驱动 tailer，并在轮询之间手动合并 offsets** ——
+它们做的正是生产代码漏掉的那一步，因此在 Runner 完全坏掉时依然全绿。
+
+- 辅助函数 `_merge` 更名为 **`_commit`**，改为调用 `adopt()`，使其镜像生产序列；
+  docstring 直言它与 Runner 必须做同一件事。
+- 新增 **`tests/test_shadow_checkpoint_advance.py`（8 例）**，全部驱动 **Runner**：
+
+| 测试 | 覆盖 |
+|---|---|
+| `a_second_cycle_reads_nothing...` | 连续多周期：第 2/3/4 周期必须读 0 行 |
+| `collectors_timestamp_advances_and_then_holds` | 时间戳只在有新数据时前进 |
+| `appended_records_are_consumed_once...` | 追加记录每条恰好消费一次 |
+| `archive_bigger_than_one_read...` | 归档超过 `max_bytes_per_poll`，跨周期吃完 |
+| `restart_resumes_where_the_running_process_left_off` | 重启恢复 |
+| `rolled_back_batch_leaves_the_tailer_where_it_was` | **事务失败不得推进内存** |
+| `memory_and_database_agree_on_every_offset` | 两份偏移必须相等 |
+| `lines_are_never_consumed_twice_across_many_cycles` | 同一批数据不反复消费 |
+
+**验证测试有牙**：临时移除 `adopt()` 调用后，**8 例全部失败**。
+
+### 11.5 边界
+
+- **未修改**任何行情新鲜度阈值（`shadow-thresholds.json` 仍为 `v2` / 90000）。
+- **未清除**任何历史数据库。
+- **未修改** Collector。
+- **未引入**任何交易功能。
+- 顺带修正 `tests/test_shadow_report_snapshot.py` 中固定时间戳漂移到未来、
+  从而把陈旧快照判为"新鲜"的问题（`_report()` 默认取真实时钟）。
+
+**651 passed, 3 skipped，Ruff 全绿。**
