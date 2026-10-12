@@ -67,7 +67,10 @@ echo "uid=$uid"
 test "$uid" != "0"
 
 echo "== API envelope and fixture stamp =="
-docker exec "$CONTAINER" python - <<'PY'
+# -i is load-bearing: without it docker exec does not attach stdin, `python -`
+# reads EOF, exits 0 and runs NOTHING. The marker grep below then fails, so a
+# silent no-op can never again look like a passing check.
+api_out="$(docker exec -i "$CONTAINER" python - <<'PY'
 import json, urllib.request
 
 def get(path):
@@ -104,6 +107,12 @@ except urllib.error.HTTPError as e:
     assert e.code == 422, e.code
 print("API OK")
 PY
+)"
+echo "$api_out"
+echo "$api_out" | grep -q "API OK" || {
+  echo "API assertions did not execute (docker exec stdin not forwarded?)" >&2
+  exit 1
+}
 
 echo "== read-only mounts cannot be written =="
 if docker exec "$CONTAINER" sh -c 'touch /sources/collector/health/.write-probe 2>/dev/null'; then
@@ -117,12 +126,18 @@ fi
 echo "mounts are read-only"
 
 echo "== no database is even visible =="
-docker exec "$CONTAINER" python - <<'PY'
+db_out="$(docker exec -i "$CONTAINER" python - <<'PY'
 import pathlib
 hits = [str(p) for root in ("/sources", "/app") for p in pathlib.Path(root).rglob("*.duckdb")]
 assert not hits, f"container can see database files: {hits}"
 print("no .duckdb anywhere in the container's view")
 PY
+)"
+echo "$db_out"
+echo "$db_out" | grep -q "no .duckdb anywhere" || {
+  echo "database-visibility check did not execute (docker exec stdin not forwarded?)" >&2
+  exit 1
+}
 
 echo "== published port serves the SPA =="
 python3 - <<'PY'
