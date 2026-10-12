@@ -1,0 +1,72 @@
+@import 'tailwindcss';
+
+/*
+ * WeatherQuant design tokens - Modern Light Dashboard / Flat Cards.
+ *
+ * The values are fixed by the product spec: light canvas, white flat cards,
+ * one teal accent, amber for warnings, a desaturated red for failures, hairline
+ * borders instead of shadows, no gradients, no glassmorphism. Everything the
+ * UI can use to deviate lives here as a token, so a component never invents a
+ * colour.
+ */
+@theme {
+  --color-canvas: #f5f6f8;
+  --color-surface: #ffffff;
+  --color-ink: #17212b;
+  --color-muted: #6b7280;
+  --color-accent: #239b78;
+  --color-accent-soft: #e4f3ee;
+  --color-warn: #d6a044;
+  --color-warn-soft: #faf1de;
+  --color-danger: #d66c6c;
+  --color-danger-soft: #f9e9e9;
+  --color-line: #e7eaf0;
+  --color-neutral-soft: #f0f2f5;
+
+  --radius-card: 14px;
+  --radius-tile: 10px;
+
+  --font-sans:
+    system-ui, -apple-system, 'Segoe UI', 'Inter', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    color: var(--color-ink);
+    background: var(--color-canvas);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-canvas);
+    color: var(--color-ink);
+  }
+
+  /* Numbers in a monitoring UI are compared vertically - align the digits. */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum';
+  }
+
+  ::selection {
+    background: var(--color-accent-soft);
+  }
+}
+
+@layer components {
+  .card {
+    background: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-card);
+    /* deliberately no box-shadow: flat cards, per the design spec */
+  }
+}
+
+/* Recharts containers must never stretch the card they sit in. */
+.recharts-wrapper,
+.recharts-surface {
+  outline: none !important;
+}
