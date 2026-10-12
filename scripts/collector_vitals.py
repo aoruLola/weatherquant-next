@@ -323,10 +323,16 @@ def render(report: dict) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--run", required=True, help="collector run directory (or its raw dir)")
+    parser.add_argument(
+        "--raw",
+        default=None,
+        help="archive directory, when the run directory holds more than one "
+        "(raw-before and raw-after sort ambiguously)",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    report = build(Path(args.run))
+    report = build(Path(args.run), Path(args.raw) if args.raw else None)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True, default=str))
     else:
