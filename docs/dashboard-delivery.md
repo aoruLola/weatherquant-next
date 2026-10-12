@@ -1,6 +1,7 @@
 # P2-1 Unified Dashboard — 交付报告
 
-日期：2026-10-12 · 分支：`worktree-p2-1-dashboard`（自 `main@8bea431`，未提交，等待确认）
+日期：2026-10-12 · 分支：`feat/p2-1-dashboard`（基于 `main@1e7e9d3` =
+Collector v0.1.2 = Shadow v0.1.1）· PR #1 · CI 全绿 · 未发布、未部署
 
 ---
 
@@ -107,13 +108,25 @@ GET /api/v1/system                  Collector/Shadow 指标 + 趋势 + N/A 说�
 
 | 套件 | 结果 |
 |---|---|
-| 仓库全量 `pytest`（含新增 13 项工作流不变量） | **645 passed, 5 skipped** |
-| `pytest dashboard/tests`（API + producer 契约 + 端到端契约一致性） | **45 passed** |
+| 仓库全量 `pytest`（含新增 13 项工作流不变量） | **659 passed, 5 skipped** |
+| `pytest dashboard/tests`（API + producer 契约 + 端到端贯通断言） | **48 passed** |
 | `ruff check .`（全仓库） | **通过** |
 | 前端 `tsc --noEmit` | **0 错误** |
-| 前端 `vitest`（7 文件：hook/组件/5 页面） | **52 passed** |
+| 前端 `vitest`（8 文件：hook/组件/5 页面） | **60 passed** |
 | Playwright 浏览器验收（3 视口 × 5 页 + 导航/详情/深链/FIXTURE 横幅） | **25 passed, 2 skipped**（抽屉用例仅移动端执行，by design） |
 | 本机真实数据集成脚本 | 全端点 200、诚实降级、无路径泄漏 |
+
+**GitHub Actions（Linux）最终结果——分支 `feat/p2-1-dashboard` 全部绿：**
+
+| 工作流 | 结果 |
+|---|---|
+| `dashboard-ci`（push + PR 两轮） | **success**：backend / frontend / **ui（浏览器验收）** / **build-dashboard-image（镜像+容器验收）** / never-publishes 五作业全过 |
+| `ci`（push + PR 两轮） | **success**（collector 套件 + 全部工作流不变量，证明共享文件追加改动无副作用） |
+| `shadow-ci`（push + PR 两轮） | **success**（同上，shadow 套件） |
+
+首轮 CI 曾失败两处并已修复（`0e97d6c`）：`@playwright/test` 当时未装进
+frontend 工程（本地靠 npx 缓存侥幸通过）、验收脚本 PASS 后被 EXIT trap 的
+`rm -rf` 权限错误反杀。第二轮起全绿。
 
 ## 8. 实际浏览器 UI 验证
 
@@ -132,12 +145,15 @@ Playwright 真实 Chromium 驱动 FastAPI + 构建产物，`dashboard/screenshot
   `healthcheck_dashboard.py`、`scripts/dashboard_docker_accept.sh`（bash -n 通过）
   均已完成，并由 `tests/test_dashboard_ci.py` 做文本级不变量校验
   （非 root、HEALTHCHECK、8787、:ro 子目录挂载、无 sock/CLI、组隔离、验收项齐全）。
-- **本机（Windows）没有 Docker**，镜像构建与 8 项容器验收**未在本机执行**；
-  两者被编排进 `dashboard-ci.yml`（build + 验收，无发布能力）与
-  `dashboard-release.yml`（全部门禁通过后才 push），推送后由 CI 实际执行。
-- CI 红绿以 Actions 为准；发布标签 `dashboard-v*` → `sha-<commit>` +
-  `dashboard-stable`，与 collector `stable`、shadow `shadow-stable` 分属不同镜像仓库，
-  有测试断言不可互移。
+- **本机（Windows）没有 Docker**，镜像构建与容器验收不在本机执行——已由
+  `dashboard-ci.yml` 在 Linux Runner **实际执行并全部通过**：
+  镜像三阶段构建成功；`scripts/dashboard_docker_accept.sh` 八项全过
+  （启动/健康 `fresh`、非 root uid=1000、信封+fixture 戳、只读挂载不可写、
+  容器视野内无任何 `.duckdb`、8787 SPA、重启恢复且源文件零改动、优雅停止）。
+- `dashboard-release.yml` 尚未触发（按指令不擅自发布）：`dashboard-v*` 标签
+  推送后执行同样的全部门禁，再推 `sha-<commit>` + `dashboard-vX.Y.Z` 并移动
+  `dashboard-stable`。与 collector `stable`、shadow `shadow-stable` 分属不同
+  镜像仓库，有测试断言不可互移。
 
 ## 10. NAS 部署步骤
 
@@ -171,11 +187,12 @@ open http://<NAS-LAN-IP>:8787
 
 1. **Shadow producer 集成**（最高优先）：决策行明细、逐市场模型概率、概率分布
    三块 UI 已就绪，等 `runner._publish_report` 追加 10 行调用（§4 契约）。
-2. **生产 Shadow 版本**：shadow-v0.1.0 无 report 快照；需升级到含 1849187 的
-   构建，否则 report 面板长期 missing。
-3. **CI 首跑**：dashboard-ci / dashboard-release 为新增工作流，需推送后由
-   Actions 验证（本机无 Docker / 无 act）；`environment: dashboard-release`
-   首次运行时需在 GitHub 创建并按需加审阅者。
+2. **生产 Shadow 版本**：NAS 上若仍是 shadow-v0.1.0，report 面板会显示
+   missing；**shadow-v0.1.1（1e7e9d3）已含 report 快照机制**，升级由你排期
+   （本任务不动生产容器）。
+3. **发布**：`dashboard-ci` / `ci` / `shadow-ci` 已在 Linux 全绿；`dashboard-release`
+   待 `dashboard-v0.1.0` 标签触发（等确认）。首次触发时 GitHub 需要创建
+   `dashboard-release` environment，可按需加 required reviewer。
 4. **认证**：无认证设计如上；如需公网暴露须先加认证层（超出本阶段范围）。
 5. **趋势历史**：仅覆盖 Dashboard 进程自身观测窗口（页面已注明），如需长期
    历史需生产者落盘指标——未擅自引入数据库。
@@ -184,8 +201,20 @@ open http://<NAS-LAN-IP>:8787
 
 ---
 
-### 提交说明
+### 提交与推送状态
 
-按任务要求**未执行任何 git 提交**。工作树：3 个追加式修改 + 新文件清单见 §2；
-`git status` 干净（生成物均被 ignore）。确认后我可以按逻辑分批提交
-（契约/后端 → 前端 → Docker/CI → 文档 → 截图），并按你的指令发布与部署。
+分支 `feat/p2-1-dashboard`（基于 main@`1e7e9d3`，与 Collector v0.1.2 /
+Shadow v0.1.1 同点，零文件冲突快进同步）已推送，PR #1：
+https://github.com/aoruLola/weatherquant-next/pull/1
+
+| commit | 内容 |
+|---|---|
+| `3448a9e` | 契约/后端（snapshot API + producer + 48 测试 + dashboard 依赖组） |
+| `32124ca` | 前端（5 页面 + 60 单测 + Playwright + 15 截图） |
+| `7897b62` | Docker/CI（镜像、SHA 钉死 compose、共享验收脚本、双工作流、13 项不变量） |
+| `a6d8e6a` | 文档（架构 / 数据契约+集成 DoD / 部署 / 交付报告） |
+| `0e97d6c` | fix(ci)：@playwright/test 归位工程依赖；验收清理不再反杀退出码 |
+| `7690cac` | chore：刷新验收截图 |
+
+**未执行**：`dashboard-v0.1.0` 发布、NAS 部署、Collector/Shadow 任何变更——
+均等你确认。
