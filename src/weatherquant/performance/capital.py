@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from weatherquant.execution.pricing import (
     ExecutionRefused,
@@ -37,7 +38,7 @@ from weatherquant.execution.pricing import (
     expected_net_profit_usd,
     expected_net_profit_usd_sell,
 )
-from weatherquant.markets.models import OrderBook, Side
+from weatherquant.markets.models import BookLevel, OrderBook, Side
 from weatherquant.performance.episodes import Episode
 
 __all__ = [
@@ -45,6 +46,7 @@ __all__ = [
     "NotExecutable",
     "PortfolioResult",
     "SingleResult",
+    "book_from_mapping",
     "simulate_portfolio",
     "simulate_single",
 ]
@@ -86,6 +88,46 @@ def _side_for(direction: str | None) -> Side | None:
     if direction == "sell_yes":
         return Side.SELL
     return None
+
+
+def book_from_mapping(
+    payload: object,
+    *,
+    market_id: str,
+    token_id: str,
+    venue_ts=None,
+    fetched_at_utc=None,
+) -> OrderBook | None:
+    """Rebuild a book from the levels a snapshot stored, or None.
+
+    The snapshot carries ``[[price, size], …]`` pairs only when the research
+    process actually had the levels. A missing or malformed ``book`` key
+    returns ``None``, which the simulator turns into ``NOT_EXECUTABLE`` -
+    the whole point of not inventing depth applies to reconstructing it too.
+    """
+    if not isinstance(payload, dict):
+        return None
+    try:
+        bids = tuple(
+            BookLevel(price_usd_per_share=float(p), size_shares=float(s))
+            for p, s in (payload.get("bids") or [])
+        )
+        asks = tuple(
+            BookLevel(price_usd_per_share=float(p), size_shares=float(s))
+            for p, s in (payload.get("asks") or [])
+        )
+    except (TypeError, ValueError):
+        return None
+    if not bids and not asks:
+        return None
+    return OrderBook(
+        market_id=market_id,
+        token_id=token_id,
+        bids=bids,
+        asks=asks,
+        venue_ts=venue_ts,
+        fetched_at_utc=fetched_at_utc or datetime.now(tz=UTC),
+    )
 
 
 @dataclass(slots=True)

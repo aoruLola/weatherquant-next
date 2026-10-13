@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from weatherquant.dashboard import API_SCHEMA_VERSION
 from weatherquant.dashboard import builders as builders
+from weatherquant.dashboard import performance as perf
 from weatherquant.dashboard.archive import ArchiveTail
 from weatherquant.dashboard.config import DashboardSettings
 from weatherquant.dashboard.contracts import (
@@ -42,6 +43,7 @@ from weatherquant.dashboard.contracts import (
     MarketDetailData,
     MarketsData,
     OverviewData,
+    PerformanceData,
     ShadowHealthData,
     ShadowReportData,
     SystemData,
@@ -274,6 +276,89 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
         now = _utcnow()
         data, freshness = await asyncio.to_thread(builders.system, state, now)
         return _env(SystemData, "system", data, freshness, now, dataset)
+
+    # -- performance -------------------------------------------------------
+    # All seven read snapshots the research process already computed. None
+    # of them opens a database, and none of them derives a figure a second
+    # time - see docs/performance-data-contract.md section 7.
+    perf_state = perf.PerformanceState(state.sources, settings)
+
+    @app.get("/api/v1/performance/summary", response_model=Envelope[PerformanceData], tags=["v1"])
+    async def r_perf_summary() -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(perf.performance_summary, perf_state, now)
+        return _env(PerformanceData, "performance/summary", data, freshness, now, dataset)
+
+    @app.get("/api/v1/performance/edge", response_model=Envelope[PerformanceData], tags=["v1"])
+    async def r_perf_edge() -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(perf.performance_edge, perf_state, now)
+        return _env(PerformanceData, "performance/edge", data, freshness, now, dataset)
+
+    @app.get("/api/v1/performance/win-rate", response_model=Envelope[PerformanceData], tags=["v1"])
+    async def r_perf_win_rate() -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(perf.performance_win_rate, perf_state, now)
+        return _env(PerformanceData, "performance/win-rate", data, freshness, now, dataset)
+
+    @app.get(
+        "/api/v1/performance/opportunities",
+        response_model=Envelope[PerformanceData],
+        tags=["v1"],
+    )
+    async def r_perf_opportunities(
+        limit: int = Query(50, ge=1, le=500),
+        cursor: int = Query(0, ge=0),
+    ) -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(
+            perf.performance_opportunities, perf_state, now, limit=limit, cursor=cursor
+        )
+        return _env(PerformanceData, "performance/opportunities", data, freshness, now, dataset)
+
+    @app.get(
+        "/api/v1/performance/settlements",
+        response_model=Envelope[PerformanceData],
+        tags=["v1"],
+    )
+    async def r_perf_settlements(
+        limit: int = Query(50, ge=1, le=500),
+        cursor: int = Query(0, ge=0),
+    ) -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(
+            perf.performance_settlements, perf_state, now, limit=limit, cursor=cursor
+        )
+        return _env(PerformanceData, "performance/settlements", data, freshness, now, dataset)
+
+    @app.get("/api/v1/performance/models", response_model=Envelope[PerformanceData], tags=["v1"])
+    async def r_perf_models() -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(perf.performance_models, perf_state, now)
+        return _env(PerformanceData, "performance/models", data, freshness, now, dataset)
+
+    @app.get(
+        "/api/v1/performance/reference-capital",
+        response_model=Envelope[PerformanceData],
+        tags=["v1"],
+    )
+    async def r_perf_reference_capital(
+        capital_usdc: float = Query(100.0, gt=0, le=1_000_000),
+        mode: str = Query("portfolio", pattern="^(portfolio|single_opportunity)$"),
+        max_allocation_fraction: float = Query(0.10, gt=0, le=1),
+    ) -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(
+            perf.performance_reference_capital,
+            perf_state,
+            now,
+            capital_usdc=capital_usdc,
+            mode=mode,
+            max_allocation_fraction=max_allocation_fraction,
+        )
+        return _env(
+            PerformanceData, "performance/reference-capital", data, freshness, now, dataset
+        )
 
 
 # ---------------------------------------------------------------------------

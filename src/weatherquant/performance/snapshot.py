@@ -229,13 +229,29 @@ def build_performance(
         "warnings": rate.warnings,
     }
 
+    resolver = book_for or (lambda _e: None)
+    opportunity_rows = []
+    for episode in episodes:
+        book = resolver(episode)
+        row = {
+            **episode.as_dict(),
+            "outcome": next(
+                (s.outcome for s in scored if s.episode.episode_id == episode.episode_id), None
+            ),
+        }
+        # Levels travel with the episode so the API can size against a
+        # different stake without re-deriving a book it no longer has. When
+        # the levels were never available the key is absent, and absence is
+        # what turns into NOT_EXECUTABLE rather than into an invented fill.
+        if book is not None:
+            row["book"] = {
+                "bids": [[lvl.price_usd_per_share, lvl.size_shares] for lvl in book.bids],
+                "asks": [[lvl.price_usd_per_share, lvl.size_shares] for lvl in book.asks],
+            }
+        opportunity_rows.append(row)
+
     opportunities = {
-        "episodes": [
-            {**e.as_dict(), "outcome": next(
-                (s.outcome for s in scored if s.episode.episode_id == e.episode_id), None
-            )}
-            for e in episodes
-        ],
+        "episodes": opportunity_rows,
         "total": len(episodes),
         "statistical_scope": ["opportunity_episodes"],
         "warnings": episode_summary["warnings"],

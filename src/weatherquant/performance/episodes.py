@@ -26,9 +26,10 @@ easy to get subtly wrong, and what each one costs:
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 __all__ = [
     "DEFAULT_GAP_WINDOW_SECONDS",
@@ -36,6 +37,7 @@ __all__ = [
     "Episode",
     "EpisodeKey",
     "build_episodes",
+    "episode_from_mapping",
 ]
 
 #: Default for how long an episode may go unheard before it closes.
@@ -258,6 +260,53 @@ def row_from_mapping(row: dict) -> _DecisionRow:
         available_depth_usd=_finite(row.get("available_depth_usd")),
         station=_normalise(row.get("station")),
         bracket_label=_normalise(row.get("bracket_label")),
+        market_question=_normalise(row.get("market_question")),
+    )
+
+
+def episode_from_mapping(row: Mapping[str, Any]) -> Episode:
+    """Rebuild an episode from the shape ``Episode.as_dict`` publishes.
+
+    The reference-capital endpoint has to answer for a stake the snapshot
+    was not built with, so it reconstructs the episodes the research process
+    recorded and re-runs the *same* sizing code over them. Rebuilding rather
+    than storing a second, differently-shaped copy is what keeps the API and
+    the backfill from drifting into two answers for one opportunity.
+    """
+    first = _timestamp(row["first_seen_utc"])
+    last = _timestamp(row["last_seen_utc"])
+    direction = _normalise(row.get("direction"))
+    mode = _normalise(row.get("mode"))
+    market_id = str(row.get("market_id") or "")
+    target_date = _normalise(row.get("target_date"))
+    model_name = _normalise(row.get("model_name"))
+
+    first_edge = _finite(row.get("first_edge"))
+    if first_edge is None:
+        raise ValueError(f"episode {row.get('episode_id')!r} has no usable first_edge")
+
+    return Episode(
+        episode_id=str(row.get("episode_id") or _episode_id(
+            EpisodeKey(market_id, target_date, model_name, direction, mode), first
+        )),
+        key=EpisodeKey(market_id, target_date, model_name, direction, mode),
+        first_seen_utc=first,
+        last_seen_utc=last,
+        observation_count=int(row.get("observation_count") or 1),
+        first_edge=first_edge,
+        last_edge=_finite(row.get("last_edge")) if _finite(row.get("last_edge")) is not None else first_edge,
+        mean_edge=_finite(row.get("mean_edge")) if _finite(row.get("mean_edge")) is not None else first_edge,
+        max_edge=_finite(row.get("max_edge")) if _finite(row.get("max_edge")) is not None else first_edge,
+        min_edge=_finite(row.get("min_edge")) if _finite(row.get("min_edge")) is not None else first_edge,
+        first_market_price=_finite(row.get("first_market_price")),
+        first_model_probability=_finite(row.get("first_model_probability")),
+        first_available_depth_usd=_finite(row.get("first_available_depth_usd")),
+        target_date=target_date,
+        station=_normalise(row.get("station")),
+        bracket_label=_normalise(row.get("bracket_label")),
+        direction=direction,
+        mode=mode,
+        end_reason=str(row.get("end_reason") or EndReason.END_OF_DATA),
         market_question=_normalise(row.get("market_question")),
     )
 

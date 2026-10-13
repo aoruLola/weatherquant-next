@@ -37,6 +37,15 @@ class DashboardSettings(BaseSettings):
     shadow_data_dir: Path = Path("data/shadow")
     """Shadow data root: <dir>/health/heartbeat.json and <dir>/reports/."""
 
+    performance_data_dir: Path = Path("data/performance")
+    """Research analytics output: the six performance snapshots.
+
+    Written by the offline research process, read-only here. Kept separate
+    from the shadow's directory so a slow backfill can never block the
+    engine's own publishes, and so this container still never sees a
+    database - only JSON that someone else already computed.
+    """
+
     # --- dataset provenance -------------------------------------------------
     # Env: WQ_DATASET (``fixture`` stamps every response and shows a banner).
     dataset: Literal["live", "fixture"] = "live"
@@ -112,3 +121,14 @@ class DashboardSettings(BaseSettings):
         API reports them as ``unavailable`` with that exact reason.
         """
         return self.shadow_data_dir / "reports"
+
+    @property
+    def performance_snapshots_dir(self) -> Path:
+        """Where research analytics publishes the performance snapshots.
+
+        The six filenames are fixed by
+        ``weatherquant.performance.snapshot.SNAPSHOT_FILES``; a missing file
+        is reported as ``missing`` with a reason rather than as zeros, so a
+        dashboard with no backfill cannot look like a dashboard with no edge.
+        """
+        return self.performance_data_dir

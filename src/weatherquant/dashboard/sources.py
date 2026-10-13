@@ -208,6 +208,28 @@ class SnapshotSources:
             now=now,
         )
 
+    def performance_snapshot(self, logical_name: str, filename: str, now: datetime) -> JsonSource:
+        """A research-analytics snapshot (docs/performance-data-contract.md §7).
+
+        Distinct from ``named_snapshot`` because it reads a *different*
+        directory with a *different* missing reason: a performance file that
+        is absent means the backfill has not run, not that a producer awaits
+        integration. Saying "awaiting integration" about a research job that
+        simply has not happened yet would send an operator looking for a
+        deployment that is not the problem.
+        """
+        return self.read(
+            logical_name,
+            self.settings.performance_snapshots_dir / filename,
+            stale_after_seconds=300.0,
+            missing_reason=(
+                f"{logical_name} not published yet: the research analytics "
+                "backfill has not produced this snapshot "
+                "(docs/performance-data-contract.md §7)"
+            ),
+            now=now,
+        )
+
     # -- internals ---------------------------------------------------------
     def _apply_report_window(self, source: JsonSource, now: datetime) -> JsonSource:
         payload = source.payload or {}
