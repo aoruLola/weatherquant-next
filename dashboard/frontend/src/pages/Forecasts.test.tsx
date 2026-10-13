@@ -74,3 +74,41 @@ describe('Forecasts', () => {
     await waitFor(() => expect(screen.getByTestId('forecasts-error')).toBeInTheDocument())
   })
 })
+
+describe('Coverage scope regression', () => {
+  it('shows scoped and historical pairs independently', async () => {
+    const fixture = forecastsFixture()
+    fixture.coverage = {
+      ...(fixture.coverage ?? {}),
+      forecast_available: 3,
+      forecast_needed: 4,
+      forecast_coverage: 0.75,
+      forecast_valid_available: 2,
+      forecast_historical_pairs: 12,
+    }
+    mockFetch({ '/api/v1/forecasts': envelopeOf(fixture) })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('forecast-coverage-scope')).toBeInTheDocument())
+    expect(screen.getByTestId('forecast-coverage-scope')).toHaveTextContent('已记录 3 / 4')
+    expect(screen.getByTestId('forecast-coverage-scope')).toHaveTextContent('有效且符合决策时点约束：2 个')
+    expect(screen.getByTestId('forecast-coverage-scope')).toHaveTextContent('历史全部预测组合：12 个')
+    expect(screen.getByText('75.0%')).toBeInTheDocument()
+  })
+
+  it('marks zero-denominator coverage N/A', async () => {
+    const fixture = forecastsFixture()
+    fixture.coverage = {
+      ...(fixture.coverage ?? {}),
+      forecast_available: 0,
+      forecast_needed: 0,
+      forecast_coverage: null,
+      forecast_valid_available: 0,
+      forecast_historical_pairs: 24,
+    }
+    mockFetch({ '/api/v1/forecasts': envelopeOf(fixture) })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('forecast-coverage-scope')).toBeInTheDocument())
+    expect(screen.getByTestId('forecast-coverage-scope')).toHaveTextContent('已记录 0 / 0')
+    expect(screen.getByText('N/A')).toBeInTheDocument()
+  })
+})
