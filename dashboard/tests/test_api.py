@@ -736,3 +736,35 @@ def test_age_is_measured_against_utc_now(tmp_path: Path, settings_for) -> None:
         stale_body_health = client.get("/api/v1/collector/health").json()
         # serialised timestamps are UTC; either spelling counts
         assert stale_body_health["data"]["updated_at_utc"].endswith(("+00:00", "Z"))
+
+
+def test_decisions_api_forwards_accept_scope_without_losing_dimensions(data_root: Path, client: TestClient) -> None:
+    report = shadow_report(now=utcnow())
+    scope = {
+        "accepted_observations": 21,
+        "accepted_distinct_markets": 3,
+        "accepted_distinct_tokens": 3,
+        "accepted_distinct_target_dates": 2,
+        "accepted_distinct_market_directions": 4,
+        "accepted_repeats": 17,
+        "models_with_decisions": 2,
+        "runs_in_database": 9,
+        "window": "whole database",
+        "scope": "shadow_database_lifetime",
+    }
+    report["decisions"]["accept_scope"] = scope
+    write_json(data_root / "shadow" / "reports" / "report.json", report)
+    response = client.get("/api/v1/decisions")
+    assert response.status_code == 200
+    totals = response.json()["data"]["totals"]
+    assert totals["accept_scope"] == scope
+    assert totals["accepted"] == 3
+    assert response.json()["data"]["rows_status"] == "unavailable"
+
+
+def test_decisions_api_degrades_when_older_report_has_no_scope(client: TestClient) -> None:
+    response = client.get("/api/v1/decisions")
+    assert response.status_code == 200
+    totals = response.json()["data"]["totals"]
+    assert totals["accept_scope"] is None
+    assert totals["accepted"] == 3
