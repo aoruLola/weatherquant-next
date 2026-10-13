@@ -314,3 +314,34 @@ def test_single_opportunity_sizes_every_episode_against_the_full_stake(tmp_path,
     assert portfolio["allocated_total_usdc"] <= 100.0 + 1e-9
     assert portfolio["mode"] == "portfolio"
     assert portfolio["executable_count"] <= single["executable_count"]
+
+
+def test_a_fixture_snapshot_keeps_its_own_label_in_the_envelope(tmp_path, settings_for) -> None:
+    """Provenance belongs to the snapshot, not to the dashboard's setting.
+
+    A backfill labelled `fixture` and mounted into a dashboard set to `live`
+    would otherwise be stamped `live` on the way out - and the fixture banner
+    reads /healthz, which carries the same setting, so sample data could be
+    presented as production with nothing on screen to say otherwise.
+    """
+    from helpers import build_tree
+
+    root = tmp_path / "live-configured"
+    build_tree(root, archive=False)
+    settings = settings_for(root)  # default dataset is "live"
+    assert settings.dataset == "live"
+
+    _publish(settings.performance_data_dir)  # publishes with dataset="fixture"
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        payload = client.get("/api/v1/performance/summary").json()
+
+    assert payload["dataset"] == "fixture", (
+        "the snapshot's own label must survive; overwriting it with the "
+        "dashboard's setting would mislabel sample data as production"
+    )
+    warnings = " ".join(payload["data"].get("warnings") or [])
+    assert "fixture" in warnings and "live" in warnings, (
+        "a mismatch must be stated, not silently resolved"
+    )

@@ -114,6 +114,37 @@ def _env[T](cls: type[T], api: str, data: T, freshness: Freshness, now: datetime
     )
 
 
+def _perf_dataset(data: Any, configured: str) -> str:
+    """The snapshot's own provenance, not the dashboard's setting.
+
+    A backfill labelled ``fixture`` and mounted into a dashboard set to
+    ``live`` would otherwise be stamped ``live`` on the way out - and the
+    fixture banner reads ``/healthz``, which carries the same setting, so
+    sample data could be presented as production with no banner to say
+    otherwise. The snapshot knows what it is; the envelope repeats it.
+    """
+    if isinstance(data, dict):
+        labelled = data.get("dataset")
+        if isinstance(labelled, str) and labelled in {"live", "fixture"}:
+            return labelled
+    return configured
+
+
+def _perf_env(
+    cls: Any, api: str, data: Any, freshness: Freshness, now: datetime, configured: str
+) -> Envelope[Any]:
+    dataset = _perf_dataset(data, configured)
+    if dataset != configured and isinstance(data, dict):
+        warnings = data.get("warnings")
+        note = (
+            f"snapshot dataset is {dataset!r} but this dashboard is configured "
+            f"as {configured!r}; the snapshot's own label governs"
+        )
+        data = dict(data)
+        data["warnings"] = ([*(warnings or []), note] if isinstance(warnings, list) else [note])
+    return _env(cls, api, data, freshness, now, dataset)
+
+
 def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: DashboardSettings) -> None:
     dataset = settings.dataset
 
@@ -287,19 +318,19 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
     async def r_perf_summary() -> Envelope[PerformanceData]:
         now = _utcnow()
         data, freshness = await asyncio.to_thread(perf.performance_summary, perf_state, now)
-        return _env(PerformanceData, "performance/summary", data, freshness, now, dataset)
+        return _perf_env(PerformanceData, "performance/summary", data, freshness, now, dataset)
 
     @app.get("/api/v1/performance/edge", response_model=Envelope[PerformanceData], tags=["v1"])
     async def r_perf_edge() -> Envelope[PerformanceData]:
         now = _utcnow()
         data, freshness = await asyncio.to_thread(perf.performance_edge, perf_state, now)
-        return _env(PerformanceData, "performance/edge", data, freshness, now, dataset)
+        return _perf_env(PerformanceData, "performance/edge", data, freshness, now, dataset)
 
     @app.get("/api/v1/performance/win-rate", response_model=Envelope[PerformanceData], tags=["v1"])
     async def r_perf_win_rate() -> Envelope[PerformanceData]:
         now = _utcnow()
         data, freshness = await asyncio.to_thread(perf.performance_win_rate, perf_state, now)
-        return _env(PerformanceData, "performance/win-rate", data, freshness, now, dataset)
+        return _perf_env(PerformanceData, "performance/win-rate", data, freshness, now, dataset)
 
     @app.get(
         "/api/v1/performance/opportunities",
@@ -314,7 +345,7 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
         data, freshness = await asyncio.to_thread(
             perf.performance_opportunities, perf_state, now, limit=limit, cursor=cursor
         )
-        return _env(PerformanceData, "performance/opportunities", data, freshness, now, dataset)
+        return _perf_env(PerformanceData, "performance/opportunities", data, freshness, now, dataset)
 
     @app.get(
         "/api/v1/performance/settlements",
@@ -329,13 +360,13 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
         data, freshness = await asyncio.to_thread(
             perf.performance_settlements, perf_state, now, limit=limit, cursor=cursor
         )
-        return _env(PerformanceData, "performance/settlements", data, freshness, now, dataset)
+        return _perf_env(PerformanceData, "performance/settlements", data, freshness, now, dataset)
 
     @app.get("/api/v1/performance/models", response_model=Envelope[PerformanceData], tags=["v1"])
     async def r_perf_models() -> Envelope[PerformanceData]:
         now = _utcnow()
         data, freshness = await asyncio.to_thread(perf.performance_models, perf_state, now)
-        return _env(PerformanceData, "performance/models", data, freshness, now, dataset)
+        return _perf_env(PerformanceData, "performance/models", data, freshness, now, dataset)
 
     @app.get(
         "/api/v1/performance/reference-capital",
@@ -356,7 +387,7 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
             mode=mode,
             max_allocation_fraction=max_allocation_fraction,
         )
-        return _env(
+        return _perf_env(
             PerformanceData, "performance/reference-capital", data, freshness, now, dataset
         )
 

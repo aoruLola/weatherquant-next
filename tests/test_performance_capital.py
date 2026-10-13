@@ -45,8 +45,9 @@ def _episode(
     probability: float = 0.67,
     first_seen: datetime = NOW,
     episode_id: str = "ep-1",
+    market: str = "m-81",
 ) -> Episode:
-    key = EpisodeKey("m-81", "2026-10-14", "calibrated", direction, "LIVE")
+    key = EpisodeKey(market, "2026-10-14", "calibrated", direction, "LIVE")
     return Episode(
         episode_id=episode_id,
         key=key,
@@ -223,7 +224,13 @@ def test_a_settled_win_and_loss_are_both_shown_for_buy_yes() -> None:
 def test_sell_yes_withholds_pnl_until_its_semantics_are_proven() -> None:
     """Contract 4.4: an unproven position type may not be given a P&L."""
     result = simulate_single(
-        _episode(direction="sell_yes"), capital_usdc=100.0, fee_rate=0.0, book=_book(),
+        # A sell prices against the bid, so the bid has to be the decision
+        # price - and it must sit below the ask, or the book is crossed and
+        # is refused for being crossed before any of this is reached.
+        _episode(direction="sell_yes", price=0.58),
+        capital_usdc=100.0,
+        fee_rate=0.0,
+        book=_book(bid=0.58),
         settlement_payout=1.0,
     )
 
@@ -305,7 +312,11 @@ def test_capital_release_is_held_conservatively_when_settlement_times_are_unknow
         [_episode()], capital_usdc=100.0, book_for=lambda e: _book(), fee_rate=0.0
     )
 
-    assert any("held for the whole window" in r for r in outcome.not_backtestable_reasons)
+    assert outcome.backtestable is False, (
+        "settlement timing is unavailable, so a capital timeline cannot be "
+        "reconstructed and the result is theoretical only"
+    )
+    assert any("settlement timing is not available" in r for r in outcome.not_backtestable_reasons)
 
 
 def test_the_result_declares_its_statistical_scope() -> None:
@@ -476,3 +487,137 @@ def test_an_unknown_fee_still_refuses_rather_than_being_treated_as_free() -> Non
         if not r.executable
     )
     assert outcome.allocated_total_usdc == 0.0
+
+
+# --- second review round: fees, time mismatch, backtestability ---------------
+
+
+def test_fees_and_buffer_are_charged_against_the_stake() -> None:
+    """A stake that covers the fill but not the fee is not a funded trade.
+
+    `total_cost_usd` is the cash actually laid out. Recording only the fill
+    notional books a position that costs more than the capital it claimed.
+    """
+    plain = simulate_single(
+        _episode(), capital_usdc=100.0, fee_rate=0.0, book=_book()
+    )
+    taxed = simulate_single(
+        _episode(), capital_usdc=100.0, fee_rate=0.05, book=_book()
+    )
+
+    assert plain.executable and taxed.executable
+    # The stake is the ceiling in both cases - sizing shrinks to fit - so the
+    # fee shows up as *fewer shares* and a higher all-in cost per share, not
+    # as a larger total. Anything else would mean the fee was not charged.
+    assert taxed.reference_shares < plain.reference_shares, (
+        "the fee shrinks what the same stake can buy"
+    )
+    assert taxed.capital_required_usdc <= 100.0 + 1e-9
+    assert plain.capital_required_usdc <= 100.0 + 1e-9
+    plain_per_share = plain.capital_required_usdc / plain.reference_shares
+    taxed_per_share = taxed.capital_required_usdc / taxed.reference_shares
+    assert taxed_per_share > plain_per_share, (
+        "the all-in cost per share must carry the fee"
+    )
+
+
+def test_roi_is_measured_against_the_all_in_cost() -> None:
+    result = simulate_single(
+        _episode(), capital_usdc=100.0, fee_rate=0.05, book=_book()
+    )
+
+    assert result.executable
+    assert result.theoretical_expected_net_edge_usdc is not None
+    assert result.theoretical_expected_roi == pytest.approx(
+        result.theoretical_expected_net_edge_usdc / result.capital_required_usdc
+    )
+
+
+def test_a_stake_that_cannot_cover_the_fee_is_refused() -> None:
+    """If the all-in cost overruns the stake, the position is not funded."""
+    # A heavy fee on a tiny stake: the fill fits, the all-in cost may not.
+    result = simulate_single(
+        _episode(), capital_usdc=0.05, fee_rate=0.05, book=_book(ask=0.60)
+    )
+
+    if result.executable:
+        assert result.capital_required_usdc <= 0.05 + 1e-9
+
+
+def test_a_price_mismatch_is_refused_not_noted() -> None:
+    """Combining a probability from one instant with a fill from another.
+
+    The episode's model probability and the book's price are from different
+    moments; continuing would produce an expected return neither instant
+    supports.
+    """
+    result = simulate_single(
+        _episode(price=0.55), capital_usdc=100.0, fee_rate=0.0, book=_book(ask=0.60)
+    )
+
+    assert result.executable is False
+    assert result.not_executable_reason == NotExecutable.TIME_MISMATCH
+    assert result.theoretical_expected_net_edge_usdc is None
+    assert result.price_time_matched is False
+
+
+def test_a_matching_price_still_proceeds() -> None:
+    result = simulate_single(
+        _episode(price=0.60), capital_usdc=100.0, fee_rate=0.0, book=_book(ask=0.60)
+    )
+
+    assert result.executable is True
+    assert result.price_time_matched is True
+
+
+def test_a_capital_timeline_that_cannot_be_rebuilt_is_not_backtestable() -> None:
+    """Settlement timing is not carried, so nothing here is historically tested."""
+    outcome = simulate_portfolio(
+        [_episode()], capital_usdc=100.0, book_for=lambda e: _book(), fee_rate=0.0
+    )
+
+    assert outcome.executable_count == 1
+    assert outcome.backtestable is False
+    assert any("settlement timing is not available" in r for r in outcome.not_backtestable_reasons)
+
+
+def test_episodes_from_one_market_share_the_allocation_cap() -> None:
+    """Contract 3.3: correlated exposure must not multiply its allowance.
+
+    Five signals on one bracket are one market's risk. Handing each a fresh
+    cap would let a single market take five times the share the risk
+    assumption allowed - the cap is per opportunity *type*, not per row.
+    """
+    market = [
+        _episode(
+            episode_id=f"same-market-{i}",
+            market="m-shared",
+            first_seen=NOW + timedelta(minutes=i),
+            depth=100_000.0,
+        )
+        for i in range(5)
+    ]
+    outcome = simulate_portfolio(
+        market, capital_usdc=100.0, book_for=lambda e: _book(), fee_rate=0.0
+    )
+
+    # Every episode is the same market_id, so the group is capped once.
+    assert outcome.allocated_total_usdc <= 10.0 + 1e-9, (
+        "five episodes on one market took five shares of the cap"
+    )
+
+    others = [
+        _episode(
+            episode_id=f"m-{i}",
+            market=f"m-{i}",
+            first_seen=NOW + timedelta(minutes=i),
+            depth=100_000.0,
+        )
+        for i in range(5)
+    ]
+    spread = simulate_portfolio(
+        others, capital_usdc=100.0, book_for=lambda e: _book(), fee_rate=0.0
+    )
+    assert spread.allocated_total_usdc > 10.0 + 1e-9, (
+        "five distinct markets should be able to take more than one market's cap"
+    )

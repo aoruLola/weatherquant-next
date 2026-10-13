@@ -177,7 +177,7 @@ class SingleResult:
         }
 
 
-def _max_shares_for(book: OrderBook, side: Side, capital: float) -> float:
+def _max_shares_for(book: OrderBook, side: Side, capital: float) -> tuple[float, bool]:
     """How many shares the stake could take, walking real levels.
 
     Using the book rather than ``capital / best_price`` is the difference
@@ -195,7 +195,11 @@ def _max_shares_for(book: OrderBook, side: Side, capital: float) -> float:
         take = min(level_notional, remaining)
         shares += take / level.price_usd_per_share
         remaining -= take
-    return shares
+    # Decided after the walk, not inside it: a single-level book never gets
+    # a second iteration in which to notice that the stake ran out first, so
+    # asking the question mid-loop reports the shallowest book as exhausted.
+    exhausted = bool(levels) and remaining > 0
+    return shares, exhausted
 
 
 def simulate_single(
@@ -268,20 +272,48 @@ def simulate_single(
     price_in_book = book.best_bid_usd_per_share if side is Side.SELL else book.best_ask_usd_per_share
     if price_at_decision is not None and price_in_book is not None:
         # A decision priced against one instant and a fill priced against
-        # another are two different trades. Without evidence they match, the
-        # two figures must not be combined into one result.
+        # another are two different trades. Continuing anyway would pair the
+        # episode's model probability with an execution price it never saw,
+        # which is precisely how a historical episode acquires a return it
+        # could not have had. The contract names this TIME_MISMATCH.
         result.price_time_matched = abs(price_at_decision - price_in_book) < 1e-9
         if not result.price_time_matched:
+            result.not_executable_reason = NotExecutable.TIME_MISMATCH
             result.notes.append(
-                "decision price and current book price differ; sized against the book"
+                f"decision price {price_at_decision:g} and book price "
+                f"{price_in_book:g} are from different instants; refusing to "
+                "combine a probability from one with a fill from the other"
             )
+            return result
 
     try:
-        wanted = _max_shares_for(book, side, capital_usdc)
+        wanted, book_exhausted = _max_shares_for(book, side, capital_usdc)
         if wanted <= 0:
             result.not_executable_reason = NotExecutable.INSUFFICIENT_DEPTH
             return result
+        # Size within the *all-in* budget. `_max_shares_for` walks notional,
+        # which is the fill only - fees and the buffer sit on top of it - so
+        # the first pass can ask for more than the stake can pay for. Shrink
+        # and re-walk until the total fits. Converges in one or two rounds
+        # because each pass scales by the shortfall it just measured.
         fill = build_fill_plan(book, side=side, shares=wanted)
+        cost = execution_cost(fill, fee_rate=fee_rate, buffer_fraction=buffer_fraction)
+        for _ in range(3):
+            if cost.total_cost_usd <= capital_usdc or fill.filled_shares <= 0:
+                break
+            scale = (capital_usdc / cost.total_cost_usd) * 0.999
+            shrunk = fill.filled_shares * scale
+            if shrunk <= 0:
+                break
+            fill = build_fill_plan(book, side=side, shares=shrunk)
+            cost = execution_cost(fill, fee_rate=fee_rate, buffer_fraction=buffer_fraction)
+    except FeeStructureUnknown as exc:
+        # Raised by the very first costing pass inside the loop above, so it
+        # has to be caught here too - not only at the second call, or an
+        # unknown fee escapes as a traceback instead of a refusal.
+        result.not_executable_reason = NotExecutable.FEE_UNKNOWN
+        result.notes.append(str(exc))
+        return result
     except ExecutionRefused as exc:
         result.not_executable_reason = NotExecutable.CROSSED_OR_ONE_SIDED
         result.notes.append(str(getattr(exc, "detail", None) or exc))
@@ -308,7 +340,19 @@ def simulate_single(
         result.notes.append(f"cost unavailable: {exc}")
         return result
 
-    if cost.fill_cost_usd <= 0:
+    if cost.total_cost_usd > capital_usdc:
+        # Still over budget after shrinking: the position cannot be paid for
+        # with this stake. Reporting it as executable would book a trade the
+        # money does not cover.
+        result.not_executable_reason = NotExecutable.INSUFFICIENT_DEPTH
+        result.notes.append(
+            f"all-in cost {cost.total_cost_usd:.4f} (fill {cost.fill_cost_usd:.4f} "
+            f"+ fees {cost.fees_usd:.4f} + buffer {cost.execution_buffer_usd:.4f}) "
+            f"exceeds the {capital_usdc:.4f} stake"
+        )
+        return result
+
+    if cost.total_cost_usd <= 0:
         result.not_executable_reason = NotExecutable.INSUFFICIENT_DEPTH
         return result
 
@@ -319,15 +363,25 @@ def simulate_single(
         return result
 
     result.reference_shares = fill.filled_shares
-    result.capital_required_usdc = cost.fill_cost_usd
-    result.capital_used_usdc = min(capital_usdc, cost.fill_cost_usd)
-    result.capacity_limited = cost.fill_cost_usd < capital_usdc
+    # All-in, not the fill notional: fees and the buffer are cash the stake
+    # has to produce too. Recording only the fill would book a trade that
+    # costs more than the capital it was sized against.
+    result.capital_required_usdc = cost.total_cost_usd
+    result.capital_used_usdc = min(capital_usdc, cost.total_cost_usd)
+    # Limited by the *book*, not by our own shrink-to-fit. "The market would
+    # not give me this much" and "I asked for less than I could afford" are
+    # different facts, and only the first is a capacity limit.
+    result.capacity_limited = book_exhausted
 
     if side is Side.BUY:
         per_share = edge_usd_per_share(q=q, filled_shares=fill.filled_shares, cost=cost)
         total = expected_net_profit_usd(q=q, filled_shares=fill.filled_shares, cost=cost)
-        result.win_net_usdc = fill.filled_shares * 1.0 - cost.fill_cost_usd if settlement_payout == 1.0 else None
-        result.loss_net_usdc = -cost.fill_cost_usd if settlement_payout == 0.0 else None
+        # Against the all-in cost: winning pays a share and recovering the
+        # outlay, losing loses everything that was laid out - fees included.
+        result.win_net_usdc = (
+            fill.filled_shares * 1.0 - cost.total_cost_usd if settlement_payout == 1.0 else None
+        )
+        result.loss_net_usdc = -cost.total_cost_usd if settlement_payout == 0.0 else None
     else:
         per_share = edge_usd_per_share_sell(q=q, filled_shares=fill.filled_shares, cost=cost)
         total = expected_net_profit_usd_sell(q=q, filled_shares=fill.filled_shares, cost=cost)
@@ -340,7 +394,7 @@ def simulate_single(
 
     result.theoretical_edge_per_share = per_share
     result.theoretical_expected_net_edge_usdc = total
-    result.theoretical_expected_roi = total / cost.fill_cost_usd if cost.fill_cost_usd else None
+    result.theoretical_expected_roi = total / cost.total_cost_usd
     result.executable = True
     return result
 
@@ -531,6 +585,10 @@ def simulate_portfolio(
     balance = capital_usdc
     per_opportunity_cap = capital_usdc * max_allocation_fraction
     funds_exhausted = False
+    # Contract section 3.3: episodes from the same market are the same
+    # correlated exposure. Giving each a fresh cap would let five signals on
+    # one bracket consume five times the share the risk assumption allowed.
+    allocated_by_market: dict[str, float] = {}
 
     for episode in sorted(episodes, key=lambda e: e.first_seen_utc):
         # Decide what this episode may spend *before* pricing it. Pricing at
@@ -538,7 +596,9 @@ def simulate_portfolio(
         # fees and expected edge describing a position that was never
         # funded - which is how a portfolio reports a profit on money it
         # did not have.
-        available = min(per_opportunity_cap, balance)
+        market_id = episode.key.market_id
+        market_used = allocated_by_market.get(market_id, 0.0)
+        available = min(per_opportunity_cap - market_used, balance)
         if available <= 0:
             if not funds_exhausted:
                 outcome.not_backtestable_reasons.append(
@@ -589,6 +649,7 @@ def simulate_portfolio(
         if single.capacity_limited:
             outcome.capacity_limited_count += 1
         outcome.allocated_total_usdc += used
+        allocated_by_market[market_id] = market_used + used
         balance -= used
         outcome.peak_open_allocation_usdc = max(
             outcome.peak_open_allocation_usdc, outcome.allocated_total_usdc
@@ -614,12 +675,16 @@ def simulate_portfolio(
             "every opportunity lacked the evidence a fill needs"
         )
     # Capital is never released inside this pass. Settlement times are not
-    # carried on an episode, so returning money to the pool would mean
-    # assuming when a market resolved. Holding every allocation to the end
-    # of the window is the conservative reading of "capital is released only
-    # on settlement" - it can only understate utilization, never overstate it.
-    if outcome.executable_count and not outcome.not_backtestable_reasons:
+    # carried on an episode, and neither the snapshot builder nor the
+    # reference-capital endpoint supplies them, so the capital timeline
+    # cannot be reconstructed. Holding every allocation to the end of the
+    # window is the conservative reading of that - it can only understate
+    # utilization - but "conservative" is not "validated". Anything with an
+    # executable book therefore cannot be presented as historically tested.
+    if outcome.executable_count:
+        outcome.backtestable = False
         outcome.not_backtestable_reasons.append(
-            "capital is held for the whole window; settlement-time release is not modelled"
+            "settlement timing is not available, so the capital timeline "
+            "cannot be reconstructed and these results are theoretical only"
         )
     return outcome
