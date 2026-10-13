@@ -734,6 +734,9 @@ def decisions(
             "replay_accepted": dec.get("replay_accepted"),
             "primary_reasons": dec.get("primary_reasons") or {},
             "p95_decision_latency_ms": dec.get("p95_decision_latency_ms"),
+            # Keep scope as a single additive nested contract. Old reports
+            # without the field must show UNAVAILABLE, not made-up zeros.
+            "accept_scope": dec.get("accept_scope") if isinstance(dec.get("accept_scope"), dict) else None,
             # Taken from the report, never restated here: the scope is a fact
             # about how the numbers were counted, and a second copy of the
             # sentence is how the two drift apart.
