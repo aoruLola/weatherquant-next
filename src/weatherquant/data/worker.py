@@ -355,6 +355,19 @@ class CollectorWorker:
                     stream.stop()
                 except Exception:
                     log.exception("stream did not stop cleanly")
+            if archive is not None:
+                # Finish the raw archive before marking the collector run
+                # stopped. A failed fsync must produce a fatal heartbeat,
+                # not a clean exit with an incomplete raw ledger.
+                try:
+                    archive.close()
+                except Exception as exc:
+                    log.exception("raw archive did not close durably")
+                    self._fatal = f"archive_close_failed: {type(exc).__name__}: {exc}"
+                    reason = self._fatal
+                    status = HealthStatus.FATAL
+                finally:
+                    self._archive_records = archive.records_written
             if self._writer is not None:
                 # Close this run's own gap before the writer goes away. A run
                 # that opened a gap at start must close it at exit whatever the
@@ -371,9 +384,6 @@ class CollectorWorker:
                     )
                 except Exception:
                     log.exception("error closing writer")
-            if archive is not None:
-                archive.close()
-                self._archive_records = archive.records_written
             if http is not None:
                 http.close()
             self._status = (
