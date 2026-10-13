@@ -5,6 +5,7 @@ import Forecasts from './pages/Forecasts'
 import MarketDetail from './pages/MarketDetail'
 import Markets from './pages/Markets'
 import Overview from './pages/Overview'
+import Performance from './pages/Performance'
 import System from './pages/System'
 
 export default function App() {
@@ -16,6 +17,7 @@ export default function App() {
         <Route path="/markets/:marketId" element={<MarketDetail />} />
         <Route path="/forecasts" element={<Forecasts />} />
         <Route path="/decisions" element={<Decisions />} />
+        <Route path="/performance" element={<Performance />} />
         <Route path="/system" element={<System />} />
         <Route path="*" element={<Overview />} />
       </Route>
