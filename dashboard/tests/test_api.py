@@ -768,3 +768,13 @@ def test_decisions_api_degrades_when_older_report_has_no_scope(client: TestClien
     totals = response.json()["data"]["totals"]
     assert totals["accept_scope"] is None
     assert totals["accepted"] == 3
+
+
+def test_overview_does_not_substitute_archive_age_for_book_age(data_root: Path, client: TestClient) -> None:
+    report = shadow_report(now=utcnow())
+    report["liveness"].pop("latest_orderbook_venue_age_seconds", None)
+    write_json(data_root / "shadow" / "reports" / "report.json", report)
+    response = client.get("/api/v1/overview")
+    assert response.status_code == 200
+    # The collector archive is fresh, but a Gamma frame is not a fresh book.
+    assert response.json()["data"]["latest_book_age_seconds"] is None
