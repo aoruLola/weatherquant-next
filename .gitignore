@@ -23,3 +23,8 @@ htmlcov/
 
 # Legacy snapshot used only for read-only inspection
 .audit-out/
+
+# scratch probes from local API audits
+.ev.json
+.one.json
+.open.json
