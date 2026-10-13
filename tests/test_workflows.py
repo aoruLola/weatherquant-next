@@ -216,3 +216,79 @@ def test_pyproject_version_is_a_single_declared_string() -> None:
     versions = re.findall(r'^version = "([^"]+)"$', text, flags=re.MULTILINE)
     assert len(versions) == 1, f"expected exactly one declared version, got {versions}"
     assert re.fullmatch(r"\d+\.\d+\.\d+", versions[0]), versions[0]
+
+
+# --- production must run a pinned image, not a floating pointer -------------
+
+
+SHADOW_COMPOSE = REPO_ROOT / "docker" / "compose.shadow.unraid.yaml"
+
+
+def _active_lines(path: Path) -> str:
+    """Config as written, with comments stripped - judge what runs, not what is said."""
+    return "\n".join(
+        line.split("#")[0]
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if not line.strip().startswith("#")
+    )
+
+
+def test_shadow_stack_pins_an_immutable_sha() -> None:
+    """The shadow must not track `shadow-stable`.
+
+    The release workflow moves that pointer the instant a shadow release
+    passes its gates, so a stack that follows it adopts the newest build on
+    the next `docker compose pull` or one click of Unraid's "Check for
+    updates" - with nobody having chosen that version. Production pins a
+    SHA instead: the running build is a property of the file, and rolling
+    back is a one-line edit.
+
+    The dashboard has had this assertion since P2-1 (see test_dashboard_ci);
+    this is the same invariant for the engine that owns the database.
+    """
+    text = _active_lines(SHADOW_COMPOSE)
+    assert "sha-${SHADOW_SHA:?" in text, "production must run a pinned SHA"
+    assert ":shadow-stable" not in text, "`shadow-stable` floats; production pins a SHA"
+    assert ":latest" not in text
+
+
+def test_shadow_version_metadata_comes_from_the_pinned_sha() -> None:
+    """GIT_SHA / IMAGE_TAG must be stated, not guessed.
+
+    The engine records both in `runs` and publishes them on its heartbeat -
+    the only place an operator can read "which build is live" without
+    registry access. Defaulting them to `unknown` / `shadow-stable` while the
+    container runs a pinned SHA puts a mutable pointer in the field that is
+    supposed to identify an immutable build. Both now read SHADOW_SHA, the
+    same value the image tag is built from, so they cannot disagree.
+    """
+    text = _active_lines(SHADOW_COMPOSE)
+    assert "GIT_SHA: ${SHADOW_SHA:?" in text, "GIT_SHA must come from the pinned sha"
+    assert "IMAGE_TAG: ${SHADOW_SHA:?" in text, "IMAGE_TAG must come from the pinned sha"
+    assert "GIT_SHA:-unknown" not in text
+    assert "IMAGE_TAG:-shadow-stable" not in text
+
+
+def test_dashboard_version_metadata_comes_from_the_pinned_sha() -> None:
+    """Same invariant on the other stack, which already pinned its image.
+
+    The dashboard has pinned `sha-${DASHBOARD_SHA}` since P2-1 but still
+    defaulted GIT_SHA / IMAGE_TAG, so it could report `dashboard-stable`
+    while running a specific commit.
+    """
+    dashboard = REPO_ROOT / "docker" / "compose.dashboard.unraid.yaml"
+    text = _active_lines(dashboard)
+    assert "sha-${DASHBOARD_SHA:?" in text
+    assert "GIT_SHA: ${DASHBOARD_SHA:?" in text
+    assert "IMAGE_TAG: ${DASHBOARD_SHA:?" in text
+    assert "GIT_SHA:-unknown" not in text
+    assert "IMAGE_TAG:-dashboard-stable" not in text
+
+
+def test_shadow_stack_still_refuses_the_properties_it_needs() -> None:
+    """The pin is a change to two lines, not a licence to reopen the others."""
+    text = _active_lines(SHADOW_COMPOSE)
+    assert "ports:" not in text, "the shadow serves nothing and must publish no port"
+    assert "/collector-raw:ro" in text or "/collector-raw\":ro" in text.replace("'", '"')
+    assert "stop_grace_period: 60s" in text
+    assert "user: \"1000:1000\"" in text

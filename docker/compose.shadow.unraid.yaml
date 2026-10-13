@@ -26,13 +26,26 @@
 #      process and it can finish its cycle, commit the batch, rewrite the
 #      heartbeat and release the lease before the container is killed.
 #
-# Image tags: `shadow-stable` tracks the newest tag that passed the shadow
-# verify job; `sha-<commit>` is the immutable rollback target. The shadow has
-# its own workflow and its own tag namespace - it can never move the
-# collector's `stable`.
+# Image tags: this stack runs a **pinned immutable SHA**, never `shadow-stable`.
+#
+# `shadow-stable` is a mutable pointer the release workflow moves the moment a
+# shadow release passes its gates. Tracking it means the next `docker compose
+# pull` - or one click on Unraid's "Check for updates" - adopts whatever was
+# released most recently, with nobody having chosen that version. Pinning the
+# SHA makes "which build is running" a property of this file, and makes
+# rolling back a one-line edit rather than a hunt through the registry.
+#
+# One variable, in the stack's .env, same shape as the dashboard stack:
+#
+#   SHADOW_SHA   <full commit sha>   e.g. 1d66e4da7bfb8bf44480480d44996743b8901e0d
+#
+# The image is `sha-${SHADOW_SHA}`, and GIT_SHA / IMAGE_TAG are read from the
+# same value, so the engine cannot report a different build from the one it is
+# running. The shadow has its own workflow and its own tag namespace - it can
+# never move the collector's `stable`.
 
 x-common: &common
-  image: ghcr.io/aorulola/weatherquant-next-shadow:shadow-stable
+  image: ghcr.io/aorulola/weatherquant-next-shadow:sha-${SHADOW_SHA:?set SHADOW_SHA in the stack .env to the released commit}
   container_name: weatherquant-shadow
   restart: unless-stopped
   stop_grace_period: 60s
@@ -55,8 +68,13 @@ x-common: &common
     # complete JSONL lines and never opens another engine's file.
     WQ_COLLECTOR_RAW_DIR: /collector-raw
     WQ_LOG_LEVEL: INFO
-    GIT_SHA: ${GIT_SHA:-unknown}
-    IMAGE_TAG: ${IMAGE_TAG:-shadow-stable}
+    # Version metadata the engine records in `runs` and publishes on its
+    # heartbeat. Both are required, and both come from the same value the
+    # image is built from: a heartbeat claiming `shadow-stable` while the
+    # container runs a pinned SHA is a lie in the one field an operator reads
+    # to answer "which build is live". IMAGE_TAG carries the bare commit sha.
+    GIT_SHA: ${SHADOW_SHA:?set SHADOW_SHA in the stack .env to the released commit}
+    IMAGE_TAG: ${SHADOW_SHA:?set SHADOW_SHA in the stack .env to the released commit}
     # Outbound access to Open-Meteo. If the NAS reaches it through a proxy,
     # uncomment and set - httpx honours the standard variables.
     # HTTPS_PROXY: http://proxy:3128

@@ -52,8 +52,13 @@ x-common: &common
     # "live" in production. Set to "fixture" ONLY for demos; the UI then shows
     # a permanent FIXTURE banner so sample data can never pass as real.
     WQ_DATASET: live
-    GIT_SHA: ${GIT_SHA:-unknown}
-    IMAGE_TAG: ${IMAGE_TAG:-dashboard-stable}
+    # Same value the image is pinned to, so the container cannot report a
+    # different build from the one it is running. Defaulting these to
+    # `unknown` / `dashboard-stable` put a floating pointer in the field that
+    # is supposed to identify an immutable build. IMAGE_TAG carries the bare
+    # commit sha.
+    GIT_SHA: ${DASHBOARD_SHA:?set DASHBOARD_SHA in the stack .env to the released commit}
+    IMAGE_TAG: ${DASHBOARD_SHA:?set DASHBOARD_SHA in the stack .env to the released commit}
   ports:
     # Trusted LAN only. Optional hardening: replace with
     #   - "192.168.x.x:8787:8787"   (the NAS's own LAN address)
