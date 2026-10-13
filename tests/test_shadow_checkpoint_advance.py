@@ -402,3 +402,80 @@ def test_lines_are_never_consumed_twice_across_many_cycles(tmp_path) -> None:
     # Nothing pending: every byte is behind an offset that stuck.
     assert runner.cycle().lines_read == 0
     runner.close(status="stopped", reason="test")
+
+
+def test_commit_failure_leaves_market_books_and_token_map_unmodified(tmp_path, monkeypatch) -> None:
+    """A failed DB commit must not publish an uncommitted market in RAM.
+
+    A same-poll Gamma event still resolves a REST book on successful retry:
+    the tailer uses a provisional map while decoding and Runner swaps its
+    prepared state only after the durable commit.
+    """
+    raw = _archive(tmp_path, rest_lines=2)
+    runner = _build(tmp_path, raw)
+    _RUNNERS.append(runner)
+    runner.start()
+    assert runner.state.markets == {}
+    assert runner.state.books == {}
+    assert runner.tailer.market_of_token == {}
+
+    real_commit = runner.store.commit_batch
+
+    def reject_commit(**kwargs):
+        raise OSError("injected DuckDB commit failure")
+
+    monkeypatch.setattr(runner.store, "commit_batch", reject_commit)
+    with pytest.raises(OSError, match="injected DuckDB"):
+        runner.cycle()
+    assert runner.state.markets == {}
+    assert runner.state.books == {}
+    assert runner.tailer.market_of_token == {}
+    assert runner.tailer.checkpoints == {}
+    assert runner.db.con.execute("SELECT COUNT(*) FROM market_catalog").fetchone()[0] == 0
+    assert runner.db.con.execute("SELECT COUNT(*) FROM token_books").fetchone()[0] == 0
+
+    monkeypatch.setattr(runner.store, "commit_batch", real_commit)
+    recovered = runner.cycle()
+    assert recovered.markets > 0 and recovered.books == 2
+    assert runner.state.markets and runner.state.books
+    assert runner.tailer.market_of_token
+    assert runner.cycle().lines_read == 0
+    runner.close(status="stopped", reason="test")
+
+
+def test_failure_after_initial_success_preserves_last_committed_book(tmp_path, monkeypatch) -> None:
+    raw = _archive(tmp_path, rest_lines=1)
+    runner = _build(tmp_path, raw)
+    _RUNNERS.append(runner)
+    runner.start()
+    runner.cycle()
+    old_book = runner.state.books["tok-0-yes"]
+    old_checkpoint = {
+        key: c.offset_bytes for key, c in runner.tailer.checkpoints.items()
+    }
+
+    write_lines(
+        raw,
+        "rest",
+        TARGET_DATE,
+        [archive_line(
+            81, "rest",
+            book_payload(token_id="tok-0-yes", venue_ts_ms=VENUE_TS_MS + 30000),
+            received=NOW + timedelta(seconds=30),
+        )],
+    )
+    commit = runner.store.commit_batch
+
+    def fail_once(**kwargs):
+        raise OSError("retry expected")
+
+    monkeypatch.setattr(runner.store, "commit_batch", fail_once)
+    with pytest.raises(OSError, match="retry expected"):
+        runner.cycle()
+    assert runner.state.books["tok-0-yes"] == old_book
+    assert {key: c.offset_bytes for key, c in runner.tailer.checkpoints.items()} == old_checkpoint
+    monkeypatch.setattr(runner.store, "commit_batch", commit)
+    assert runner.cycle().books == 1
+    assert runner.state.books["tok-0-yes"] != old_book
+    assert runner.cycle().lines_read == 0
+    runner.close(status="stopped", reason="test")
