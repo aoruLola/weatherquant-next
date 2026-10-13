@@ -43,10 +43,12 @@ from weatherquant.performance.episodes import Episode
 
 __all__ = [
     "DEFAULT_MAX_ALLOCATION_FRACTION",
+    "IndependentResult",
     "NotExecutable",
     "PortfolioResult",
     "SingleResult",
     "book_from_mapping",
+    "simulate_independent",
     "simulate_portfolio",
     "simulate_single",
 ]
@@ -75,6 +77,9 @@ class NotExecutable:
     CROSSED_OR_ONE_SIDED = "CROSSED_OR_ONE_SIDED"
     NOT_PRICED = "NOT_PRICED"
     FEE_UNKNOWN = "FEE_UNKNOWN"
+    #: The portfolio had nothing left to allocate. Distinct from a book that
+    #: is too thin: there, the market refused; here, we never got to ask.
+    NO_FUNDS = "NO_FUNDS"
 
 
 #: How stale a snapshot may be and still describe a fillable market. Matches
@@ -214,6 +219,12 @@ def simulate_single(
     """
     if capital_usdc <= 0:
         raise ValueError(f"capital_usdc must be > 0, got {capital_usdc!r}")
+
+    # The market's own fee travels with the episode. An explicit argument
+    # still wins, but defaulting to None when the episode carries a rate
+    # would refuse every sizing for a reason the data had already answered.
+    if fee_rate is None:
+        fee_rate = episode.fee_rate
 
     result = SingleResult(episode_id=episode.episode_id, executable=False, capital_usdc=capital_usdc)
     result.available_depth_usdc = episode.first_available_depth_usd
@@ -393,6 +404,101 @@ class PortfolioResult:
         }
 
 
+def simulate_independent(
+    episodes: Sequence[Episode],
+    *,
+    capital_usdc: float,
+    book_for: Callable[[Episode], OrderBook | None],
+    **single_kwargs: object,
+) -> IndependentResult:
+    """Size every episode against the full stake, as if it stood alone.
+
+    This is the answer to "what if I put 100 USDC on *this* opportunity" -
+    asked once per episode. Nothing is shared: the first episode's fill
+    does not reduce what the second one may use, because they are separate
+    hypotheticals rather than positions in one account.
+
+    Which is exactly why their totals must not be presented as one account.
+    The sum of ten independent "if I had staked 100 here" answers is not
+    "I would have had 1000" - it is ten separate questions, each assumed to
+    have its own stake. ``IndependentResult.as_dict()`` says so on every
+    payload instead of letting a total imply a balance that never existed.
+    """
+    if capital_usdc <= 0:
+        raise ValueError(f"capital_usdc must be > 0, got {capital_usdc!r}")
+
+    results: list[SingleResult] = []
+    for episode in episodes:
+        results.append(
+            simulate_single(
+                episode,
+                capital_usdc=capital_usdc,
+                book=book_for(episode),
+                **single_kwargs,  # type: ignore[arg-type]
+            )
+        )
+    return IndependentResult(capital_usdc=capital_usdc, results=results)
+
+
+@dataclass(slots=True)
+class IndependentResult:
+    """A set of single-opportunity hypotheticals, deliberately unsummed."""
+
+    capital_usdc: float
+    results: list[SingleResult] = field(default_factory=list)
+
+    @property
+    def executable_count(self) -> int:
+        return sum(1 for r in self.results if r.executable)
+
+    @property
+    def not_executable_count(self) -> int:
+        return sum(1 for r in self.results if not r.executable)
+
+    @property
+    def capacity_limited_count(self) -> int:
+        return sum(1 for r in self.results if r.capacity_limited)
+
+    @property
+    def per_opportunity_expected_edge(self) -> list[float]:
+        """Edges of the executable results, kept separate on purpose.
+
+        Not summed: ten of these sharing one row would invite the reader to
+        add them, and the sum has no referent - there is no account that
+        held ten stakes at once.
+        """
+        return [
+            r.theoretical_expected_net_edge_usdc
+            for r in self.results
+            if r.executable and r.theoretical_expected_net_edge_usdc is not None
+        ]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "mode": "single_opportunity",
+            "capital_usdc": self.capital_usdc,
+            "evaluated_opportunities": len(self.results),
+            "executable_count": self.executable_count,
+            "not_executable_count": self.not_executable_count,
+            "capacity_limited_count": self.capacity_limited_count,
+            # A list, never a total: these are independent hypotheticals.
+            "per_opportunity_expected_edge": self.per_opportunity_expected_edge,
+            "combined_expected_edge": None,
+            "statistical_scope": ["reference_capital_hypothetical"],
+            "warnings": [
+                "Each result assumes its own reference stake, held "
+                "independently of every other result.",
+                "There is deliberately no combined total: ten separate "
+                "'if I staked N here' answers are not one account holding "
+                "ten stakes, and summing them would describe money never held.",
+                "Reference capital is a research assumption, not a funded "
+                "account, not a virtual position and not realised profit.",
+                "Actual profit is N/A: this system places no orders.",
+            ],
+            "results": [r.as_dict() for r in self.results],
+        }
+
+
 def simulate_portfolio(
     episodes: Sequence[Episode],
     *,
@@ -424,11 +530,37 @@ def simulate_portfolio(
     )
     balance = capital_usdc
     per_opportunity_cap = capital_usdc * max_allocation_fraction
+    funds_exhausted = False
 
     for episode in sorted(episodes, key=lambda e: e.first_seen_utc):
+        # Decide what this episode may spend *before* pricing it. Pricing at
+        # the full cap and trimming the result afterwards leaves shares,
+        # fees and expected edge describing a position that was never
+        # funded - which is how a portfolio reports a profit on money it
+        # did not have.
+        available = min(per_opportunity_cap, balance)
+        if available <= 0:
+            if not funds_exhausted:
+                outcome.not_backtestable_reasons.append(
+                    "capital exhausted before all opportunities were funded"
+                )
+                funds_exhausted = True
+            outcome.results.append(
+                SingleResult(
+                    episode_id=episode.episode_id,
+                    executable=False,
+                    not_executable_reason=NotExecutable.NO_FUNDS,
+                    capital_usdc=per_opportunity_cap,
+                    theoretical_edge_per_share=episode.first_edge,
+                    notes=["no reference capital remained for this opportunity"],
+                )
+            )
+            outcome.not_executable_count += 1
+            continue
+
         single = simulate_single(
             episode,
-            capital_usdc=per_opportunity_cap,
+            capital_usdc=available,
             book=book_for(episode),
             **single_kwargs,  # type: ignore[arg-type]
         )
@@ -438,26 +570,38 @@ def simulate_portfolio(
             outcome.not_executable_count += 1
             continue
 
+        used = single.capital_used_usdc
+        if used <= 0:
+            # Sized but not spendable: treat it as unfunded rather than
+            # counting a position that contributes nothing.
+            single.executable = False
+            single.not_executable_reason = NotExecutable.NO_FUNDS
+            outcome.not_executable_count += 1
+            continue
+
+        if used > balance:  # pragma: no cover - guards the invariant
+            raise AssertionError(
+                f"allocated {used} exceeds the remaining balance {balance}: "
+                "pricing must never exceed the funds it was given"
+            )
+
         outcome.executable_count += 1
         if single.capacity_limited:
             outcome.capacity_limited_count += 1
-
-        needed = min(single.capital_required_usdc, per_opportunity_cap)
-        if needed > balance:
-            single.notes.append("allocation capped by remaining balance")
-            needed = balance
-        if needed <= 0:
-            outcome.not_backtestable_reasons.append("capital exhausted before all opportunities")
-            continue
-
-        single.capital_used_usdc = needed
-        outcome.allocated_total_usdc += needed
-        balance -= needed
+        outcome.allocated_total_usdc += used
+        balance -= used
         outcome.peak_open_allocation_usdc = max(
             outcome.peak_open_allocation_usdc, outcome.allocated_total_usdc
         )
 
     outcome.balance_remaining_usdc = balance
+
+    # The core invariant, checked rather than asserted in prose.
+    if outcome.allocated_total_usdc > capital_usdc + 1e-9:
+        raise AssertionError(
+            f"allocated {outcome.allocated_total_usdc} exceeds the reference "
+            f"capital {capital_usdc}"
+        )
 
     if outcome.executable_count == 0:
         outcome.backtestable = False

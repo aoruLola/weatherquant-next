@@ -337,22 +337,41 @@ export default function Performance() {
             </div>
 
             <div className="text-xs text-muted">
-              <div>
-                理论预期收益（组合）：
-                {capitalData.theoretical_expected_net_edge_usdc == null
-                  ? 'N/A — 无可执行机会'
-                  : fmtUsd(capitalData.theoretical_expected_net_edge_usdc)}
-              </div>
-              <div>
-                理论预期 ROI：
-                {capitalData.theoretical_expected_roi == null
-                  ? 'N/A'
-                  : fmtPct(Number(capitalData.theoretical_expected_roi))}
-              </div>
-              <div>
-                同时占用峰值：{fmtUsd(capitalData.peak_open_allocation_usdc)} · 余额：
-                {fmtUsd(capitalData.balance_remaining_usdc)}
-              </div>
+              {capitalData.mode === 'single_opportunity' ? (
+                <>
+                  <div>
+                    每个机会各自持有参考本金，互不占用
+                  </div>
+                  <div>
+                    可执行机会的独立理论收益：
+                    {(capitalData.per_opportunity_expected_edge ?? []).length === 0
+                      ? 'N/A — 无可执行机会'
+                      : `${(capitalData.per_opportunity_expected_edge as number[]).length} 个机会，各自独立`}
+                  </div>
+                  <div className="font-medium">
+                    不提供合并总额：十个"各自投入 N"的答案不是一个持有十份本金的账户
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div>
+                    理论预期收益（组合）：
+                    {capitalData.theoretical_expected_net_edge_usdc == null
+                      ? 'N/A — 无可执行机会'
+                      : fmtUsd(capitalData.theoretical_expected_net_edge_usdc)}
+                  </div>
+                  <div>
+                    理论预期 ROI：
+                    {capitalData.theoretical_expected_roi == null
+                      ? 'N/A'
+                      : fmtPct(Number(capitalData.theoretical_expected_roi))}
+                  </div>
+                  <div>
+                    同时占用峰值：{fmtUsd(capitalData.peak_open_allocation_usdc)} · 余额：
+                    {fmtUsd(capitalData.balance_remaining_usdc)}
+                  </div>
+                </>
+              )}
               <div>
                 经历史数据验证的模拟收益：
                 {capitalData.backtestable === false

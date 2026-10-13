@@ -26,7 +26,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from weatherquant.dashboard.config import DashboardSettings
 from weatherquant.dashboard.sources import JsonSource, SnapshotSources, freshness_of
-from weatherquant.performance.capital import book_from_mapping, simulate_portfolio
+from weatherquant.performance.capital import (
+    book_from_mapping,
+    simulate_independent,
+    simulate_portfolio,
+)
 from weatherquant.performance.episodes import episode_from_mapping
 
 __all__ = [
@@ -113,6 +117,41 @@ def performance_win_rate(state: PerformanceState, now: datetime) -> tuple[dict[s
     return payload.model_dump(), freshness
 
 
+def _paginate(
+    payload: PerformancePayload,
+    *,
+    rows: list[Any],
+    limit: int,
+    cursor: int,
+    collection: str,
+) -> dict[str, Any]:
+    """Slice ``rows`` and build a response that carries only the slice.
+
+    The snapshot's own ``data`` block holds the complete collection, so it
+    is dropped rather than spread: otherwise ``limit`` would bound nothing
+    and a large history would make one page cost the whole history - which
+    is also how the gateway's 2 MiB ceiling gets tripped by a request that
+    asked for fifty rows.
+
+    ``data`` is not simply removed either. The UI decides "this snapshot is
+    missing" from an empty ``data`` block, so an empty one here would make a
+    successful page render as an unavailable one. It keeps the counts.
+    """
+    window = rows[cursor : cursor + limit]
+    envelope = payload.model_dump()
+    envelope.pop("data", None)
+    envelope["items"] = window
+    envelope["total"] = len(rows)
+    envelope["next_cursor"] = (cursor + limit) if cursor + limit < len(rows) else None
+    envelope["data"] = {
+        "collection": collection,
+        "returned": len(window),
+        "total": len(rows),
+        "cursor": cursor,
+    }
+    return envelope
+
+
 def performance_opportunities(
     state: PerformanceState, now: datetime, *, limit: int = 50, cursor: int = 0
 ) -> tuple[dict[str, Any], Any]:
@@ -125,13 +164,7 @@ def performance_opportunities(
         }, freshness
 
     rows = list(payload.data.get("episodes") or [])
-    window = rows[cursor : cursor + limit]
-    return {
-        **payload.model_dump(),
-        "items": window,
-        "total": payload.data.get("total", len(rows)),
-        "next_cursor": (cursor + limit) if cursor + limit < len(rows) else None,
-    }, freshness
+    return _paginate(payload, rows=rows, limit=limit, cursor=cursor, collection="episodes"), freshness
 
 
 def performance_settlements(
@@ -144,14 +177,9 @@ def performance_settlements(
             "items": [], "total": 0, "next_cursor": None,
             "statistical_scope": [], "warnings": [],
         }, freshness
+
     rows = list(payload.data.get("answers") or [])
-    window = rows[cursor : cursor + limit]
-    return {
-        **payload.model_dump(),
-        "items": window,
-        "total": len(rows),
-        "next_cursor": (cursor + limit) if cursor + limit < len(rows) else None,
-    }, freshness
+    return _paginate(payload, rows=rows, limit=limit, cursor=cursor, collection="answers"), freshness
 
 
 def performance_models(state: PerformanceState, now: datetime) -> tuple[dict[str, Any], Any]:
@@ -207,29 +235,27 @@ def performance_reference_capital(
             token_id=episode.key.market_id,
         )
 
-    result = simulate_portfolio(
-        episodes,
-        capital_usdc=capital_usdc,
-        max_allocation_fraction=max_allocation_fraction,
-        book_for=_book_for,
-    )
-    payload_out = result.as_dict()
     if mode == "single_opportunity":
-        # Same computation, reported per opportunity rather than shared: the
-        # stake is imagined independently for each episode instead of split.
-        per_episode = simulate_portfolio(
+        # Each episode gets the whole stake, independently. Not the portfolio
+        # simulator with the fraction dialled up: that still drains one
+        # shared balance, so the second opportunity would be priced against
+        # money the first one already spent.
+        payload_out = simulate_independent(
+            episodes, capital_usdc=capital_usdc, book_for=_book_for
+        ).as_dict()
+        source = "weatherquant.performance.capital.simulate_independent"
+    else:
+        payload_out = simulate_portfolio(
             episodes,
             capital_usdc=capital_usdc,
-            max_allocation_fraction=1.0,
+            max_allocation_fraction=max_allocation_fraction,
             book_for=_book_for,
-        )
-        payload_out["mode"] = mode
-        payload_out["single_opportunity"] = per_episode.as_dict()
-    else:
-        payload_out["mode"] = mode
+        ).as_dict()
+        source = "weatherquant.performance.capital.simulate_portfolio"
 
+    payload_out["mode"] = mode
     payload_out["as_of_utc"] = now.isoformat()
     payload_out["generated_at_utc"] = now.isoformat()
     payload_out["sample_size"] = len(episodes)
-    payload_out["source_endpoint"] = "weatherquant.performance.capital.simulate_portfolio"
+    payload_out["source_endpoint"] = source
     return payload_out, freshness

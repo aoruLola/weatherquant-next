@@ -398,7 +398,178 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("report", help="data-quality report")
     p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser(
+        "backfill-settlements",
+        help="ask the platform about conditions and write a settlement index",
+    )
+    p.add_argument(
+        "--markets",
+        required=True,
+        help="JSON list of {market_id, event_id, target_date, condition_id, token_yes}",
+    )
+    p.add_argument(
+        "--verified",
+        help="optional JSON list of {market_id, target_date} that passed observation cross-check",
+    )
+    p.add_argument("--out", required=True, help="where to write the settlement index (JSON)")
+    p.add_argument(
+        "--dataset",
+        required=True,
+        choices=("live", "fixture"),
+        help="what the data actually is; there is no default",
+    )
+    p.add_argument("--timeout", type=float, default=20.0)
+
+    p = sub.add_parser(
+        "build-performance",
+        help="build the six performance snapshots from a decisions export",
+    )
+    p.add_argument(
+        "--export",
+        required=True,
+        help="decisions export (.json / .jsonl / .parquet) published by the shadow",
+    )
+    p.add_argument("--settlements", help="settlement index written by backfill-settlements")
+    p.add_argument("--out", required=True, help="directory to publish the six snapshots into")
+    p.add_argument(
+        "--dataset",
+        required=True,
+        choices=("live", "fixture"),
+        help="what the data actually is; there is no default",
+    )
+    p.add_argument("--capital-usdc", default="100")
+    p.add_argument("--max-allocation-fraction", default="0.10")
+    p.add_argument("--gap-window-seconds", default="900")
     return parser
+
+
+def cmd_backfill_settlements(settings: Settings, args: argparse.Namespace) -> int:
+    """Ask the platform about a list of conditions, and write what it said.
+
+    Never opens the shadow's database: the market list is a file the caller
+    supplies. That is the single-writer rule - the engine owns its DuckDB,
+    and this process reads an export.
+    """
+    from weatherquant.performance.backfill import backfill_settlements
+
+    markets_path = Path(args.markets)
+    if not markets_path.exists():
+        print(f"markets file not found: {markets_path}", file=sys.stderr)
+        return 2
+    with markets_path.open(encoding="utf-8") as handle:
+        markets = json.load(handle)
+    if not isinstance(markets, list):
+        print("markets file must be a JSON list", file=sys.stderr)
+        return 2
+
+    verified_path = Path(args.verified) if args.verified else None
+    verified: list[dict] = []
+    if verified_path is not None:
+        if not verified_path.exists():
+            print(f"verified file not found: {verified_path}", file=sys.stderr)
+            return 2
+        with verified_path.open(encoding="utf-8") as handle:
+            verified = json.load(handle)
+        if not isinstance(verified, list):
+            print("verified file must be a JSON list", file=sys.stderr)
+            return 2
+
+    # httpx, never urllib: the platform refuses Python's default agent.
+    import httpx
+
+    timeout = float(getattr(args, "timeout", 20.0))
+    with httpx.Client(timeout=httpx.Timeout(timeout), follow_redirects=False) as client:
+        rows = backfill_settlements(
+            markets,
+            get_json=_http_get(client),
+            dataset=args.dataset,
+            verified=verified,
+        )
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # Written via a temp file and a rename so a reader never sees half a list.
+    _atomic_write_json(out, rows)
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["settlement_status"]] = counts.get(row["settlement_status"], 0) + 1
+    print(f"wrote {len(rows)} settlement record(s) to {out} (dataset={args.dataset})")
+    print(f"  by status: {counts}")
+    return 0
+
+
+def _http_get(client):
+    """Adapt httpx.Client to the (url, params, timeout) shape fetch_resolution wants."""
+    def _get(url, *, params=None, timeout=20.0):
+        return client.get(url, params=params, timeout=timeout).json()
+
+    return _get
+
+
+def _atomic_write_json(path: Path, payload) -> None:
+    """Write JSON so a reader never sees half a list.
+
+    Temp file in the same directory, fsync, rename. The rename is what makes
+    it atomic on POSIX, and the directory is the same one so it cannot cross
+    a filesystem.
+    """
+    import os
+    import tempfile
+
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=directory, suffix=".tmp", delete=False
+    ) as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = handle.name
+    Path(temporary).replace(path)
+
+
+def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
+    """Turn a decisions export plus settlements into the six snapshots."""
+    from weatherquant.performance.backfill import (
+        build_performance_snapshots,
+        load_decisions,
+        load_settlements,
+    )
+
+    try:
+        decisions = load_decisions(args.export)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"could not read decisions export: {exc}", file=sys.stderr)
+        return 2
+
+    settlements: list[dict] = []
+    if args.settlements:
+        try:
+            settlements = load_settlements(args.settlements)
+        except (OSError, ValueError) as exc:
+            print(f"could not read settlement index: {exc}", file=sys.stderr)
+            return 2
+
+    out = Path(args.out)
+    try:
+        written = build_performance_snapshots(
+            decisions=decisions,
+            settlements=settlements,
+            out_dir=out,
+            dataset=args.dataset,
+            capital_usdc=float(args.capital_usdc),
+            max_allocation_fraction=float(args.max_allocation_fraction),
+            gap_window_seconds=float(args.gap_window_seconds),
+        )
+    except (ValueError, RuntimeError) as exc:
+        print(f"could not build performance snapshots: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"published {len(written)} snapshot(s) to {out} (dataset={args.dataset})")
+    for path in written:
+        print(f"  {path.name}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -418,6 +589,8 @@ def main(argv: list[str] | None = None) -> int:
         "rules": cmd_rules,
         "fit-models": cmd_fit_models,
         "report": cmd_report,
+        "backfill-settlements": cmd_backfill_settlements,
+        "build-performance": cmd_build_performance,
     }
     return handlers[args.command](settings, args)
 

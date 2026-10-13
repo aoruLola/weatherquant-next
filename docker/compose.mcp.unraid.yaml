@@ -34,13 +34,25 @@ x-common: &common
     TZ: UTC
     # The only host this gateway will ever call. A path is not accepted
     # here: the gateway appends its own allowlisted paths.
+    #
+    # Plaintext is allowed only inside networks declared explicitly below.
+    # Declaring nothing means refusing everything - a Docker network is a
+    # convenience, not a security boundary, so trust is granted per CIDR.
     WQ_MCP_DASHBOARD_URL: ${WQ_MCP_DASHBOARD_URL:?set WQ_MCP_DASHBOARD_URL to the dashboard origin, e.g. http://weatherquant-dashboard:8787}
-    # Required whenever the bind address is not loopback. The process refuses
-    # to start without it in that case, rather than starting open.
+    WQ_MCP_PLAINTEXT_NETWORKS: ${WQ_MCP_PLAINTEXT_NETWORKS:?set the internal CIDRs reachable over http, e.g. 172.16.0.0/12}
+    # INBOUND bearer: what an MCP client must present to *us*. Required
+    # whenever the bind address is not loopback; the process refuses to
+    # start without it rather than starting open.
     WQ_MCP_TOKEN: ${WQ_MCP_TOKEN:-}
+    # OUTBOUND credential: what we present to the dashboard. A different
+    # secret from the line above - neither defaults to the other, and the
+    # inbound bearer is never forwarded upstream.
+    WQ_MCP_DASHBOARD_TOKEN: ${WQ_MCP_DASHBOARD_TOKEN:-}
     # Browser origins allowed to call it, comma separated. Empty means
     # "no browser origin is accepted", which is correct for stdio agents.
     WQ_MCP_ALLOWED_ORIGINS: ${WQ_MCP_ALLOWED_ORIGINS:-}
+    # Host header values accepted, for DNS-rebinding protection.
+    WQ_MCP_ALLOWED_HOSTS: ${WQ_MCP_ALLOWED_HOSTS:-}
     WQ_MCP_HOST: 0.0.0.0
     WQ_MCP_PORT: "8788"
     WQ_MCP_RATE: ${WQ_MCP_RATE:-60}

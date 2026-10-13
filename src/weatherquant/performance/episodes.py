@@ -90,6 +90,11 @@ class Episode:
     mode: str | None
     end_reason: str
     market_question: str | None = None
+    #: The market's own fee rate at the decision instant. Carried because
+    #: ``execution_cost`` refuses to assume a fee of zero when none is
+    #: reported - without it every sizing comes back FEE_UNKNOWN, and the
+    #: whole reference-capital feature would be a fixture that never fires.
+    fee_rate: float | None = None
 
     @property
     def duration_seconds(self) -> float:
@@ -128,6 +133,7 @@ class Episode:
             "first_model_probability": self.first_model_probability,
             "first_available_depth_usd": self.first_available_depth_usd,
             "end_reason": self.end_reason,
+            "fee_rate": self.fee_rate,
         }
 
 
@@ -146,6 +152,7 @@ class _OpenEpisode:
     station: str | None = None
     bracket_label: str | None = None
     market_question: str | None = None
+    fee_rate: float | None = None
 
     def observe(self, row: _DecisionRow) -> None:
         self.last_seen = row.decided_at_utc
@@ -164,6 +171,8 @@ class _OpenEpisode:
             self.bracket_label = row.bracket_label
         if self.market_question is None:
             self.market_question = row.market_question
+        if self.fee_rate is None:
+            self.fee_rate = row.fee_rate
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +193,7 @@ class _DecisionRow:
     station: str | None = None
     bracket_label: str | None = None
     market_question: str | None = None
+    fee_rate: float | None = None
 
     @property
     def key(self) -> EpisodeKey:
@@ -258,6 +268,7 @@ def row_from_mapping(row: dict) -> _DecisionRow:
         market_price=_finite(row.get("market_price")),
         model_probability=_finite(row.get("model_probability")),
         available_depth_usd=_finite(row.get("available_depth_usd")),
+        fee_rate=_finite(row.get("fee_rate")),
         station=_normalise(row.get("station")),
         bracket_label=_normalise(row.get("bracket_label")),
         market_question=_normalise(row.get("market_question")),
@@ -308,6 +319,7 @@ def episode_from_mapping(row: Mapping[str, Any]) -> Episode:
         mode=mode,
         end_reason=str(row.get("end_reason") or EndReason.END_OF_DATA),
         market_question=_normalise(row.get("market_question")),
+        fee_rate=_finite(row.get("fee_rate")),
     )
 
 
@@ -345,6 +357,7 @@ def _close(open_ep: _OpenEpisode, *, reason: str, gap_missing: bool) -> Episode:
         # claim a gap was classified at all.
         end_reason=EndReason.END_OF_DATA if reason == EndReason.END_OF_DATA else reason,
         market_question=open_ep.market_question,
+        fee_rate=open_ep.fee_rate,
     )
 
 
@@ -421,6 +434,7 @@ def build_episodes(
                     station=row.station,
                     bracket_label=row.bracket_label,
                     market_question=row.market_question,
+                    fee_rate=row.fee_rate,
                 )
             else:
                 current.observe(row)

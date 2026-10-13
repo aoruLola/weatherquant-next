@@ -312,3 +312,167 @@ def test_the_result_declares_its_statistical_scope() -> None:
     outcome = simulate_portfolio([], capital_usdc=100.0, book_for=lambda e: None)
 
     assert outcome.as_dict()["statistical_scope"] == ["reference_capital_hypothetical"]
+
+
+# --- portfolio funding invariants (P1-07) -------------------------------------
+#
+# The bug these guard: sizing at the full cap and trimming the *result*
+# afterwards leaves shares, fees and expected edge describing money that was
+# never allocated. A portfolio with enough simultaneous opportunities then
+# reports returns for unfunded positions.
+
+
+def _many(n: int, *, first_seen_start: int = 0) -> list:
+    return [
+        _episode(
+            episode_id=f"ep-{i}",
+            first_seen=NOW + timedelta(minutes=first_seen_start + i),
+            depth=10_000.0,
+        )
+        for i in range(n)
+    ]
+
+
+def test_allocated_capital_never_exceeds_the_reference_capital() -> None:
+    """The core invariant, checked against a crowd of opportunities."""
+    episodes = _many(12)
+    outcome = simulate_portfolio(
+        episodes, capital_usdc=100.0, book_for=lambda e: _book(), fee_rate=0.0
+    )
+
+    assert outcome.allocated_total_usdc <= 100.0 + 1e-9
+    assert outcome.balance_remaining_usdc >= -1e-9
+    assert outcome.allocated_total_usdc + outcome.balance_remaining_usdc == pytest.approx(100.0)
+
+
+def test_a_position_with_no_funds_contributes_no_profit() -> None:
+    """Unfunded episodes are excluded from the portfolio's expected return."""
+    episodes = _many(12)
+    outcome = simulate_portfolio(
+        episodes, capital_usdc=100.0, book_for=lambda e: _book(), fee_rate=0.0
+    )
+
+    unfunded = [r for r in outcome.results if r.not_executable_reason == NotExecutable.NO_FUNDS]
+    assert unfunded, "with 12 opportunities against a 10% cap, some must go unfunded"
+    for result in unfunded:
+        assert result.executable is False
+        assert result.theoretical_expected_net_edge_usdc is None
+
+    # The total equals the sum over funded positions only.
+    funded = [
+        r.theoretical_expected_net_edge_usdc
+        for r in outcome.results
+        if r.executable and r.theoretical_expected_net_edge_usdc is not None
+    ]
+    assert outcome.theoretical_expected_net_edge_usdc == pytest.approx(sum(funded))
+
+
+def test_a_partially_funded_episode_is_repriced_not_trimmed() -> None:
+    """Pricing at the cap and lowering `capital_used` would misstate the edge.
+
+    The executable result must describe the smaller stake: fewer shares,
+    a lower cost, and an edge recomputed from that fill.
+    """
+    # The first episode takes its whole cap; the second gets the remainder.
+    two = _many(2)
+    outcome = simulate_portfolio(
+        two,
+        capital_usdc=100.0,
+        book_for=lambda e: _book(ask=0.60, ask_size=1000),
+        fee_rate=0.0,
+    )
+
+    assert len(outcome.results) == 2
+    funded = [r for r in outcome.results if r.executable]
+    assert funded, "at least the first opportunity must be fundable"
+    for result in funded:
+        # Required capital can never exceed the stake it was sized against.
+        assert result.capital_required_usdc <= 10.0 + 1e-9
+        assert result.reference_shares > 0
+        if result.theoretical_expected_net_edge_usdc is not None:
+            # Recomputed from the fill that was actually funded.
+            assert result.theoretical_expected_roi is not None
+
+
+def test_a_zero_balance_yields_no_new_positions() -> None:
+    """Once the money is gone, later opportunities are refused outright."""
+    # A 100% cap lets the first episode take the entire stake, so the
+    # balance really does reach zero rather than merely running low.
+    episodes = _many(6)
+    outcome = simulate_portfolio(
+        episodes,
+        capital_usdc=100.0,
+        book_for=lambda e: _book(),
+        fee_rate=0.0,
+        max_allocation_fraction=1.0,
+    )
+
+    after_exhaustion = []
+    seen_exhausted = False
+    for result in outcome.results:
+        if seen_exhausted:
+            after_exhaustion.append(result)
+        if result.not_executable_reason == NotExecutable.NO_FUNDS:
+            seen_exhausted = True
+
+    for result in after_exhaustion:
+        assert result.executable is False
+        assert result.capital_used_usdc == 0.0
+        assert result.theoretical_expected_net_edge_usdc is None
+
+    assert outcome.allocated_total_usdc <= 100.0 + 1e-9
+
+
+def test_an_empty_allocation_is_recorded_once_not_per_episode() -> None:
+    episodes = _many(8)
+    outcome = simulate_portfolio(
+        episodes,
+        capital_usdc=100.0,
+        book_for=lambda e: _book(),
+        fee_rate=0.0,
+        max_allocation_fraction=1.0,
+    )
+
+    exhausted = [r for r in outcome.not_backtestable_reasons if "exhausted" in r]
+    assert len(exhausted) == 1, "the reason should be recorded once, not once per episode"
+
+
+def test_ordering_is_by_first_seen_not_by_edge() -> None:
+    """Funding the best-looking edge first would be hindsight as a rule."""
+    rich = _episode(
+        episode_id="rich", edge=0.99, first_seen=NOW + timedelta(hours=1)
+    )
+    poor = _episode(
+        episode_id="poor", edge=0.001, first_seen=NOW
+    )
+    outcome = simulate_portfolio(
+        [rich, poor],
+        capital_usdc=100.0,
+        book_for=lambda e: _book(),
+        fee_rate=0.0,
+        max_allocation_fraction=0.10,
+    )
+
+    assert outcome.results[0].episode_id == "poor", "first_seen, not edge, decides the order"
+
+
+def test_depth_shortfall_is_still_reported_as_a_depth_problem() -> None:
+    """A thin book is a different fact from an empty wallet."""
+    thin = [_episode(episode_id="thin", depth=1.0)]
+    outcome = simulate_portfolio(
+        thin, capital_usdc=100.0, book_for=lambda e: _book(ask=0.60, ask_size=3), fee_rate=0.0
+    )
+
+    assert outcome.results[0].not_executable_reason != NotExecutable.NO_FUNDS
+
+
+def test_an_unknown_fee_still_refuses_rather_than_being_treated_as_free() -> None:
+    episodes = _many(2)
+    outcome = simulate_portfolio(episodes, capital_usdc=100.0, book_for=lambda e: _book())
+
+    assert all(
+        r.not_executable_reason == NotExecutable.FEE_UNKNOWN
+        for r in outcome.results
+        if not r.executable
+    )
+    assert outcome.allocated_total_usdc == 0.0

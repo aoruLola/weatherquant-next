@@ -21,6 +21,9 @@ token has protected nothing.
 from __future__ import annotations
 
 import ipaddress
+import re
+import socket
+from collections.abc import Callable, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -28,9 +31,11 @@ import httpx
 
 __all__ = [
     "ALLOWED_PATHS",
+    "ALLOWED_PATH_PATTERNS",
     "ClientError",
     "DashboardClient",
     "TimeoutError",
+    "resolve_path",
 ]
 
 #: The only paths this gateway will ever request. Adding one is a decision,
@@ -55,11 +60,57 @@ ALLOWED_PATHS = frozenset(
     }
 )
 
-#: Refuse to send research data over plaintext, except to loopback where
-#: there is no network to observe it.
-_ALLOW_PLAINTEXT_LOOPBACK = True
+#: Routes with one interpolated segment. An exact set cannot express
+#: ``/api/v1/markets/<id>`` - matching it by substring would also admit
+#: ``/api/v1/markets/../shadow/report``, so the pattern is anchored and the
+#: segment is restricted to characters that cannot form a traversal.
+#:
+#: Dots are excluded deliberately: a market id is an integer, and ``..`` is
+#: the whole reason a naive prefix check is unsafe.
+ALLOWED_PATH_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^/api/v1/markets/[A-Za-z0-9_-]{1,64}$"),
+)
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
+#: Resolver is injectable so the network-boundary check is testable without
+#: touching real DNS - and so a test can prove a name resolving outside the
+#: trusted networks is refused.
+Resolver = Callable[[str], list[str]]
+
+
+def _dns_resolver(host: str) -> list[str]:
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return []
+    return sorted({info[4][0] for info in infos})
+
+
+def resolve_path(path: str) -> str:
+    """Return ``path`` if the gateway is allowed to request it.
+
+    Two shapes are accepted: an exact member of the allowlist, or a pattern
+    from ``ALLOWED_PATH_PATTERNS``. Anything containing a percent sign, a
+    query, a fragment or a dot is refused before matching - those are the
+    characters that turn an anchored pattern into a bypass, and none of them
+    appear in any path this gateway legitimately builds.
+    """
+    if not path:
+        raise ValueError("path must not be empty")
+    if any(ch in path for ch in ("%", "?", "#")):
+        raise ValueError(
+            f"path {path!r} may not contain percent-encoding, a query or a fragment"
+        )
+    if path in ALLOWED_PATHS:
+        return path
+    for pattern in ALLOWED_PATH_PATTERNS:
+        if pattern.match(path):
+            return path
+    raise ValueError(
+        f"path {path!r} is not in the gateway's allowlist; add it to "
+        "ALLOWED_PATHS or ALLOWED_PATH_PATTERNS deliberately, not here"
+    )
 
 
 class ClientError(Exception):
@@ -79,23 +130,88 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def _validate_base_url(base_url: str) -> str:
+def _parse_networks(raw: Sequence[str] | str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    text = raw if isinstance(raw, str) else ",".join(raw)
+    networks = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(part, strict=False))
+        except ValueError as exc:
+            raise ValueError(f"invalid plaintext network {part!r}: {exc}") from exc
+    return tuple(networks)
+
+
+def _validate_base_url(
+    base_url: str,
+    *,
+    allow_plaintext_networks: Sequence[str] | str = (),
+    resolver: Resolver | None = None,
+) -> str:
+    """Validate the *upstream target* the gateway will call.
+
+    This is a destination, not a bind address. A listener on ``0.0.0.0`` is
+    a normal way to accept connections inside a container; validating it as
+    if it were a URL we intended to fetch from is a category error that
+    stops the shipped image from starting.
+
+    Plaintext to a non-loopback host is allowed only when the operator has
+    explicitly declared the internal networks where it may happen, *and*
+    the name resolves inside one of them. Declaring nothing means refusing
+    everything - a Docker network is a convenience, not a security boundary,
+    so trust is granted per CIDR rather than assumed from the topology.
+    """
     parts = urlsplit(base_url)
     if parts.scheme not in {"http", "https"}:
         raise ValueError(f"unsupported scheme {parts.scheme!r} in base URL")
     if not parts.hostname:
         raise ValueError("base URL must include a host")
-    if parts.scheme == "http" and not _is_loopback(parts.hostname):
-        raise ValueError(
-            "refusing a plaintext base URL that is not loopback: performance "
-            "and settlement data would cross the network unencrypted"
-        )
     if parts.path and parts.path not in {"", "/"}:
         raise ValueError(
             "base URL must be an origin, not a path - the gateway appends "
             "its own allowlisted paths"
         )
-    return base_url.rstrip("/")
+    if parts.scheme == "https" or _is_loopback(parts.hostname):
+        return base_url.rstrip("/")
+
+    networks = _parse_networks(allow_plaintext_networks)
+    if not networks:
+        raise ValueError(
+            "refusing a plaintext base URL that is not loopback: performance "
+            "and settlement data would cross the network unencrypted. Set "
+            "WQ_MCP_PLAINTEXT_NETWORKS to the internal CIDRs this gateway "
+            "may reach over http (for example 172.16.0.0/12), or use https."
+        )
+
+    resolve = resolver or _dns_resolver
+    addresses = resolve(parts.hostname)
+    if not addresses:
+        raise ValueError(
+            f"could not resolve {parts.hostname!r} to check it against the "
+            "configured plaintext networks"
+        )
+
+    candidates: list[ipaddress._BaseAddress] = []
+    for address in addresses:
+        try:
+            candidates.append(ipaddress.ip_address(address.split("%")[0]))
+        except ValueError:
+            continue
+    if not candidates:
+        raise ValueError(f"resolved {parts.hostname!r} to no usable address")
+
+    for candidate in candidates:
+        for network in networks:
+            if candidate in network:
+                return base_url.rstrip("/")
+
+    raise ValueError(
+        f"{parts.hostname!r} resolved to {', '.join(map(str, candidates))}, which is "
+        f"outside the configured plaintext networks "
+        f"({', '.join(str(n) for n in networks)}); refusing to send data there in clear text"
+    )
 
 
 class DashboardClient:
@@ -109,13 +225,22 @@ class DashboardClient:
         max_response_bytes: int = MAX_RESPONSE_BYTES,
         token: str | None = None,
         user_agent: str = "weatherquant-mcp/0.1.4",
+        allow_plaintext_networks: Sequence[str] | str = (),
+        resolver: Resolver | None = None,
     ) -> None:
-        self.base_url = _validate_base_url(base_url)
+        self.base_url = _validate_base_url(
+            base_url,
+            allow_plaintext_networks=allow_plaintext_networks,
+            resolver=resolver,
+        )
         self.timeout_seconds = timeout_seconds
         self.max_response_bytes = max_response_bytes
         headers = {"User-Agent": user_agent, "Accept": "application/json"}
         if token:
-            # Never logged, never echoed in an error, never returned.
+            # This is the *outbound* credential - what we present to the
+            # dashboard. It is a different secret from the bearer token an
+            # inbound MCP client presents to us, and it is never copied from
+            # one to the other. Never logged, never echoed in an error.
             headers["Authorization"] = f"Bearer {token}"
         self._client = httpx.Client(
             base_url=self.base_url,
@@ -141,11 +266,9 @@ class DashboardClient:
         audit trail is more useful than a token is secret, but not at the
         price of the token.
         """
-        if path not in ALLOWED_PATHS:
-            raise ValueError(
-                f"path {path!r} is not in the gateway's allowlist; add it to "
-                "weatherquant.mcp.client.ALLOWED_PATHS deliberately, not here"
-            )
+        # Resolved here rather than trusted: the allowlist is the only thing
+        # standing between a tool argument and an outbound request.
+        resolve_path(path)
         try:
             response = self._client.get(path, params=params)
         except httpx.TimeoutException as exc:

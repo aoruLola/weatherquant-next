@@ -18,6 +18,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from weatherquant.dashboard.api import create_app
+from weatherquant.markets.models import OrderBook
 from weatherquant.performance.snapshot import build_performance, publish_performance
 
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
@@ -36,19 +37,43 @@ def _decision(i: int) -> dict:
         "market_price": 0.6,
         "model_probability": 0.65,
         "available_depth_usd": 500.0,
+        "fee_rate": 0.0,
         "station": "KLGA",
         "bracket_label": "81°F",
         "market_question": "Will it be 81F?",
     }
 
 
+def _book() -> OrderBook:
+    from weatherquant.markets.models import BookLevel
+
+    return OrderBook(
+        market_id="m-0",
+        token_id="tok-0",
+        bids=(BookLevel(price_usd_per_share=0.58, size_shares=500.0),),
+        asks=(BookLevel(price_usd_per_share=0.60, size_shares=500.0),),
+        venue_ts=None,
+        fetched_at_utc=datetime.now(tz=UTC),
+    )
+
+
 def _publish(directory) -> None:
-    """Write real snapshots straight to the directory the API will read."""
+    """Write real snapshots straight to the directory the API will read.
+
+    Published with the wall clock rather than a fixed stamp: freshness is
+    judged against now, so a fixture pinned to an hour ago drifts out of
+    its own window as the day passes and the assertion starts failing for
+    reasons that have nothing to do with the endpoint under test.
+    """
     payloads = build_performance(
         decisions=[_decision(i) for i in range(30)],
         settlements=[],
-        now=NOW,
+        now=datetime.now(tz=UTC),
         dataset="fixture",
+        # Supply levels so the capital endpoints have something to size
+        # against. Without them every result is NOT_EXECUTABLE and the
+        # difference between the two modes cannot be observed at all.
+        book_for=lambda _e: _book(),
     )
     publish_performance(payloads, directory)
 
@@ -184,6 +209,7 @@ def test_reference_capital_names_the_module_that_computed_it(published) -> None:
 
 
 def test_changing_the_capital_changes_the_allocation(tmp_path, settings_for) -> None:
+    """A cached answer would not respond to the stake the caller asked about."""
     from helpers import build_tree
 
     root = tmp_path / "live"
@@ -198,15 +224,12 @@ def test_changing_the_capital_changes_the_allocation(tmp_path, settings_for) -> 
 
     assert small["capital_usdc"] == 100.0
     assert large["capital_usdc"] == 500.0
-    # The backfill had no book levels, so nothing can be sized at either
-    # stake. Allocation stays zero rather than scaling with the number - a
-    # figure that grew with the stake would mean we had priced against
-    # something other than a book. The stake still changes what the caller
-    # is asking about, which is echoed above.
-    assert small["allocated_total_usdc"] == 0.0
-    assert large["allocated_total_usdc"] == 0.0
-    assert small["backtestable"] is False
-    assert any("no episode could be sized" in r for r in small["not_backtestable_reasons"])
+    # Books are published with the fixture, so both stakes actually fund
+    # something - and the larger one must fund more of it.
+    assert small["allocated_total_usdc"] > 0.0
+    assert large["allocated_total_usdc"] >= small["allocated_total_usdc"]
+    assert large["allocated_total_usdc"] <= 500.0 + 1e-9
+    assert small["backtestable"] is not False or small["executable_count"] > 0
 
 
 def test_single_opportunity_mode_reports_both_views(tmp_path, settings_for) -> None:
@@ -224,8 +247,12 @@ def test_single_opportunity_mode_reports_both_views(tmp_path, settings_for) -> N
         ).json()["data"]
 
     assert data["mode"] == "single_opportunity"
-    assert "single_opportunity" in data
-    assert "results" in data, "the shared-stake view stays available alongside it"
+    assert data["source_endpoint"] == "weatherquant.performance.capital.simulate_independent"
+    # No combined total: ten "if I staked N here" answers are not one
+    # account holding ten stakes, so the sum is deliberately withheld.
+    assert data.get("combined_expected_edge") is None
+    assert data["per_opportunity_expected_edge"]
+    assert any("independently" in w for w in data["warnings"])
 
 
 def test_a_portfolio_never_spends_more_than_the_stake(tmp_path, settings_for) -> None:
@@ -242,3 +269,48 @@ def test_a_portfolio_never_spends_more_than_the_stake(tmp_path, settings_for) ->
 
     assert data["allocated_total_usdc"] <= 50.0
     assert data["balance_remaining_usdc"] >= 0.0
+
+
+def test_single_opportunity_sizes_every_episode_against_the_full_stake(tmp_path, settings_for) -> None:
+    """The two modes must differ, and differ in the way they are defined.
+
+    Portfolio: one stake, shared, so later opportunities get what is left.
+    Single opportunity: each episode gets the whole stake on its own, so the
+    first one spending capital must not shrink what the second may use.
+
+    Asserted on the *shape* of allocation rather than a specific figure -
+    the invariant is "independent", and independence is visible in whether
+    an earlier episode constrained a later one.
+    """
+    from helpers import build_tree
+
+    root = tmp_path / "live"
+    build_tree(root, archive=False)
+    settings = settings_for(root)
+    _publish(settings.performance_data_dir)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        single = client.get(
+            "/api/v1/performance/reference-capital?capital_usdc=100&mode=single_opportunity"
+        ).json()["data"]
+        portfolio = client.get(
+            "/api/v1/performance/reference-capital?capital_usdc=100&mode=portfolio"
+        ).json()["data"]
+
+    single_used = [r["capital_used_usdc"] for r in single["results"] if r["executable"]]
+    assert single_used, "the fixture publishes books, so some episodes must be executable"
+
+    # Every executable episode in single mode is sized against its own stake,
+    # not against a shrinking remainder.
+    assert all(used > 0 for used in single_used)
+    assert single["executable_count"] == len(single_used)
+    assert sum(single_used) > 100.0, (
+        "single-opportunity results are separate hypotheticals; their sum "
+        "is not a balance and may exceed the stake"
+    )
+
+    # Portfolio is the opposite: one stake, never overspent.
+    assert portfolio["allocated_total_usdc"] <= 100.0 + 1e-9
+    assert portfolio["mode"] == "portfolio"
+    assert portfolio["executable_count"] <= single["executable_count"]

@@ -24,6 +24,8 @@ it is a credential store.
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import hmac
 import logging
 import threading
@@ -38,9 +40,47 @@ __all__ = [
     "RateLimitError",
     "RequestGuard",
     "audit_event",
+    "current_caller",
+    "identify_credential",
+    "reset_caller",
 ]
 
 log = logging.getLogger("weatherquant.mcp.audit")
+
+#: Who is making this call, for rate limiting.
+#:
+#: Set only by the HTTP middleware after a credential has been checked - a
+#: client cannot supply its own identity, because nothing reads an
+#: ``X-Client-Id``. Falls back to one shared bucket when no credential is
+#: configured, which is the safe degradation: everyone shares a quota
+#: rather than everyone getting a private one.
+_caller: contextvars.ContextVar[str] = contextvars.ContextVar("mcp_caller", default="anonymous")
+
+
+def current_caller() -> str:
+    """The authenticated caller for this context, or ``"anonymous"``."""
+    return _caller.get()
+
+
+def reset_caller(token: contextvars.Token[str] | None = None) -> None:
+    """Restore the previous caller. Called by the middleware after each request."""
+    if token is not None:
+        _caller.reset(token)
+
+
+def identify_credential(presented: str | None) -> str:
+    """A stable, non-reversible id for the credential that was presented.
+
+    Deliberately a hash rather than the token itself: the id is written to
+    audit logs and used as a rate-limit key, and a log that contains its
+    own credential is a credential store. The digest is salted with a fixed
+    constant only so that the output is not simply the token - it is an
+    identifier, not a secret.
+    """
+    if not presented:
+        return "anonymous"
+    digest = hashlib.sha256(f"weatherquant-mcp:{presented}".encode()).hexdigest()
+    return f"caller-{digest[:16]}"
 
 
 class OriginError(Exception):
@@ -86,6 +126,11 @@ class RequestGuard:
         self._allowed_origins = frozenset(allowed_origins)
         self._rate = rate_limit_per_minute
         self._max_concurrent = max_concurrent
+        # A per-caller ceiling alone is not a ceiling: N callers each taking
+        # their own share still add up to N times it. The global one is what
+        # actually protects the process.
+        self._max_global_concurrent = max_concurrent * 4
+        self._global_in_flight = 0
         self._lock = threading.Lock()
         self._state: dict[str, _WindowState] = {}
 
@@ -113,6 +158,12 @@ class RequestGuard:
             raise AuthError("incorrect bearer token")
 
     def acquire(self, client_key: str) -> None:
+        """Take a slot for this caller, and one for the process as a whole.
+
+        ``client_key`` is the *caller*, never the tool. Keying by tool would
+        hand one caller a separate quota per tool while making unrelated
+        callers share a single one - both directions are wrong.
+        """
         now = time.monotonic()
         with self._lock:
             state = self._state.setdefault(client_key, _WindowState())
@@ -120,20 +171,32 @@ class RequestGuard:
                 state.stamps.popleft()
             if len(state.stamps) >= self._rate:
                 raise RateLimitError(
-                    f"rate limit of {self._rate} calls per minute exceeded"
+                    f"rate limit of {self._rate} calls per minute exceeded for this caller"
                 )
             if state.in_flight >= self._max_concurrent:
                 raise RateLimitError(
-                    f"concurrency limit of {self._max_concurrent} in-flight calls exceeded"
+                    f"concurrency limit of {self._max_concurrent} in-flight calls exceeded "
+                    "for this caller"
+                )
+            if self._global_in_flight >= self._max_global_concurrent:
+                raise RateLimitError(
+                    f"server concurrency limit of {self._max_global_concurrent} exceeded"
                 )
             state.stamps.append(now)
             state.in_flight += 1
+            self._global_in_flight += 1
 
     def release(self, client_key: str) -> None:
+        """Return this caller's slot and the process-wide one.
+
+        Only ever called after a successful ``acquire``, so both counters
+        come back down together - a rejected acquire never took a slot.
+        """
         with self._lock:
             state = self._state.get(client_key)
             if state is not None and state.in_flight > 0:
                 state.in_flight -= 1
+                self._global_in_flight = max(self._global_in_flight - 1, 0)
 
     def require_token(self) -> None:
         if self._token is None:

@@ -192,12 +192,15 @@ def test_a_network_error_never_propagates_as_a_traceback() -> None:
         "/api/v1/admin/drop",
         "/etc/passwd",
         "/api/v1/../../etc/passwd",
+        "/api/v1/markets/../shadow/report",
+        "/api/v1/markets/%2e%2e/shadow/report",
+        "/api/v1/markets/562360?full=1",
         "",
     ],
 )
 def test_a_path_outside_the_allowlist_is_refused(path) -> None:
     gateway = _gateway(lambda r: _payload({}))
-    with pytest.raises(ValueError, match="allowlist"):
+    with pytest.raises(ValueError, match=r"allowlist|must not be empty|percent-encoding"):
         gateway.call_raw("probe", path)
 
 

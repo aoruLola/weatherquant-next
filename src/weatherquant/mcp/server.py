@@ -16,13 +16,14 @@ a confident wrong sentence in a chat window.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from weatherquant.mcp import GATEWAY_VERSION
 from weatherquant.mcp.client import ClientError, DashboardClient, TimeoutError
-from weatherquant.mcp.security import RequestGuard, audit_event
+from weatherquant.mcp.security import RequestGuard, audit_event, current_caller
 
-__all__ = ["Gateway", "build_server"]
+__all__ = ["Gateway", "build_server", "market_path"]
 
 #: Tools that answer about *now*. The distinction matters because a client
 #: that asks "what is happening" and gets a week-old settlement will
@@ -41,11 +42,15 @@ class Gateway:
 
     def call(self, tool: str, path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Fetch, stamp and return. One place, so every answer looks alike."""
-        self.guard.acquire(tool)
+        # Keyed by the authenticated caller, not by the tool. Keying by tool
+        # would hand one caller a fresh quota per tool while making unrelated
+        # callers contend for a single one.
+        caller = current_caller()
+        self.guard.acquire(caller)
         try:
             payload = self.client.get_json(path, params=params)
         finally:
-            self.guard.release(tool)
+            self.guard.release(caller)
 
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
         freshness = payload.get("freshness") if isinstance(payload.get("freshness"), dict) else {}
@@ -68,11 +73,12 @@ class Gateway:
 
     def call_raw(self, tool: str, path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Fetch without unwrapping - for payloads whose data is a list."""
-        self.guard.acquire(tool)
+        caller = current_caller()
+        self.guard.acquire(caller)
         try:
             payload = self.client.get_json(path, params=params)
         finally:
-            self.guard.release(tool)
+            self.guard.release(caller)
         return {
             "tool_name": tool,
             "source_endpoint": path,
@@ -126,6 +132,30 @@ def _warnings(data: Any, freshness: dict[str, Any], tool: str) -> list[str]:
     if tool in _REALTIME_TOOLS:
         out.append("Figures describe the last published snapshot, not a live trading feed.")
     return out
+
+
+#: One segment, no dots. A market id is an integer from the dashboard, and
+#: refusing dots is what keeps ``..`` from becoming a traversal no matter
+#: what the allowlist pattern later says.
+_MARKET_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def market_path(market_id: str) -> str:
+    """Build the market-detail path from a validated id.
+
+    The id is checked here *and* again by ``resolve_path`` in the client.
+    Two checks on one path is deliberate: this one produces a readable error
+    for a bad argument, and that one is the only thing standing between a
+    tool call and an outbound request - neither is allowed to be the single
+    point of failure for the other's mistake.
+    """
+    candidate = str(market_id or "")
+    if not _MARKET_ID.match(candidate):
+        raise ValueError(
+            f"market_id {market_id!r} is not a valid identifier: expected 1-64 "
+            "characters from A-Z a-z 0-9 _ or -"
+        )
+    return f"/api/v1/markets/{candidate}"
 
 
 def build_server(gateway: Gateway) -> Any:
@@ -205,9 +235,7 @@ def build_server(gateway: Gateway) -> Any:
         ),
     )
     def get_market_detail(market_id: str) -> dict[str, Any]:
-        return gateway.call_raw(
-            "get_market_detail", f"/api/v1/markets/{market_id}"
-        )
+        return gateway.call_raw("get_market_detail", market_path(market_id))
 
     @server.tool(
         name="get_forecasts",

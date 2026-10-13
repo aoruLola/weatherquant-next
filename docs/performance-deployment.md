@@ -66,35 +66,74 @@ Dashboard 需要新增一条只读挂载：
 
 ### 3.2 结算回填
 
-```bash
-# 研究进程读取导出 + Gamma 发现 + Data-API 结算
-weatherquant-research backfill-settlements \
-  --since 2026-10-01 --until 2026-10-13 \
-  --station KLGA
+输入是一份**市场清单文件**（JSON 列表），不是数据库连接：
+
+```json
+[
+  {"market_id": "562360", "event_id": "31936", "target_date": "2026-10-13",
+   "condition_id": "0x1d74…", "token_yes": "2891…", "station": "KLGA"}
+]
 ```
 
-结算判定只采信 **`data-api.polymarket.com/v2/resolutions`**（契约 §4.1 实测
-契约），Gamma 仅作交叉参考。`price="69"` 是哨兵值必须归一为 `None`。
+```bash
+weatherquant-research backfill-settlements \
+  --markets /tmp/markets.json \
+  --out /tmp/settlements.json \
+  --dataset live \
+  --verified /tmp/verified.json
+```
 
-> **本机曾无法直连 Polymarket**（已恢复）。若回填主机不可达上游，
-> 用 `tests/fixtures/polymarket/*.json` 做离线验证，并在结果中标注
-> `dataset: "fixture"`——**不得把 fixture 数据当生产数据发布**。
+| 参数 | 说明 |
+|---|---|
+| `--markets` | **必填**。市场清单 JSON 路径 |
+| `--out` | **必填**。结算索引输出路径 |
+| `--dataset` | **必填**，`live` 或 `fixture`。**没有默认值**——一次未标注的运行会被拒绝 |
+| `--verified` | 可选。已通过观测交叉核对的 `{market_id, target_date}` 列表；不提供时全部记为 `UNVERIFIED` |
+| `--timeout` | 可选，默认 20s |
+
+结算判定只采信 **`data-api.polymarket.com/v2/resolutions`**（契约 §4.1 实测），
+Gamma 仅作交叉参考。`price="69"` 是哨兵值必须归一为 `None`；未决时返回
+`PENDING`，condition 不存在时返回 `UNAVAILABLE`——**不是失败**。
+
+> 该命令**需要能访问 Polymarket**。若主机不可达上游，用
+> `tests/fixtures/polymarket/*.json` 做离线验证，并且必须显式标
+> `--dataset fixture`。**不得把 fixture 结果标记为生产数据。**
 
 ### 3.3 生成 Performance 快照
 
 ```bash
 weatherquant-research build-performance \
-  --export /mnt/user/appdata/weatherquant-shadow/reports/decisions-export.parquet \
-  --research-db /mnt/user/appdata/weatherquant-research/research.duckdb \
+  --export /mnt/user/appdata/weatherquant-shadow/reports/decisions-export.jsonl \
+  --settlements /tmp/settlements.json \
   --out /mnt/user/appdata/weatherquant-performance \
-  --capital-usdc 100
+  --dataset live \
+  --capital-usdc 100 \
+  --max-allocation-fraction 0.10
 ```
 
+| 参数 | 说明 |
+|---|---|
+| `--export` | **必填**。决策导出，支持 `.json` / `.jsonl` / `.parquet`（parquet 需 pyarrow） |
+| `--out` | **必填**。快照输出目录 |
+| `--dataset` | **必填**，`live` 或 `fixture`。**没有默认值** |
+| `--settlements` | 可选。§3.2 产出的结算索引 |
+| `--capital-usdc` | 默认 100，必须 > 0 |
+| `--max-allocation-fraction` | 默认 0.10，研究假设而非已验证的风险规则 |
+| `--gap-window-seconds` | 默认 900 |
+
 写入是**原子的**（临时文件 + fsync + rename），读者永远看不到半个 JSON。
-六个文件同时发布，Dashboard 与 MCP 读取同一份结果。
+六个文件**一次性全部构建后**才写入：中途失败会保留上一份完整集合，
+不会留下三个新、三个旧的混合状态。
 
 **不发布快照 ≠ 出错。** Dashboard 会显示 `missing` + "回填尚未产生该快照"，
 不会显示 0，也不会编造图表。
+
+验证命令确实存在：
+
+```bash
+weatherquant-research --help          # 应列出 backfill-settlements 与 build-performance
+weatherquant-research build-performance --help
+```
 
 ---
 
@@ -109,7 +148,7 @@ weatherquant-research build-performance \
 | 3 | 执行回填（§3），确认六个文件已原子发布 |
 | 4 | Dashboard **Apply**（新镜像 `sha-<commit>`） |
 | 5 | 验证 `/api/v1/performance/summary` 返回 `fresh` |
-| 6 | MCP compose 填入 `MCP_SHA` / `WQ_MCP_DASHBOARD_URL` / `WQ_MCP_TOKEN` |
+| 6 | MCP compose 填入 `MCP_SHA` / `WQ_MCP_DASHBOARD_URL` / `WQ_MCP_PLAINTEXT_NETWORKS` / `WQ_MCP_TOKEN` |
 | 7 | MCP **Apply** |
 | 8 | 验证 `/healthz` 与工具发现 |
 
@@ -168,7 +207,30 @@ Dashboard 随即显示 `missing`，不会显示错误数据。
 网关只监听 **`127.0.0.1:8788`**（默认）。远程客户端必须经你自行运维的
 **带认证的 HTTPS 反向代理**——网关本身不终止 TLS。
 
-### 7.1 本地 Agent（stdio，无需 token）
+### 7.1 环境变量
+
+| 变量 | 方向 | 说明 |
+|---|---|---|
+| `WQ_MCP_DASHBOARD_URL` | 出站 | Dashboard 原点。**必填** |
+| `WQ_MCP_PLAINTEXT_NETWORKS` | 出站 | 允许明文 http 的内部 CIDR，逗号分隔。**未设置则拒绝所有非回环明文** |
+| `WQ_MCP_TOKEN` | **入站** | MCP 客户端必须出示的 Bearer |
+| `WQ_MCP_DASHBOARD_TOKEN` | **出站** | 我们向 Dashboard 出示的凭据。**与入站是两个不同的秘密** |
+| `WQ_MCP_ALLOWED_ORIGINS` | 入站 | 允许的浏览器 Origin，逗号分隔。空 = 拒绝所有浏览器 Origin |
+| `WQ_MCP_ALLOWED_HOSTS` | 入站 | Host 头白名单（DNS rebinding 防护） |
+
+**入站 Bearer 永远不会转发给 Dashboard。** 两者独立配置、独立轮换。
+
+`WQ_MCP_PLAINTEXT_NETWORKS` 的取值示例（Docker 默认网段）：
+
+```
+WQ_MCP_PLAINTEXT_NETWORKS=172.16.0.0/12,192.168.0.0/16,10.0.0.0/8
+```
+
+> Docker 网络**不是**完整的安全边界。它是便利设施，不是信任边界——
+> 所以明文放行是**按 CIDR 显式授予**的，而不是因为"在同一个 compose
+> 里"就默认成立。名字必须解析到这些网段之内，否则拒绝。
+
+### 7.2 本地 Agent（stdio，无需 token）
 
 ```json
 {
@@ -182,7 +244,7 @@ Dashboard 随即显示 `missing`，不会显示错误数据。
 }
 ```
 
-### 7.2 远程客户端（Streamable HTTP，必须带 token）
+### 7.3 远程客户端（Streamable HTTP，必须带 token）
 
 ```json
 {
@@ -199,7 +261,7 @@ Dashboard 随即显示 `missing`，不会显示错误数据。
 > 不同客户端对自定义 MCP 的支持与订阅档位各不相同，请以该客户端
 > **当时的官方文档**为准；本文件不假定所有计划都能直接安装。
 
-### 7.3 密钥轮换
+### 7.4 密钥轮换
 
 改 `WQ_MCP_TOKEN` → **Apply**（重启容器）。无状态、无旧 token 残留、
 无需迁移。轮换后旧凭据立即失效。
