@@ -56,6 +56,12 @@ def build_report(con, *, now: datetime | None = None, horizon_days: int = 7) -> 
             "uptime_seconds": uptime,
         }
 
+    # How many runs this database file has ever held. Every decision aggregate
+    # below counts rows across all of them - nothing in this module filters by
+    # run_id and nothing anywhere deletes them - so this number is what stops
+    # the totals from being read as "since this process started".
+    runs_in_database = int(_one(con, "SELECT COUNT(*) FROM shadow_runs") or 1)
+
     counts = {
         row[0]: _table_count(con, row[0])
         for row in con.execute(
@@ -116,7 +122,18 @@ def build_report(con, *, now: datetime | None = None, horizon_days: int = 7) -> 
             "all_reasons": all_reasons,
             "p95_decision_latency_ms": latency,
             "by_model": _by_model(con),
-            "accept_scope": _accept_scope(con),
+            "accept_scope": _accept_scope(con, runs_in_database=runs_in_database),
+            # Scope of every number in this block. It is *not* the current
+            # process: nothing here filters on run_id and nothing deletes
+            # decisions, so a restart adds to these totals instead of
+            # resetting them. `cycles` in the heartbeat is the one counter
+            # that does start at zero, which is exactly how the two got
+            # mistaken for each other.
+            "window": (
+                f"cumulative over this shadow database's lifetime "
+                f"({runs_in_database} run(s) recorded); a restart does not reset it"
+            ),
+            "runs_in_database": runs_in_database,
         },
         "theoretical_edge": edge,
         "prediction_quality": _prediction_quality(con, now),
@@ -188,7 +205,7 @@ def _by_model(con) -> dict[str, dict[str, Any]]:
     return dict(sorted(out.items()))
 
 
-def _accept_scope(con) -> dict[str, Any]:
+def _accept_scope(con, *, runs_in_database: int) -> dict[str, Any]:
     """How many *independent* observations an ACCEPT total actually contains.
 
     The engine re-evaluates every open market on every cycle, so a single
@@ -199,6 +216,12 @@ def _accept_scope(con) -> dict[str, Any]:
 
     Token is the decided market's ``token_yes``: a buy_yes and a sell_yes on
     the same bracket are two reads of the same book, not two instruments.
+
+    Scope: the whole database, not this process. ``shadow_decisions`` is never
+    filtered by ``run_id`` and never deleted, so a restart **adds** to these
+    numbers. ``scope`` / ``runs_in_database`` travel with the payload so a
+    reader never has to guess, and a zeroed ``cycles`` counter in the heartbeat
+    can never be mistaken for these totals falling.
     """
     obs, markets, pairs, target_dates = con.execute(
         """
@@ -226,7 +249,12 @@ def _accept_scope(con) -> dict[str, Any]:
         "accepted_distinct_market_directions": distinct_pairs,
         "accepted_repeats": max(observations - distinct_pairs, 0),
         "models_with_decisions": int(model_count),
-        "window": "cumulative for the current run",
+        "scope": "shadow_database_lifetime",
+        "runs_in_database": int(runs_in_database),
+        "window": (
+            f"cumulative over this shadow database's lifetime "
+            f"({runs_in_database} run(s) recorded); a restart does not reset it"
+        ),
         "note": (
             "an ACCEPT is one evaluation of one market in one cycle, not one "
             "opportunity: the same bracket is counted again on every later "

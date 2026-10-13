@@ -189,6 +189,7 @@ point-in-time：只携带当时的 run 与训练截止，不允许出现"已知�
 | WS 队列长度/高水位/丢帧 | ✅ 可用（Collector ≥ v0.1.2） | 心跳 `telemetry.ws_queue{depth, high_water, capacity, frames_dropped}`；旧版无字段时 UI 显示"暂未接入" |
 | Shadow 数据库大小 / 版本 | ✅ 可用* | 心跳 `db_bytes` / `app_version` / `image_tag`；旧版无字段时 UI 显示"暂未接入" |
 | ACCEPT 独立度（独立市场 / Token / 重复周期） | ✅ 可用* | report `decisions.accept_scope`；*同上 |
+| 决策计数的**统计范围** | ✅ 已标注 | `decisions.window` + `decisions.runs_in_database`；范围是**整个 shadow 数据库**，不是当前进程。见 §4.1 |
 | 目标日是否已结束（纽约自然日） | ✅ 可用 | `MarketSummary.target_day_ended`，由 `local_day_bounds_utc` 判定，**不是**宿主机时钟 |
 | 收益曲线 | ❌ 结构性禁止 | report 恒为 null，UI 原样传递 |
 
@@ -259,6 +260,35 @@ UI 从 `unavailable` 变为实时数据，需要以下条件**全部**满足：
 同一轮里 Dashboard 还新增了三样**不属于**本节集成的东西（它们各自有字段、
 有测试，且不依赖上面任何一条）：Shadow 的 `app_version`/`db_bytes`、
 `decisions.accept_scope`、`MarketSummary.target_day_ended`。
+
+### 4.1 决策计数的统计范围：整个数据库，不是当前进程
+
+**这是契约事实，不是实现细节。** `report.decisions` 下的每一个数字
+（`evaluated` / `accepted` / `rejected` / `no_trade` / `data_unavailable` /
+`by_mode` / `by_model` / `primary_reasons` / `accept_scope`）都统计的是
+**这份 shadow 数据库里全部的历史决策行**。
+
+依据（三条独立证据，缺一不可地指向同一结论）：
+
+1. `report.py` 里没有任何一条聚合查询带 `run_id` 过滤；
+2. 代码库中不存在任何 `DELETE FROM shadow_decisions`；
+3. `/data` 是持久 bind mount，`shadow_runs` 已记录 4 次启动
+   （`data_quality.by_kind.shadow_started.count = 4`），而当前 run 是
+   16:29 UTC 才开始的。
+
+**唯一按进程归零的是心跳里的 `cycles`。** 把两者当成同一个东西，
+就会把"重启"读成"机会消失了"——这正是必须防止的误读。
+
+因此：
+
+- `decisions.window` 与 `decisions.accept_scope.window` 给出完整范围说明；
+- `decisions.runs_in_database` / `accept_scope.runs_in_database` 是可核对的数字；
+- `accept_scope.scope = "shadow_database_lifetime"` 是机器可读的枚举；
+- Dashboard 在 Decisions 页顶部用 `totals-scope` banner 原样呈现，
+  并明写"Shadow 重启不会清零这些计数"。
+
+> 代价也写在这里：**范围不可选**。当前无法只看"本次运行"的子集——
+> 需要它就要在查询里加 `run_id` 过滤，那是下一轮的事，本轮不改统计语义。
 
 ## 5. HTTP API 映射（消费者侧）
 

@@ -240,7 +240,7 @@ export default function Overview() {
                       <ModeBadge mode="REPLAY" />
                       <span className="tnum">ACCEPT {fmtInt(Number(totals.replay_accepted ?? 0))}</span>
                     </span>
-                    <span>窗口：{String(totals.window ?? '—')}</span>
+                    <span title={String(totals.window ?? '')}>窗口：全库累计（重启不清零）</span>
                     <Link
                       to="/decisions"
                       className="ml-auto inline-flex items-center gap-1 font-medium text-accent hover:underline"

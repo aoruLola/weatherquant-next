@@ -123,6 +123,30 @@ export default function Decisions() {
         也不会生成收益曲线。REPLAY 数据是历史回放，不是当时可做出的决策。
       </Banner>
 
+      {/*
+        Scope of everything in this block, stated before any of it is read.
+        These counts span the shadow database, not the process: nothing filters
+        on run_id and nothing deletes decisions, so a restart adds to them.
+        The heartbeat's `cycles` counter *does* start at zero, and the two were
+        being read as the same thing - which is how a restart came to look like
+        opportunities disappearing.
+      */}
+      {totals && (
+        <div className="mb-4">
+          <Banner tone="info" title="统计范围" testId="totals-scope">
+            {String(
+              totals.window ??
+                'cumulative over this shadow database’s lifetime; a restart does not reset it',
+            )}
+            {totals.runs_in_database != null && (
+              <> · 已记录 {fmtInt(Number(totals.runs_in_database))} 次运行</>
+            )}
+            <> · 本页所有 ACCEPT / REJECT / NO_TRADE / 已评估均属此范围</>
+            <> · Shadow 重启不会清零这些计数</>
+          </Banner>
+        </div>
+      )}
+
       <div className="my-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard
           testId="stat-accept"
@@ -148,7 +172,7 @@ export default function Decisions() {
           testId="stat-evaluated"
           label="已评估 evaluated"
           value={fmtInt(totals?.evaluated ?? 0)}
-          sub={totals ? String(totals.window ?? '') : 'report 未发布'}
+          sub="全库累计 · 见上方统计范围"
         />
       </div>
 
@@ -163,7 +187,7 @@ export default function Decisions() {
           testId="accept-scope"
           className="mb-4"
           title="ACCEPT 的独立度"
-          hint={String(totals.accept_scope.note ?? '')}
+          hint={`${String(totals.accept_scope.note ?? '')} · 范围：全库累计，重启不清零`}
           bodyClassName="p-3.5"
         >
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">

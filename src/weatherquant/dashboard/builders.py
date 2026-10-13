@@ -55,6 +55,13 @@ from weatherquant.markets.models import Side
 from weatherquant.shadow.health import evaluate_shadow_health
 from weatherquant.weather.daily_max import local_day_bounds_utc
 
+#: What the decision aggregates cover, for the case where the report predates
+#: the field. Nothing in the shadow report filters on run_id and nothing
+#: deletes decisions, so these totals span the database, not the process.
+_DATABASE_LIFETIME_WINDOW = (
+    "cumulative over this shadow database's lifetime; a restart does not reset it"
+)
+
 __all__ = [
     "DashboardState",
     "collector_health",
@@ -727,7 +734,11 @@ def decisions(
             "replay_accepted": dec.get("replay_accepted"),
             "primary_reasons": dec.get("primary_reasons") or {},
             "p95_decision_latency_ms": dec.get("p95_decision_latency_ms"),
-            "window": "cumulative for the current run",
+            # Taken from the report, never restated here: the scope is a fact
+            # about how the numbers were counted, and a second copy of the
+            # sentence is how the two drift apart.
+            "window": dec.get("window") or _DATABASE_LIFETIME_WINDOW,
+            "runs_in_database": dec.get("runs_in_database"),
         }
         totals_status = report_freshness.state
         totals_source = "shadow-report"
@@ -900,7 +911,8 @@ def overview(state: DashboardState, now: datetime) -> tuple[OverviewData, Freshn
             "by_mode": dec.get("by_mode") or {},
             "live_accepted": dec.get("live_accepted"),
             "replay_accepted": dec.get("replay_accepted"),
-            "window": "cumulative for the current run",
+            "window": dec.get("window") or _DATABASE_LIFETIME_WINDOW,
+            "runs_in_database": dec.get("runs_in_database"),
         }
         totals_status = report_freshness.state
         totals_source = "shadow-report"
