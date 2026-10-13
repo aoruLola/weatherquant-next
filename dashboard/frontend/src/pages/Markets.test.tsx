@@ -72,6 +72,33 @@ describe('Markets', () => {
     expect(screen.getByTestId('markets-empty')).toHaveTextContent('collector raw archive not found')
   })
 
+  it('never calls a market whose New York day has ended ACTIVE', async () => {
+    mockFetch({
+      '/api/v1/markets': envelopeOf(
+        marketsFixture([marketFixture({ target_day_ended: true })]),
+      ),
+    })
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('market-card')).toBeInTheDocument())
+    expect(screen.getByText('目标日已过')).toBeInTheDocument()
+    expect(screen.queryByText('ACTIVE')).not.toBeInTheDocument()
+  })
+
+  it('opens on tradeable markets instead of the whole archive tail', async () => {
+    const fetchMock = mockFetch({
+      '/api/v1/markets': envelopeOf(marketsFixture([marketFixture()])),
+    })
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('market-card')).toBeInTheDocument())
+    await waitFor(() => {
+      const urls = fetchMock.mock.calls.map((c) => String(c[0]))
+      expect(urls.some((u) => u.includes('status=tradeable'))).toBe(true)
+    })
+    expect(screen.getByLabelText('市场状态')).toHaveValue('tradeable')
+  })
+
   it('passes filter changes into the polled URL', async () => {
     const fetchMock = mockFetch({ '/api/v1/markets': envelopeOf(marketsFixture([marketFixture()])) })
     renderPage()

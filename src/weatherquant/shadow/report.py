@@ -56,6 +56,12 @@ def build_report(con, *, now: datetime | None = None, horizon_days: int = 7) -> 
             "uptime_seconds": uptime,
         }
 
+    # How many runs this database file has ever held. Every decision aggregate
+    # below counts rows across all of them - nothing in this module filters by
+    # run_id and nothing anywhere deletes them - so this number is what stops
+    # the totals from being read as "since this process started".
+    runs_in_database = int(_one(con, "SELECT COUNT(*) FROM shadow_runs") or 1)
+
     counts = {
         row[0]: _table_count(con, row[0])
         for row in con.execute(
@@ -115,11 +121,24 @@ def build_report(con, *, now: datetime | None = None, horizon_days: int = 7) -> 
             "primary_reasons": reasons,
             "all_reasons": all_reasons,
             "p95_decision_latency_ms": latency,
+            "by_model": _by_model(con),
+            "accept_scope": _accept_scope(con, runs_in_database=runs_in_database),
+            # Scope of every number in this block. It is *not* the current
+            # process: nothing here filters on run_id and nothing deletes
+            # decisions, so a restart adds to these totals instead of
+            # resetting them. `cycles` in the heartbeat is the one counter
+            # that does start at zero, which is exactly how the two got
+            # mistaken for each other.
+            "window": (
+                f"cumulative over this shadow database's lifetime "
+                f"({runs_in_database} run(s) recorded); a restart does not reset it"
+            ),
+            "runs_in_database": runs_in_database,
         },
         "theoretical_edge": edge,
         "prediction_quality": _prediction_quality(con, now),
         "liquidity": _liquidity(con),
-        "coverage": _coverage(con, now, horizon_days=horizon_days),
+        "coverage": _coverage(con, horizon_days=horizon_days),
         "data_quality": _data_quality(con),
         "warnings": _warnings(decision_counts, by_mode),
         "equity_curve": None,
@@ -172,6 +191,77 @@ def _by_mode(con) -> dict[str, dict[str, Any]]:
         if state == "ACCEPT":
             entry["accepted"] += int(n)
     return dict(sorted(out.items()))
+
+
+def _by_model(con) -> dict[str, dict[str, Any]]:
+    """State counts per model, so a decision total can never be read as if
+    every model contributed the same number of judgements."""
+    out: dict[str, dict[str, Any]] = {}
+    for model, state, n in con.execute(
+        "SELECT COALESCE(model_name, 'unknown'), state, COUNT(*) "
+        "FROM shadow_decisions GROUP BY 1, 2"
+    ).fetchall():
+        out.setdefault(str(model), {})[str(state)] = int(n)
+    return dict(sorted(out.items()))
+
+
+def _accept_scope(con, *, runs_in_database: int) -> dict[str, Any]:
+    """How many *independent* observations an ACCEPT total actually contains.
+
+    The engine re-evaluates every open market on every cycle, so a single
+    opportunity that stays open for an hour is recorded dozens of times. The
+    raw ACCEPT count is a number of **observations**, not of opportunities -
+    reporting it alone is how a shadow log starts to sound like a track
+    record. Everything here is counted to make that distinction checkable.
+
+    Token is the decided market's ``token_yes``: a buy_yes and a sell_yes on
+    the same bracket are two reads of the same book, not two instruments.
+
+    Scope: the whole database, not this process. ``shadow_decisions`` is never
+    filtered by ``run_id`` and never deleted, so a restart **adds** to these
+    numbers. ``scope`` / ``runs_in_database`` travel with the payload so a
+    reader never has to guess, and a zeroed ``cycles`` counter in the heartbeat
+    can never be mistaken for these totals falling.
+    """
+    obs, markets, pairs, target_dates = con.execute(
+        """
+        SELECT COUNT(*),
+               COUNT(DISTINCT market_id),
+               COUNT(DISTINCT market_id || '|' || COALESCE(direction, '')),
+               COUNT(DISTINCT target_date)
+        FROM shadow_decisions WHERE state = 'ACCEPT'
+        """
+    ).fetchone()
+    tokens = _one(
+        con,
+        "SELECT COUNT(DISTINCT c.token_yes) FROM shadow_decisions d "
+        "JOIN market_catalog c ON c.market_id = d.market_id "
+        "WHERE d.state = 'ACCEPT' AND c.token_yes IS NOT NULL",
+    )
+    model_count = _one(con, "SELECT COUNT(DISTINCT model_name) FROM shadow_decisions") or 0
+    observations = int(obs or 0)
+    distinct_pairs = int(pairs or 0)
+    return {
+        "accepted_observations": observations,
+        "accepted_distinct_markets": int(markets or 0),
+        "accepted_distinct_tokens": int(tokens or 0),
+        "accepted_distinct_target_dates": int(target_dates or 0),
+        "accepted_distinct_market_directions": distinct_pairs,
+        "accepted_repeats": max(observations - distinct_pairs, 0),
+        "models_with_decisions": int(model_count),
+        "scope": "shadow_database_lifetime",
+        "runs_in_database": int(runs_in_database),
+        "window": (
+            f"cumulative over this shadow database's lifetime "
+            f"({runs_in_database} run(s) recorded); a restart does not reset it"
+        ),
+        "note": (
+            "an ACCEPT is one evaluation of one market in one cycle, not one "
+            "opportunity: the same bracket is counted again on every later "
+            "cycle in which it still passes, so accepted_observations >= "
+            "accepted_distinct_markets by construction"
+        ),
+    }
 
 
 def _edge_stats(con) -> dict[str, Any]:
@@ -246,7 +336,7 @@ def _liquidity(con) -> dict[str, Any]:
     }
 
 
-def _coverage(con, now: datetime, *, horizon_days: int) -> dict[str, Any]:
+def _coverage(con, *, horizon_days: int) -> dict[str, Any]:
     open_targets = [
         r[0]
         for r in con.execute(
@@ -273,14 +363,11 @@ def _coverage(con, now: datetime, *, horizon_days: int) -> dict[str, Any]:
     for _market_id, token in token_rows:
         if token and _one(con, "SELECT token_id FROM token_books WHERE token_id = ?", [token]):
             with_book += 1
-    fresh = (
-        _one(
-            con,
-            "SELECT COUNT(*) FROM token_books WHERE shadow_received_at_utc >= ?",
-            [now],
-        )
-        or 0
-    )
+    # How many tokens have ever had a book recorded. This used to filter on
+    # `shadow_received_at_utc >= now`, which can only ever match a row stamped
+    # in the future - so the field read 0 forever while every book on screen
+    # was seconds old. "Total" is what the name says, so that is what it is.
+    books_total = _one(con, "SELECT COUNT(*) FROM token_books") or 0
     return {
         "open_target_dates": [str(d) for d in open_targets],
         "models_tracked": sorted(models),
@@ -290,7 +377,7 @@ def _coverage(con, now: datetime, *, horizon_days: int) -> dict[str, Any]:
         "open_markets": len(token_rows),
         "open_markets_with_a_book": with_book,
         "orderbook_coverage": (with_book / len(token_rows)) if token_rows else None,
-        "books_total": fresh,
+        "books_total": books_total,
         "note": (
             "coverage counts whether an input exists at all; it says nothing "
             "about whether the input is any good"

@@ -56,6 +56,12 @@ testpaths = ["tests"]
 # Project-local temp root: the OS temp directory is not writable on some hosts.
 addopts = "--basetemp=.pytest_tmp"
 filterwarnings = ["ignore::DeprecationWarning"]
+# If a single test wedges, dump every live thread's traceback instead of
+# letting the job die silently at its 15-minute ceiling. Main CI has hung
+# twice at ~53% with no output for 14 minutes and the log could not name the
+# culprit (-q prints a dot per test, not a name). 600s is far above any
+# honest test here - the whole suite runs in ~127s - so a dump means a hang.
+faulthandler_timeout = 600
 
 [tool.ruff]
 line-length = 120

@@ -102,6 +102,10 @@ export interface ShadowHealth {
   disk_free_percent?: number | null
   last_cycle?: Record<string, unknown> | null
   reason?: string | null
+  /** Absent on heartbeats published before these fields existed. */
+  app_version?: string | null
+  image_tag?: string | null
+  db_bytes?: number | null
   [k: string]: unknown
 }
 
@@ -160,6 +164,8 @@ export interface MarketSummary {
   closed: boolean
   accepting_orders: boolean
   tradeable: boolean
+  /** Server-derived: the market's civil day in New York has already ended. */
+  target_day_ended: boolean
   token_yes?: string | null
   book?: BookQuote | null
   model_probability?: number | null

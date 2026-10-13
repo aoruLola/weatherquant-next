@@ -104,6 +104,41 @@ describe('Decisions page', () => {
     expect(screen.getByTestId('stat-accept')).toHaveTextContent('REPLAY 2')
   })
 
+  it('separates repeated ACCEPT cycles from independent markets', async () => {
+    mockFetch({ '/api/v1/decisions': envelopeOf(decisionsFixture()) })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('accept-scope')).toBeInTheDocument())
+    // 3 observations of 1 market: the number that must not be read as 3 chances.
+    expect(screen.getByTestId('stat-accept-observations')).toHaveTextContent('3')
+    expect(screen.getByTestId('stat-accept-markets')).toHaveTextContent('1')
+    expect(screen.getByTestId('stat-accept-tokens')).toHaveTextContent('1')
+    expect(screen.getByTestId('stat-accept-repeats')).toHaveTextContent('2')
+  })
+
+  it('states the statistics span the database, not the process', async () => {
+    mockFetch({ '/api/v1/decisions': envelopeOf(decisionsFixture()) })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('totals-scope')).toBeInTheDocument())
+    const scope = screen.getByTestId('totals-scope')
+    // The failure this guards: a restart zeroes the heartbeat's `cycles`, and
+    // reading that as these totals falling means interpreting a reboot as
+    // opportunities disappearing.
+    expect(scope).toHaveTextContent('restart does not reset it')
+    expect(scope).toHaveTextContent('已记录 2 次运行')
+    expect(scope).toHaveTextContent('Shadow 重启不会清零这些计数')
+  })
+
+  it('says the independence dimensions are unavailable rather than guessing', async () => {
+    const fixture = decisionsFixture()
+    const totals: Record<string, any> = { ...fixture.totals }
+    delete totals.accept_scope
+    mockFetch({ '/api/v1/decisions': envelopeOf({ ...fixture, totals }) })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('accept-scope-unavailable')).toBeInTheDocument())
+    expect(screen.getByTestId('accept-scope-reason')).toHaveTextContent('不可用')
+    expect(screen.queryByTestId('stat-accept-markets')).not.toBeInTheDocument()
+  })
+
   it('sends filter changes to the API', async () => {
     const fetchMock = mockFetch({ '/api/v1/decisions': envelopeOf(decisionsFixture()) })
     renderPage()

@@ -1,23 +1,19 @@
 """Detail snapshots the *shadow engine* can publish from its own connection.
 
-Status: **ready, not yet wired.** The dashboard's row-level views (decision
-list, model-vs-market, probability distributions) can only be built by
-somebody who is allowed to hold ``shadow.duckdb`` - which is the shadow engine
-alone, for its whole life. Another session owns that file, so this module
-delivers the *contract implementation* and the dashboard degrades to explicit
-``unavailable`` until the engine calls :func:`publish_detail_snapshots`.
+Status: **wired.** The dashboard's row-level views (decision list,
+model-vs-market, probability distributions) can only be built by somebody who
+is allowed to hold ``shadow.duckdb`` - which is the shadow engine alone, for
+its whole life. ``weatherquant.shadow.runner._publish_report`` calls
+:func:`publish_detail_snapshots` on the connection it already holds, under the
+same throttle as the report and in its own ``try`` (docs/dashboard-data-contract.md §4);
+the dashboard degrades to explicit ``unavailable`` if that call ever stops
+landing.
 
-Integration (docs/dashboard-data-contract.md §4), from
-``weatherquant.shadow.runner._publish_report`` - three lines, same throttle::
-
-    from weatherquant.dashboard.producer import publish_detail_snapshots
-    publish_detail_snapshots(
-        self.db.con,
-        directory=self.shadow.shadow_report_path.parent,
-        run_id=self.run_id or "",
-        source_version=_app_version(),
-        now=now,
-    )
+Note for anyone touching :func:`build_forecasts_snapshot`: its column list must
+match ``migrations_shadow/0001_shadow_schema.sql``. The first version selected
+a ``bracket_label`` that only existed in this module's own test fixture, and
+the query failed against the real database while every producer test stayed
+green.
 
 Design constraints, same as everywhere else:
 
@@ -370,7 +366,7 @@ def build_forecasts_snapshot(
     horizon = now.date() + timedelta(days=max(horizon_days, 1))
     rows = con.execute(
         """
-        SELECT model_name, model_version, target_date, event_id, bracket_label,
+        SELECT model_name, model_version, target_date, event_id,
                probabilities_json, predicted_max_f, forecast_run_time_utc,
                training_cutoff_utc, forecast_received_at_utc, station
         FROM model_predictions
@@ -386,7 +382,7 @@ def build_forecasts_snapshot(
 
     distributions: list[dict[str, Any]] = []
     for row in rows:
-        model, version, target_date, _event_id, _label, probs_json, predicted_max, run_time, cutoff, received, station = row
+        model, version, target_date, _event_id, probs_json, predicted_max, run_time, cutoff, received, station = row
         try:
             buckets_raw = json.loads(probs_json) if isinstance(probs_json, str) else probs_json
         except json.JSONDecodeError:

@@ -44,6 +44,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from weatherquant.config import Settings
+from weatherquant.dashboard.producer import publish_detail_snapshots
 from weatherquant.data.http import ResilientHttp
 from weatherquant.data.lock import LockError, SingleInstanceLock
 from weatherquant.shadow.config import ShadowSettings, Thresholds
@@ -539,6 +540,35 @@ class ShadowRunner:
                 ],
                 run_id=self.run_id or "",
             )
+        # The row-level detail snapshots (decisions, model-vs-market,
+        # probability distributions) ride the same connection and the same
+        # throttle as the report - see docs/dashboard-data-contract.md §4.
+        # Kept in its own try so a broken detail row still leaves the report
+        # published, and swallowed for the same reason: the dashboard must
+        # never be able to stop the engine.
+        try:
+            publish_detail_snapshots(
+                self.db.con,
+                directory=self.shadow.shadow_report_path.parent,
+                run_id=self.run_id or "",
+                source_version=_app_version(),
+                primary_model=self.shadow.shadow_primary_model,
+                now=now,
+                stale_after_seconds=self.shadow.shadow_report_stale_seconds,
+            )
+        except Exception as exc:
+            log.warning("could not publish the detail snapshots: %s", exc)
+            self.store.record_quality(
+                [
+                    QualityEvent(
+                        kind="detail_publish_failed",
+                        severity="warning",
+                        detail=f"{type(exc).__name__}: {exc}",
+                        ts_utc=now,
+                    )
+                ],
+                run_id=self.run_id or "",
+            )
 
     def _decision_instant(self) -> datetime:
         """The instant decisions are judged against.
@@ -836,6 +866,14 @@ class ShadowRunner:
             "primary_model": self.shadow.shadow_primary_model,
             "disk": {"free_percent": disk},
             "last_cycle": self._last_cycle.as_dict() if self._last_cycle else None,
+            # Identity and size, so an operator can answer "which build is
+            # running" and "how big is the shadow database" without opening
+            # the file - this process holds the lease on it, nobody else can.
+            # db_bytes counts the main file only, the same definition the
+            # collector's heartbeat uses, so the two numbers are comparable.
+            "app_version": _app_version(),
+            "image_tag": os.environ.get("IMAGE_TAG", "unknown"),
+            "db_bytes": _file_size(self.shadow.shadow_db_path),
         }
         try:
             write_heartbeat(path, payload)
@@ -850,6 +888,18 @@ def _app_version() -> str:
         return version("weatherquant-next")
     except Exception:
         return "unknown"
+
+
+def _file_size(path: str | Path) -> int:
+    """Size of a file we are allowed to stat, 0 if it is not there yet.
+
+    ``stat`` never opens the database for reading, so this cannot collide with
+    the lease this process already holds.
+    """
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return 0
 
 
 def free_disk_percent(path: str | Path) -> float | None:

@@ -189,6 +189,11 @@ class ShadowHealthData(BaseModel):
     disk_free_percent: float | None = None
     last_cycle: dict[str, Any] | None = None
     reason: str | None = None
+    # Absent (None) on heartbeats published before these fields existed - the
+    # dashboard reports "暂未接入" rather than guessing at a value.
+    app_version: str | None = None
+    image_tag: str | None = None
+    db_bytes: int | None = None
 
 
 class ShadowReportData(BaseModel):
@@ -261,6 +266,11 @@ class MarketSummary(BaseModel):
     closed: bool = False
     accepting_orders: bool = False
     tradeable: bool = False
+    # Derived, not read from the venue: the market's *civil day in New York*
+    # has already ended. A market can still be accepting orders after its
+    # target date (the exchange has not resolved it yet), and presenting that
+    # next to a current market is the mix this field exists to prevent.
+    target_day_ended: bool = False
     token_yes: str | None = None
     book: BookQuote | None = None
     model_probability: float | None = None

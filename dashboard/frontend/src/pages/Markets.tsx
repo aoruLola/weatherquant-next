@@ -14,6 +14,15 @@ import { daysUntil, fmtAge, fmtProb, fmtUsd, fmtUsdDepth } from '../format'
 import { useNow } from '../useNow'
 import type { MarketSummary, MarketsData } from '../types'
 
+/**
+ * What the page opens on, and what "clear filters" returns to.
+ *
+ * The archive tail also carries markets that closed months ago. Defaulting to
+ * `tradeable` - and marking the ones whose New York day has already ended -
+ * is how this page avoids presenting expired and current markets as one list.
+ */
+const DEFAULT_STATUS = 'tradeable'
+
 function MarketCard({ market }: { market: MarketSummary }) {
   const book = market.book
   const quoteFresh = Boolean(book?.available && !book.stale)
@@ -31,8 +40,31 @@ function MarketCard({ market }: { market: MarketSummary }) {
         </h3>
         <div className="flex shrink-0 flex-col items-end gap-1">
           <StatusChip
-            value={market.closed ? 'stopped' : market.tradeable ? 'live' : 'unknown'}
-            label={market.closed ? 'CLOSED' : market.tradeable ? 'ACTIVE' : 'INACTIVE'}
+            value={
+              market.closed
+                ? 'stopped'
+                : market.target_day_ended
+                  ? 'expired'
+                  : market.tradeable
+                    ? 'live'
+                    : 'unknown'
+            }
+            label={
+              market.closed
+                ? 'CLOSED'
+                : market.target_day_ended
+                  ? '目标日已过'
+                  : market.tradeable
+                    ? 'ACTIVE'
+                    : 'INACTIVE'
+            }
+            title={
+              market.closed
+                ? '市场已关闭'
+                : market.target_day_ended
+                  ? '目标日已经过去，交易所尚未标记关闭；这不是当前机会'
+                  : undefined
+            }
           />
         </div>
       </div>
@@ -126,7 +158,7 @@ function useDebounced<T>(value: T, delayMs: number): T {
 
 export default function Markets() {
   const [date, setDate] = useState('')
-  const [status, setStatus] = useState('all')
+  const [status, setStatus] = useState(DEFAULT_STATUS)
   const [book, setBook] = useState('all')
   const [decision, setDecision] = useState('')
   const [query, setQuery] = useState('')
@@ -215,12 +247,12 @@ export default function Markets() {
             aria-label="搜索"
             data-testid="market-search"
           />
-          {(date || status !== 'all' || book !== 'all' || decision || query) && (
+          {(date || status !== DEFAULT_STATUS || book !== 'all' || decision || query) && (
             <button
               type="button"
               onClick={() => {
                 setDate('')
-                setStatus('all')
+                setStatus(DEFAULT_STATUS)
                 setBook('all')
                 setDecision('')
                 setQuery('')
