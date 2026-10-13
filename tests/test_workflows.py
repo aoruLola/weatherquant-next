@@ -177,3 +177,42 @@ def test_disk_overrides_reach_the_healthcheck_from_the_environment() -> None:
             f"{workflow.name} starts a container without declaring its disk "
             "expectations, so a runner's free space is judged by the NAS threshold"
         )
+
+
+# --- release tags must match the version the image will report ---------------
+
+
+RELEASE_TAG_GUARDS = ("shadow-release.yml", "dashboard-release.yml")
+
+
+def test_every_release_workflow_guards_its_own_tag() -> None:
+    """A release whose tag disagrees with pyproject ships an unidentifiable image.
+
+    ``app_version`` comes from package metadata, i.e. from this file. The
+    drift already happened once - shadow-v0.1.0, shadow-v0.1.1 and v0.1.2 all
+    shipped ``version = "0.1.1"``, so three different builds reported the same
+    string and "which shadow is live" could only be answered from the registry.
+
+    The guard lives in the workflow because that is the only place a tag
+    exists. This test exists because a guard that can be deleted quietly is
+    the same as no guard.
+    """
+    for name in RELEASE_TAG_GUARDS:
+        workflow = REPO_ROOT / ".github" / "workflows" / name
+        assert workflow.exists(), f"{name} is missing"
+        text = workflow.read_text(encoding="utf-8")
+        assert "Release tag must match pyproject version" in text, (
+            f"{name} publishes an image without checking that its tag matches "
+            "pyproject.version, so the image cannot identify itself"
+        )
+        # The check has to actually fail, not just exist as a step name.
+        assert "exit 1" in text
+        assert "pyproject.toml" in text
+
+
+def test_pyproject_version_is_a_single_declared_string() -> None:
+    """The guard parses this shape; if it changes shape the guard stops working."""
+    text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    versions = re.findall(r'^version = "([^"]+)"$', text, flags=re.MULTILINE)
+    assert len(versions) == 1, f"expected exactly one declared version, got {versions}"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", versions[0]), versions[0]
