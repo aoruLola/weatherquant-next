@@ -215,17 +215,66 @@ not_executable_reason ∈ {…见下}
 
 ### 4.1 来源与状态
 
-| 来源 | 用途 | 说明 |
+**本节全部字段已于 2026-10-13 对生产 API 实测核验**（任务 4.1 要求）。
+实测与既有文档有三处出入，实现必须以本节为准。
+
+| 来源 | 用途 | 实测契约 |
 |---|---|---|
-| Polymarket `/v2/resolutions?condition=<conditionId>` | **平台正式结算** | `status=="resolved"`、`was_disputed`、`proposed_price`；`outcomePrices=["0","1"]`；未决时 `price=69` 为**哨兵值**，必须归一为 `None` |
-| Gamma `umaResolutionStatus` / `outcomePrices` | 交叉参考 | 不得单独作为结算依据 |
+| **Data-API** `GET https://data-api.polymarket.com/v2/resolutions?condition=<conditionId>` | **平台正式结算（唯一采信）** | 见下方实测 |
+| Gamma `GET /events?series_slug=nyc-daily-weather` | 发现市场、取 `conditionId` | `umaResolutionStatus`、`outcomePrices`、`resolutionSource` |
+| Gamma `umaResolutionStatus` / `outcomePrices` | 交叉参考 | **不得单独作为结算依据** |
 | KLGA 官方观测（NOAA / GHCN TMAX / IEM） | **独立观测** | 只入 `klga_observations` / `klga_daily_max` |
 | WeatherQuant 研究库 | 历史评分 | 复用现有表 |
 
-> **本机无法直连 Polymarket 域名**（`gamma-api` / `clob` 均不可达）。
-> 上述契约取自 `docs/weather-data-sources.md` 与 `docs/open-source-review.md`
-> 的**既有实测记录**。首次回填必须在具备访问权限的主机执行，
-> 回填前用 §7 的 fixture 做端到端验证。**不得据猜测编写字段。**
+**关键：`/v2/resolutions` 不在 `clob` 也不在 `gamma`**，而在 **`data-api.polymarket.com`**。
+在前两者上请求一律 404（实测）。
+
+#### 实测响应（2026-10-13，真实 conditionId）
+
+已结算：
+
+```json
+{"data": [{
+  "question_id": "0x0ee0…", "condition_id": "0x1d74…",
+  "status": "resolved", "extended_review": false, "was_disputed": false,
+  "proposed_price": "0", "reproposed_price": "69", "price": "0",
+  "transaction_hash": "0x7ac0…", "log_index": "373",
+  "last_update_timestamp": "1791868379"
+}]}
+```
+
+未结算（同一结构，不是空）：
+
+```json
+{"data": [{ "status": "posed", "proposed_price": "69",
+            "reproposed_price": "69", "price": "69", … }]}
+```
+
+不存在的 condition：`{"data": []}`。
+
+#### 实现必须遵守的四条（均为实测得出）
+
+1. **响应包在 `data` 数组里**，不是裸对象。直接 `json["status"]` 会 `KeyError`。
+2. **`price` 是字符串**，不是数字。`"69"` 是哨兵值 → 必须归一为 `None`，
+   否则会把 69 当成每份赔付。判定只认 `price in {"0", "1"}`。
+3. **`status` 不止 resolved**：实测见到 `"posed"`（已提议未定案）。
+   只有 `status == "resolved"` **且** `price in {"0","1"}` 才是已结算。
+4. **必须用 `httpx`，不能用 `urllib`**：Python 默认 UA 触发 Cloudflare
+   `error code: 1010` → HTTP 403（实测）；`httpx` 默认 UA → 200。
+   仓库的 `weatherquant.data.http.ResilientHttp` 已是 httpx，直接复用。
+
+**状态映射**：
+
+| 实测 | 本契约 `settlement_status` |
+|---|---|
+| `status=="resolved"` 且 `price in {"0","1"}` | `RESOLVED` |
+| `was_disputed == true` | `DISPUTED` |
+| `status=="posed"` 或 `price=="69"` | `PENDING` |
+| `{"data": []}`（condition 不存在） | `UNAVAILABLE` |
+| 无法取得响应 / 响应畸形 | `UNVERIFIABLE` |
+
+`transaction_hash` + `log_index` + `last_update_timestamp` 一并落库作
+`raw_source_reference`，使每个结算结论可回溯到链上凭据。
 
 ### 4.2 结构（新增字段在既有研究库之上扩展）
 
