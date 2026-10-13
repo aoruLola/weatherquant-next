@@ -1,0 +1,55 @@
+# WeatherQuant MCP gateway - read-only, and deliberately the least privileged
+# container in the stack.
+#
+# Three rules this file is built around:
+#
+#  1. It gets NO database. The gateway reads the dashboard's HTTP API and
+#     nothing else, so a compromise here cannot reach a DuckDB file - which
+#     is also why the data mounts below are absent rather than read-only.
+#  2. It gets NO docker socket and no Portainer credential. A gateway that
+#     can schedule containers is not a gateway.
+#  3. It runs as a non-root user that owns nothing it can overwrite.
+#
+# The `mcp` dependency group is the only group installed: fastapi and the
+# dashboard's own stack are not needed, so they never enter this image.
+
+FROM python:3.12-slim AS uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.0 /uv /uvx /usr/local/bin/
+
+FROM python:3.12-slim AS builder
+ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1 UV_PYTHON_DOWNLOADS=never
+WORKDIR /app
+COPY --from=uv /uv /uvx /usr/local/bin/
+COPY pyproject.toml uv.lock README.md ./
+# Only the group this image needs. `--no-install-project` first so a changed
+# lock does not force a rebuild of the dependency layer on every commit.
+RUN uv sync --frozen --no-dev --group mcp --no-install-project
+COPY src ./src
+RUN uv sync --frozen --no-dev --group mcp --no-editable
+
+FROM python:3.12-slim AS runtime
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+WORKDIR /app
+
+# A uid that is not root and owns nothing writable outside its own state.
+RUN groupadd --gid 1000 wq && \
+    useradd --uid 1000 --gid wq --no-create-home --shell /usr/sbin/nologin wq
+
+COPY --from=builder /app/.venv /app/.venv
+COPY --chown=wq:wq src ./src
+
+# No data directory: this container has nothing to write and nothing to read
+# from disk. It talks to one configured host over HTTP.
+USER wq
+EXPOSE 8788
+
+# Health is a liveness probe against the process's own listener, not a probe
+# that reaches the dashboard - a gateway whose health depends on its upstream
+# restarts whenever the dashboard has a bad minute.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import socket,os,sys; s=socket.create_connection(('127.0.0.1', int(os.environ.get('WQ_MCP_PORT','8788'))), 2); s.close()"
+
+ENTRYPOINT ["python", "-m", "weatherquant.mcp.main"]
+CMD ["--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8788"]

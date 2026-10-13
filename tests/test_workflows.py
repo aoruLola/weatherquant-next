@@ -292,3 +292,61 @@ def test_shadow_stack_still_refuses_the_properties_it_needs() -> None:
     assert "/collector-raw:ro" in text or "/collector-raw\":ro" in text.replace("'", '"')
     assert "stop_grace_period: 60s" in text
     assert "user: \"1000:1000\"" in text
+
+
+# --- the MCP container must stay the least privileged one --------------------
+
+MCP_COMPOSE = REPO_ROOT / "docker" / "compose.mcp.unraid.yaml"
+MCP_DOCKERFILE = REPO_ROOT / "Dockerfile.mcp"
+
+
+def test_the_mcp_container_has_no_data_mount_at_all() -> None:
+    """The gateway reads an HTTP API; a volume would be a second way in.
+
+    Read-only is not enough here. The security property is that a
+    compromised gateway has no database to reach, and a `:ro` mount still
+    puts the file inside the container where a parser bug can find it.
+    """
+    text = _active_lines(MCP_COMPOSE)
+    assert "volumes:" not in text, "the MCP gateway must mount nothing"
+    assert "docker.sock" not in text, "a gateway that can schedule containers is not a gateway"
+    assert "portainer" not in text.lower()
+
+
+def test_the_mcp_container_binds_loopback_unless_a_token_is_supplied() -> None:
+    """An unauthenticated gateway on a LAN address is an audience nobody chose.
+
+    The port line is loopback by default, and the process itself refuses a
+    non-loopback bind without WQ_MCP_TOKEN - both halves are asserted so
+    neither can be relaxed alone.
+    """
+    text = _active_lines(MCP_COMPOSE)
+    assert '- "127.0.0.1:8788:8788"' in text
+    assert "WQ_MCP_TOKEN" in text
+    assert "WQ_MCP_ALLOWED_ORIGINS" in text
+
+
+def test_the_mcp_image_is_pinned_and_installs_only_its_own_group() -> None:
+    text = _active_lines(MCP_COMPOSE)
+    assert "sha-${MCP_SHA:?" in text, "production must run a pinned SHA"
+    assert ":latest" not in text
+
+    dockerfile = MCP_DOCKERFILE.read_text(encoding="utf-8")
+    assert "--group mcp" in dockerfile
+    assert "--group dashboard" not in dockerfile, (
+        "the dashboard stack's dependencies have no business in the gateway image"
+    )
+    assert "USER wq" in dockerfile
+    assert "read_only: true" in text
+
+
+def test_the_mcp_container_has_no_order_tool_imported() -> None:
+    """No path in this package may reach execution or a wallet."""
+    root = REPO_ROOT / "src" / "weatherquant" / "mcp"
+    offenders: list[str] = []
+    for path in root.rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        for forbidden in ("build_fill_plan", "private_key", "wallet", "sign_order", "place_order"):
+            if forbidden in source:
+                offenders.append(f"{path.name}: {forbidden}")
+    assert not offenders, offenders
