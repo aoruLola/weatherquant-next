@@ -36,6 +36,7 @@ export operate on one day at a time.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -84,8 +85,8 @@ class RawArchive:
         self._seq = 0
         self._last_flush = datetime.now(tz=UTC)
         self._lock = threading.Lock()
-        self._open: dict[tuple[str, date], Any] = {}
         self._closed = False
+        self._write_uncertain = False
         self.records_written = 0
 
     # -- writing -----------------------------------------------------------
@@ -99,22 +100,24 @@ class RawArchive:
         if record.venue_ts_utc is not None and record.venue_ts_utc.tzinfo is None:
             raise ValueError("venue_ts_utc must be timezone-aware")
 
-        self._seq += 1
-        line = json.dumps(
-            {
-                "archive_seq": self._seq,
-                "source": record.source,
-                "received_at_utc": record.received_at_utc.isoformat(),
-                "venue_ts_utc": record.venue_ts_utc.isoformat() if record.venue_ts_utc else None,
-                "venue_ts_origin": record.venue_ts_origin,
-                "quality": record.quality,
-                "run_id": record.run_id,
-                "payload": record.payload,
-            },
-            separators=(",", ":"),
-            default=str,
-        )
         with self._lock:
+            if self._closed or self._write_uncertain:
+                raise RuntimeError("archive is closed or its last write could not be rolled back")
+            self._seq += 1
+            line = json.dumps(
+                {
+                    "archive_seq": self._seq,
+                    "source": record.source,
+                    "received_at_utc": record.received_at_utc.isoformat(),
+                    "venue_ts_utc": record.venue_ts_utc.isoformat() if record.venue_ts_utc else None,
+                    "venue_ts_origin": record.venue_ts_origin,
+                    "quality": record.quality,
+                    "run_id": record.run_id,
+                    "payload": record.payload,
+                },
+                separators=(",", ":"),
+                default=str,
+            )
             self._buffer.append(line)
             due = (
                 len(self._buffer) >= self.flush_records
@@ -124,7 +127,7 @@ class RawArchive:
                 self._flush_locked()
 
     def flush(self) -> int:
-        """Force buffered lines to disk. Returns lines written."""
+        """Write and fsync complete JSONL records. Returns durable lines."""
         with self._lock:
             return self._flush_locked()
 
@@ -133,47 +136,75 @@ class RawArchive:
             if self._closed:
                 return
             self._flush_locked()
-            for fh in self._open.values():
-                fh.close()
-            self._open.clear()
             self._closed = True
 
     # -- internals ---------------------------------------------------------
 
     def _flush_locked(self) -> int:
+        if self._write_uncertain:
+            raise RuntimeError("archive write outcome uncertain; refusing a duplicate-prone retry")
         if not self._buffer:
             self._last_flush = datetime.now(tz=UTC)
             return 0
+
+        # Group without discarding any pending records. A partition is removed
+        # only after its complete bytes have been fsynced. Other partitions
+        # remain retryable if a later one fails.
+        pending: list[tuple[tuple[str, date], str]] = []
         by_file: dict[tuple[str, date], list[str]] = {}
-        # Re-derive the partition from the buffered line so a single buffer can
-        # span a UTC midnight without needing a second buffer.
         for line in self._buffer:
             obj = json.loads(line)
             day = datetime.fromisoformat(obj["received_at_utc"]).astimezone(UTC).date()
-            by_file.setdefault((obj["source"], day), []).append(line)
-        self._buffer.clear()
+            key = (obj["source"], day)
+            pending.append((key, line))
+            by_file.setdefault(key, []).append(line)
 
-        written = 0
+        durable = 0
         for key, lines in by_file.items():
-            fh = self._handle(*key)
-            fh.write("\n".join(lines) + "\n")
-            written += len(lines)
-        self.records_written += written
-        self._last_flush = datetime.now(tz=UTC)
-        return written
+            directory = self.root / key[0]
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"{key[1].isoformat()}.jsonl"
+            payload = ("\n".join(lines) + "\n").encode("utf-8")
+            # O_APPEND protects the line boundary even after a short write.
+            # The collector lock guarantees this process is the sole writer.
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
+            try:
+                original_size = os.fstat(fd).st_size
+                if original_size and os.pread(fd, 1, original_size - 1) != b"\n":
+                    # A torn last line from a previous process must not be
+                    # buried in the JSONL stream. Preserve it for inspection;
+                    # refuse until repaired rather than silently discard it.
+                    raise RuntimeError(f"archive has an unterminated line: {path}")
+                try:
+                    offset = 0
+                    while offset < len(payload):
+                        count = os.write(fd, payload[offset:])
+                        if count <= 0:
+                            raise OSError("archive write made no progress")
+                        offset += count
+                    # os.write completion alone is not a durability promise.
+                    os.fsync(fd)
+                except OSError:
+                    try:
+                        # Remove this attempt's partial bytes before retry.
+                        # Completed historical records remain untouched.
+                        os.ftruncate(fd, original_size)
+                        os.fsync(fd)
+                    except OSError:
+                        # A rollback that cannot be verified means retrying
+                        # could duplicate a complete line. Fail closed.
+                        self._write_uncertain = True
+                    raise
+            finally:
+                os.close(fd)
 
-    def _handle(self, source: str, day: date):
-        key = (source, day)
-        fh = self._open.get(key)
-        if fh is not None:
-            return fh
-        directory = self.root / source
-        directory.mkdir(parents=True, exist_ok=True)
-        # Held open deliberately across appends and released in close(); one
-        # handle per (source, date) partition keeps a day's writes sequential.
-        fh = open(directory / f"{day.isoformat()}.jsonl", "a", encoding="utf-8")  # noqa: SIM115
-        self._open[key] = fh
-        return fh
+            durable += len(lines)
+            self.records_written += len(lines)
+            pending = [(partition, line) for partition, line in pending if partition != key]
+            self._buffer = [line for _, line in pending]
+
+        self._last_flush = datetime.now(tz=UTC)
+        return durable
 
     def __enter__(self) -> RawArchive:
         return self
