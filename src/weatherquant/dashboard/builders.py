@@ -897,8 +897,8 @@ def overview(state: DashboardState, now: datetime) -> tuple[OverviewData, Freshn
     latest_book_age = None
     if report.present and isinstance(report.liveness, dict):
         latest_book_age = _num(report.liveness.get("latest_orderbook_venue_age_seconds"))
-    if latest_book_age is None and archive_freshness.age_seconds is not None:
-        latest_book_age = archive_freshness.age_seconds
+    # The age of the newest archive line can be from Gamma or another
+    # market; it cannot stand in for an orderbook's venue timestamp.
 
     decision_totals: dict[str, Any] | None = None
     totals_status = FreshnessState.MISSING
