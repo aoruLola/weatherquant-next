@@ -31,12 +31,14 @@ import pytest
 from shadow_helpers import (
     NOW,
     TARGET_DATE,
+    FakeRunsClient,
     archive_line,
     book_payload,
     gamma_event,
     write_lines,
 )
 from weatherquant.config import Settings
+from weatherquant.shadow import runner as runner_module
 from weatherquant.shadow.config import ShadowSettings, load_thresholds
 from weatherquant.shadow.runner import RunnerConfig, ShadowRunner
 
@@ -55,6 +57,20 @@ def _close_runners():
     for runner in _RUNNERS:
         runner.close(status="stopped", reason="teardown")
     _RUNNERS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_forecast_fetches(monkeypatch):
+    """Never let a test reach Open-Meteo.
+
+    ``cycle()`` refreshes forecasts, and these settings refresh every tick
+    (``shadow_forecast_refresh_seconds=0.01``). Without the stub each cycle
+    opens a real TLS connection: harmless on a laptop with egress, and on a
+    GitHub runner it wedged main CI for fifteen minutes straight - the job
+    was cancelled at its ceiling with the thread parked in ``ssl.do_handshake``,
+    because ``faulthandler_timeout`` was finally there to say so.
+    """
+    monkeypatch.setattr(runner_module, "SingleRunsClient", FakeRunsClient)
 
 
 def _archive(root, *, rest_lines: int = 6) -> Path:

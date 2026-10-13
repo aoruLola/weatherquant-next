@@ -28,8 +28,10 @@ from weatherquant.shadow.decision import Direction
 from weatherquant.shadow.events import BookObservation, CatalogMarket
 from weatherquant.shadow.forecast import ResolvedForecast
 from weatherquant.shadow.inference import PredictionResult
+from weatherquant.weather.single_runs import HourlyPoint, RunFetch
 
 __all__ = [
+    "FakeRunsClient",
     "archive_line",
     "book_payload",
     "gamma_event",
@@ -42,6 +44,43 @@ __all__ = [
 
 TARGET_DATE = date(2026, 10, 11)
 NOW = datetime(2026, 10, 11, 12, 0, 0, tzinfo=UTC)
+
+
+class FakeRunsClient:
+    """Stands in for :class:`SingleRunsClient` with a fixed, deterministic run.
+
+    Temperatures sit inside the 32-33 degF bracket so the resulting
+    distribution spreads over the ladder instead of collapsing onto one end -
+    which is what makes the decision assertions meaningful rather than a
+    foregone conclusion.
+
+    **Every test that drives the Runner must use this.** The Runner refreshes
+    forecasts during ``cycle()``, and without this the refresh goes out to
+    Open-Meteo for real. That is what wedged main CI for fifteen minutes at a
+    stretch: a live TLS handshake in ``test_shadow_checkpoint_advance``,
+    invisible locally because the developer machine has working egress, and
+    fatal on a runner that does not.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def fetch(self, model: str, run_time: datetime) -> RunFetch:
+        hourly = [
+            HourlyPoint(
+                valid_time_utc=datetime(2026, 10, 11, 4, tzinfo=UTC) + timedelta(hours=h),
+                temperature_2m=32.0 + (h % 4) * 0.5,
+            )
+            for h in range(48)
+        ]
+        return RunFetch(
+            model=model,
+            run_time_utc=run_time,
+            status="ok",
+            hourly=hourly,
+            payload_sha256="f" * 64,
+            fetched_at_utc=NOW - timedelta(hours=12),
+        )
 
 
 def archive_line(

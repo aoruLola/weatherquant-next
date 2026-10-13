@@ -18,45 +18,22 @@ from pathlib import Path
 
 import pytest
 
-from shadow_helpers import NOW, TARGET_DATE, archive_line, book_payload, gamma_event, write_lines
+from shadow_helpers import (
+    NOW,
+    TARGET_DATE,
+    FakeRunsClient,
+    archive_line,
+    book_payload,
+    gamma_event,
+    write_lines,
+)
 from weatherquant.config import Settings
 from weatherquant.shadow import runner as runner_module
 from weatherquant.shadow.config import ShadowSettings, load_thresholds
 from weatherquant.shadow.report import build_report, format_report
 from weatherquant.shadow.runner import RunnerConfig, ShadowRunner
-from weatherquant.weather.single_runs import HourlyPoint, RunFetch
 
 THRESHOLDS_PATH = Path("configs/shadow-thresholds.json")
-
-
-class _FakeRunsClient:
-    """Stands in for :class:`SingleRunsClient` with a fixed, deterministic run.
-
-    Temperatures sit inside the 32-33 degF bracket so the resulting
-    distribution spreads over the ladder instead of collapsing onto one end -
-    which is what makes the decision assertions meaningful rather than a
-    foregone conclusion.
-    """
-
-    def __init__(self, *args, **kwargs) -> None:
-        pass
-
-    def fetch(self, model: str, run_time: datetime) -> RunFetch:
-        hourly = [
-            HourlyPoint(
-                valid_time_utc=datetime(2026, 10, 11, 4, tzinfo=UTC) + timedelta(hours=h),
-                temperature_2m=32.0 + (h % 4) * 0.5,
-            )
-            for h in range(48)
-        ]
-        return RunFetch(
-            model=model,
-            run_time_utc=run_time,
-            status="ok",
-            hourly=hourly,
-            payload_sha256="f" * 64,
-            fetched_at_utc=NOW - timedelta(hours=12),
-        )
 
 
 def _fit_models(models_dir: Path) -> None:
@@ -156,7 +133,7 @@ def _settings(tmp_path: Path, archive: Path, models_dir: Path) -> ShadowSettings
 
 @pytest.fixture
 def make_runner(tmp_path, archive, models_dir, monkeypatch):
-    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "SingleRunsClient", FakeRunsClient)
 
     def _make(**overrides) -> ShadowRunner:
         shadow = _settings(tmp_path, archive, models_dir)
@@ -404,7 +381,7 @@ def test_no_input_can_arrive_after_the_decision_that_used_it(
     impossible to reintroduce unnoticed: with a frozen clock every timestamp
     compares equal and the bug is invisible.
     """
-    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "SingleRunsClient", FakeRunsClient)
 
     tick = {"n": 0}
 
@@ -459,7 +436,7 @@ def test_starting_alone_publishes_a_heartbeat(tmp_path, archive, models_dir, mon
     a liveness signal reporting a third party's latency. `start()` writes it,
     and so does the top of every cycle.
     """
-    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "SingleRunsClient", FakeRunsClient)
     shadow = _settings(tmp_path, archive, models_dir)
     runner = ShadowRunner(
         RunnerConfig(
@@ -521,7 +498,7 @@ def test_the_engine_publishes_a_report_snapshot(tmp_path, archive, models_dir, m
     """
     import itertools
 
-    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "SingleRunsClient", FakeRunsClient)
     counter = itertools.count(start=1)
     shadow = _settings(tmp_path, archive, models_dir)
     runner = ShadowRunner(
@@ -553,7 +530,7 @@ def test_a_failing_report_never_stops_the_engine(tmp_path, archive, models_dir, 
     def _boom(*_args, **_kwargs):
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "SingleRunsClient", FakeRunsClient)
     monkeypatch.setattr(runner_module, "publish_report_snapshot", _boom)
 
     shadow = _settings(tmp_path, archive, models_dir)
@@ -591,7 +568,7 @@ def test_the_engine_publishes_the_detail_snapshots_the_dashboard_reads(
     """
     import itertools
 
-    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "SingleRunsClient", FakeRunsClient)
     counter = itertools.count(start=1)
     shadow = _settings(tmp_path, archive, models_dir)
     runner = ShadowRunner(
@@ -645,7 +622,7 @@ def test_a_failing_detail_publisher_never_stops_the_engine(
     def _boom(*_args, **_kwargs):
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "SingleRunsClient", FakeRunsClient)
     monkeypatch.setattr(runner_module, "publish_detail_snapshots", _boom)
 
     shadow = _settings(tmp_path, archive, models_dir)
@@ -828,7 +805,7 @@ def _historical_archive(root: Path) -> Path:
 def test_replay_decisions_are_stamped_with_the_archive_instant(
     tmp_path, models_dir, monkeypatch
 ) -> None:
-    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "SingleRunsClient", FakeRunsClient)
     raw = _historical_archive(tmp_path)
 
     shadow = _settings(tmp_path, raw, models_dir)
@@ -877,7 +854,7 @@ def test_configured_live_stays_live_even_against_a_stale_archive(
     `auto` would call this REPLAY; `live` says the feed should be current and
     is not, which is the finding an operator actually needs.
     """
-    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "SingleRunsClient", FakeRunsClient)
     raw = _historical_archive(tmp_path)
 
     shadow = _settings(tmp_path, raw, models_dir).model_copy(update={"shadow_mode": "live"})
@@ -905,7 +882,7 @@ def test_the_mode_is_decided_once_and_does_not_flip_mid_run(
     tmp_path, archive, models_dir, monkeypatch
 ) -> None:
     """A collector that dies after startup must surface as an outage, not a replay."""
-    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "SingleRunsClient", FakeRunsClient)
     shadow = _settings(tmp_path, archive, models_dir)
     runner = ShadowRunner(
         RunnerConfig(settings=Settings(), shadow=shadow, thresholds=load_thresholds(THRESHOLDS_PATH)),
@@ -949,7 +926,7 @@ def test_a_dead_feed_never_produces_a_live_accept(tmp_path, models_dir, monkeypa
     of it counts as a live signal. The failure mode this guards is a service
     whose feed died and whose log quietly kept saying ACCEPT.
     """
-    monkeypatch.setattr(runner_module, "SingleRunsClient", _FakeRunsClient)
+    monkeypatch.setattr(runner_module, "SingleRunsClient", FakeRunsClient)
     raw = _historical_archive(tmp_path)
 
     shadow = _settings(tmp_path, raw, models_dir)
