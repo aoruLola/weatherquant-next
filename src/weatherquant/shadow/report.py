@@ -347,14 +347,29 @@ def _coverage(con, *, horizon_days: int) -> dict[str, Any]:
     ]
     models = [r[0] for r in con.execute("SELECT DISTINCT model_name FROM model_versions").fetchall()]
     needed = len(open_targets) * len(models)
+    # The numerator must be counted over exactly the set the denominator is
+    # built from: open target dates x tracked models. It used to count every
+    # (model, target_date) inside a horizon window instead, so a 3-date
+    # horizon against 4 dates of history reported 16/12 and then clamped the
+    # ratio to 1.0 - a coverage figure that could never fall below 100% no
+    # matter how many forecasts were missing. A ratio whose numerator is
+    # unrelated to its denominator is not a coverage ratio.
     have = (
         _one(
             con,
-            "SELECT COUNT(*) FROM (SELECT DISTINCT model_name, target_date FROM model_predictions "
-            f"WHERE target_date >= CURRENT_DATE - INTERVAL '{max(horizon_days, 1)} days') x",
+            "SELECT COUNT(*) FROM ("
+            "SELECT DISTINCT p.model_name, p.target_date FROM model_predictions p "
+            "JOIN (SELECT DISTINCT target_date FROM market_catalog "
+            "      WHERE active AND accepting_orders AND NOT closed "
+            "        AND target_date IS NOT NULL) t ON p.target_date = t.target_date "
+            "WHERE p.model_name IN (SELECT DISTINCT model_name FROM model_versions)"
+            ") x",
         )
         or 0
     )
+    # Clamped only as a guard against a view counting a pair the set does not;
+    # with the query above it cannot exceed `needed`.
+    have = min(have, needed)
 
     token_rows = con.execute(
         "SELECT market_id, token_yes FROM market_catalog WHERE active AND accepting_orders AND NOT closed"
@@ -373,7 +388,8 @@ def _coverage(con, *, horizon_days: int) -> dict[str, Any]:
         "models_tracked": sorted(models),
         "forecast_needed": needed,
         "forecast_available": have if needed else 0,
-        "forecast_coverage": (min(have, needed) / needed) if needed else None,
+        "forecast_missing": max(needed - have, 0),
+        "forecast_coverage": (have / needed) if needed else None,
         "open_markets": len(token_rows),
         "open_markets_with_a_book": with_book,
         "orderbook_coverage": (with_book / len(token_rows)) if token_rows else None,

@@ -1,0 +1,416 @@
+# Performance & MCP 数据契约（v0.1.4）
+
+**本文件是 Edge、Settlement、Performance API、Performance UI、MCP 的唯一口径来源。**
+生产者与消费者各自实现本文档，互不读对方代码；改动先改本文档。
+
+版本：`performance_schema_version = 1`（字段只增不改语义；破坏性变更必须升版本）。
+
+---
+
+## 0. 通用规则
+
+1. **原子发布**：临时文件 + `flush`/`fsync` + `os.rename`（复用
+   `weatherquant.shadow.publish.atomic_write_json`）。读者永远看不到半个 JSON。
+2. **信封字段**（每个快照与每个 API/MCP 响应的顶层）：
+
+   ```json
+   {
+     "performance_schema_version": 1,
+     "generated_at_utc": "…", "source": "weatherquant-research",
+     "as_of_utc": "…", "stale_after_seconds": 300,
+     "freshness": {"state": "fresh|stale|missing|corrupt|unavailable",
+                    "age_seconds": 12.0, "reason": null},
+     "dataset": "live|fixture",
+     "statistical_scope": "…见 §9", "sample_size": 0,
+     "mode": "LIVE|REPLAY|null", "warnings": ["…"],
+     "data": { }
+   }
+   ```
+
+3. **一切统计都带 `statistical_scope`**，见 §9。
+4. **快照只放窗口，不放全表**：默认 ≤500 行 / ≤90 天；禁止把 GB 级数据搬进快照。
+5. **禁止** Dashboard / MCP 直接打开任何 `.duckdb`。
+6. **禁止** 任何模块自行重算另一模块已定义的指标——单一实现。
+
+---
+
+## 1. 角色与数据流
+
+```
+Research Analytics (离线) → Performance Snapshot (原子 JSON) → Dashboard REST API
+                                                              → Dashboard UI
+                                                              → MCP Gateway (只读代理)
+```
+
+- **Research Analytics**：唯一可以读研究库 / 导出的决策历史的写方。离线计算、增量更新。
+- **Dashboard API**：只读快照 + 计算量小的**纯函数**（如参考本金模拟）。
+- **MCP**：**只转发 API 结果，绝不自己算**。
+
+---
+
+## 2. Opportunity Episode（独立机会）
+
+### 2.1 身份键
+
+```
+episode_key = (market_id, target_date, model_name, direction, mode)
+```
+
+五元组缺一不可：不同模型、不同方向、LIVE/REPLAY **必须隔离**。
+
+### 2.2 状态机
+
+| 事件 | 动作 |
+|---|---|
+| 首次 ACCEPT（无进行中 episode） | 开新 episode |
+| 连续 ACCEPT | 归入当前 episode，**不新建**；更新统计 |
+| 变为非 ACCEPT（REJECT / NO_TRADE / DATA_UNAVAILABLE 等） | 结束 episode，`end_reason = "state_change"` |
+| 间隔 > `gap_window_seconds`（可配置，默认 900） | 结束，`end_reason = "gap"`；**必须区分**见 §2.3 |
+| gap 后再次 ACCEPT | 开新 episode |
+| 进程重启 | episode 跨重启延续（依据 `decided_at_utc` 而非进程内计数） |
+
+**`end_reason` 枚举**：`state_change` | `gap_data_missing` | `gap_signal_break` | `end_of_data`。
+
+### 2.3 gap 必须区分"数据缺失"与"信号中断"
+
+| 判据 | `end_reason` |
+|---|---|
+| gap 期间 `shadow_decisions` **完全没有该 episode_key 的行**（Collector 静默 / DATA_UNAVAILABLE） | `gap_data_missing` |
+| gap 期间**有其他 episode_key 的行**（说明引擎在跑，只是本市场不再 ACCEPT） | `gap_signal_break` |
+
+**`gap_data_missing` 不得计为"机会结束"，也不得进入胜率分母的时间权重计算。**
+
+### 2.4 Episode 字段
+
+```
+episode_id            全局唯一（episode_key + first_seen 的哈希，稳定可复现）
+episode_key           见 §2.1
+first_seen_utc        首次 ACCEPT 时刻
+last_seen_utc         最后一次 ACCEPT 时刻
+duration_seconds      last_seen - first_seen
+observation_count     ACCEPT 次数
+first_edge            首次有效 ACCEPT 的 net_edge_usd（**代表值**）
+last_edge / mean_edge / max_edge / min_edge
+first_market_price    首次 ACCEPT 时的评估价格（盘口快照）
+first_model_probability
+direction             buy_yes | sell_yes
+mode                  LIVE | REPLAY
+target_date, station, bracket_label, available_depth_usd
+end_reason
+settlement_status     见 §4
+outcome               WIN | LOSS | UNVERIFIABLE | null(未结算)
+```
+
+**无有效 `net_edge_usd`（null / 非有限值）的 ACCEPT 不得开始 episode**——
+记入 `warnings`，不伪造代表值。
+
+### 2.5 汇总层级（必须分别展示，不可互相替代）
+
+| 指标 | 定义 |
+|---|---|
+| `accept_observations` | 全部 ACCEPT 行数（重复评估） |
+| `opportunity_episodes` | episode 数 |
+| `distinct_market_direction_pairs` | distinct (market_id, direction) |
+| `distinct_markets` | distinct market_id |
+| `distinct_target_dates` | distinct target_date |
+
+```
+Observation Edge Sum   = Σ 所有 ACCEPT 行的 net_edge_usd   ← 重复评估
+Unique Opportunity Edge Sum = Σ episode.first_edge          ← 去重代表值
+```
+
+**两者都是模型理论期望的汇总，不是利润、不是资产增长、不是已实现收益。**
+该声明必须原样出现在 API、UI 和 MCP 的 `warnings` 中。
+
+---
+
+## 3. Edge 统计口径
+
+### 3.1 Observation（全部 ACCEPT）
+
+`sum / mean / median / min / max / std / p05 p25 p50 p75 p95`，
+按 `model_name`、`direction`、`target_date` 分组，另附每日趋势。
+
+只统计 `state == "ACCEPT"` 且 `net_edge_usd` 非 null 的行。
+
+### 3.2 参考本金模拟（Reference Capital）——**纯函数，单一实现**
+
+实现位置：`weatherquant.performance.capital`（新模块）。
+**Dashboard API 与任何内部调用方都必须调用此模块**；MCP 只调 API。
+
+```
+simulate(capital_usdc, mode, *, episodes, start_date=None, end_date=None,
+         model=None, direction=None, max_allocation_fraction=0.10)
+```
+
+#### 模式 A：`single_opportunity`
+
+对**每一个** episode 计算：
+
+```
+capital          = capital_usdc (> 0，否则 ValueError)
+fill             = build_fill_plan(...)          ← 必须复用 execution/pricing.py
+shares           = fill.shares（受盘口深度与最小下单量约束）
+capital_required = fill.cost（含 fee 与 buffer，来自 execution_cost）
+usable           = min(capital, capital_required)  或按比例缩放
+edge_total       = edge_usd_per_share × shares    ← 来自 pricing，禁止手算
+roi              = edge_total / capital_required
+win_net          = 结算获胜的假设净收益（pricing 口径）
+loss_net         = 结算失败的假设净亏损
+capacity_limited = capital_required < capital
+executable       = bool 且有明确原因
+not_executable_reason ∈ {…见下}
+```
+
+`not_executable_reason` 枚举（任一命中即 `executable=false`，UI/MCP 必须标 `NOT_EXECUTABLE`）：
+
+| reason | 含义 |
+|---|---|
+| `NO_BOOK` | 无盘口 / 盘口不可用 |
+| `INSUFFICIENT_DEPTH` | 所需资金超过当时可成交深度 |
+| `BELOW_MIN_ORDER` | 低于市场最小下单量 |
+| `STALE_SNAPSHOT` | 盘口快照过期（超过 stale 阈值） |
+| `DEPTH_NOT_MEASURED` | 缺少深度证据 |
+| `TIME_MISMATCH` | 价格与概率非同一时刻 |
+| `NO_SETTLEMENT` | 无结算（模拟收益不可验证） |
+| `CROSSED_OR_ONE_SIDED` | 盘口交叉或单边 |
+
+**`executable=false` 时只能显示理论值，禁止显示为可实现收益。**
+
+#### 模式 B：`portfolio`
+
+以 `capital_usdc` 作为**整个组合**的初始资金（不是每个机会各有一份）。
+
+```
+可用余额          balance = capital_usdc
+单机会上限        cap = capital_usdc × max_allocation_fraction（默认 0.10）
+排序              按 first_seen_utc 升序（不按 Edge 排序——那会引入前视）
+分配              alloc = min(cap, balance, episode 资金需求)
+同时占用          peak_open_allocation（任意时刻未结算占用的最大值）
+资金释放          仅在 settlement_status == RESOLVED（或 DISPUTED 终局）时释放
+未结算不得释放    PENDING / UNAVAILABLE / UNVERIFIABLE → 占用直到 end_date
+费用              累加 execution_cost 的 fee 与 buffer
+关联风险          同一 market_id 的多个 episode 共享 cap 配额（按 market 聚合限制）
+```
+
+**输出必须含**：`capital`、`allocated_total`、`peak_open_allocation`、
+`utilization`、`balance_remaining`、`capacity_limited_count`、
+`executable_episodes`、`theoretical_expected_roi`、
+`backtestable(bool)`、`not_backtestable_reason`。
+
+**`backtestable = false` 的情形**（必须明说，不得构造收益曲线）：
+缺历史盘口深度、缺结算、样本 < 最小阈值、资金时间线无法重建。
+
+#### 分级展示（UI 必须严格区分五档，禁止混用）
+
+1. 每份合约 Edge（per-share）
+2. 每机会理论预期收益
+3. 组合理论预期收益
+4. **经历史数据验证的模拟收益**（仅当 `backtestable`）
+5. 实际收益 → 恒为 `N/A`（**无真实交易**）
+
+---
+
+## 4. Settlement
+
+### 4.1 来源与状态
+
+| 来源 | 用途 | 说明 |
+|---|---|---|
+| Polymarket `/v2/resolutions?condition=<conditionId>` | **平台正式结算** | `status=="resolved"`、`was_disputed`、`proposed_price`；`outcomePrices=["0","1"]`；未决时 `price=69` 为**哨兵值**，必须归一为 `None` |
+| Gamma `umaResolutionStatus` / `outcomePrices` | 交叉参考 | 不得单独作为结算依据 |
+| KLGA 官方观测（NOAA / GHCN TMAX / IEM） | **独立观测** | 只入 `klga_observations` / `klga_daily_max` |
+| WeatherQuant 研究库 | 历史评分 | 复用现有表 |
+
+> **本机无法直连 Polymarket 域名**（`gamma-api` / `clob` 均不可达）。
+> 上述契约取自 `docs/weather-data-sources.md` 与 `docs/open-source-review.md`
+> 的**既有实测记录**。首次回填必须在具备访问权限的主机执行，
+> 回填前用 §7 的 fixture 做端到端验证。**不得据猜测编写字段。**
+
+### 4.2 结构（新增字段在既有研究库之上扩展）
+
+平台结算与天气观测**分别存储**，只通过 `event_id` 关联：
+
+```
+market_id, event_id, token_id, target_date, station
+settlement_status      PENDING | RESOLVED | DISPUTED | UNAVAILABLE | UNVERIFIABLE
+resolved_outcome       1 | 0 | null
+resolution_source      "clob:/v2/resolutions" | "gamma:umaResolutionStatus" | …
+resolved_at_utc, fetched_at_utc, raw_source_reference
+observation_max_f, observation_source, observation_rule
+observation_retrieved_at_utc, verified_at_utc
+verification_status    VERIFIED | MISMATCH | UNVERIFIED
+discrepancy_reason
+```
+
+**禁止**：用气象实测代替平台结算；用平台结算反推气象读数。
+矛盾必须写入 `discrepancy_reason`，不得静默取其一。
+
+### 4.3 WIN / LOSS
+
+仅 `settlement_status == RESOLVED` **且** `verification_status == VERIFIED`
+的 episode 进入胜率分母。
+
+| 方向 | 规则 |
+|---|---|
+| `buy_yes` | YES 支付 $1 → `WIN`；YES 支付 $0 → `LOSS` |
+| `sell_yes` | **语义未证明前**只给"方向判断正确率"，`outcome = UNVERIFIABLE`，**不得混入可执行策略胜率** |
+| 其他 | `UNVERIFIABLE` |
+
+`sell_yes` 必须先证明：是卖出既有 YES 持仓，还是被定义为某种做空。
+未证明收益结构与执行可行性之前，禁止并入盈利胜率。
+
+---
+
+## 5. 胜率统计
+
+```
+Win Rate = WIN / (WIN + LOSS)
+```
+
+- 未结算、争议未决、不可验证 → **不进分母**。
+- 同一市场的多个 episode 可在 episode 层展示，但**市场级胜率与推断中不得视为独立结算事件**。
+- **禁止**把 ACCEPT 比例当胜率。
+
+**必须提供**：`valid_samples`、`distinct_markets`、`distinct_target_dates`、
+`confidence_interval`、`gaps_and_exclusions`（含原因）。
+
+**置信区间**：必须处理 target_date 聚类与重复市场相关性。
+- 首选：按 `target_date` 分层 bootstrap（默认 2000 次，固定随机种子保证可复现）。
+- 样本不足时降级为 Wilson 区间并**在响应中标注方法**。
+- `valid_samples < min_samples`（默认 20）或 `distinct_target_dates < 2` →
+  `win_rate = null`，`reason = "N/A — insufficient resolved independent samples"`。
+
+**分组**：BUY YES / SELL YES 分列、LIVE / REPLAY 分列、按模型、按 target_date、
+按 Edge 区间（默认 `<0.02 | 0.02–0.05 | 0.05–0.10 | ≥0.10`）。
+
+计数：`WIN / LOSS / PENDING / DISPUTED / UNVERIFIABLE / UNAVAILABLE`。
+
+---
+
+## 6. 模型准确度
+
+复用 `weatherquant.models.metrics` 与 `weatherquant.models.evaluation`，
+**不得重写**：
+
+| 指标 | 现有实现 |
+|---|---|
+| Brier | `brier_multiclass` |
+| Log Loss | `log_loss` |
+| Calibration / ECE | `calibration_bins` + `expected_calibration_error` |
+| MAE / RMSE | `mae` / `rmse` |
+| 时序切分 | `chronological_split` |
+| 评分 | `score` / `evaluate_pairwise` |
+| Top-1 Accuracy | 在 `score` 基础上新增，不得另起一套 |
+| Model vs Market Baseline | `models.market_baseline` |
+
+**严格样本外、按时间顺序**：`forecast_run_time_utc` ≤ `training_cutoff_utc` ≤
+市场报价时刻 ≤ `resolved_at_utc`。四者都要在响应中可追踪。
+**禁止未来数据泄漏。**
+
+---
+
+## 7. Performance API
+
+全部沿用现有 Dashboard 信封与分页/筛选/422 规则。
+
+| 端点 | 主要来源 |
+|---|---|
+| `GET /api/v1/performance/summary` | `performance/summary.json` |
+| `GET /api/v1/performance/edge` | `performance/edge.json` |
+| `GET /api/v1/performance/win-rate` | `performance/win-rate.json` |
+| `GET /api/v1/performance/opportunities` | `performance/opportunities.json`（分页） |
+| `GET /api/v1/performance/settlements` | `performance/settlements.json`（分页） |
+| `GET /api/v1/performance/models` | `performance/models.json` |
+| `GET /api/v1/performance/reference-capital` | **纯函数** `capital.simulate(...)`，参数：`capital_usdc`(默认100,>0)、`mode`、`start_date`、`end_date`、`model`、`direction`、`max_allocation_fraction` |
+
+**快照缺失时**：`freshness.state = "missing"` + 原因，**禁止返回伪造数据**。
+
+---
+
+## 8. MCP 响应信封
+
+13 个工具全部返回 §0 信封，外加：
+
+```
+tool_name, arguments_echo, duration_ms,
+source_endpoint   ← 证明数据来自哪个 API（禁止 MCP 自算）
+```
+
+**必须保留**：`schema_version`、`source`、`generated_at_utc`、`as_of_utc`、
+`freshness`、`dataset`、`mode`、`sample_size`、`statistical_scope`、`warnings`。
+
+**禁止**（违反即为缺陷）：
+- 过期盘口包装成实时机会（`freshness.state != fresh` 时必须显式 STALE）；
+- REPLAY 包装成 LIVE；
+- 把理论净 Edge 说成已实现利润；
+- 无结算数据时回答具体实际胜率；
+- 用模型自身推测填补缺失的报价 / 结算 / 观测。
+
+**工具清单（13）**：
+`get_overview` `get_system_health` `list_markets` `get_market_detail`
+`get_forecasts` `list_decisions` `get_shadow_report`
+`get_edge_summary` `get_opportunities` `get_win_rate` `get_settlements`
+`compare_models` `simulate_reference_capital`
+
+前 7 个 → 既有 Dashboard API；后 6 个 → Performance API。
+
+---
+
+## 9. `statistical_scope` 取值（必须显式）
+
+| 值 | 含义 |
+|---|---|
+| `observation_all_accepts` | 全部 ACCEPT 评估（含重复） |
+| `opportunity_episodes` | 去重后的独立机会 |
+| `resolved_verified_only` | 仅 RESOLVED + VERIFIED（胜率分母） |
+| `out_of_sample_chronological` | 按时间顺序样本外 |
+| `reference_capital_hypothetical` | 参考本金假设，非实盘 |
+| `live_only` / `replay_only` / `live_and_replay` | 模式范围 |
+| `database_lifetime` / `window:<n>d` | 时间范围 |
+
+**每个响应至少一个**，可组合（数组）。
+
+---
+
+## 10. 字段可得性总表
+
+| 数据 | 状态 | 说明 |
+|---|---|---|
+| Shadow 决策全量字段 | ✅ 可用 | `shadow_decisions`（需 §11 导出机制） |
+| `accept_scope` / `by_model` | ✅ 报告有、**UI 缺透传** | 见 Part F 8.1 |
+| Edge 汇总 | ⏳ 本轮实现 | Research Analytics |
+| Episode | ⏳ 本轮实现 | 状态机 |
+| 平台结算 | ⏳ 本轮实现 | 本机不可达上游，见 §4.1 |
+| KLGA 观测 / 研究库 | ✅ 已存在 | `migrations_research` |
+| 指标（Brier/ECE/MAE/RMSE） | ✅ 已存在 | `models/metrics.py` |
+| 参考本金 | ⏳ 本轮实现 | 复用 `execution/pricing.py` |
+| Performance API / UI / MCP | ⏳ 本轮实现 | |
+
+---
+
+## 11. 生产数据导出（单写者）
+
+研究进程需要 Shadow 全量历史决策。**禁止**绕过 DuckDB 锁读运行中的生产库。
+
+采用**单写者导出**：
+
+1. Shadow 引擎在自己持有的连接上，按周期追加导出到
+   `shadow/reports/decisions-export.parquet`（或 JSONL），**原子替换**；
+2. Research Analytics 只读该导出文件 + 研究库，**从不打开 shadow.duckdb**；
+3. 导出窗口可配置（默认 90 天），带 `exported_at_utc` 与行数校验；
+4. 若导出不足，回退方案是**维护窗口内的一致性备份**（先 `docker stop`
+   再复制 `.duckdb` + `.wal`），须经用户批准后执行。
+
+---
+
+## 12. 安全底线（MCP）
+
+1 独立容器 · 2 独立最小权限身份 · 3 不挂载生产 DuckDB · 4 不挂 Docker Socket ·
+5 不挂 Portainer 凭证 · 6 无下单工具 · 7 不接受任意 SQL · 8 不支持任意文件读取 ·
+9 不做任意 URL 代理 · 10 限制参数/输出/速率 · 11 请求超时与并发上限 ·
+12 认证与密钥轮换 · 13 校验 HTTP Origin · 14 仅允许配置的 Dashboard API 地址 ·
+15 审计日志不含凭据。
+
+默认仅监听内网/本机；远程接入必须走认证 HTTPS（反向代理或受控隧道）。
+**无认证的 MCP / Dashboard / Portainer / 生产库禁止暴露公网。**

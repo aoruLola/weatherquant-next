@@ -505,6 +505,43 @@ def test_overview_carries_the_five_second_verdicts(client: TestClient) -> None:
     assert data["report"]["equity_curve"] is None
 
 
+def test_decision_aggregates_are_not_field_whitelisted(client: TestClient) -> None:
+    """A new field in the report must reach the API without a code change.
+
+    `accept_scope` and `by_model` were published by the shadow report and
+    simply never made it to the Decisions page, because the builder listed
+    the keys it expected instead of passing the block through. The page then
+    reported the dimension as unavailable while the number sat one hop away.
+    A whitelist can only ever be as complete as the day it was written.
+    """
+    decisions = client.get("/api/v1/decisions").json()["data"]
+    totals = decisions["totals"]
+    assert totals["accept_scope"]["accepted_distinct_markets"] == 1
+    assert totals["accept_scope"]["scope"] == "shadow_database_lifetime"
+    assert totals["by_model"]["calibrated"]["ACCEPT"] == 3
+
+    overview = client.get("/api/v1/overview").json()["data"]
+    assert overview["decision_totals"]["accept_scope"]["accepted_repeats"] == 2
+
+
+def test_forecast_coverage_counts_the_same_set_it_divides_by(client: TestClient) -> None:
+    """Numerator and denominator must be built from one set of dates and models.
+
+    The counter used to tally every (model, target_date) in a horizon window
+    while the denominator counted open target dates x tracked models, so a
+    three-date horizon against four dates of history read 16/12 and then
+    clamped to 1.0 - coverage that could not fall below 100% however many
+    forecasts were missing.
+    """
+    coverage = client.get("/api/v1/forecasts").json()["data"]["coverage"]
+    assert coverage["forecast_available"] == 8
+    assert coverage["forecast_needed"] == 8
+    assert coverage["forecast_missing"] == 0
+    # available can never exceed needed: both come from the same set.
+    assert coverage["forecast_available"] <= coverage["forecast_needed"]
+    assert coverage["forecast_coverage"] <= 1.0
+
+
 def test_system_marks_unavailable_metrics_as_such(client: TestClient) -> None:
     data = client.get("/api/v1/system").json()["data"]
     joined = " ".join(data["notes"])

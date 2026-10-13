@@ -361,7 +361,12 @@ export default function Decisions() {
                     <th className="pb-2 font-medium">状态</th>
                     <th className="pb-2 font-medium">模式</th>
                     <th className="pb-2 text-right font-medium">模型概率</th>
-                    <th className="pb-2 text-right font-medium">可执行价格</th>
+                    <th
+                      className="pb-2 text-right font-medium"
+                      title="盘口快照的评估价格，不是可保证成交的价格"
+                    >
+                      评估价格（盘口快照）
+                    </th>
                     <th className="pb-2 text-right font-medium">理论净 Edge</th>
                     <th className="pb-2 font-medium">拒绝原因</th>
                     <th className="pb-2 text-right font-medium">盘口年龄</th>
