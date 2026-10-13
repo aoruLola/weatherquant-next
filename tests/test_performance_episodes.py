@@ -227,6 +227,43 @@ def test_rows_without_a_market_id_are_dropped() -> None:
     assert counters["decisions_seen"] == 1
 
 
+def test_an_exported_timestamp_string_is_accepted() -> None:
+    """JSON exports carry ISO-8601 strings; a database cursor carries datetimes.
+
+    The research process reads an export, so refusing strings here would
+    fail on the only path production actually uses.
+    """
+    rows = [
+        {**_row(minutes=0), "decided_at_utc": "2026-10-12T12:00:00+00:00"},
+        {**_row(minutes=10), "decided_at_utc": "2026-10-12T12:10:00+00:00"},
+    ]
+    episodes, _ = build_episodes(rows)
+
+    assert len(episodes) == 1
+    assert episodes[0].duration_seconds == pytest.approx(600.0)
+
+
+def test_a_timestamp_without_an_offset_is_read_as_utc() -> None:
+    """The engine's clock is UTC, so a naive stamp is not ambiguous - just undecorated."""
+    rows = [{**_row(minutes=0), "decided_at_utc": "2026-10-12T12:00:00"}]
+    episodes, _ = build_episodes(rows)
+
+    assert episodes[0].first_seen_utc.tzinfo is not None
+    assert episodes[0].first_seen_utc.isoformat().endswith("+00:00")
+
+
+def test_a_zulu_suffix_is_read_as_utc() -> None:
+    rows = [{**_row(minutes=0), "decided_at_utc": "2026-10-12T12:00:00Z"}]
+    episodes, _ = build_episodes(rows)
+
+    assert episodes[0].first_seen_utc.tzinfo is not None
+
+
+def test_a_timestamp_that_is_not_a_time_is_refused() -> None:
+    with pytest.raises(TypeError, match="decided_at_utc"):
+        build_episodes([{**_row(minutes=0), "decided_at_utc": 12345}])
+
+
 def test_unsorted_input_produces_the_same_episodes() -> None:
     """The state machine is defined over time; order in must not matter."""
     ordered = [_row(minutes=i) for i in (0, 10, 20, 30)]

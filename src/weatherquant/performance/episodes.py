@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
 __all__ = [
     "DEFAULT_GAP_WINDOW_SECONDS",
@@ -221,6 +221,27 @@ def _finite(value: object) -> float | None:
     return number
 
 
+def _timestamp(value: object) -> datetime:
+    """Accept a datetime or the ISO-8601 string a JSON export carries.
+
+    The export the research process reads (contract section 11) serialises
+    timestamps as strings, so treating ``row["decided_at_utc"]`` as already
+    parsed works on a database cursor and fails on a file - which is the
+    direction the data actually travels. A naive string is read as UTC
+    rather than rejected, because a decision recorded without an offset was
+    recorded in the engine's own clock, which is UTC.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    raise TypeError(f"decided_at_utc must be a datetime or ISO-8601 string, got {type(value).__name__}")
+
+
 def row_from_mapping(row: dict) -> _DecisionRow:
     """Build a row from a decision dict (API shape or a database mapping)."""
     return _DecisionRow(
@@ -230,7 +251,7 @@ def row_from_mapping(row: dict) -> _DecisionRow:
         direction=_normalise(row.get("direction")),
         mode=_normalise(row.get("mode")),
         state=_normalise(row.get("state")) or "",
-        decided_at_utc=row["decided_at_utc"],
+        decided_at_utc=_timestamp(row["decided_at_utc"]),
         net_edge_usd=_finite(row.get("net_edge_usd")),
         market_price=_finite(row.get("market_price")),
         model_probability=_finite(row.get("model_probability")),
