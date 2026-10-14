@@ -43,6 +43,8 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import duckdb
+
 from weatherquant.config import Settings
 from weatherquant.dashboard.producer import publish_detail_snapshots
 from weatherquant.data.http import ResilientHttp
@@ -310,6 +312,23 @@ class ShadowRunner:
                     log.error("lost the single-instance lease: %s", exc)
                     self._fatal = str(exc)
                     exit_code = 4
+                    break
+                except duckdb.FatalException as exc:
+                    # DuckDB has invalidated this connection: every further
+                    # statement on it will fail the same way. Backing off and
+                    # retrying would burn cycles against a database that is
+                    # never coming back, and - worse - any state the tailer
+                    # holds would sit next to a database that rejected the
+                    # batch. Stop, say why, and leave the checkpoint where
+                    # the last *successful* commit put it.
+                    self._fatal = f"database fatal: {type(exc).__name__}: {exc}"
+                    log.critical(
+                        "duckdb invalidated the connection; stopping rather than "
+                        "retrying against a dead handle: %s",
+                        exc,
+                    )
+                    self._write_heartbeat(status="stopping", fatal=self._fatal)
+                    exit_code = 5
                     break
                 except Exception as exc:
                     self._fatal = f"{type(exc).__name__}: {exc}"
