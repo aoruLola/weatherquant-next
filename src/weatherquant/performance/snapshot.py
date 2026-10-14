@@ -19,6 +19,7 @@ the number rather than living in a document nobody loads.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -38,10 +39,13 @@ from weatherquant.performance.winrate import (
 from weatherquant.shadow.publish import atomic_write_json
 
 __all__ = [
+    "CURRENT_POINTER",
     "PERFORMANCE_SCHEMA_VERSION",
     "SNAPSHOT_FILES",
     "build_performance",
+    "new_generation_id",
     "publish_performance",
+    "resolve_generation",
 ]
 
 PERFORMANCE_SCHEMA_VERSION = 1
@@ -321,27 +325,118 @@ def build_performance(
     }
 
 
+CURRENT_POINTER = "current.json"
+
+
+def new_generation_id(*, now: datetime, payloads: Mapping[str, dict[str, Any]]) -> str:
+    """A stable id for one batch.
+
+    Derived from the instant and the payloads themselves, so the same data
+    republished under a new clock does not masquerade as a new generation,
+    and two different generations can never share an id.
+    """
+    digest = hashlib.sha256()
+    for name in sorted(payloads):
+        digest.update(name.encode("utf-8"))
+        digest.update(json.dumps(payloads[name], sort_keys=True, default=str).encode("utf-8"))
+    return f"{now.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}-{digest.hexdigest()[:12]}"
+
+
 def publish_performance(
     payloads: Mapping[str, dict[str, Any]],
     directory: str | Path,
+    *,
+    generation_id: str | None = None,
+    watermark: Any = None,
+    coverage: Mapping[str, Any] | None = None,
 ) -> list[Path]:
-    """Atomically publish every snapshot.
+    """Publish six snapshots as one generation, then switch the pointer.
 
-    Each file is written the same way the shadow writes its own reports -
-    temp file, fsync, rename - so a reader never sees half a document. A
-    failure on one file must not skip the others silently, so the paths
-    returned are the ones that actually landed.
+    Six separate renames into one directory is not an atomic cross-file
+    commit: a reader that arrives halfway sees a mixture of two generations,
+    and a mixture of an old opportunities file with a new win-rate file is
+    exactly the kind of inconsistency nobody would notice until it was
+    scored against. So the batch goes into its own directory first, and only
+    once every file is durable does a single rename publish it by name.
+
+    A failure at any point before the pointer move leaves the previous
+    generation current and intact. The half-written directory is inert - no
+    reader follows it - and the next publish uses a fresh id.
     """
     target = Path(directory)
-    target.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(tz=UTC)
+    gid = generation_id or new_generation_id(now=now, payloads=payloads)
+    generation_dir = target / "generations" / gid
+    generation_dir.mkdir(parents=True, exist_ok=True)
+
     written: list[Path] = []
+    files_meta: dict[str, Any] = {}
     for filename in SNAPSHOT_FILES:
         if filename not in payloads:
             continue
-        path = target / filename
-        atomic_write_json(path, payloads[filename])
+        payload = dict(payloads[filename])
+        payload["generation_id"] = gid
+        path = generation_dir / filename
+        atomic_write_json(path, payload)
         written.append(path)
+        files_meta[filename] = {"bytes": path.stat().st_size}
+
+    missing = [name for name in SNAPSHOT_FILES if name not in files_meta]
+    if missing:
+        raise RuntimeError(
+            f"generation {gid} is incomplete: missing {missing}; "
+            "the previous generation stays current"
+        )
+
+    manifest = {
+        "generation_id": gid,
+        "published_at_utc": now.astimezone(UTC).isoformat(),
+        "dataset": next(
+            (p.get("dataset") for p in payloads.values() if p.get("dataset")), None
+        ),
+        "source": next(
+            (p.get("source") for p in payloads.values() if p.get("source")), None
+        ),
+        "watermark": watermark,
+        "coverage": dict(coverage or {}),
+        "files": files_meta,
+        "performance_schema_version": PERFORMANCE_SCHEMA_VERSION,
+    }
+    atomic_write_json(generation_dir / "manifest.json", manifest)
+
+    # One rename publishes the batch. Before this line the previous
+    # generation is still the current one; after it, this one is.
+    atomic_write_json(target / CURRENT_POINTER, {"generation_id": gid})
     return written
+
+
+def resolve_generation(directory: str | Path) -> tuple[Path | None, dict[str, Any] | None]:
+    """Where to read from, and what that batch claims to be.
+
+    Falls back to the flat layout when no pointer exists, so a deployment
+    that predates generations keeps working - and so the answer to "which
+    files" is one function rather than a rule each caller re-derives.
+    """
+    root = Path(directory)
+    pointer = root / CURRENT_POINTER
+    if not pointer.exists():
+        return (root if root.exists() else None), None
+    try:
+        generation = json.loads(pointer.read_text(encoding="utf-8"))["generation_id"]
+    except (OSError, ValueError, KeyError):
+        return None, None
+    generation_dir = root / "generations" / str(generation)
+    manifest_path = generation_dir / "manifest.json"
+    if not manifest_path.exists():
+        # A pointer to a directory that is not there is a broken publish,
+        # not a missing backfill - say so by returning nothing rather than
+        # a path that will 404 inside.
+        return None, None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return generation_dir, None
+    return generation_dir, manifest
 
 
 def write_json_debug(payload: Mapping[str, Any], path: str | Path) -> None:

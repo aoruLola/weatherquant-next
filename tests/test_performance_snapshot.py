@@ -16,6 +16,7 @@ from weatherquant.performance.snapshot import (
     SNAPSHOT_FILES,
     build_performance,
     publish_performance,
+    resolve_generation,
 )
 
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
@@ -170,13 +171,26 @@ def test_settlements_are_indexed_by_market_and_target_date() -> None:
 
 # --- publication ---------------------------------------------------------------
 
+
+def _published(out: Path, name: str) -> Path:
+    """Follow the generation pointer, the way the dashboard does.
+
+    Snapshots now live under `generations/<id>/`; a test that read a flat
+    path would be asserting the layout that was deliberately removed.
+    """
+    generation_dir, manifest = resolve_generation(out)
+    assert generation_dir is not None, "nothing was published"
+    assert manifest is not None, "the published generation has no manifest"
+    return generation_dir / name
+
+
 def test_publish_writes_every_declared_file(tmp_path: Path) -> None:
     payloads = build_performance(decisions=_decisions(), now=NOW)
     written = publish_performance(payloads, tmp_path)
 
     assert len(written) == len(SNAPSHOT_FILES)
     for name in SNAPSHOT_FILES:
-        assert (tmp_path / name).exists(), name
+        assert _published(tmp_path, name).exists(), name
 
 
 def test_a_published_file_parses_as_one_document(tmp_path: Path) -> None:
@@ -185,7 +199,7 @@ def test_a_published_file_parses_as_one_document(tmp_path: Path) -> None:
     publish_performance(payloads, tmp_path)
 
     for name in SNAPSHOT_FILES:
-        parsed = json.loads((tmp_path / name).read_text(encoding="utf-8"))
+        parsed = json.loads(_published(tmp_path, name).read_text(encoding="utf-8"))
         assert parsed["data"] is not None, name
 
 
@@ -195,7 +209,7 @@ def test_publishing_an_empty_dataset_still_produces_a_valid_document(tmp_path: P
     written = publish_performance(payloads, tmp_path)
 
     assert len(written) == len(SNAPSHOT_FILES)
-    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    summary = json.loads(_published(tmp_path, "summary.json").read_text(encoding="utf-8"))
     assert summary["data"]["observation_edge_sum"] is None
     assert summary["data"]["opportunity_episodes"] == 0
     assert summary["data"]["realized_directional_win_rate"] is None
@@ -209,3 +223,129 @@ def test_supplied_episodes_are_used_as_given() -> None:
     payloads = build_performance(decisions=_decisions(), episodes=episodes, now=NOW)
 
     assert payloads["summary.json"]["data"]["opportunity_episodes"] == len(episodes)
+
+
+# --- generation consistency --------------------------------------------------
+
+
+def test_every_file_carries_one_generation_id(tmp_path: Path) -> None:
+    """A batch must be identifiable, not merely co-located.
+
+    Co-location is not consistency: six files in one directory can still be
+    three from one run and three from the last. The id is what a reader
+    compares.
+    """
+    payloads = build_performance(decisions=_decisions(), now=NOW)
+    publish_performance(payloads, tmp_path)
+
+    generation_dir, manifest = resolve_generation(tmp_path)
+    ids = set()
+    for name in SNAPSHOT_FILES:
+        payload = json.loads((generation_dir / name).read_text(encoding="utf-8"))
+        ids.add(payload["generation_id"])
+
+    assert len(ids) == 1, f"a published batch carries more than one generation: {ids}"
+    assert manifest["generation_id"] in ids
+
+
+def test_the_manifest_records_what_the_batch_was(tmp_path: Path) -> None:
+    """Provenance travels with the batch, not with the directory."""
+    payloads = build_performance(decisions=_decisions(), now=NOW, dataset="fixture")
+    publish_performance(
+        payloads,
+        tmp_path,
+        watermark=("2026-10-14T08:00:00+00:00", "id-0042"),
+        coverage={"rows": 30},
+    )
+
+    _, manifest = resolve_generation(tmp_path)
+
+    assert manifest["dataset"] == "fixture"
+    assert manifest["source"] == "weatherquant-research"
+    assert manifest["watermark"] == ["2026-10-14T08:00:00+00:00", "id-0042"]
+    assert manifest["coverage"] == {"rows": 30}
+    assert manifest["published_at_utc"]
+    assert set(manifest["files"]) == set(SNAPSHOT_FILES)
+
+
+def test_a_second_publish_replaces_the_pointer_not_the_files(tmp_path: Path) -> None:
+    """The previous generation stays intact - that is the rollback story."""
+    publish_performance(build_performance(decisions=_decisions(n=10), now=NOW), tmp_path)
+    first, first_manifest = resolve_generation(tmp_path)
+
+    publish_performance(build_performance(decisions=_decisions(n=20), now=NOW), tmp_path)
+    second, second_manifest = resolve_generation(tmp_path)
+
+    assert first != second, "a new publish must select a new generation"
+    assert first.exists(), "the previous generation was destroyed"
+    assert first_manifest["generation_id"] != second_manifest["generation_id"]
+
+
+def test_a_republish_of_the_same_data_keeps_the_same_id(tmp_path: Path) -> None:
+    """The id names the batch, not the clock that wrote it."""
+    payloads = build_performance(decisions=_decisions(), now=NOW)
+    publish_performance(payloads, tmp_path, generation_id="fixed-id")
+    _, manifest = resolve_generation(tmp_path)
+
+    assert manifest["generation_id"] == "fixed-id"
+    assert (tmp_path / "generations" / "fixed-id" / "summary.json").exists()
+
+
+def test_a_pointer_to_an_incomplete_generation_is_refused(tmp_path: Path) -> None:
+    """A publish that died before its manifest must not become readable."""
+    payloads = build_performance(decisions=_decisions(), now=NOW)
+    publish_performance(payloads, tmp_path)
+
+    generation_dir, manifest = resolve_generation(tmp_path)
+    assert manifest is not None
+    (generation_dir / "manifest.json").unlink()
+
+    resolved_dir, resolved_manifest = resolve_generation(tmp_path)
+    assert resolved_manifest is None
+    assert resolved_dir is None, (
+        "a generation without a manifest is an incomplete publish, not an "
+        "absent backfill"
+    )
+
+
+def test_an_unparseable_pointer_yields_nothing_rather_than_a_crash(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "current.json").write_text("{ not json", encoding="utf-8")
+
+    assert resolve_generation(tmp_path) == (None, None)
+
+
+def test_a_file_from_another_generation_is_refused_by_the_source(tmp_path: Path) -> None:
+    """Read-time check: the file must belong to the batch the pointer names."""
+    # Only the performance directory matters here; the collector and shadow
+    # trees may be empty, because the assertion is about one snapshot's
+    # provenance and nothing else.
+    root = tmp_path / "tree"
+    (root / "collector").mkdir(parents=True, exist_ok=True)
+    (root / "shadow").mkdir(parents=True, exist_ok=True)
+    payloads = build_performance(decisions=_decisions(), now=NOW)
+    publish_performance(payloads, root / "performance", generation_id="gen-a")
+    # Tamper: leave a file that claims an older batch inside the current one.
+    directory, manifest = resolve_generation(root / "performance")
+    stale = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+    stale["generation_id"] = "gen-000"
+    (directory / "summary.json").write_text(json.dumps(stale), encoding="utf-8")
+    assert manifest["generation_id"] == "gen-a"
+
+    from datetime import UTC, datetime
+
+    from weatherquant.dashboard.config import DashboardSettings
+    from weatherquant.dashboard.sources import SnapshotSources
+
+    settings = DashboardSettings(
+        collector_data_dir=root / "collector",
+        shadow_data_dir=root / "shadow",
+        performance_data_dir=root / "performance",
+    )
+    sources = SnapshotSources(settings)
+    source = sources.performance_snapshot(
+        "performance-summary", "summary.json", datetime.now(tz=UTC)
+    )
+
+    assert source.payload is None
+    assert "refusing to mix generations" in (source.reason or "")

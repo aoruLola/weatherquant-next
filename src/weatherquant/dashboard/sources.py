@@ -26,6 +26,7 @@ from typing import Any
 
 from weatherquant.dashboard.config import DashboardSettings
 from weatherquant.dashboard.contracts import Freshness, FreshnessState
+from weatherquant.performance.snapshot import resolve_generation
 
 __all__ = ["JsonSource", "SnapshotSources", "age_seconds", "freshness_of", "parse_utc"]
 
@@ -217,18 +218,72 @@ class SnapshotSources:
         integration. Saying "awaiting integration" about a research job that
         simply has not happened yet would send an operator looking for a
         deployment that is not the problem.
+
+        Reads follow the generation pointer, so all six files come from one
+        published batch. That is the whole reason they are published that way
+        - six independent renames into one directory would let a reader pair
+        an old opportunities file with a new win-rate file and score a
+        mixture that never existed.
         """
-        return self.read(
+        root = self.settings.performance_snapshots_dir
+        missing_reason = (
+            f"{logical_name} not published yet: the research analytics "
+            "backfill has not produced this snapshot "
+            "(docs/performance-data-contract.md §7)"
+        )
+
+        generation_dir, manifest = resolve_generation(root)
+        if generation_dir is None:
+            # No pointer at all: either nothing has been published, or this
+            # deployment still uses the flat layout the API always accepted.
+            return self.read(
+                logical_name,
+                root / filename,
+                stale_after_seconds=300.0,
+                missing_reason=missing_reason,
+                now=now,
+            )
+        if manifest is None:
+            # A pointer with no readable manifest is a broken publish, not an
+            # absent one. Saying "missing" would send someone to re-run a
+            # backfill that already succeeded.
+            return self.read(
+                logical_name,
+                generation_dir / filename,
+                stale_after_seconds=300.0,
+                missing_reason=(
+                    f"{logical_name} exists but its generation has no readable "
+                    "manifest; the publish is incomplete"
+                ),
+                now=now,
+            )
+
+        source = self.read(
             logical_name,
-            self.settings.performance_snapshots_dir / filename,
+            generation_dir / filename,
             stale_after_seconds=300.0,
-            missing_reason=(
-                f"{logical_name} not published yet: the research analytics "
-                "backfill has not produced this snapshot "
-                "(docs/performance-data-contract.md §7)"
-            ),
+            missing_reason=missing_reason,
             now=now,
         )
+        claimed = (source.payload or {}).get("generation_id")
+        published = manifest.get("generation_id")
+        if source.payload is not None and claimed and published and claimed != published:
+            # The file is from another batch than the one the pointer names.
+            # Refuse it rather than serve a mixture of two generations.
+            reason = (
+                f"{logical_name} belongs to generation {claimed} but the "
+                f"pointer selects {published}; refusing to mix generations"
+            )
+            return JsonSource(
+                logical_name=logical_name,
+                payload=None,
+                present=False,
+                freshness=freshness_of(
+                    None, now, stale_after_seconds=300.0, missing_reason=reason
+                ),
+                reason=reason,
+            )
+        return source
 
     # -- internals ---------------------------------------------------------
     def _apply_report_window(self, source: JsonSource, now: datetime) -> JsonSource:

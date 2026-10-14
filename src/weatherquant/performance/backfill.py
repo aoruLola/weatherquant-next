@@ -65,6 +65,20 @@ def load_decisions(path: str | Path) -> list[dict[str, Any]]:
     if not source.exists():
         raise FileNotFoundError(f"decisions export not found: {source}")
 
+    if source.is_dir():
+        # The shadow publishes append-only parts under this directory. A
+        # directory is the production input; the flat formats below are for
+        # hand-carried or legacy exports.
+        from weatherquant.shadow.export import read_export
+
+        rows = read_export(source)
+        if not rows:
+            raise ValueError(
+                f"no exported decisions under {source}; run the shadow's "
+                "export first, or point --export at a file"
+            )
+        return rows
+
     suffix = source.suffix.lower()
     if suffix in {".jsonl", ".ndjson"}:
         with source.open(encoding="utf-8") as handle:

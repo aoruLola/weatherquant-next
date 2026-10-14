@@ -50,6 +50,7 @@ from weatherquant.data.lock import LockError, SingleInstanceLock
 from weatherquant.shadow.config import ShadowSettings, Thresholds
 from weatherquant.shadow.decision import Decision, Direction, Mode, evaluate
 from weatherquant.shadow.events import CatalogMarket
+from weatherquant.shadow.export import DecisionExporter
 from weatherquant.shadow.forecast import ForecastCache
 from weatherquant.shadow.health import disk_free_percent, write_heartbeat
 from weatherquant.shadow.inference import PredictionResult, Predictor, prediction_rows
@@ -166,6 +167,7 @@ class ShadowRunner:
         self._next_forecast_refresh = datetime.min.replace(tzinfo=UTC)
         self._next_metrics = datetime.min.replace(tzinfo=UTC)
         self._next_report = datetime.min.replace(tzinfo=UTC)
+        self._next_export = datetime.min.replace(tzinfo=UTC)
         self._forecast_backoff = 0.0
         self._last_decision_at: datetime | None = None
         self._last_cycle: CycleStats | None = None
@@ -265,6 +267,7 @@ class ShadowRunner:
         # - which is a liveness signal reading the latency of a third party.
         self._write_heartbeat(status="running")
         self._publish_report()
+        self._export_decisions()
         return self.run_id
 
     def stop(self, reason: str = "requested") -> None:
@@ -450,6 +453,7 @@ class ShadowRunner:
             )
 
         self._publish_report()
+        self._export_decisions()
 
         stats.duration_ms = int((self.clock() - started).total_seconds() * 1000)
         self._last_cycle = stats
@@ -569,6 +573,70 @@ class ShadowRunner:
                 [
                     QualityEvent(
                         kind="detail_publish_failed",
+                        severity="warning",
+                        detail=f"{type(exc).__name__}: {exc}",
+                        ts_utc=now,
+                    )
+                ],
+                run_id=self.run_id or "",
+            )
+
+    def _export_decisions(self) -> None:
+        """Append one bounded batch to the historical decision export.
+
+        The performance module could consume an export and nothing produced
+        one, so the research side had no honest way to reach the decision
+        history. This is the single writer that does: the process holding
+        the lease, on its own connection, on a schedule that never blocks a
+        decision.
+
+        Bounded three ways - rows, wall clock, and parts per tick - because
+        an initial backfill of a large table is many ticks of work, not one.
+        A failure is recorded and swallowed: an export that cannot run is a
+        reportable gap, not a reason to stop deciding.
+        """
+        if self.store is None:
+            return
+        now = self.clock()
+        if now < self._next_export:
+            return
+        # Advanced before the work, so a slow or failing export is not
+        # retried on every tick.
+        self._next_export = now + timedelta(seconds=self.shadow.shadow_export_seconds)
+        try:
+            exporter = DecisionExporter(
+                self.db.con,
+                self.shadow.shadow_report_path.parent / "decisions-export",
+                batch_rows=self.shadow.shadow_export_rows,
+                max_seconds=self.shadow.shadow_export_max_seconds,
+                max_parts_per_run=self.shadow.shadow_export_max_parts,
+            )
+            result = exporter.run_batch()
+            if result.rows_exported:
+                log.info(
+                    "exported %d decision row(s) in %d part(s), watermark=%s",
+                    result.rows_exported,
+                    result.parts_written,
+                    result.watermark,
+                )
+            if any(note.startswith("export failed") for note in result.notes):
+                self.store.record_quality(
+                    [
+                        QualityEvent(
+                            kind="decision_export_failed",
+                            severity="warning",
+                            detail="; ".join(result.notes),
+                            ts_utc=now,
+                        )
+                    ],
+                    run_id=self.run_id or "",
+                )
+        except Exception as exc:
+            log.warning("could not export decisions: %s", exc)
+            self.store.record_quality(
+                [
+                    QualityEvent(
+                        kind="decision_export_failed",
                         severity="warning",
                         detail=f"{type(exc).__name__}: {exc}",
                         ts_utc=now,

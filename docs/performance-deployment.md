@@ -57,12 +57,19 @@ Dashboard 需要新增一条只读挂载：
 
 ### 3.1 决策历史的获取（单写者规则）
 
-**禁止**直接打开运行中的 `shadow.duckdb`（引擎持独占租约）。两条合法路径：
+**禁止**直接打开运行中的 `shadow.duckdb`（引擎持独占租约）。
 
-1. **Shadow 导出**（推荐，无停机）：Shadow 在自己持有的连接上按周期原子
-   发布 `shadow/reports/decisions-export.parquet`（契约 §11）；
-2. **一致性备份**（需批准）：`docker stop weatherquant-shadow` → 复制
-   `.duckdb` + `.wal` → 恢复容器。**仅在维护窗口执行，且需你确认。**
+**导出已由 Shadow 自动执行**（`runner._export_decisions`，默认每 300s 一批），
+产物在 `shadow/reports/decisions-export/` —— 追加式分片加上一个 `state.json` 水位。
+引擎用自己持有的连接写入，Research 只读该目录，**不需要停机，也不需要手动导出命令**。
+
+分片布局、游标语义与失败恢复见契约 §11。
+
+> 需要一次性追平时，可临时调小 `WQ_SHADOW_EXPORT_SECONDS`，观察
+> `reports/decisions-export/state.json` 的 `rows_exported` 增长后恢复默认。
+
+**回退方案（需批准）**：一致性备份 —— `docker stop weatherquant-shadow`，
+复制 `.duckdb` 与 `.wal`，再恢复容器。**仅在维护窗口执行。**
 
 ### 3.2 结算回填
 
@@ -103,7 +110,7 @@ Gamma 仅作交叉参考。`price="69"` 是哨兵值必须归一为 `None`；未
 
 ```bash
 weatherquant-research build-performance \
-  --export /mnt/user/appdata/weatherquant-shadow/reports/decisions-export.jsonl \
+  --export /mnt/user/appdata/weatherquant-shadow/reports/decisions-export \
   --settlements /tmp/settlements.json \
   --out /mnt/user/appdata/weatherquant-performance \
   --dataset live \
@@ -121,9 +128,15 @@ weatherquant-research build-performance \
 | `--max-allocation-fraction` | 默认 0.10，研究假设而非已验证的风险规则 |
 | `--gap-window-seconds` | 默认 900 |
 
-写入是**原子的**（临时文件 + fsync + rename），读者永远看不到半个 JSON。
-六个文件**一次性全部构建后**才写入：中途失败会保留上一份完整集合，
-不会留下三个新、三个旧的混合状态。
+输出是**一个世代**：`performance/generations/<id>/` 内放六份快照与 `manifest.json`，
+最后以一次 rename 切换 `performance/current.json` 指针（契约 §7.1）。
+读者要么看到完整的一批，要么看到上一批，**不会**看到三个新、三个旧。
+中途失败时新世代无人跟随，上一批仍然 current。
+
+`manifest.json` 记录 `dataset`、输入水位 `watermark`、覆盖范围 `coverage`、
+生成时间与各文件大小 —— 每一批都可被审计与回溯。
+
+`--export` 同时接受目录（生产路径）与 `.json` / `.jsonl` / `.parquet` 文件。
 
 **不发布快照 ≠ 出错。** Dashboard 会显示 `missing` + "回填尚未产生该快照"，
 不会显示 0，也不会编造图表。

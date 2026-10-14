@@ -24,7 +24,7 @@ from weatherquant.performance.backfill import (
     build_performance_snapshots,
     load_decisions,
 )
-from weatherquant.performance.snapshot import SNAPSHOT_FILES
+from weatherquant.performance.snapshot import SNAPSHOT_FILES, resolve_generation
 
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
 
@@ -102,6 +102,14 @@ def test_a_missing_export_is_reported_not_guessed(tmp_path, capsys) -> None:
 # --- an offline run produces the six snapshots --------------------------------
 
 
+
+def _published(out: Path, name: str) -> Path:
+    """Follow the generation pointer, the way the dashboard does."""
+    generation_dir, manifest = resolve_generation(out)
+    assert generation_dir is not None and manifest is not None, "nothing was published"
+    return generation_dir / name
+
+
 def test_build_performance_publishes_all_six_snapshots(tmp_path, capsys) -> None:
     out = tmp_path / "performance"
     code = research_main(
@@ -115,7 +123,7 @@ def test_build_performance_publishes_all_six_snapshots(tmp_path, capsys) -> None
 
     assert code == 0, capsys.readouterr()
     for name in SNAPSHOT_FILES:
-        assert (out / name).exists(), name
+        assert _published(out, name).exists(), name
 
 
 def test_a_json_export_is_read_as_well_as_jsonl(tmp_path) -> None:
@@ -139,7 +147,7 @@ def test_the_published_snapshot_carries_the_requested_dataset(tmp_path) -> None:
         now=NOW,
     )
 
-    payload = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    payload = json.loads(_published(out, "summary.json").read_text(encoding="utf-8"))
     assert payload["dataset"] == "fixture", "a fixture run must not read as live"
 
 
@@ -152,7 +160,7 @@ def test_a_live_run_is_labelled_live(tmp_path) -> None:
         now=NOW,
     )
 
-    payload = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    payload = json.loads(_published(out, "summary.json").read_text(encoding="utf-8"))
     assert payload["dataset"] == "live"
 
 

@@ -375,6 +375,35 @@ Win Rate = WIN / (WIN + LOSS)
 
 **快照缺失时**：`freshness.state = "missing"` + 原因，**禁止返回伪造数据**。
 
+### 7.1 世代目录与一致性
+
+六份快照**作为一个世代发布**，不是六次独立 rename：
+
+```
+performance/
+    current.json                      # {"generation_id": "<id>"}  原子指针
+    generations/<id>/
+        summary.json edge.json win-rate.json
+        opportunities.json settlements.json models.json
+        manifest.json                 # 数据集、水位、覆盖范围、文件清单
+```
+
+**为什么不能直接 rename 六次**：那不是跨文件的原子提交。读者若在中途到达，
+会拿到「旧的 opportunities + 新的 win-rate」——两份从未同时存在的数据
+拼在一起，而这种不一致不会报错，只会被拿去评分。
+
+流程：全部写入 `generations/<id>/` → 全部 fsync → 写 manifest →
+**最后**一次 rename 切换 `current.json`。指针切换前，旧世代仍然 current；
+切换后，新世代 current。中途失败则新目录无人跟随，成为惰性残留。
+
+**读取时校验**：Dashboard 读到的文件必须声明自己属于指针所指的世代；
+不符则拒收（`refusing to mix generations`），而不是混用两批数据。
+`manifest.json` 缺失同样拒收——那是**发布不完整**，不是"回填没跑"，
+把前者说成后者会把人送去重跑一次已经成功的作业。
+
+**兼容性**：无 `current.json` 时回退到扁平布局，因此既有部署不受影响。
+MCP 感知不到目录结构——它只调 Dashboard API。
+
 ---
 
 ## 8. MCP 响应信封
@@ -438,18 +467,59 @@ source_endpoint   ← 证明数据来自哪个 API（禁止 MCP 自算）
 
 ---
 
-## 11. 生产数据导出（单写者）
+## 11. 生产数据导出（单写者）——已实现
 
 研究进程需要 Shadow 全量历史决策。**禁止**绕过 DuckDB 锁读运行中的生产库。
 
-采用**单写者导出**：
+导出由 `weatherquant.shadow.export.DecisionExporter` 在**持有租约的引擎进程内**
+执行（`runner._export_decisions`，独立节流，默认 300s）。
 
-1. Shadow 引擎在自己持有的连接上，按周期追加导出到
-   `shadow/reports/decisions-export.parquet`（或 JSONL），**原子替换**；
-2. Research Analytics 只读该导出文件 + 研究库，**从不打开 shadow.duckdb**；
-3. 导出窗口可配置（默认 90 天），带 `exported_at_utc` 与行数校验；
-4. 若导出不足，回退方案是**维护窗口内的一致性备份**（先 `docker stop`
-   再复制 `.duckdb` + `.wal`），须经用户批准后执行。
+### 11.1 布局
+
+```
+shadow/reports/decisions-export/
+    state.json                  # 水位缓存：{watermark, rows_exported, next_part}
+    parts/part-000000001.jsonl  # 追加式分片，发布后不可变
+    parts/part-000000002.jsonl
+```
+
+### 11.2 游标：`(decision_time_utc, decision_id)`
+
+**不只用时间戳。** 同一周期内的多条决策共享同一时刻；仅以时刻为游标会
+重复或丢失其中之一。`decision_id` 是 `sha256(run|cycle|market|direction)[:32]`，
+**唯一但无序**——因此它只作并列打破者，不作排序键。
+
+### 11.3 水位：以分片为准，state 只是缓存
+
+写入顺序是 **先分片、后 state**。进程若在两者之间崩溃：
+
+- 分片已落盘而 state 未推进 → 下次运行**从分片最后一行重新推导水位**，
+  不会重复导出；
+- state 若先推进而分片缺失 → 数据丢失且无法察觉。
+
+因此 state 仅用于快速启动，**权威来源是分片本身**。已由测试
+`test_losing_the_state_file_does_not_duplicate_a_range` 验证。
+
+### 11.4 有界与非阻断
+
+每 tick 受三重约束：`batch_rows`（默认 20,000）、`max_seconds`（默认 5s）、
+`max_parts_per_run`（默认 5）。初次回填因此由多个 tick 完成，而非阻塞一次决策。
+
+导出失败**不抛出**：返回带 `notes` 的结果，Runner 记录
+`decision_export_failed` 质量事件。**导出是旁路，决策是任务。**
+
+### 11.5 字段
+
+导出包含 45 列，覆盖 Episode 身份键、Edge、模型概率、盘口深度、
+`mode`（LIVE/REPLAY 隔离所必需）、`thresholds_version`，以及从
+`market_catalog` 联接的 `fee_rate` / `fee_exponent`——定价模块拒绝假设费率为零，
+缺了它每一笔参考本金测算都会是 `FEE_UNKNOWN`。
+
+### 11.6 回退方案
+
+若导出不足，唯一合法替代是**维护窗口内的一致性备份**
+（先 `docker stop weatherquant-shadow`，再复制 `.duckdb` + `.wal`），
+须经用户批准后执行。
 
 ---
 
