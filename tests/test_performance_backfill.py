@@ -105,9 +105,9 @@ def test_a_missing_export_is_reported_not_guessed(tmp_path, capsys) -> None:
 
 def _published(out: Path, name: str) -> Path:
     """Follow the generation pointer, the way the dashboard does."""
-    generation_dir, manifest = resolve_generation(out)
-    assert generation_dir is not None and manifest is not None, "nothing was published"
-    return generation_dir / name
+    gen = resolve_generation(out)
+    assert gen.directory is not None and gen.manifest is not None, "nothing was published"
+    return gen.directory / name
 
 
 def test_build_performance_publishes_all_six_snapshots(tmp_path, capsys) -> None:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ __all__ = [
     "CURRENT_POINTER",
     "PERFORMANCE_SCHEMA_VERSION",
     "SNAPSHOT_FILES",
+    "Generation",
     "build_performance",
     "new_generation_id",
     "publish_performance",
@@ -410,7 +412,31 @@ def publish_performance(
     return written
 
 
-def resolve_generation(directory: str | Path) -> tuple[Path | None, dict[str, Any] | None]:
+@dataclass(frozen=True, slots=True)
+class Generation:
+    """Which published batch to read, and whether anything is wrong with it.
+
+    Three states, and they are genuinely different facts:
+
+    * ``directory is None`` and ``problem is None`` - no generation has ever
+      been published here. The caller falls back to the flat layout, which is
+      also what an older deployment has.
+    * ``directory`` set - a batch is published and readable.
+    * ``problem`` set - a pointer exists but cannot be honoured. That is a
+      *broken publish*, and calling it "not published yet" would send an
+      operator to re-run a backfill that already succeeded.
+
+    A two-tuple could not hold these apart, and conflating the first and the
+    third is exactly what this dataclass replaced: an empty performance
+    directory was being reported as an incomplete publish.
+    """
+
+    directory: Path | None = None
+    manifest: dict[str, Any] | None = None
+    problem: str | None = None
+
+
+def resolve_generation(directory: str | Path) -> Generation:
     """Where to read from, and what that batch claims to be.
 
     Falls back to the flat layout when no pointer exists, so a deployment
@@ -418,25 +444,37 @@ def resolve_generation(directory: str | Path) -> tuple[Path | None, dict[str, An
     files" is one function rather than a rule each caller re-derives.
     """
     root = Path(directory)
+    if not root.exists():
+        return Generation()
+
     pointer = root / CURRENT_POINTER
     if not pointer.exists():
-        return (root if root.exists() else None), None
+        return Generation()  # nothing published yet, or the flat layout
+
     try:
         generation = json.loads(pointer.read_text(encoding="utf-8"))["generation_id"]
-    except (OSError, ValueError, KeyError):
-        return None, None
+    except (OSError, ValueError, KeyError) as exc:
+        return Generation(problem=f"the generation pointer is unreadable: {exc}")
+
     generation_dir = root / "generations" / str(generation)
     manifest_path = generation_dir / "manifest.json"
     if not manifest_path.exists():
-        # A pointer to a directory that is not there is a broken publish,
-        # not a missing backfill - say so by returning nothing rather than
-        # a path that will 404 inside.
-        return None, None
+        # A pointer to a directory with no manifest is a publish that died
+        # before it could describe itself - not an absent backfill.
+        return Generation(
+            problem=(
+                f"the pointer selects generation {generation}, which has no "
+                "manifest; the publish is incomplete"
+            )
+        )
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return generation_dir, None
-    return generation_dir, manifest
+    except (OSError, ValueError) as exc:
+        return Generation(
+            directory=generation_dir,
+            problem=f"generation {generation} has an unreadable manifest: {exc}",
+        )
+    return Generation(directory=generation_dir, manifest=manifest)
 
 
 def write_json_debug(payload: Mapping[str, Any], path: str | Path) -> None:

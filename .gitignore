@@ -28,3 +28,8 @@ htmlcov/
 .ev.json
 .one.json
 .open.json
+
+# Local credentials and scratch. `ssh.env` holds the NAS password: a file
+# that reads a credential must never be one `git add -A` can pick up.
+ssh.env
+.probe/
