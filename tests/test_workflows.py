@@ -182,7 +182,11 @@ def test_disk_overrides_reach_the_healthcheck_from_the_environment() -> None:
 # --- release tags must match the version the image will report ---------------
 
 
-RELEASE_TAG_GUARDS = ("shadow-release.yml", "dashboard-release.yml")
+RELEASE_TAG_GUARDS = (
+    "shadow-release.yml",
+    "dashboard-release.yml",
+    "mcp-release.yml",
+)
 
 
 def test_every_release_workflow_guards_its_own_tag() -> None:
