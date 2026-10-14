@@ -1,0 +1,39 @@
+-- Shadow engine: drop the non-unique index that breaks UPSERT on DuckDB 1.5.6.
+--
+-- PRODUCTION DEFECT. On an isolated copy of the live database:
+--
+--   with idx_catalog_open present      -> UPSERT into market_catalog raises
+--                                         FatalException, and the connection
+--                                         is invalidated
+--   after DROP INDEX idx_catalog_open  -> the same UPSERT succeeds
+--   with only idx_catalog_target kept  -> still fails
+--   after rebuilding idx_catalog_open  -> fails again
+--
+-- The error is "Failed to delete all rows from index. Only deleted 0 out of
+-- 1 rows". An `INSERT ... ON CONFLICT DO UPDATE` deletes the old row before
+-- inserting the new one, and that delete has to walk every index. This one
+-- is the one it cannot walk.
+--
+-- WHY THIS INDEX IN PARTICULAR: it is non-unique, and it is built on three
+-- low-cardinality booleans - (active, accepting_orders, closed). Almost every
+-- row shares the same key, and almost every column in the delete vector is a
+-- constant. That is the shape DuckDB 1.5.6's index-delete path mishandles,
+-- and it is why the other indexes on the same table are unaffected.
+--
+-- THIS FILE IS A NEW MIGRATION, NOT AN EDIT TO 0002. 0002 is already applied
+-- in production and its checksum is recorded in schema_migrations; rewriting
+-- it would make every existing database fail the migrator's checksum check on
+-- next start, turning a fix into an outage.
+--
+-- WHAT IS KEPT:
+--   * market_id, the primary key - the conflict target of the UPSERT itself
+--   * idx_catalog_target (target_date) - a real, selective index
+--   * idx_books_market, idx_daily_max_target, and every 0001/0003 index
+--
+-- WHY IT IS SAFE TO LOSE: the query in report._coverage that motivated this
+-- index filters market_catalog by (active, accepting_orders, NOT closed).
+-- With at most a few thousand catalog rows, a sequential scan is not the
+-- difference between a 60s cycle and a stalled one - and a scan that works is
+-- strictly better than an index whose maintenance kills the engine.
+
+DROP INDEX IF EXISTS idx_catalog_open;
