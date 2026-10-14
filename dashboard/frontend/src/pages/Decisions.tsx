@@ -205,6 +205,12 @@ export default function Decisions() {
               sub="distinct market_id"
             />
             <StatCard
+              testId="stat-accept-directions"
+              label="独立市场方向组合"
+              value={fmtInt(totals.accept_scope.accepted_distinct_market_directions)}
+              sub="distinct market_id + direction"
+            />
+            <StatCard
               testId="stat-accept-tokens"
               label="独立 Token"
               value={fmtInt(totals.accept_scope.accepted_distinct_tokens ?? 0)}

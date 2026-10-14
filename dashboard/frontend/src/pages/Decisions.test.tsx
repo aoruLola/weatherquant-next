@@ -204,3 +204,20 @@ describe('Decisions page', () => {
     await waitFor(() => expect(screen.getByTestId('totals-missing')).toBeInTheDocument())
   })
 })
+
+describe('Decision scope API contract', () => {
+  it('displays direction distinctness when the report supplies it', async () => {
+    const fixture = decisionsFixture()
+    fixture.totals = {
+      ...fixture.totals!,
+      accept_scope: {
+        ...(fixture.totals?.accept_scope ?? {}),
+        accepted_distinct_market_directions: 2,
+      },
+    }
+    mockFetch({ '/api/v1/decisions': envelopeOf(fixture) })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('stat-accept-directions')).toBeInTheDocument())
+    expect(screen.getByTestId('stat-accept-directions')).toHaveTextContent('2')
+  })
+})

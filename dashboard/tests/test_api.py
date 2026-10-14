@@ -773,3 +773,60 @@ def test_age_is_measured_against_utc_now(tmp_path: Path, settings_for) -> None:
         stale_body_health = client.get("/api/v1/collector/health").json()
         # serialised timestamps are UTC; either spelling counts
         assert stale_body_health["data"]["updated_at_utc"].endswith(("+00:00", "Z"))
+
+
+def test_decisions_api_forwards_accept_scope_without_losing_dimensions(data_root: Path, client: TestClient) -> None:
+    report = shadow_report(now=utcnow())
+    scope = {
+        "accepted_observations": 21,
+        "accepted_distinct_markets": 3,
+        "accepted_distinct_tokens": 3,
+        "accepted_distinct_target_dates": 2,
+        "accepted_distinct_market_directions": 4,
+        "accepted_repeats": 17,
+        "models_with_decisions": 2,
+        "runs_in_database": 9,
+        "window": "whole database",
+        "scope": "shadow_database_lifetime",
+    }
+    report["decisions"]["accept_scope"] = scope
+    write_json(data_root / "shadow" / "reports" / "report.json", report)
+    response = client.get("/api/v1/decisions")
+    assert response.status_code == 200
+    totals = response.json()["data"]["totals"]
+    assert totals["accept_scope"] == scope
+    assert totals["accepted"] == 3
+    assert response.json()["data"]["rows_status"] == "unavailable"
+
+
+def test_decisions_api_degrades_when_older_report_has_no_scope(
+    data_root: Path, settings_for
+) -> None:
+    """A report from before the field existed renders UNAVAILABLE, not zeros.
+
+    The scenario is built here rather than inherited from the default
+    fixture: the fixture now publishes `accept_scope` (the current report
+    does), so depending on its absence would make this test pass or fail for
+    a reason unrelated to the branch under test.
+    """
+    report = shadow_report(now=utcnow())
+    report["decisions"].pop("accept_scope", None)
+    write_json(data_root / "shadow" / "reports" / "report.json", report)
+
+    app = create_app(settings_for(data_root))
+    with TestClient(app) as client:
+        response = client.get("/api/v1/decisions")
+        assert response.status_code == 200
+        totals = response.json()["data"]["totals"]
+        assert totals["accept_scope"] is None
+        assert totals["accepted"] == 3
+
+
+def test_overview_does_not_substitute_archive_age_for_book_age(data_root: Path, client: TestClient) -> None:
+    report = shadow_report(now=utcnow())
+    report["liveness"].pop("latest_orderbook_venue_age_seconds", None)
+    write_json(data_root / "shadow" / "reports" / "report.json", report)
+    response = client.get("/api/v1/overview")
+    assert response.status_code == 200
+    # The collector archive is fresh, but a Gamma frame is not a fresh book.
+    assert response.json()["data"]["latest_book_age_seconds"] is None

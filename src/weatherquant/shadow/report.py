@@ -347,29 +347,33 @@ def _coverage(con, *, horizon_days: int) -> dict[str, Any]:
     ]
     models = [r[0] for r in con.execute("SELECT DISTINCT model_name FROM model_versions").fetchall()]
     needed = len(open_targets) * len(models)
-    # The numerator must be counted over exactly the set the denominator is
-    # built from: open target dates x tracked models. It used to count every
-    # (model, target_date) inside a horizon window instead, so a 3-date
-    # horizon against 4 dates of history reported 16/12 and then clamped the
-    # ratio to 1.0 - a coverage figure that could never fall below 100% no
-    # matter how many forecasts were missing. A ratio whose numerator is
-    # unrelated to its denominator is not a coverage ratio.
-    have = (
-        _one(
-            con,
-            "SELECT COUNT(*) FROM ("
-            "SELECT DISTINCT p.model_name, p.target_date FROM model_predictions p "
-            "JOIN (SELECT DISTINCT target_date FROM market_catalog "
-            "      WHERE active AND accepting_orders AND NOT closed "
-            "        AND target_date IS NOT NULL) t ON p.target_date = t.target_date "
-            "WHERE p.model_name IN (SELECT DISTINCT model_name FROM model_versions)"
-            ") x",
-        )
-        or 0
-    )
-    # Clamped only as a guard against a view counting a pair the set does not;
-    # with the query above it cannot exceed `needed`.
-    have = min(have, needed)
+    # A forecast pair counts only when both its model and target date belong
+    # to the *same* scope as the denominator. Historic predictions must not
+    # turn a 16/12 mismatch into a reported 100% via min().
+    pairs = con.execute(
+        """
+        SELECT p.model_name, p.target_date,
+               BOOL_OR(
+                   p.n_hours > 0 AND p.n_missing_hours = 0
+                   AND p.forecast_publishable_at_utc <= p.decision_time_utc
+                   AND p.training_cutoff_utc <= p.decision_time_utc
+               ) AS valid_at_decision
+        FROM model_predictions p
+        JOIN (SELECT DISTINCT target_date FROM market_catalog
+              WHERE active AND accepting_orders AND NOT closed
+                AND target_date IS NOT NULL) d ON p.target_date = d.target_date
+        JOIN (SELECT DISTINCT model_name FROM model_versions) m
+             ON p.model_name = m.model_name
+        GROUP BY p.model_name, p.target_date
+        """
+    ).fetchall()
+    have = len(pairs)
+    valid = sum(1 for _model, _date, flag in pairs if flag)
+    historical_pairs = _one(
+        con,
+        "SELECT COUNT(*) FROM (SELECT DISTINCT model_name, target_date "
+        "FROM model_predictions) historical",
+    ) or 0
 
     token_rows = con.execute(
         "SELECT market_id, token_yes FROM market_catalog WHERE active AND accepting_orders AND NOT closed"
@@ -387,16 +391,29 @@ def _coverage(con, *, horizon_days: int) -> dict[str, Any]:
         "open_target_dates": [str(d) for d in open_targets],
         "models_tracked": sorted(models),
         "forecast_needed": needed,
-        "forecast_available": have if needed else 0,
-        "forecast_missing": max(needed - have, 0),
+        "forecast_available": have,
         "forecast_coverage": (have / needed) if needed else None,
+        # Kept from the first pass at this bug: with the join above,
+        # `have` cannot exceed `needed`, so this is a plain difference
+        # rather than a clamp that hides a bad numerator.
+        "forecast_missing": max(needed - have, 0),
+        "forecast_historical_pairs": int(historical_pairs),
+        "forecast_valid_available": valid,
+        "forecast_valid_coverage": (valid / needed) if needed else None,
+        "forecast_valid_definition": (
+            "at least one prediction per active model/target-date pair with "
+            "n_hours > 0, n_missing_hours = 0, publishable_at <= decision_time "
+            "and training_cutoff <= decision_time; historical validity, not "
+            "a guarantee of current forecast freshness"
+        ),
         "open_markets": len(token_rows),
         "open_markets_with_a_book": with_book,
         "orderbook_coverage": (with_book / len(token_rows)) if token_rows else None,
         "books_total": books_total,
         "note": (
-            "coverage counts whether an input exists at all; it says nothing "
-            "about whether the input is any good"
+            "forecast_available is the number of model/target-date pairs "
+            "recorded for currently open target dates; forecast_historical_pairs "
+            "includes every historical target date. No open dates -> N/A."
         ),
     }
 

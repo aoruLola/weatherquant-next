@@ -151,6 +151,8 @@ class ArchiveTailer:
         self.checkpoints: dict[str, Checkpoint] = {}
         self.last_file_date: dict[str, date] = {}
         self.market_of_token_map: dict[str, str] = {}
+        # Changes learned during a poll are provisional until Runner commits.
+        self._poll_market_of_token_map: dict[str, str] = {}
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -194,6 +196,9 @@ class ArchiveTailer:
     # -- reading ------------------------------------------------------------
 
     def poll(self) -> TailResult:
+        # Within-batch metadata must resolve later books without advancing
+        # the committed token map if DuckDB rolls back.
+        self._poll_market_of_token_map = dict(self.market_of_token_map)
         stats = ReadStats()
         quality: list[QualityEvent] = []
         market_updates: list[list[CatalogMarket]] = []
@@ -483,7 +488,7 @@ class ArchiveTailer:
             if markets:
                 stats.markets += len(markets)
                 market_updates.append(markets)
-                self.market_of_token_map.update(market_of_token_table(markets))
+                self._poll_market_of_token_map.update(market_of_token_table(markets))
             return
 
         if kind is EventKind.BOOK_SNAPSHOT:
@@ -522,7 +527,7 @@ class ArchiveTailer:
             token_id = str(payload.get("asset_id") or "")
             if not token_id:
                 raise ValueError("book payload has no asset_id")
-            market_id = self.market_of_token_map.get(token_id, "")
+            market_id = self._poll_market_of_token_map.get(token_id, "")
             if not market_id:
                 return [], [f"rest book for token {token_id} arrived before any market metadata"]
             return [
@@ -538,7 +543,7 @@ class ArchiveTailer:
 
         snapshots, ws_notes = parse_ws_frame(
             payload,
-            market_of_token=self.market_of_token_map,
+            market_of_token=self._poll_market_of_token_map,
             collector_received_at_utc=envelope.received_at_utc,
             shadow_received_at_utc=shadow_now,
             run_id=envelope.run_id,

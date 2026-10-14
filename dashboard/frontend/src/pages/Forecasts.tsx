@@ -223,16 +223,24 @@ export default function Forecasts() {
             <SectionTitle hint="来自 shadow report coverage">覆盖与数据状态</SectionTitle>
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
               <StatCard
-                label="预报覆盖 forecast coverage"
+                label="当前开放目标日预测覆盖"
                 value={
                   coverage?.forecast_coverage != null
                     ? fmtPct(Number(coverage.forecast_coverage))
-                    : '—'
+                    : 'N/A'
                 }
                 sub={
-                  coverage
-                    ? `${coverage.forecast_available ?? '—'} / ${coverage.forecast_needed ?? '—'}`
-                    : 'report 未提供'
+                  coverage ? (
+                    <span data-testid="forecast-coverage-scope">
+                      已记录 {coverage.forecast_available ?? '—'} / {coverage.forecast_needed ?? '—'} 个模型与目标日组合
+                      <span className="block">
+                        有效且符合决策时点约束：{coverage.forecast_valid_available ?? 'N/A'} 个
+                      </span>
+                      <span className="block">
+                        历史全部预测组合：{coverage.forecast_historical_pairs ?? 'N/A'} 个
+                      </span>
+                    </span>
+                  ) : 'report 未提供'
                 }
               />
               <StatCard

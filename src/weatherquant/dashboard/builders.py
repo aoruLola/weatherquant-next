@@ -722,16 +722,22 @@ def decisions(
     # --- aggregate totals (always attempted; independent of the row list) ---
     if report.present and isinstance(report.decisions, dict):
         dec = report.decisions
-        # Passed through whole, not field-by-field. This block used to
-        # whitelist keys, which silently dropped `accept_scope` and `by_model`
-        # - the report published them and the Decisions page said "unavailable"
-        # for weeks, because a whitelist can only ever be as complete as the
-        # day it was written. Anything the report considers part of a decision
-        # aggregate is part of one here too.
+        # Passed through whole, not field-by-field. A whitelist silently
+        # dropped `accept_scope` and `by_model` - the report published them
+        # and the Decisions page said "unavailable" for weeks, because a
+        # whitelist can only ever be as complete as the day it was written.
+        # Anything the report considers part of a decision aggregate is part
+        # of one here too.
         totals: dict[str, Any] = dict(dec)
         totals.setdefault("by_state", {})
         totals.setdefault("by_mode", {})
         totals.setdefault("primary_reasons", {})
+        # Kept from the other side of this merge: the scope is a *typed*
+        # contract, so a report that predates it, or that sends something
+        # which is not a mapping, must render UNAVAILABLE rather than a value
+        # the UI would treat as a dimension it could group by.
+        scope = dec.get("accept_scope")
+        totals["accept_scope"] = scope if isinstance(scope, dict) else None
         # Taken from the report, never restated here: the scope is a fact
         # about how the numbers were counted, and a second copy of the
         # sentence is how the two drift apart.
@@ -891,8 +897,8 @@ def overview(state: DashboardState, now: datetime) -> tuple[OverviewData, Freshn
     latest_book_age = None
     if report.present and isinstance(report.liveness, dict):
         latest_book_age = _num(report.liveness.get("latest_orderbook_venue_age_seconds"))
-    if latest_book_age is None and archive_freshness.age_seconds is not None:
-        latest_book_age = archive_freshness.age_seconds
+    # The age of the newest archive line can be from Gamma or another
+    # market; it cannot stand in for an orderbook's venue timestamp.
 
     decision_totals: dict[str, Any] | None = None
     totals_status = FreshnessState.MISSING

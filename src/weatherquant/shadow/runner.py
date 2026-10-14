@@ -364,9 +364,13 @@ class ShadowRunner:
 
         # Phase 1: ingest, atomically with its offsets.
         tail = self.tailer.poll()
-        self.state.apply_markets(tail.market_updates)
-        self.state.apply_books(tail.book_updates)
-        self.tailer.set_market_of_token(self.state.market_of_token)
+        # Prepare a candidate state without mutating the committed view.
+        # Rollback must leave both market metadata and books unchanged.
+        candidate = ShadowState()
+        candidate.markets = self.state.markets.copy()
+        candidate.books = self.state.books.copy()
+        candidate.apply_markets(tail.market_updates)
+        candidate.apply_books(tail.book_updates)
         flat_markets = [m for batch in tail.market_updates for m in batch]
         self.store.commit_batch(
             run_id=self.run_id or "",
@@ -376,6 +380,9 @@ class ShadowRunner:
             checkpoints=tail.checkpoints,
             quality=tail.quality,
         )
+        # Commit succeeded: publish the already-validated in-memory view.
+        self.state = candidate
+        self.tailer.set_market_of_token(candidate.market_of_token)
         # Adopt only once the transaction above has committed. `poll` is
         # deliberately read-only with respect to this tailer: if the batch had
         # advanced memory and then rolled back, the next cycle would resume
