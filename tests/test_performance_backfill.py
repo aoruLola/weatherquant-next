@@ -138,6 +138,138 @@ def test_an_unsupported_format_is_refused(tmp_path) -> None:
         load_decisions(weird)
 
 
+def _export_row(**overrides):
+    """A row in the *export's* shape, keyed by the export's own names.
+
+    Derived from EXPORT_COLUMNS rather than hand-written, so a rename in
+    the export moves this test with it instead of leaving it green against
+    a vocabulary nothing produces.
+    """
+    from weatherquant.shadow.export import EXPORT_COLUMNS
+
+    values = {
+        "decision_id": "d-1",
+        "market_id": "m-1",
+        "target_date": "2026-10-14",
+        "model_name": "calibrated",
+        "direction": "buy_yes",
+        "mode": "LIVE",
+        "state": "ACCEPT",
+        "decision_time_utc": NOW.isoformat(),
+        "net_edge": 0.03,
+        "market_price": 0.6,
+        "model_probability": 0.65,
+        "available_depth_usd": 500.0,
+        "fee_rate": 0.0,
+        "station": "KLGA",
+        "bracket_label": "81°F",
+    }
+    values.update(overrides)
+    return tuple(values.get(name.rsplit(".", 1)[-1]) for name in EXPORT_COLUMNS)
+
+
+def test_the_export_shape_feeds_the_build(tmp_path) -> None:
+    """The seam the two sides actually meet on.
+
+    The fixtures above are written in the public vocabulary; a decisions
+    export carries the engine's. Each suite passed against its own, so
+    nothing caught that ``build-performance --export <shadow export>`` -
+    the documented production path - died on its first row with a KeyError.
+    """
+    from weatherquant.shadow.export import _write_part
+
+    parts = tmp_path / "export" / "parts"
+    parts.mkdir(parents=True)
+    _write_part(
+        parts / "part-000000001.jsonl",
+        [_export_row(decision_id=f"d-{i}", market_id=f"m-{i % 3}") for i in range(9)],
+    )
+
+    decisions = load_decisions(tmp_path / "export")
+    assert len(decisions) == 9
+
+    out = tmp_path / "performance"
+    build_performance_snapshots(decisions=decisions, out_dir=out, dataset="live", now=NOW)
+
+    # An unread alias would leave every ACCEPT unpriced, so the count is
+    # what proves the edge was read rather than defaulted away.
+    edge = json.loads(_published(out, "edge.json").read_text(encoding="utf-8"))
+    assert edge["data"]["overall"]["count"] == 9
+
+
+def test_an_export_row_with_no_edge_is_refused_not_zeroed(tmp_path) -> None:
+    """Missing is not zero.
+
+    The export carries a null edge for a decision the book could not price.
+    Reading that as 0.0 would invent a break-even trade that never existed
+    and drag the average toward it, so the row has to be refused instead.
+    """
+    from weatherquant.shadow.export import _write_part
+
+    parts = tmp_path / "export" / "parts"
+    parts.mkdir(parents=True)
+    _write_part(
+        parts / "part-000000001.jsonl",
+        [
+            _export_row(decision_id="d-priced"),
+            _export_row(decision_id="d-unpriced", net_edge=None),
+        ],
+    )
+
+    out = tmp_path / "performance"
+    build_performance_snapshots(
+        decisions=load_decisions(tmp_path / "export"),
+        out_dir=out,
+        dataset="live",
+        now=NOW,
+    )
+
+    edge = json.loads(_published(out, "edge.json").read_text(encoding="utf-8"))
+    assert edge["data"]["overall"]["count"] == 1, "an unpriced ACCEPT became an edge"
+    assert edge["data"]["refused"]["accept_without_usable_edge"] == 1
+
+
+def test_an_export_row_without_a_decision_time_fails_loudly(tmp_path) -> None:
+    """A row that cannot say when it was decided is unusable, not defaulted.
+
+    Episodes are ordered by this instant, so substituting one would merge
+    opportunities that never coexisted.
+    """
+    from weatherquant.performance.episodes import row_from_mapping
+    from weatherquant.shadow.export import _row_as_dict
+
+    row = _row_as_dict(_export_row(decision_time_utc=None))
+
+    with pytest.raises(TypeError, match="decided_at_utc"):
+        row_from_mapping(row)
+
+
+def test_an_export_row_with_no_book_claims_no_profit(tmp_path) -> None:
+    """Depth is not a fill. Without retained book levels nothing is provable,
+    so the opportunity is NOT_EXECUTABLE and no profit is asserted - rather
+    than the zero that would read as a flat result.
+    """
+    from weatherquant.shadow.export import _row_as_dict
+
+    out = tmp_path / "performance"
+    build_performance_snapshots(
+        decisions=[
+            _row_as_dict(_export_row(decision_id=f"d-{i}", market_id=f"m-{i}"))
+            for i in range(3)
+        ],
+        out_dir=out,
+        dataset="live",
+        now=NOW,
+    )
+
+    summary = json.loads(_published(out, "summary.json").read_text(encoding="utf-8"))
+    capital = summary["data"]["reference_capital"]
+    assert capital["executable_count"] == 0
+    assert capital["not_executable_count"] == 3
+    assert capital["backtestable"] is False
+    assert capital["allocated_total_usdc"] == 0.0
+
+
 def test_the_published_snapshot_carries_the_requested_dataset(tmp_path) -> None:
     out = tmp_path / "performance"
     build_performance_snapshots(
