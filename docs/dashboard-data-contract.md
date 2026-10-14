@@ -306,3 +306,18 @@ UI 从 `unavailable` 变为实时数据，需要以下条件**全部**满足：
 全部为只读 GET，Pydantic 响应模型，分页 `limit/cursor`，筛选参数枚举校验
 （非法 → 422），无限流（默认 600/min/IP，可关）。不提供查询、写入、执行类接口，
 不提供 DuckDB / 原始 JSONL 下载。
+
+
+### Hotfix v0.1.3：预测覆盖与独立度契约
+
+`forecast_needed` 是当前开放市场的去重目标日数量与已登记模型数量的乘积。
+`forecast_available` 只统计相同目标日和模型集合中存在历史预测的组合，历史其他目标日
+不参与分子，另计于新增字段 `forecast_historical_pairs`。`forecast_valid_available`
+要求有完整预测，且预测可用时间和模型训练截止时间均不晚于决策时点；
+`forecast_valid_coverage` 的分母与 `forecast_coverage` 完全相同。这些指标
+不表示该模型当前仍然新鲜，也不表示盈利概率。没有开放目标日或模型时，两种覆盖率
+均为 null，UI 显示 N/A。新增字段为可选项，不改变已有数据库结构。
+
+Dashboard 的 `/api/v1/decisions` 原样保留 `data.totals.accept_scope` 内的所有
+独立度维度，包括观察次数、市场、Token、目标日、市场方向、重复计数、模型数、
+运行次数及统计范围。旧版 Shadow 未发布 `accept_scope` 时返回 null，不伪造零值。

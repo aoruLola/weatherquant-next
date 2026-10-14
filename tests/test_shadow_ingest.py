@@ -14,7 +14,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from shadow_helpers import NOW, TARGET_DATE, archive_line, gamma_event, write_lines
-from weatherquant.shadow.events import EventKind, classify, parse_envelope
+from weatherquant.shadow.events import EventKind, classify, market_of_token_table, parse_envelope
 from weatherquant.shadow.ingest import ArchiveTailer, Checkpoint
 
 
@@ -60,6 +60,10 @@ def _commit(tailer: ArchiveTailer, result) -> None:
     defect reached production behind a green suite. Whatever this does, the
     runner must do, and vice versa.
     """
+    mapping = tailer.market_of_token
+    for batch in result.market_updates:
+        mapping.update(market_of_token_table(batch))
+    tailer.set_market_of_token(mapping)
     tailer.adopt(result.checkpoints, result.file_dates)
 
 

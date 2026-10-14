@@ -734,6 +734,9 @@ def decisions(
             "replay_accepted": dec.get("replay_accepted"),
             "primary_reasons": dec.get("primary_reasons") or {},
             "p95_decision_latency_ms": dec.get("p95_decision_latency_ms"),
+            # Keep scope as a single additive nested contract. Old reports
+            # without the field must show UNAVAILABLE, not made-up zeros.
+            "accept_scope": dec.get("accept_scope") if isinstance(dec.get("accept_scope"), dict) else None,
             # Taken from the report, never restated here: the scope is a fact
             # about how the numbers were counted, and a second copy of the
             # sentence is how the two drift apart.
@@ -894,8 +897,8 @@ def overview(state: DashboardState, now: datetime) -> tuple[OverviewData, Freshn
     latest_book_age = None
     if report.present and isinstance(report.liveness, dict):
         latest_book_age = _num(report.liveness.get("latest_orderbook_venue_age_seconds"))
-    if latest_book_age is None and archive_freshness.age_seconds is not None:
-        latest_book_age = archive_freshness.age_seconds
+    # The age of the newest archive line can be from Gamma or another
+    # market; it cannot stand in for an orderbook's venue timestamp.
 
     decision_totals: dict[str, Any] | None = None
     totals_status = FreshnessState.MISSING
