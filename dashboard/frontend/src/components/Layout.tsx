@@ -12,6 +12,7 @@ import {
   LayoutDashboard,
   ListChecks,
   Menu,
+  TrendingUp,
   WifiOff,
   X,
 } from 'lucide-react'
@@ -24,6 +25,7 @@ const NAV = [
   { to: '/markets', label: '市场行情', en: 'Markets', icon: BarChart3 },
   { to: '/forecasts', label: '天气预测', en: 'Forecasts', icon: CloudSun },
   { to: '/decisions', label: 'Shadow 决策', en: 'Decisions', icon: ListChecks },
+  { to: '/performance', label: '绩效分析', en: 'Performance', icon: TrendingUp },
   { to: '/system', label: '系统监控', en: 'System', icon: Activity },
 ]
 

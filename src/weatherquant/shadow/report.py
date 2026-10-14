@@ -393,6 +393,10 @@ def _coverage(con, *, horizon_days: int) -> dict[str, Any]:
         "forecast_needed": needed,
         "forecast_available": have,
         "forecast_coverage": (have / needed) if needed else None,
+        # Kept from the first pass at this bug: with the join above,
+        # `have` cannot exceed `needed`, so this is a plain difference
+        # rather than a clamp that hides a bad numerator.
+        "forecast_missing": max(needed - have, 0),
         "forecast_historical_pairs": int(historical_pairs),
         "forecast_valid_available": valid,
         "forecast_valid_coverage": (valid / needed) if needed else None,

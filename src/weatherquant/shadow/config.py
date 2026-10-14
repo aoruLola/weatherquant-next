@@ -104,6 +104,30 @@ class ShadowSettings(BaseSettings):
         "The report is still shown: a stale answer is more useful than none, "
         "provided it says so.",
     )
+    shadow_export_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description="How often a bounded batch of historical decisions is "
+        "appended to the export the research side reads. Never blocks the "
+        "decision cycle: one batch, then back to deciding.",
+    )
+    shadow_export_rows: int = Field(
+        default=20_000,
+        gt=0,
+        description="Hard cap on rows read and written in one export batch.",
+    )
+    shadow_export_max_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description="Wall-clock budget for one export batch, independent of "
+        "the row cap. A large batch on a slow disk must still yield.",
+    )
+    shadow_export_max_parts: int = Field(
+        default=5,
+        gt=0,
+        description="Parts written per export tick. Bounds how far one tick "
+        "can run on a cold start; the next tick continues from the watermark.",
+    )
     shadow_collector_silence_seconds: float = Field(
         default=900.0,
         gt=0,

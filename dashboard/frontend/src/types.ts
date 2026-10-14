@@ -314,6 +314,43 @@ export interface SystemData {
   unavailable: string[]
 }
 
+/**
+ * A performance snapshot as the API serves it.
+ *
+ * Deliberately loose: the payload carries `statistical_scope` and
+ * `warnings` as *data*, because those two are what stop an edge total
+ * being read as a return. Typing the body tightly would drop the caveat
+ * that travels with the number.
+ */
+export interface PerformancePayload {
+  reason?: string | null
+  statistical_scope: string[]
+  warnings: string[]
+  sample_size?: number | null
+  source?: string | null
+  generated_at_utc?: string | null
+  as_of_utc?: string | null
+  dataset?: string | null
+  data?: Record<string, any>
+  items?: Record<string, any>[]
+  total?: number
+  next_cursor?: number | null
+  // reference-capital
+  mode?: string
+  capital_usdc?: number
+  allocated_total_usdc?: number
+  peak_open_allocation_usdc?: number
+  balance_remaining_usdc?: number
+  utilization?: number
+  capacity_limited_count?: number
+  executable_count?: number
+  not_executable_count?: number
+  backtestable?: boolean
+  not_backtestable_reasons?: string[]
+  source_endpoint?: string
+  [k: string]: any
+}
+
 export interface Healthz {
   status: string
   uptime_seconds: number

@@ -23,6 +23,7 @@ from weatherquant.shadow import cli as shadow_cli
 from weatherquant.shadow.config import ShadowSettings
 from weatherquant.shadow.report import (
     SNAPSHOT_SCHEMA_VERSION,
+    _coverage,
     format_report,
     load_report_snapshot,
     publish_report_snapshot,
@@ -308,3 +309,70 @@ def test_build_report_is_what_gets_published(tmp_path) -> None:
     for key in ("generated_at_utc", "decisions", "equity_curve", "schema_version", "expires_at_utc"):
         assert key in payload, key
     assert payload["equity_curve"] is None  # never a fabricated return
+
+
+# --- coverage is one set divided by another ---------------------------------
+
+
+def _coverage_db(tmp_path):
+    """A real migrated shadow DB with two open dates and four tracked models."""
+    from datetime import UTC, datetime
+
+    from weatherquant.storage.shadow import ShadowDatabase
+
+    db = ShadowDatabase(tmp_path / "shadow.duckdb")
+    db.open()
+    con = db.con
+    now = datetime.now(tz=UTC)
+    for i, (day, token) in enumerate([("2026-10-13", "tok-a"), ("2026-10-14", "tok-b")]):
+        con.execute(
+            "INSERT INTO market_catalog (market_id, event_id, question, token_yes, token_no, "
+            "station, target_date, active, closed, accepting_orders, first_seen_utc, last_seen_utc) "
+            "VALUES (?, ?, ?, ?, ?, 'KLGA', ?, TRUE, FALSE, TRUE, ?, ?)",
+            [f"m-{i}", f"ev-{i}", f"q{i}", token, f"{token}-no", day, now, now],
+        )
+    for model in ("calibrated", "ecmwf_raw", "fusion", "gfs_raw"):
+        con.execute(
+            "INSERT INTO model_versions (model_name, model_version, training_cutoff_utc, "
+            "created_at_utc, source_data_hash, artifact_sha256, n_pairs, n_dates, "
+            "loaded_at_utc, is_primary) VALUES (?, 'v1', ?, ?, 'h', 'a', 1, 1, ?, FALSE)",
+            [model, now, now, now],
+        )
+    # Only three of the eight (model, open date) pairs exist: one forecast short.
+    for model, day in [("calibrated", "2026-10-13"), ("calibrated", "2026-10-14"), ("fusion", "2026-10-13")]:
+        con.execute(
+            "INSERT INTO model_predictions (model_name, model_version, station, target_date, "
+            "event_id, forecast_run_time_utc, probabilities_json, lead_hours, model_run_id, "
+            "training_cutoff_utc, forecast_publishable_at_utc, forecast_publishable_basis, "
+            "forecast_received_at_utc, decision_time_utc, calibration_version, "
+            "source_data_hash, computed_at_utc) VALUES (?, 'v1', 'KLGA', ?, 'ev-0', ?, '{}', 1, "
+            "'r', ?, ?, 'estimated', ?, ?, 'v1', 'h', ?)",
+            [model, day, now, now, now, now, now, now],
+        )
+    return db
+
+
+def test_forecast_coverage_counts_the_same_set_it_divides_by(tmp_path) -> None:
+    """16/12 showing 100% is a ratio whose parts have nothing to do with each other.
+
+    The numerator counted every (model, target_date) inside a horizon window;
+    the denominator counted open target dates x tracked models. A three-date
+    horizon over four dates of history therefore reported 16 available against
+    12 needed, and the clamp turned that into 1.0 - coverage that could not
+    fall below 100% however many forecasts were genuinely missing.
+    """
+    db = _coverage_db(tmp_path)
+    try:
+        cov = _coverage(db.con, horizon_days=7)
+        assert cov["open_target_dates"] == ["2026-10-13", "2026-10-14"]
+        assert len(cov["models_tracked"]) == 4
+        assert cov["forecast_needed"] == 8  # 2 open dates x 4 models
+        assert cov["forecast_available"] == 3  # only the three that exist
+        assert cov["forecast_missing"] == 5
+        assert cov["forecast_coverage"] == 3 / 8
+        # The clamp must not be doing the work: available is counted within
+        # the same set, so it cannot exceed needed on its own.
+        assert cov["forecast_available"] <= cov["forecast_needed"]
+        assert cov["forecast_coverage"] < 1.0
+    finally:
+        db.close()

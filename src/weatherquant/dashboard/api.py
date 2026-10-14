@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from weatherquant.dashboard import API_SCHEMA_VERSION
 from weatherquant.dashboard import builders as builders
+from weatherquant.dashboard import performance as perf
 from weatherquant.dashboard.archive import ArchiveTail
 from weatherquant.dashboard.config import DashboardSettings
 from weatherquant.dashboard.contracts import (
@@ -42,6 +43,7 @@ from weatherquant.dashboard.contracts import (
     MarketDetailData,
     MarketsData,
     OverviewData,
+    PerformanceData,
     ShadowHealthData,
     ShadowReportData,
     SystemData,
@@ -110,6 +112,37 @@ def _env[T](cls: type[T], api: str, data: T, freshness: Freshness, now: datetime
         freshness=freshness,
         data=data,
     )
+
+
+def _perf_dataset(data: Any, configured: str) -> str:
+    """The snapshot's own provenance, not the dashboard's setting.
+
+    A backfill labelled ``fixture`` and mounted into a dashboard set to
+    ``live`` would otherwise be stamped ``live`` on the way out - and the
+    fixture banner reads ``/healthz``, which carries the same setting, so
+    sample data could be presented as production with no banner to say
+    otherwise. The snapshot knows what it is; the envelope repeats it.
+    """
+    if isinstance(data, dict):
+        labelled = data.get("dataset")
+        if isinstance(labelled, str) and labelled in {"live", "fixture"}:
+            return labelled
+    return configured
+
+
+def _perf_env(
+    cls: Any, api: str, data: Any, freshness: Freshness, now: datetime, configured: str
+) -> Envelope[Any]:
+    dataset = _perf_dataset(data, configured)
+    if dataset != configured and isinstance(data, dict):
+        warnings = data.get("warnings")
+        note = (
+            f"snapshot dataset is {dataset!r} but this dashboard is configured "
+            f"as {configured!r}; the snapshot's own label governs"
+        )
+        data = dict(data)
+        data["warnings"] = ([*(warnings or []), note] if isinstance(warnings, list) else [note])
+    return _env(cls, api, data, freshness, now, dataset)
 
 
 def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: DashboardSettings) -> None:
@@ -274,6 +307,89 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
         now = _utcnow()
         data, freshness = await asyncio.to_thread(builders.system, state, now)
         return _env(SystemData, "system", data, freshness, now, dataset)
+
+    # -- performance -------------------------------------------------------
+    # All seven read snapshots the research process already computed. None
+    # of them opens a database, and none of them derives a figure a second
+    # time - see docs/performance-data-contract.md section 7.
+    perf_state = perf.PerformanceState(state.sources, settings)
+
+    @app.get("/api/v1/performance/summary", response_model=Envelope[PerformanceData], tags=["v1"])
+    async def r_perf_summary() -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(perf.performance_summary, perf_state, now)
+        return _perf_env(PerformanceData, "performance/summary", data, freshness, now, dataset)
+
+    @app.get("/api/v1/performance/edge", response_model=Envelope[PerformanceData], tags=["v1"])
+    async def r_perf_edge() -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(perf.performance_edge, perf_state, now)
+        return _perf_env(PerformanceData, "performance/edge", data, freshness, now, dataset)
+
+    @app.get("/api/v1/performance/win-rate", response_model=Envelope[PerformanceData], tags=["v1"])
+    async def r_perf_win_rate() -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(perf.performance_win_rate, perf_state, now)
+        return _perf_env(PerformanceData, "performance/win-rate", data, freshness, now, dataset)
+
+    @app.get(
+        "/api/v1/performance/opportunities",
+        response_model=Envelope[PerformanceData],
+        tags=["v1"],
+    )
+    async def r_perf_opportunities(
+        limit: int = Query(50, ge=1, le=500),
+        cursor: int = Query(0, ge=0),
+    ) -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(
+            perf.performance_opportunities, perf_state, now, limit=limit, cursor=cursor
+        )
+        return _perf_env(PerformanceData, "performance/opportunities", data, freshness, now, dataset)
+
+    @app.get(
+        "/api/v1/performance/settlements",
+        response_model=Envelope[PerformanceData],
+        tags=["v1"],
+    )
+    async def r_perf_settlements(
+        limit: int = Query(50, ge=1, le=500),
+        cursor: int = Query(0, ge=0),
+    ) -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(
+            perf.performance_settlements, perf_state, now, limit=limit, cursor=cursor
+        )
+        return _perf_env(PerformanceData, "performance/settlements", data, freshness, now, dataset)
+
+    @app.get("/api/v1/performance/models", response_model=Envelope[PerformanceData], tags=["v1"])
+    async def r_perf_models() -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(perf.performance_models, perf_state, now)
+        return _perf_env(PerformanceData, "performance/models", data, freshness, now, dataset)
+
+    @app.get(
+        "/api/v1/performance/reference-capital",
+        response_model=Envelope[PerformanceData],
+        tags=["v1"],
+    )
+    async def r_perf_reference_capital(
+        capital_usdc: float = Query(100.0, gt=0, le=1_000_000),
+        mode: str = Query("portfolio", pattern="^(portfolio|single_opportunity)$"),
+        max_allocation_fraction: float = Query(0.10, gt=0, le=1),
+    ) -> Envelope[PerformanceData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(
+            perf.performance_reference_capital,
+            perf_state,
+            now,
+            capital_usdc=capital_usdc,
+            mode=mode,
+            max_allocation_fraction=max_allocation_fraction,
+        )
+        return _perf_env(
+            PerformanceData, "performance/reference-capital", data, freshness, now, dataset
+        )
 
 
 # ---------------------------------------------------------------------------

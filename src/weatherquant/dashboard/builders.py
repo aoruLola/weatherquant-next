@@ -722,27 +722,27 @@ def decisions(
     # --- aggregate totals (always attempted; independent of the row list) ---
     if report.present and isinstance(report.decisions, dict):
         dec = report.decisions
-        totals: dict[str, Any] = {
-            "evaluated": dec.get("evaluated"),
-            "by_state": dec.get("by_state") or {},
-            "by_mode": dec.get("by_mode") or {},
-            "accepted": dec.get("accepted"),
-            "rejected": dec.get("rejected"),
-            "no_trade": dec.get("no_trade"),
-            "data_unavailable": dec.get("data_unavailable"),
-            "live_accepted": dec.get("live_accepted"),
-            "replay_accepted": dec.get("replay_accepted"),
-            "primary_reasons": dec.get("primary_reasons") or {},
-            "p95_decision_latency_ms": dec.get("p95_decision_latency_ms"),
-            # Keep scope as a single additive nested contract. Old reports
-            # without the field must show UNAVAILABLE, not made-up zeros.
-            "accept_scope": dec.get("accept_scope") if isinstance(dec.get("accept_scope"), dict) else None,
-            # Taken from the report, never restated here: the scope is a fact
-            # about how the numbers were counted, and a second copy of the
-            # sentence is how the two drift apart.
-            "window": dec.get("window") or _DATABASE_LIFETIME_WINDOW,
-            "runs_in_database": dec.get("runs_in_database"),
-        }
+        # Passed through whole, not field-by-field. A whitelist silently
+        # dropped `accept_scope` and `by_model` - the report published them
+        # and the Decisions page said "unavailable" for weeks, because a
+        # whitelist can only ever be as complete as the day it was written.
+        # Anything the report considers part of a decision aggregate is part
+        # of one here too.
+        totals: dict[str, Any] = dict(dec)
+        totals.setdefault("by_state", {})
+        totals.setdefault("by_mode", {})
+        totals.setdefault("primary_reasons", {})
+        # Kept from the other side of this merge: the scope is a *typed*
+        # contract, so a report that predates it, or that sends something
+        # which is not a mapping, must render UNAVAILABLE rather than a value
+        # the UI would treat as a dimension it could group by.
+        scope = dec.get("accept_scope")
+        totals["accept_scope"] = scope if isinstance(scope, dict) else None
+        # Taken from the report, never restated here: the scope is a fact
+        # about how the numbers were counted, and a second copy of the
+        # sentence is how the two drift apart.
+        totals["window"] = dec.get("window") or _DATABASE_LIFETIME_WINDOW
+        totals["runs_in_database"] = dec.get("runs_in_database")
         totals_status = report_freshness.state
         totals_source = "shadow-report"
     else:
@@ -905,18 +905,12 @@ def overview(state: DashboardState, now: datetime) -> tuple[OverviewData, Freshn
     totals_source = None
     if report.present and isinstance(report.decisions, dict):
         dec = report.decisions
-        decision_totals = {
-            "accepted": dec.get("accepted"),
-            "rejected": dec.get("rejected"),
-            "no_trade": dec.get("no_trade"),
-            "data_unavailable": dec.get("data_unavailable"),
-            "evaluated": dec.get("evaluated"),
-            "by_mode": dec.get("by_mode") or {},
-            "live_accepted": dec.get("live_accepted"),
-            "replay_accepted": dec.get("replay_accepted"),
-            "window": dec.get("window") or _DATABASE_LIFETIME_WINDOW,
-            "runs_in_database": dec.get("runs_in_database"),
-        }
+        # Same passthrough as `decisions()` above: no field whitelist, for the
+        # same reason. See docs/p2-0.1-audit.md - a whitelist dropped
+        # accept_scope while the report happily published it.
+        decision_totals = dict(dec)
+        decision_totals.setdefault("by_mode", {})
+        decision_totals["window"] = dec.get("window") or _DATABASE_LIFETIME_WINDOW
         totals_status = report_freshness.state
         totals_source = "shadow-report"
 

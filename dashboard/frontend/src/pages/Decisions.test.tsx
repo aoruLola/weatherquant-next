@@ -139,6 +139,17 @@ describe('Decisions page', () => {
     expect(screen.queryByTestId('stat-accept-markets')).not.toBeInTheDocument()
   })
 
+  it('calls the price column what it is, not what a trader would hope', async () => {
+    // A snapshot of the book is an evaluation input, never a promise that the
+    // price is available at that level. The header said "executable price",
+    // which is exactly the claim the rest of the page spends its time denying.
+    mockFetch({ '/api/v1/decisions': envelopeOf(decisionsFixture()) })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('decisions-table')).toBeInTheDocument())
+    expect(screen.getByText('评估价格（盘口快照）')).toBeInTheDocument()
+    expect(screen.queryByText('可执行价格')).not.toBeInTheDocument()
+  })
+
   it('sends filter changes to the API', async () => {
     const fetchMock = mockFetch({ '/api/v1/decisions': envelopeOf(decisionsFixture()) })
     renderPage()

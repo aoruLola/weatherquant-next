@@ -1,0 +1,76 @@
+# WeatherQuant MCP gateway - Unraid / Portainer stack.
+#
+# The least privileged container in the system, by construction:
+#
+#   NO database mount     the gateway reads the dashboard's HTTP API and
+#                         nothing else, so a compromise here cannot reach a
+#                         DuckDB file. The mounts are absent, not :ro.
+#   NO docker socket      a gateway that can schedule containers is not a
+#                         gateway.
+#   NO Portainer credential
+#   NO order tools        nothing in this container can place, simulate or
+#                         queue a trade.
+#
+# It listens on loopback by default. Exposing it to a LAN means also setting
+# WQ_MCP_TOKEN, because the process refuses to bind a non-loopback address
+# without one - see weatherquant/mcp/main.py.
+#
+# Remote clients (ChatGPT, Codex, Claude over the internet) must go through
+# an authenticating TLS reverse proxy you operate. This container does not
+# terminate TLS and never should.
+
+x-common: &common
+  image: ghcr.io/aorulola/weatherquant-next-mcp:sha-${MCP_SHA:?set MCP_SHA in the stack .env to a released sha-<commit>}
+  container_name: weatherquant-mcp
+  restart: unless-stopped
+  stop_grace_period: 15s
+  user: "1000:1000"
+  security_opt:
+    - no-new-privileges:true
+  read_only: true
+  tmpfs:
+    - /tmp
+  environment:
+    TZ: UTC
+    # The only host this gateway will ever call. A path is not accepted
+    # here: the gateway appends its own allowlisted paths.
+    #
+    # Plaintext is allowed only inside networks declared explicitly below.
+    # Declaring nothing means refusing everything - a Docker network is a
+    # convenience, not a security boundary, so trust is granted per CIDR.
+    WQ_MCP_DASHBOARD_URL: ${WQ_MCP_DASHBOARD_URL:?set WQ_MCP_DASHBOARD_URL to the dashboard origin, e.g. http://weatherquant-dashboard:8787}
+    WQ_MCP_PLAINTEXT_NETWORKS: ${WQ_MCP_PLAINTEXT_NETWORKS:?set the internal CIDRs reachable over http, e.g. 172.16.0.0/12}
+    # INBOUND bearer: what an MCP client must present to *us*. Required
+    # whenever the bind address is not loopback; the process refuses to
+    # start without it rather than starting open.
+    WQ_MCP_TOKEN: ${WQ_MCP_TOKEN:-}
+    # OUTBOUND credential: what we present to the dashboard. A different
+    # secret from the line above - neither defaults to the other, and the
+    # inbound bearer is never forwarded upstream.
+    WQ_MCP_DASHBOARD_TOKEN: ${WQ_MCP_DASHBOARD_TOKEN:-}
+    # Browser origins allowed to call it, comma separated. Empty means
+    # "no browser origin is accepted", which is correct for stdio agents.
+    WQ_MCP_ALLOWED_ORIGINS: ${WQ_MCP_ALLOWED_ORIGINS:-}
+    # Host header values accepted, for DNS-rebinding protection.
+    WQ_MCP_ALLOWED_HOSTS: ${WQ_MCP_ALLOWED_HOSTS:-}
+    WQ_MCP_HOST: 0.0.0.0
+    WQ_MCP_PORT: "8788"
+    WQ_MCP_RATE: ${WQ_MCP_RATE:-60}
+    WQ_MCP_TRANSPORT: streamable-http
+    GIT_SHA: ${MCP_SHA:?set MCP_SHA in the stack .env to the released commit}
+    IMAGE_TAG: ${MCP_SHA:?set MCP_SHA in the stack .env to the released commit}
+  ports:
+    # Loopback by default. To serve a trusted LAN, replace with the NAS's own
+    # address and set WQ_MCP_TOKEN - never publish this to a public interface.
+    - "127.0.0.1:8788:8788"
+  # No volumes at all. That is the security property, not an omission.
+  healthcheck:
+    test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8788), 2).close()"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
+
+services:
+  mcp:
+    <<: *common

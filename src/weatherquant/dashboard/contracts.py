@@ -461,3 +461,28 @@ class SystemData(BaseModel):
     storage: dict[str, Any] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
     unavailable: list[str] = Field(default_factory=list)
+
+
+class PerformanceData(BaseModel):
+    """A performance snapshot, passed through with its own scope attached.
+
+    Deliberately open: the payload carries ``statistical_scope`` and
+    ``warnings`` as *data*, because those two fields are what stop an edge
+    total being repeated as a return. Narrowing them into a fixed schema
+    would drop the caveat that travels with the number.
+
+    ``reason`` appears instead of ``data`` when the snapshot has not been
+    published - a missing backfill reads as missing, never as zeros.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    reason: str | None = None
+    statistical_scope: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    sample_size: int | None = None
+    source: str | None = None
+    generated_at_utc: datetime | None = None
+    as_of_utc: datetime | None = None
+    dataset: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)

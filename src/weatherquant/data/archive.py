@@ -170,7 +170,18 @@ class RawArchive:
             fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
             try:
                 original_size = os.fstat(fd).st_size
-                if original_size and os.pread(fd, 1, original_size - 1) != b"\n":
+                if original_size:
+                    # lseek + read rather than `os.pread`: pread is
+                    # POSIX-only and does not exist on Windows, where
+                    # this module is exercised too. O_APPEND pins every
+                    # *write* to the end on both platforms, so moving the
+                    # descriptor for a one-byte read cannot move where the
+                    # payload lands.
+                    os.lseek(fd, original_size - 1, os.SEEK_SET)
+                    last_byte = os.read(fd, 1)
+                else:
+                    last_byte = b"\n"
+                if original_size and last_byte != b"\n":
                     # A torn last line from a previous process must not be
                     # buried in the JSONL stream. Preserve it for inspection;
                     # refuse until repaired rather than silently discard it.

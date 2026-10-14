@@ -505,6 +505,43 @@ def test_overview_carries_the_five_second_verdicts(client: TestClient) -> None:
     assert data["report"]["equity_curve"] is None
 
 
+def test_decision_aggregates_are_not_field_whitelisted(client: TestClient) -> None:
+    """A new field in the report must reach the API without a code change.
+
+    `accept_scope` and `by_model` were published by the shadow report and
+    simply never made it to the Decisions page, because the builder listed
+    the keys it expected instead of passing the block through. The page then
+    reported the dimension as unavailable while the number sat one hop away.
+    A whitelist can only ever be as complete as the day it was written.
+    """
+    decisions = client.get("/api/v1/decisions").json()["data"]
+    totals = decisions["totals"]
+    assert totals["accept_scope"]["accepted_distinct_markets"] == 1
+    assert totals["accept_scope"]["scope"] == "shadow_database_lifetime"
+    assert totals["by_model"]["calibrated"]["ACCEPT"] == 3
+
+    overview = client.get("/api/v1/overview").json()["data"]
+    assert overview["decision_totals"]["accept_scope"]["accepted_repeats"] == 2
+
+
+def test_forecast_coverage_counts_the_same_set_it_divides_by(client: TestClient) -> None:
+    """Numerator and denominator must be built from one set of dates and models.
+
+    The counter used to tally every (model, target_date) in a horizon window
+    while the denominator counted open target dates x tracked models, so a
+    three-date horizon against four dates of history read 16/12 and then
+    clamped to 1.0 - coverage that could not fall below 100% however many
+    forecasts were missing.
+    """
+    coverage = client.get("/api/v1/forecasts").json()["data"]["coverage"]
+    assert coverage["forecast_available"] == 8
+    assert coverage["forecast_needed"] == 8
+    assert coverage["forecast_missing"] == 0
+    # available can never exceed needed: both come from the same set.
+    assert coverage["forecast_available"] <= coverage["forecast_needed"]
+    assert coverage["forecast_coverage"] <= 1.0
+
+
 def test_system_marks_unavailable_metrics_as_such(client: TestClient) -> None:
     data = client.get("/api/v1/system").json()["data"]
     joined = " ".join(data["notes"])
@@ -762,12 +799,27 @@ def test_decisions_api_forwards_accept_scope_without_losing_dimensions(data_root
     assert response.json()["data"]["rows_status"] == "unavailable"
 
 
-def test_decisions_api_degrades_when_older_report_has_no_scope(client: TestClient) -> None:
-    response = client.get("/api/v1/decisions")
-    assert response.status_code == 200
-    totals = response.json()["data"]["totals"]
-    assert totals["accept_scope"] is None
-    assert totals["accepted"] == 3
+def test_decisions_api_degrades_when_older_report_has_no_scope(
+    data_root: Path, settings_for
+) -> None:
+    """A report from before the field existed renders UNAVAILABLE, not zeros.
+
+    The scenario is built here rather than inherited from the default
+    fixture: the fixture now publishes `accept_scope` (the current report
+    does), so depending on its absence would make this test pass or fail for
+    a reason unrelated to the branch under test.
+    """
+    report = shadow_report(now=utcnow())
+    report["decisions"].pop("accept_scope", None)
+    write_json(data_root / "shadow" / "reports" / "report.json", report)
+
+    app = create_app(settings_for(data_root))
+    with TestClient(app) as client:
+        response = client.get("/api/v1/decisions")
+        assert response.status_code == 200
+        totals = response.json()["data"]["totals"]
+        assert totals["accept_scope"] is None
+        assert totals["accepted"] == 3
 
 
 def test_overview_does_not_substitute_archive_age_for_book_age(data_root: Path, client: TestClient) -> None:

@@ -30,6 +30,11 @@ def settings_for(tmp_path: Path):
         options = {
             "collector_data_dir": base / "collector",
             "shadow_data_dir": base / "shadow",
+            # Pinned to the tree, never left at the default relative path:
+            # a default of "data/performance" resolves against the working
+            # directory, so one test writing a snapshot would make the next
+            # test's "nothing is published" assertion read it as fresh.
+            "performance_data_dir": base / "performance",
             "rate_limit_per_minute": 0,
             "trend_sample_seconds": 3600.0,
             "archive_cache_seconds": 0.0,
