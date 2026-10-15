@@ -243,8 +243,12 @@ def _coverage_of(decisions: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         last = moment if last is None or moment > last else last
     return {
         "decisions": len(decisions),
-        "distinct_markets": len(markets),
-        "distinct_target_dates": len(dates),
+        # Named for the population they describe. The summary publishes a
+        # `distinct_markets` too, over opportunities rather than over
+        # everything read, and the two are not interchangeable - one
+        # generation showed 55 here and 28 there under the same word.
+        "all_decision_distinct_markets": len(markets),
+        "all_decision_distinct_target_dates": len(dates),
         "first_decision_utc": first.isoformat() if first else None,
         "last_decision_utc": last.isoformat() if last else None,
     }

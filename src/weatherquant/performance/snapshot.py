@@ -189,6 +189,16 @@ def build_performance(
         "reference_capital": capital.as_dict(),
         "accept_observations": episode_summary["accept_observations"],
         "opportunity_episodes": episode_summary["opportunity_episodes"],
+        # Scoped to opportunities, not to everything read. The old name was
+        # shared with `coverage`, which counts every decision in the input -
+        # so one generation published 55 and 28 under the same word, and a
+        # reader could not tell which population either described.
+        "accept_opportunity_distinct_markets": episode_summary["distinct_markets"],
+        "accept_opportunity_distinct_target_dates": episode_summary[
+            "distinct_target_dates"
+        ],
+        # Deprecated aliases. A deployed dashboard still reads these, and a
+        # payload cannot tell its readers to upgrade.
         "distinct_markets": episode_summary["distinct_markets"],
         "distinct_target_dates": episode_summary["distinct_target_dates"],
         "episode_build": episode_counters,

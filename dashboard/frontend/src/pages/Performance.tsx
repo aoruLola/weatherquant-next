@@ -186,8 +186,11 @@ export default function Performance() {
             <StatCard
               testId="stat-distinct-markets"
               label="涉及独立市场"
-              value={fmtInt(summaryData.distinct_markets)}
-              sub={`独立目标日 ${fmtInt(summaryData.distinct_target_dates)}`}
+              // The opportunity-scoped count. `coverage` publishes a
+              // different one over every decision read, and the two used to
+              // share this name.
+              value={fmtInt(summaryData.accept_opportunity_distinct_markets)}
+              sub={`独立目标日 ${fmtInt(summaryData.accept_opportunity_distinct_target_dates)}`}
             />
           </div>
           <div className="mt-3 space-y-1 border-t border-line pt-3">

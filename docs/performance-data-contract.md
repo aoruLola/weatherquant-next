@@ -111,8 +111,19 @@ outcome               WIN | LOSS | UNVERIFIABLE | null(未结算)
 | `accept_observations` | 全部 ACCEPT 行数（重复评估） |
 | `opportunity_episodes` | episode 数 |
 | `distinct_market_direction_pairs` | distinct (market_id, direction) |
-| `distinct_markets` | distinct market_id |
-| `distinct_target_dates` | distinct target_date |
+| `accept_opportunity_distinct_markets` | distinct market_id，**口径 = 机会（episode）** |
+| `accept_opportunity_distinct_target_dates` | distinct target_date，**口径 = 机会（episode）** |
+
+> **口径必须写进字段名。** 这两个字段曾叫 `distinct_markets` / `distinct_target_dates`，
+> 与 `manifest.coverage` 中的同名字段口径不同——同一世代里一个报 55、一个报 28，
+> 读者无法判断哪个在描述哪个总体。`coverage` 现在叫
+> `all_decision_distinct_markets` / `all_decision_distinct_target_dates`（口径 = 读入的全部决策）。
+>
+> 旧名 `distinct_markets` / `distinct_target_dates` 在 `summary` 中作为**已废弃别名**保留，
+> 取值与 `accept_opportunity_*` 相同，供已部署的 Dashboard 过渡使用。
+>
+> 注意还有第三处：`win_rate.overall.distinct_markets`，口径是**已结算（RESOLVED + VERIFIED）**
+> 的 episode，与上面两者都不同。改名时未动它，但它的含义同样受此规则约束。
 
 ```
 Observation Edge Sum   = Σ 所有 ACCEPT 行的 net_edge_usd   ← 重复评估
