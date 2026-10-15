@@ -132,24 +132,37 @@ function mockAll(overrides: Record<string, any> = {}) {
       payload({ kind: 'performance-models', data: { by_model_edge: {} } }),
     ),
     '/api/v1/performance/reference-capital?capital_usdc=100&mode=portfolio': envelopeOf(
+      // Flat, as the endpoint returns it: the numbers sit on the payload, not
+      // inside a `data` block. A nested fixture would leave the panel's figures
+      // unasserted, which is how it went unnoticed that they were undefined.
       payload({
         kind: 'performance-summary',
-        statistical_scope: ['reference_capital_hypothetical'],
-        data: {
-          capital_usdc: 100,
-          utilization: 0.4,
-          executable_count: 3,
-          not_executable_count: 4,
-          capacity_limited_count: 1,
-          allocated_total_usdc: 40,
-          peak_open_allocation_usdc: 40,
-          balance_remaining_usdc: 60,
-          theoretical_expected_net_edge_usdc: 1.2,
-          theoretical_expected_roi: 0.03,
-          backtestable: false,
-          not_backtestable_reasons: ['no episode could be sized from retained book levels'],
-          warnings: ['Reference capital is a research assumption, not a funded account.'],
-        },
+        statistical_scope: ['reference_capital_hypothetical', 'opportunity_episodes'],
+        warnings: ['Reference capital is a research assumption, not a funded account.'],
+        scope: 'window',
+        mode: 'portfolio',
+        capital_usdc: 100,
+        initial_capital_usdc: 100,
+        utilization: 0.4,
+        peak_utilization: 0.4,
+        executable_count: 3,
+        not_executable_count: 4,
+        capacity_limited_count: 1,
+        allocated_total_usdc: 40,
+        peak_open_allocation_usdc: 40,
+        balance_remaining_usdc: 60,
+        settled_count: 0,
+        funding_state: 'fills_unsettled',
+        funding_state_reason: '3 position(s) were sized but no settlement was applied',
+        simulated_net_profit_usdc: null,
+        simulated_roi: null,
+        simulated_result_reason: 'no simulated profit is reported: capital is still committed',
+        theoretical_expected_net_edge_usdc: 1.2,
+        theoretical_expected_roi: 0.03,
+        backtestable: false,
+        not_backtestable_reasons: ['no episode could be sized from retained book levels'],
+        window: { complete: true, episodes: 3, days: 90 },
+        window_completeness: 'complete',
       }),
     ),
     ...overrides,
@@ -277,6 +290,50 @@ describe('Performance page', () => {
 
     await waitFor(() => expect(screen.getByTestId('performance-summary')).toBeInTheDocument())
     expect(screen.getByTestId('performance-summary')).toHaveTextContent('observation_all_accepts')
+  })
+
+  it('shows the lifetime and the window capital apart, each labelled', async () => {
+    // Two simulations, two accounts. The lifetime block comes from the
+    // published summary and covers everything; the block below it is the
+    // on-demand stake over the detail window. Neither may be read as the other.
+    const routes = mockAll()
+    routes['/api/v1/performance/summary'] = envelopeOf(
+      payload({
+        data: {
+          ...(payload().data as Record<string, any>),
+          reference_capital: {
+            scope: 'lifetime',
+            capital_usdc: 100,
+            executable_count: 0,
+            not_executable_count: 12,
+            peak_utilization: 0,
+            funding_state: 'no_fills_simulated',
+            funding_state_reason: 'no opportunity could be sized from the evidence available',
+            simulated_net_profit_usdc: null,
+            not_executable_reason_counts: { NO_BOOK: 12 },
+            statistical_window: { first_seen_utc_from: '2026-10-01T00:00:00+00:00', last_seen_utc_to: '2026-10-13T12:00:00+00:00', episodes_simulated: 12 },
+            data_watermark: ['2026-10-15T05:45:04+00:00', 'd000001'],
+            settlement_coverage: { decisive_episodes: 3, episodes: 12 },
+            warnings: ['Reference capital is a research assumption.'],
+          },
+        },
+      }),
+    )
+    mockFetch(routes)
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('lifetime-capital')).toBeInTheDocument())
+    const lifetime = screen.getByTestId('lifetime-capital')
+    expect(lifetime).toHaveTextContent('scope = lifetime')
+    expect(lifetime).toHaveTextContent('全历史模拟净收益')
+    expect(lifetime).toHaveTextContent('N/A')
+    expect(lifetime).toHaveTextContent('no_fills_simulated')
+    expect(screen.getByTestId('lifetime-capital-detail')).toHaveTextContent('NO_BOOK 12')
+    expect(screen.getByTestId('lifetime-capital-detail')).toHaveTextContent('3 / 12')
+
+    // And the on-demand block is labelled as a window, not merged into it.
+    await waitFor(() => expect(screen.getByTestId('capital-result')).toBeInTheDocument())
+    expect(screen.getByTestId('reference-capital')).toHaveTextContent('scope = window')
   })
 
   it('renders the edge band as a distribution, not as a list of values', async () => {
@@ -415,6 +472,48 @@ describe('Performance page: paged detail', () => {
     await waitFor(() => expect(screen.getByTestId('window-note')).toBeInTheDocument())
     expect(screen.getByTestId('window-note')).toHaveTextContent('共 40 条')
     expect(screen.getByTestId('window-note')).toHaveTextContent('覆盖全部历史')
+  })
+
+  it('does not show the previous mode answer under the new mode label', async () => {
+    // Switching the mode is a different question. Reusing the last answer would
+    // render the portfolio figures under the single-opportunity heading.
+    const fetchMock = mockFetch({
+      ...mockAll(),
+      '/api/v1/performance/reference-capital': (path: string) => {
+        const single = path.includes('single_opportunity')
+        return envelopeOf(
+          payload({
+            kind: 'performance-summary',
+            statistical_scope: ['reference_capital_hypothetical'],
+            warnings: [],
+            scope: 'window',
+            mode: single ? 'single_opportunity' : 'portfolio',
+            capital_usdc: 100,
+            executable_count: single ? 7 : 3,
+            not_executable_count: 0,
+            results_total: single ? 7 : 3,
+            window: { complete: true, episodes: 3, days: 90 },
+            window_completeness: 'complete',
+          }),
+        )
+      },
+    })
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('capital-result')).toBeInTheDocument())
+    expect(screen.getByTestId('capital-result')).toHaveTextContent('3 / 7')
+
+    const select = screen.getByTestId('capital-mode') as HTMLSelectElement
+    select.value = 'single_opportunity'
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+
+    const urls = fetchMock.mock.calls.map((call: any[]) => String(call[0]))
+    expect(urls.some((url) => url.includes('mode=single_opportunity'))).toBe(true)
+    // And the portfolio answer is gone while the new one is in flight.
+    await waitFor(() =>
+      expect(screen.getByTestId('capital-result')).toHaveTextContent('7 / 7'),
+    )
+    expect(screen.getByTestId('capital-result')).not.toHaveTextContent('3 / 7')
   })
 
   it('shows a reason when the window is empty after filtering', async () => {

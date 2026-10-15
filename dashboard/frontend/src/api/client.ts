@@ -61,6 +61,20 @@ export function usePoll<T>(path: string, intervalMs: number, options: UsePollOpt
 
   const inFlight = useRef(false)
   const controller = useRef<AbortController | null>(null)
+  const lastPath = useRef(path)
+
+  // A new path is a different question, so the previous answer is dropped
+  // rather than shown while the new one is in flight. Without this, switching
+  // the reference-capital mode would render the old mode's figures under the
+  // new mode's label - a cached answer to a question nobody asked.
+  useEffect(() => {
+    if (lastPath.current === path) return
+    lastPath.current = path
+    setEnvelope(null)
+    setError(null)
+    setStatus(undefined)
+    setLoading(true)
+  }, [path])
 
   const refresh = useCallback(() => setNonce((n) => n + 1), [])
 

@@ -120,6 +120,9 @@ export default function Performance() {
   const opportunityFilters = opportunityPage.filters ?? {}
   // Loose on purpose: the payload is a snapshot, not a fixed schema.
   const capitalData: Record<string, any> = capitalResult.envelope?.data ?? {}
+  // The published whole-history block, and the on-demand window answer. Two
+  // different accounts; never one row.
+  const lifetimeCapital: Record<string, any> = summaryData.reference_capital ?? {}
 
   const generation = opportunities.envelope?.data?.generation_id ?? null
   const generationChanged =
@@ -316,7 +319,91 @@ export default function Performance() {
 
       {/* ---- Reference capital ---- */}
       <SectionTitle hint="研究假设，非真实资金 · 复用 execution/pricing.py">参考本金</SectionTitle>
+      {/*
+        Two simulations live on this page and they are not the same account.
+        The upper block is the *lifetime* figure the research engine published:
+        every episode it has consumed, simulated once at publish time. The
+        lower one is what the stake and mode below produce, sized over the
+        published detail window. They are labelled, and their counts are never
+        mixed into one row.
+      */}
+      <Card testId="lifetime-capital" className="mb-4">
+        <div className="mb-2 flex flex-wrap items-baseline gap-2">
+          <span className="text-sm font-medium">全历史参考本金（终身）</span>
+          <span className="rounded border border-line px-1.5 py-0.5 text-[10px] text-muted">
+            scope = {String(lifetimeCapital.scope ?? 'lifetime')}
+          </span>
+          <span className="text-xs text-muted">
+            覆盖全部已消费历史 · 发布时模拟一次，不由本页每次请求重算
+          </span>
+        </div>
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <StatCard label="参考本金" value={fmtUsd(lifetimeCapital.capital_usdc)} sub="hypothetical" />
+          <StatCard
+            label="可执行 / 不可执行"
+            value={`${fmtInt(lifetimeCapital.executable_count ?? 0)} / ${fmtInt(
+              lifetimeCapital.not_executable_count ?? 0,
+            )}`}
+            sub={`资金状态 ${String(lifetimeCapital.funding_state ?? '—')}`}
+          />
+          <StatCard
+            label="峰值资金利用率"
+            value={fmtPct(Number(lifetimeCapital.peak_utilization ?? lifetimeCapital.utilization ?? 0))}
+            sub="peak open / capital"
+          />
+          <StatCard
+            label="全历史模拟净收益"
+            value={
+              lifetimeCapital.simulated_net_profit_usdc == null
+                ? 'N/A'
+                : fmtUsd(Number(lifetimeCapital.simulated_net_profit_usdc))
+            }
+            sub={
+              lifetimeCapital.simulated_net_profit_usdc == null
+                ? String(lifetimeCapital.funding_state_reason ?? '证据不足')
+                : '已结算'
+            }
+          />
+        </div>
+        <div className="mt-2 space-y-0.5 text-xs text-muted" data-testid="lifetime-capital-detail">
+          <div>
+            统计区间 {String(lifetimeCapital.statistical_window?.first_seen_utc_from ?? '—')} →{' '}
+            {String(lifetimeCapital.statistical_window?.last_seen_utc_to ?? '—')} · episode{' '}
+            {fmtInt(lifetimeCapital.statistical_window?.episodes_simulated ?? 0)}
+          </div>
+          <div>
+            数据水位 {String((lifetimeCapital.data_watermark ?? [])[0] ?? '—')} · 结算覆盖{' '}
+            {fmtInt(lifetimeCapital.settlement_coverage?.decisive_episodes ?? 0)} /{' '}
+            {fmtInt(lifetimeCapital.settlement_coverage?.episodes ?? 0)} 个 episode 有定论
+          </div>
+          <div>
+            不可执行原因：{' '}
+            {Object.entries((lifetimeCapital.not_executable_reason_counts as any) ?? {}).length === 0
+              ? '无'
+              : Object.entries((lifetimeCapital.not_executable_reason_counts as any) ?? {})
+                  .map(([reason, count]) => `${reason} ${fmtInt(Number(count))}`)
+                  .join(' · ')}
+          </div>
+        </div>
+        <div className="mt-2 border-t border-line pt-2">
+          {(lifetimeCapital.warnings as string[] | undefined)?.map((w, i) => (
+            <div key={i} className="text-xs text-muted">
+              · {w}
+            </div>
+          ))}
+        </div>
+      </Card>
+
       <Card testId="reference-capital" className="mb-4">
+        <div className="mb-2 flex flex-wrap items-baseline gap-2">
+          <span className="text-sm font-medium">按窗口模拟</span>
+          <span className="rounded border border-line px-1.5 py-0.5 text-[10px] text-muted">
+            scope = window
+          </span>
+          <span className="text-xs text-muted">
+            只覆盖明细窗口 · 独立本金假设，不是终身账户某段时间的余额
+          </span>
+        </div>
         <div className="mb-3 flex flex-wrap items-end gap-3">
           <label className="flex flex-col gap-1">
             <span className="text-xs text-muted">Reference Capital (USDC)</span>
@@ -348,6 +435,8 @@ export default function Performance() {
 
         {capitalQuery === null ? (
           <Banner tone="warn" title="参考本金必须大于 0" testId="capital-invalid" />
+        ) : capitalResult.loading && !capitalResult.envelope ? (
+          <EmptyState title="正在计算" reason="按当前本金与模式模拟" testId="capital-loading" />
         ) : capitalResult.error ? (
           <EmptyState title="无法获取" reason={capitalResult.error} testId="capital-error" />
         ) : (

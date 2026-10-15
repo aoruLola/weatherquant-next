@@ -214,8 +214,16 @@ def test_reference_capital_names_the_module_that_computed_it(published) -> None:
     data = published.get("/api/v1/performance/reference-capital").json()["data"]
 
     assert data["source_endpoint"] == "weatherquant.performance.capital.simulate_portfolio"
-    assert data["statistical_scope"] == ["reference_capital_hypothetical"]
+    # A window simulation is labelled as one, and it is not a period of the
+    # lifetime account: both facts have to travel with the number.
+    assert data["scope"] == "window"
+    assert data["statistical_scope"] == [
+        "reference_capital_hypothetical",
+        "opportunity_episodes",
+    ]
+    assert data["window_completeness"] in {"complete", "truncated"}
     assert any("not realised profit" in w for w in data["warnings"])
+    assert any("not a period of the lifetime account" in w for w in data["warnings"])
 
 
 def test_changing_the_capital_changes_the_allocation(tmp_path, settings_for) -> None:

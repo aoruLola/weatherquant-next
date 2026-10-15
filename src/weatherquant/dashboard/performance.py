@@ -46,6 +46,7 @@ from weatherquant.performance.capital import (
     book_from_mapping,
     simulate_independent,
     simulate_portfolio,
+    window_portfolio_payload,
 )
 from weatherquant.performance.episodes import Episode, episode_from_mapping
 
@@ -534,32 +535,30 @@ def performance_reference_capital(
         # simulator with the fraction dialled up: that still drains one
         # shared balance, so the second opportunity would be priced against
         # money the first one already spent.
-        payload_out = simulate_independent(
-            episodes, capital_usdc=capital_usdc, book_for=_book_for
-        ).as_dict()
+        result = simulate_independent(episodes, capital_usdc=capital_usdc, book_for=_book_for)
         source = "weatherquant.performance.capital.simulate_independent"
     else:
-        payload_out = simulate_portfolio(
+        result = simulate_portfolio(
             episodes,
             capital_usdc=capital_usdc,
             max_allocation_fraction=max_allocation_fraction,
             book_for=_book_for,
-        ).as_dict()
+        )
         source = "weatherquant.performance.capital.simulate_portfolio"
 
-    window = payload.data.get("window") or {}
+    window = dict(payload.data.get("window") or {})
+    payload_out = window_portfolio_payload(
+        result,
+        window=window,
+        generation_id=payload.generation_id,
+        mode=mode,
+        initial_capital_usdc=capital_usdc,
+    )
     payload_out["mode"] = mode
     payload_out["as_of_utc"] = now.isoformat()
     payload_out["generated_at_utc"] = now.isoformat()
     payload_out["sample_size"] = len(episodes)
     payload_out["source_endpoint"] = source
-    payload_out["window"] = window
-    if not window.get("complete", True):
-        payload_out.setdefault("warnings", []).append(
-            "This on-demand stake was sized over the published detail window "
-            f"({window.get('episodes')} of {window.get('episodes_all')} episodes). "
-            "The reference capital published with the summary covers the whole history."
-        )
     return payload_out, freshness
 
 
