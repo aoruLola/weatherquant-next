@@ -202,23 +202,36 @@ class DecisionExporter:
                 stored = tuple(state["watermark"]) if state.get("watermark") else None
                 if stored is None or _ahead(end, stored):
                     state["watermark"] = list(end)
-                state["next_part"] = max(
-                    int(state.get("next_part") or 1), _index_of(last) + 1
+                # Everything below `accounted` is already inside rows_exported.
+                #
+                # A state that names parts but counts no rows is not one this
+                # can trust - the two are written together - so it is treated as
+                # absent and the count is rebuilt.
+                accounted = (
+                    int(state.get("next_part") or 1) if state.get("rows_exported") else 1
                 )
-                # rows_exported is deliberately NOT recounted here.
+                state["next_part"] = max(accounted, _index_of(last) + 1)
+                # Only the parts the state does not already cover are counted.
                 #
-                # Counting it means reading every part, and this call happens
-                # inside the tick's wall-clock budget - so the count grew with
-                # the export until it outran the budget, and every tick broke
-                # out before writing anything. The export stalled at 700,000
-                # rows with no error, no watermark move and no quality event,
-                # because a tick that writes nothing is indistinguishable from
-                # a tick that is caught up.
+                # Counting them all means reading every part, and this call
+                # happens inside the tick's wall-clock budget - so the count grew
+                # with the export until it outran the budget, and every tick broke
+                # out before writing anything. The export stalled at 700,000 rows
+                # with no error, no watermark move and no quality event, because
+                # a tick that writes nothing is indistinguishable from a tick
+                # that is caught up.
                 #
-                # The watermark still comes from the parts, which is the fact
-                # that has to survive a crash. The row count is a running total
-                # this writer keeps, and verify() is where it is reconciled
-                # against the files - on demand, never on the hot path.
+                # The unaccounted tail is normally empty, and after a crash
+                # between publishing a part and saving state it is that one part,
+                # so recovery stays exact without a full recount. A state lost
+                # entirely counts everything - once: the next write records the
+                # total again, and that tick still exports, because the budget is
+                # not consulted until a part has been written.
+                tail = [path for path in existing if _index_of(path) >= accounted]
+                if tail:
+                    state["rows_exported"] = int(
+                        state.get("rows_exported") or 0
+                    ) + _count_rows(tail)
         return state
 
     def _save(self, state: dict[str, Any]) -> None:

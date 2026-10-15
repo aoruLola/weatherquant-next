@@ -338,6 +338,48 @@ def test_loading_state_does_not_count_every_part(db, tmp_path, monkeypatch) -> N
     assert state["watermark"] is not None
 
 
+def test_a_part_published_before_a_crash_is_counted_on_recovery(db, tmp_path) -> None:
+    """A crash between publishing a part and saving state must not lose the count.
+
+    The watermark is recovered from the part, and the row count has to be too.
+    Otherwise `verify()` reports an otherwise valid export as inconsistent -
+    and a check that cries wolf is a check nobody reads when it is right.
+    """
+    ex = _exporter(db, tmp_path, batch_rows=5)
+    for i in range(12):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i))
+    ex.run_batch()
+
+    # The state as it stood before the last part was accounted for.
+    state = json.loads(ex.state_path.read_text(encoding="utf-8"))
+    assert state["rows_exported"] == 12 and state["next_part"] == 4
+    state["rows_exported"] = 10  # parts 1 and 2 only
+    state["next_part"] = 3
+    ex.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    recovered = ex._load()
+
+    assert recovered["rows_exported"] == 12, "the unaccounted part was not counted"
+    assert recovered["next_part"] == 4
+    assert ex.verify()["consistent"] is True
+
+
+def test_a_lost_state_file_rebuilds_the_count_exactly(db, tmp_path) -> None:
+    """State is a cache. Losing it must cost a recount, not the count."""
+    ex = _exporter(db, tmp_path, batch_rows=5)
+    for i in range(12):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i))
+    ex.run_batch()
+
+    ex.state_path.unlink()
+    recovered = ex._load()
+
+    assert recovered["rows_exported"] == 12
+    assert recovered["next_part"] == 4
+    assert recovered["watermark"] is not None
+    assert ex.verify()["consistent"] is True
+
+
 def test_a_tick_still_writes_when_setup_has_eaten_the_budget(
     db, tmp_path, monkeypatch
 ) -> None:
