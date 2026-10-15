@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from weatherquant.performance.episodes import _field, _timestamp
 from weatherquant.performance.settlement import (
     SettlementStatus,
     fetch_resolution,
@@ -188,6 +189,44 @@ def backfill_settlements(
     return rows
 
 
+def _coverage_of(decisions: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """What this run actually read, counted from the rows it read.
+
+    Derived from the input rather than from the export's own bookkeeping, so a
+    snapshot cannot claim a range it never saw. A field with nothing behind it
+    stays ``None``: a zero would read as "covered nothing", which is a
+    different and stronger claim than "not known".
+
+    Timestamps go through the same alias resolution the episode builder uses,
+    so an export's ``decision_time_utc`` and an API row's ``decided_at_utc``
+    describe one instant under two names.
+    """
+    first: datetime | None = None
+    last: datetime | None = None
+    markets: set[str] = set()
+    dates: set[str] = set()
+    for row in decisions:
+        market = row.get("market_id")
+        if market:
+            markets.add(str(market))
+        target = row.get("target_date")
+        if target:
+            dates.add(str(target))
+        stamp = _field(row, "decided_at_utc")
+        if stamp is None:
+            continue
+        moment = _timestamp(stamp)
+        first = moment if first is None or moment < first else first
+        last = moment if last is None or moment > last else last
+    return {
+        "decisions": len(decisions),
+        "distinct_markets": len(markets),
+        "distinct_target_dates": len(dates),
+        "first_decision_utc": first.isoformat() if first else None,
+        "last_decision_utc": last.isoformat() if last else None,
+    }
+
+
 def build_performance_snapshots(
     *,
     decisions: Sequence[Mapping[str, Any]],
@@ -199,12 +238,20 @@ def build_performance_snapshots(
     gap_window_seconds: float = 900.0,
     book_for=None,
     now: datetime | None = None,
+    watermark: Sequence[str] | None = None,
 ) -> list[Path]:
     """Build and publish all six snapshots, or none of them.
 
     Everything is computed before anything is written: a failure partway
     leaves the previous complete set on disk rather than a mixture of old
     and new that no reader can reconcile.
+
+    ``watermark`` is the cursor the decisions export had reached when it was
+    read - the input's high-water mark, which is what lets a reader tell
+    "everything up to here" from "whatever happened to be there". It is the
+    caller's to supply because only the caller knows where the rows came
+    from; a hand-carried file has no cursor, and the manifest says ``null``
+    rather than inventing one.
     """
     _require_dataset(dataset)
     if capital_usdc <= 0:
@@ -225,4 +272,9 @@ def build_performance_snapshots(
     if missing:  # pragma: no cover - a builder bug, not a user error
         raise RuntimeError(f"builder did not produce {missing}")
 
-    return publish_performance(payloads, out_dir)
+    return publish_performance(
+        payloads,
+        out_dir,
+        watermark=list(watermark) if watermark else None,
+        coverage=_coverage_of(decisions),
+    )

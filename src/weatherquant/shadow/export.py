@@ -42,6 +42,7 @@ __all__ = [
     "EXPORT_COLUMNS",
     "DecisionExporter",
     "ExportResult",
+    "export_watermark",
     "read_export",
 ]
 
@@ -432,3 +433,27 @@ def read_export(directory: str | Path) -> list[dict[str, Any]]:
                 if line.strip():
                     rows.append(json.loads(line))
     return rows
+
+
+def export_watermark(directory: str | Path) -> list[str] | None:
+    """The cursor the export last committed, read from the parts.
+
+    This is what the *input* claimed to have reached, which a snapshot's
+    manifest needs in order to say which decisions it could have seen.
+
+    Taken from the last line of the newest part rather than from `state.json`,
+    for the same reason the writer recovers it that way: state is a cache, and
+    a watermark read from a cache would be a claim about the data rather than a
+    fact about it.
+
+    ``None`` when there is no export here - a hand-carried JSONL has no cursor,
+    and inventing one would put a range in the manifest that nothing backs.
+    """
+    parts = Path(directory) / "parts"
+    if not parts.is_dir():
+        return None
+    existing = sorted(parts.glob("part-*.jsonl"))
+    if not existing:
+        return None
+    end = _end_cursor_of(existing[-1])
+    return list(end) if end is not None else None

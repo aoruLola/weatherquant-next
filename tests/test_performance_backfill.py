@@ -13,7 +13,7 @@ single-writer rule stated as a test.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -436,3 +436,91 @@ def test_the_backfill_cli_writes_an_index(tmp_path, capsys) -> None:
         payload = json.loads(out.read_text(encoding="utf-8"))
         assert isinstance(payload, list)
         assert payload[0]["dataset"] == "fixture"
+
+
+# --- the manifest has to say what the run could see ---------------------------
+
+
+def _manifest(out: Path) -> dict:
+    return json.loads(_published(out, "manifest.json").read_text(encoding="utf-8"))
+
+
+def test_the_manifest_records_the_export_watermark_and_coverage(tmp_path) -> None:
+    """`watermark: null` and `coverage: {}` is not what the deployment doc claims.
+
+    It promises both so a batch can be audited and traced back. Both were
+    empty, so the auditability the doc described did not exist - and a reader
+    could not tell a snapshot covering everything from one covering a slice.
+    """
+    from weatherquant.shadow.export import _write_part, export_watermark
+
+    parts = tmp_path / "export" / "parts"
+    parts.mkdir(parents=True)
+    _write_part(
+        parts / "part-000000001.jsonl",
+        [
+            _export_row(
+                decision_id=f"d-{i}",
+                market_id=f"m-{i % 3}",
+                decision_time_utc=(NOW + timedelta(minutes=i)).isoformat(),
+            )
+            for i in range(9)
+        ],
+    )
+
+    out = tmp_path / "performance"
+    build_performance_snapshots(
+        decisions=load_decisions(tmp_path / "export"),
+        out_dir=out,
+        dataset="live",
+        now=NOW,
+        watermark=export_watermark(tmp_path / "export"),
+    )
+
+    manifest = _manifest(out)
+
+    # The input's high-water mark, read from the parts rather than invented.
+    assert manifest["watermark"] == ["2026-10-13T12:08:00+00:00", "d-8"]
+
+    coverage = manifest["coverage"]
+    assert coverage["decisions"] == 9
+    assert coverage["distinct_markets"] == 3
+    assert coverage["first_decision_utc"] == NOW.isoformat()
+    assert coverage["last_decision_utc"] == (NOW + timedelta(minutes=8)).isoformat()
+
+
+def test_a_file_input_records_no_watermark_rather_than_inventing_one(tmp_path) -> None:
+    """A hand-carried JSONL has no cursor, and `null` is the honest answer.
+
+    A guessed range would read as a claim about coverage that nothing backs.
+    """
+    out = tmp_path / "performance"
+    build_performance_snapshots(
+        decisions=load_decisions(_export(tmp_path)),
+        out_dir=out,
+        dataset="live",
+        now=NOW,
+    )
+
+    manifest = _manifest(out)
+    assert manifest["watermark"] is None
+    assert manifest["coverage"]["decisions"] == 30
+
+
+def test_no_export_means_no_watermark(tmp_path) -> None:
+    """Only a published parts directory has a cursor."""
+    from weatherquant.shadow.export import export_watermark
+
+    assert export_watermark(tmp_path / "nope") is None
+    assert export_watermark(_export(tmp_path)) is None, "a file is not an export"
+
+
+def test_coverage_of_nothing_is_null_not_zero(tmp_path) -> None:
+    """No rows means no range. A zero instant would read as a covered one."""
+    out = tmp_path / "performance"
+    build_performance_snapshots(decisions=[], out_dir=out, dataset="live", now=NOW)
+
+    coverage = _manifest(out)["coverage"]
+    assert coverage["decisions"] == 0
+    assert coverage["first_decision_utc"] is None
+    assert coverage["last_decision_utc"] is None

@@ -536,6 +536,7 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
         load_decisions,
         load_settlements,
     )
+    from weatherquant.shadow.export import export_watermark
 
     try:
         decisions = load_decisions(args.export)
@@ -561,6 +562,10 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
             capital_usdc=float(args.capital_usdc),
             max_allocation_fraction=float(args.max_allocation_fraction),
             gap_window_seconds=float(args.gap_window_seconds),
+            # The input's own high-water mark, so the manifest can say which
+            # decisions the run could have seen rather than only which ones it
+            # happened to read. A file input has no cursor and stays null.
+            watermark=export_watermark(args.export),
         )
     except (ValueError, RuntimeError) as exc:
         print(f"could not build performance snapshots: {exc}", file=sys.stderr)
