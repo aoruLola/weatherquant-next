@@ -790,3 +790,58 @@ MCP 仍**只调 Dashboard API**，不新增任何统计逻辑：
 
 **明确不做**：不让 Dashboard 连接生产 Shadow 库；不给 Dashboard 状态库的写路径；
 不为分页引入新的常驻服务。
+
+### 14.9 Reference Capital：两种口径，不能混读
+
+§14.6 让按需本金在**明细窗口**上计算，这是查询优化，**不得**让它悄悄顶替全历史口径。
+因此两者各自具名，并各自带上读它所需要的字段。
+
+#### A. 全历史（lifetime）—— 由研究引擎在发布时算一次
+
+`summary.json` → `data.reference_capital`：
+
+```json
+{
+  "scope": "lifetime",
+  "simulation_mode": "portfolio",
+  "capital_usdc": 100.0, "initial_capital_usdc": 100.0,
+  "peak_open_allocation_usdc": …, "peak_utilization": …, "balance_remaining_usdc": …,
+  "final_balance": {"value": null, "reason": "…不是盈亏…"},
+  "executable_count": …, "not_executable_count": …,
+  "not_executable_reason_counts": {"NO_BOOK": …},
+  "settled_count": 0,
+  "funding_state": "no_fills_simulated | fills_unsettled | incomplete | fully_settled",
+  "funding_state_reason": "…",
+  "simulated_net_profit_usdc": null, "simulated_roi": null, "simulated_result_reason": "…",
+  "theoretical_expected_net_edge_usdc": …, "theoretical_expected_roi": …,
+  "statistical_window": {"first_seen_utc_from": …, "last_seen_utc_to": …, "episodes_simulated": …},
+  "data_watermark": ["…", "…"],
+  "settlement_coverage": {"answers": …, "verified": …, "decisive_episodes": …, "episodes": …, "coverage_fraction": …},
+  "statistical_scope": ["reference_capital_hypothetical", "opportunity_episodes", "database_lifetime"],
+  "backtestable": false, "not_backtestable_reasons": ["…"]
+}
+```
+
+**`simulated_net_profit_usdc` 只有在"至少一个可执行仓位"且"每个可执行仓位都有结算"时才是一个数**，
+否则为 `null` 并给出理由。**不得用 `balance_remaining_usdc == capital` 暗示不赚不亏**——
+`final_balance.value` 恒为 `null` 并说明它只是"未占用的本金"。实际收益恒为 N/A。
+
+#### B. 窗口（window）—— 按需、独立本金假设
+
+`GET /api/v1/performance/reference-capital`：
+
+```json
+{
+  "scope": "window", "simulation_mode": "portfolio|single_opportunity",
+  "window": {…}, "window_start": …, "window_end": …, "window_episode_limit": …,
+  "total_episodes_in_window": …, "window_completeness": "complete|truncated",
+  "generation_id": "…", "initial_capital_assumption_usdc": 250.0,
+  …（与 A 相同的聚合字段与 funding_state / N/A 规则）…,
+  "statistical_scope": ["reference_capital_hypothetical", "opportunity_episodes", "window:<n>d"]
+}
+```
+
+**UI 默认展示哪一种**：页面**同时**展示两块，各自标注 `scope`。
+上方是**全历史（lifetime）**（来自已发布 summary，覆盖全部已消费历史），
+下方是**按窗口（window）**（跟随本金/模式输入，覆盖明细窗口）。
+两者的机会计数**不得并列成同一范围的指标**。
