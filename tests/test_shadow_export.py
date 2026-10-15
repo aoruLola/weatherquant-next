@@ -380,6 +380,36 @@ def test_a_lost_state_file_rebuilds_the_count_exactly(db, tmp_path) -> None:
     assert ex.verify()["consistent"] is True
 
 
+def test_recovery_is_written_back_so_it_is_paid_for_once(
+    db, tmp_path, monkeypatch
+) -> None:
+    """A caught-up run never calls `_save()` - saving follows writing a part.
+
+    A reconciliation left in memory alone would therefore be redone on every
+    tick, rereading the whole export each time, forever. The recovered state
+    has to become durable on the path that recovered it.
+    """
+    from weatherquant.shadow import export as export_module
+
+    ex = _exporter(db, tmp_path, batch_rows=5)
+    for i in range(12):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i))
+    ex.run_batch()
+
+    ex.state_path.unlink()
+    ex._load()
+    assert ex.state_path.exists(), "the recovered state was not written back"
+
+    def _boom(_paths):
+        raise AssertionError("recovery was repeated instead of being persisted")
+
+    monkeypatch.setattr(export_module, "_count_rows", _boom)
+
+    state = ex._load()
+
+    assert state["rows_exported"] == 12
+
+
 def test_a_tick_still_writes_when_setup_has_eaten_the_budget(
     db, tmp_path, monkeypatch
 ) -> None:

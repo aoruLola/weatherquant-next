@@ -178,6 +178,11 @@ class DecisionExporter:
         range and duplicate every row in it. The last line of the newest
         part carries the cursor it ended on, so the watermark is recovered
         from the durable artifact rather than from the assumption.
+
+        Recovery is written back. It is paid for once rather than on every
+        tick: a caught-up run never reaches `_save()` - saving happens after
+        writing a part - so a reconciliation left in memory alone would be
+        redone forever, rereading the whole export each time.
         """
         state: dict[str, Any] = {
             "next_part": 1,
@@ -185,11 +190,13 @@ class DecisionExporter:
             "watermark": None,
             "last_run_at_utc": None,
         }
+        on_disk: dict[str, Any] | None = None
         if self.state_path.exists():
             # A corrupt state file must not stop the engine; the parts are
             # still the authority and the watermark is re-derived below.
             with contextlib.suppress(OSError, ValueError):
-                state.update(json.loads(self.state_path.read_text(encoding="utf-8")))
+                on_disk = json.loads(self.state_path.read_text(encoding="utf-8"))
+                state.update(on_disk)
 
         self.directory.mkdir(parents=True, exist_ok=True)
         self.parts_dir.mkdir(parents=True, exist_ok=True)
@@ -232,6 +239,8 @@ class DecisionExporter:
                     state["rows_exported"] = int(
                         state.get("rows_exported") or 0
                     ) + _count_rows(tail)
+        if on_disk != state:
+            self._save(state)
         return state
 
     def _save(self, state: dict[str, Any]) -> None:
