@@ -26,8 +26,8 @@ easy to get subtly wrong, and what each one costs:
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -35,9 +35,15 @@ __all__ = [
     "DEFAULT_GAP_WINDOW_SECONDS",
     "EndReason",
     "Episode",
+    "EpisodeFolder",
     "EpisodeKey",
+    "EpisodeSummary",
+    "FolderState",
+    "OpenEpisode",
     "build_episodes",
     "episode_from_mapping",
+    "episode_from_open",
+    "summarize",
 ]
 
 #: Default for how long an episode may go unheard before it closes.
@@ -138,14 +144,38 @@ class Episode:
 
 
 @dataclass(slots=True)
-class _OpenEpisode:
-    """Working state for an episode still accepting observations."""
+class OpenEpisode:
+    """Working state for an episode still accepting observations.
+
+    Fixed-size on purpose. The whole record is scalars, so the open set can be
+    persisted between runs and reloaded without loss - which is what lets the
+    streaming engine resume across a crash without cutting an episode in half.
+
+    ``sum_edges`` is a running **left-to-right** sum, the same accumulation the
+    original builder got from ``sum(edges)``, and ``max_edge``/``min_edge`` are
+    running extremes. Keeping the accumulation rather than the values is what
+    makes ``mean_edge`` bit-for-bit identical between the two implementations
+    while bounding memory by the number of open episodes instead of the length
+    of the history.
+    """
 
     key: EpisodeKey
     first_seen: datetime
     last_seen: datetime
     count: int
-    edges: list[float] = field(default_factory=list)
+    sum_edges: float
+    first_edge: float
+    last_edge: float
+    max_edge: float
+    min_edge: float
+    #: Position of this episode's first ACCEPT in the global fold order. Used
+    #: to publish episodes in the order the original builder produced, which
+    #: matters because the representative-edge sum is a float left-fold.
+    opened_seq: int = 0
+    #: Observations that carried a usable edge. Always equal to ``count`` at
+    #: the call sites, kept separately so ``mean_edge`` divides by the same
+    #: denominator the original builder used (``len(edges)``).
+    edge_count: int = 1
     first_market_price: float | None = None
     first_model_probability: float | None = None
     first_available_depth_usd: float | None = None
@@ -158,7 +188,14 @@ class _OpenEpisode:
         self.last_seen = row.decided_at_utc
         self.count += 1
         if row.net_edge_usd is not None:
-            self.edges.append(float(row.net_edge_usd))
+            number = float(row.net_edge_usd)
+            self.edge_count += 1
+            self.sum_edges += number
+            self.last_edge = number
+            if number > self.max_edge:
+                self.max_edge = number
+            if number < self.min_edge:
+                self.min_edge = number
         if self.first_market_price is None:
             self.first_market_price = row.market_price
         if self.first_model_probability is None:
@@ -361,20 +398,38 @@ def _episode_id(key: EpisodeKey, first_seen: datetime) -> str:
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 
-def _close(open_ep: _OpenEpisode, *, reason: str, gap_missing: bool) -> Episode:
-    edges = open_ep.edges
-    first_edge = edges[0]
+def episode_from_open(
+    open_ep: OpenEpisode,
+    *,
+    end_reason: str,
+    closed_seq: int | None = None,
+) -> Episode:
+    """Turn an in-flight episode into the published record.
+
+    ``end_reason`` is supplied by the caller because the same open record is
+    rendered two different ways: the whole-history builder closes everything
+    left over as ``end_of_data`` at the end of its pass, while the streaming
+    engine renders the *still open* set the same way for publication and then
+    keeps it open in the store so the next run can extend it. Rendering and
+    state are separate on purpose - a published ``end_of_data`` must not stop
+    the episode from being observed again.
+
+    ``closed_seq`` is carried so a reader can order the published set exactly
+    as the original builder ordered it; it is not part of the record itself.
+    """
+    if open_ep.edge_count <= 0:  # pragma: no cover - guarded by the constructor
+        raise ValueError(f"episode {open_ep.key} has no observations to summarise")
     return Episode(
         episode_id=_episode_id(open_ep.key, open_ep.first_seen),
         key=open_ep.key,
         first_seen_utc=open_ep.first_seen,
         last_seen_utc=open_ep.last_seen,
         observation_count=open_ep.count,
-        first_edge=first_edge,
-        last_edge=edges[-1],
-        mean_edge=sum(edges) / len(edges),
-        max_edge=max(edges),
-        min_edge=min(edges),
+        first_edge=open_ep.first_edge,
+        last_edge=open_ep.last_edge,
+        mean_edge=open_ep.sum_edges / open_ep.edge_count,
+        max_edge=open_ep.max_edge,
+        min_edge=open_ep.min_edge,
         first_market_price=open_ep.first_market_price,
         first_model_probability=open_ep.first_model_probability,
         first_available_depth_usd=open_ep.first_available_depth_usd,
@@ -385,10 +440,181 @@ def _close(open_ep: _OpenEpisode, *, reason: str, gap_missing: bool) -> Episode:
         mode=open_ep.key.mode,
         # `end_of_data` beats `gap_*`: the stream simply stopped, so we cannot
         # claim a gap was classified at all.
-        end_reason=EndReason.END_OF_DATA if reason == EndReason.END_OF_DATA else reason,
+        end_reason=EndReason.END_OF_DATA if end_reason == EndReason.END_OF_DATA else end_reason,
         market_question=open_ep.market_question,
         fee_rate=open_ep.fee_rate,
     )
+
+
+@dataclass(slots=True)
+class FolderState:
+    """Everything about the fold that has to survive between runs.
+
+    ``prev_instant`` is the whole of the global activity index. It is the
+    largest decision instant strictly below ``last_instant``, and it is enough
+    because the fold consumes instants in non-decreasing order: when a row at
+    instant ``t`` arrives, every instant below ``t`` has already been seen and
+    no instant above ``t`` can fall inside an interval ending at ``t``. So
+    ``activity_between(a, b)`` is exactly ``prev_instant > a`` at that moment -
+    no index of the whole history, and no per-episode bookkeeping.
+    """
+
+    row_seq: int = 0
+    last_instant: datetime | None = None
+    prev_instant: datetime | None = None
+
+
+class EpisodeFolder:
+    """The episode state machine, fed one decision at a time.
+
+    One implementation, two drivers. ``build_episodes`` feeds it a whole
+    history and keeps the closed episodes in a list; the streaming engine
+    feeds it one export part at a time, persists the open set between runs
+    through :meth:`snapshot`/:meth:`restore`, and hands each closure to a
+    callback that writes it to the research store. The rules - the
+    five-dimensional key, what a gap means, what ends an episode - live here
+    and nowhere else, which is what keeps the two paths from drifting apart.
+    """
+
+    def __init__(
+        self,
+        *,
+        gap_window_seconds: float = DEFAULT_GAP_WINDOW_SECONDS,
+        accepted_state: str = "ACCEPT",
+        on_close: Callable[[Episode, OpenEpisode, int], None] | None = None,
+    ) -> None:
+        self.gap_window_seconds = float(gap_window_seconds)
+        self.accepted_state = accepted_state
+        self._on_close = on_close
+        self.open_by_key: dict[EpisodeKey, OpenEpisode] = {}
+        self.state = FolderState()
+        self.decisions_seen = 0
+        self.accepts_without_edge = 0
+        self.episodes_built = 0
+        #: Only used when no callback was supplied (the whole-history driver).
+        self.closed: list[Episode] = []
+
+    # -- resumption --------------------------------------------------------
+
+    def restore(
+        self,
+        open_episodes: Iterable[OpenEpisode],
+        *,
+        state: FolderState | None = None,
+    ) -> None:
+        """Adopt the open set and the fold cursor a previous run left behind.
+
+        Insertion order is preserved because the original builder publishes
+        the episodes that are still open in the order they entered the dict.
+        """
+        for open_ep in open_episodes:
+            self.open_by_key[open_ep.key] = open_ep
+        if state is not None:
+            self.state = state
+
+    def snapshot(self) -> FolderState:
+        return FolderState(
+            row_seq=self.state.row_seq,
+            last_instant=self.state.last_instant,
+            prev_instant=self.state.prev_instant,
+        )
+
+    # -- the machine -------------------------------------------------------
+
+    def activity_between(self, start: datetime, end: datetime) -> bool:
+        """Was anything decided strictly between these two instants?
+
+        ``end`` is only used to document the call; the answer is already
+        determined by the position in the stream (see :class:`FolderState`).
+        """
+        del end
+        return self.state.prev_instant is not None and self.state.prev_instant > start
+
+    def add(self, row: _DecisionRow) -> None:
+        """Fold one decision in. Rows without a market are not fold input."""
+        if not row.market_id:
+            return
+        self.decisions_seen += 1
+        if row.state == self.accepted_state and row.net_edge_usd is None:
+            self.accepts_without_edge += 1
+
+        instant = row.decided_at_utc
+        # The activity index only advances on rows that carry a market: the
+        # original builder built its instant list from the rows it kept.
+        if instant != self.state.last_instant:
+            self.state.prev_instant = self.state.last_instant
+            self.state.last_instant = instant
+        seq = self.state.row_seq
+        self.state.row_seq += 1
+
+        key = row.key
+        current = self.open_by_key.get(key)
+        if current is not None:
+            gap = (instant - current.last_seen).total_seconds()
+            if gap > self.gap_window_seconds:
+                missing = not self.activity_between(current.last_seen, instant)
+                self._close(
+                    current,
+                    EndReason.GAP_DATA_MISSING if missing else EndReason.GAP_SIGNAL_BREAK,
+                    seq,
+                )
+                current = None
+
+        is_accept = row.state == self.accepted_state and row.net_edge_usd is not None
+
+        if is_accept:
+            assert row.net_edge_usd is not None
+            value = float(row.net_edge_usd)
+            if current is None:
+                self.open_by_key[key] = OpenEpisode(
+                    key=key,
+                    first_seen=instant,
+                    last_seen=instant,
+                    count=1,
+                    sum_edges=value,
+                    first_edge=value,
+                    last_edge=value,
+                    max_edge=value,
+                    min_edge=value,
+                    opened_seq=seq,
+                    first_market_price=row.market_price,
+                    first_model_probability=row.model_probability,
+                    first_available_depth_usd=row.available_depth_usd,
+                    station=row.station,
+                    bracket_label=row.bracket_label,
+                    market_question=row.market_question,
+                    fee_rate=row.fee_rate,
+                )
+            else:
+                current.observe(row)
+        elif current is not None:
+            # A state that is not ACCEPT ends the episode. It is a real
+            # signal, not a gap, so it closes as a state change.
+            self._close(current, EndReason.STATE_CHANGE, seq)
+
+    def finish(self) -> list[Episode]:
+        """Close whatever is still open as ``end_of_data`` and return it.
+
+        Only the whole-history driver calls this. The streaming engine leaves
+        its episodes open in the store and renders them as ``end_of_data`` at
+        publication time, because a stream that has merely stopped is not a
+        stream that has ended.
+        """
+        for open_ep in list(self.open_by_key.values()):
+            self._close(open_ep, EndReason.END_OF_DATA, self.state.row_seq)
+        return self.closed
+
+    def _close(self, open_ep: OpenEpisode, reason: str, seq: int) -> None:
+        del self.open_by_key[open_ep.key]
+        episode = episode_from_open(open_ep, end_reason=reason, closed_seq=seq)
+        self.episodes_built += 1
+        if self._on_close is None:
+            self.closed.append(episode)
+        else:
+            # The open record travels with the episode: the running sum it holds
+            # is not recoverable from the finished record, and the store keeps
+            # the number that was actually accumulated.
+            self._on_close(episode, open_ep, seq)
 
 
 def build_episodes(
@@ -412,111 +638,100 @@ def build_episodes(
     opportunity), ``open_at_end``.
     """
     normalised: list[_DecisionRow] = []
-    accepts_without_edge = 0
     for raw in rows:
         row = raw if isinstance(raw, _DecisionRow) else row_from_mapping(raw)
         if not row.market_id:
             continue
-        if row.state == accepted_state and row.net_edge_usd is None:
-            accepts_without_edge += 1
         normalised.append(row)
 
     normalised.sort(key=lambda r: r.decided_at_utc)
 
-    open_by_key: dict[EpisodeKey, _OpenEpisode] = {}
-    closed: list[Episode] = []
-    # Every instant at which anything was decided. A gap with nothing in it is
-    # an outage; a gap with other markets moving is this signal stopping.
-    decided_at: list[datetime] = [r.decided_at_utc for r in normalised]
-    import bisect
-
-    def activity_between(start: datetime, end: datetime) -> bool:
-        i = bisect.bisect_right(decided_at, start)
-        return i < len(decided_at) and decided_at[i] < end
-
+    folder = EpisodeFolder(
+        gap_window_seconds=gap_window_seconds, accepted_state=accepted_state
+    )
     for row in normalised:
-        key = row.key
-        current = open_by_key.get(key)
-        if current is not None:
-            gap = (row.decided_at_utc - current.last_seen).total_seconds()
-            if gap > gap_window_seconds:
-                missing = not activity_between(current.last_seen, row.decided_at_utc)
-                closed.append(
-                    _close(
-                        current,
-                        reason=EndReason.GAP_DATA_MISSING if missing else EndReason.GAP_SIGNAL_BREAK,
-                        gap_missing=missing,
-                    )
-                )
-                del open_by_key[key]
-                current = None
+        folder.add(row)
 
-        is_accept = row.state == accepted_state and row.net_edge_usd is not None
-
-        if is_accept:
-            if current is None:
-                open_by_key[key] = _OpenEpisode(
-                    key=key, first_seen=row.decided_at_utc, last_seen=row.decided_at_utc, count=1,
-                    edges=[float(row.net_edge_usd)],
-                    first_market_price=row.market_price,
-                    first_model_probability=row.model_probability,
-                    first_available_depth_usd=row.available_depth_usd,
-                    station=row.station,
-                    bracket_label=row.bracket_label,
-                    market_question=row.market_question,
-                    fee_rate=row.fee_rate,
-                )
-            else:
-                current.observe(row)
-        elif current is not None:
-            # A state that is not ACCEPT ends the episode. It is a real
-            # signal, not a gap, so it closes as a state change.
-            closed.append(_close(current, reason=EndReason.STATE_CHANGE, gap_missing=False))
-            del open_by_key[key]
-
-    # Anything still open simply ran out of data. We do not know it ended.
-    for remaining in open_by_key.values():
-        closed.append(_close(remaining, reason=EndReason.END_OF_DATA, gap_missing=False))
-
+    open_at_end = len(folder.open_by_key)
+    closed = folder.finish()
     closed.sort(key=lambda e: e.first_seen_utc)
     counters = {
-        "decisions_seen": len(normalised),
+        "decisions_seen": folder.decisions_seen,
         "episodes_built": len(closed),
-        "accepts_without_edge": accepts_without_edge,
-        "open_at_end": 0 if not open_by_key else len(open_by_key),
+        "accepts_without_edge": folder.accepts_without_edge,
+        "open_at_end": open_at_end,
     }
     return closed, counters
 
 
-def summarize(episodes: Sequence[Episode]) -> dict[str, object]:
-    """The five counts that must never be substituted for one another.
+class EpisodeSummary:
+    """The five counts and two sums, accumulated one episode at a time.
 
-    Contract section 2.5. ``accept_observations`` is the number of
-    evaluations; ``opportunity_episodes`` is the number of opportunities.
-    They are different questions and the gap between them is the measure of
-    how much a raw ACCEPT count was overstating.
+    ``summarize`` formats this; the streaming engine fills it from a store
+    cursor instead of a list. Both go through :meth:`as_dict`, so the two
+    paths cannot disagree about what a number means or how it is shaped.
+
+    ``unique_opportunity_edge_sum`` is a plain left fold in episode order,
+    matching the original ``sum(e.first_edge for e in episodes)`` exactly -
+    including its floating-point rounding, which is why the order is fixed
+    rather than sorted by value. ``observation_edge_sum`` is the same kind of
+    fold over ``mean_edge * observation_count``.
     """
-    markets = {e.key.market_id for e in episodes}
-    pairs = {(e.key.market_id, e.key.direction) for e in episodes}
-    dates = {e.key.target_date for e in episodes if e.key.target_date is not None}
-    edges = [e.first_edge for e in episodes]
-    return {
-        "opportunity_episodes": len(episodes),
-        "accept_observations": sum(e.observation_count for e in episodes),
-        "distinct_market_direction_pairs": len(pairs),
-        "distinct_markets": len(markets),
-        "distinct_target_dates": len(dates),
-        "unique_opportunity_edge_sum": sum(edges) if edges else 0.0,
-        "observation_edge_sum": sum(
-            e.mean_edge * e.observation_count for e in episodes
-        ),
-        "mean_episode_edge": (sum(edges) / len(edges)) if edges else None,
-        "statistical_scope": ["opportunity_episodes", "observation_all_accepts"],
-        "warnings": [
-            "Observation Edge Sum counts repeated evaluations of one opportunity; "
-            "it is not profit, not asset growth and not the expected return of "
-            "independent trades.",
-            "Unique Opportunity Edge Sum is the model's theoretical expectation "
-            "under its own probabilities; it is not realised profit.",
-        ],
-    }
+
+    def __init__(self) -> None:
+        self.opportunity_episodes = 0
+        self.accept_observations = 0
+        self.unique_opportunity_edge_sum = 0.0
+        self.observation_edge_sum = 0.0
+        self._markets: set[str] = set()
+        self._pairs: set[tuple[str, str | None]] = set()
+        self._dates: set[str] = set()
+
+    def add(self, episode: Episode) -> None:
+        self.opportunity_episodes += 1
+        self.accept_observations += episode.observation_count
+        self.unique_opportunity_edge_sum += episode.first_edge
+        self.observation_edge_sum += episode.mean_edge * episode.observation_count
+        self._markets.add(episode.key.market_id)
+        self._pairs.add((episode.key.market_id, episode.key.direction))
+        if episode.key.target_date is not None:
+            self._dates.add(episode.key.target_date)
+
+    def as_dict(self) -> dict[str, object]:
+        """The five counts that must never be substituted for one another.
+
+        Contract section 2.5. ``accept_observations`` is the number of
+        evaluations; ``opportunity_episodes`` is the number of opportunities.
+        They are different questions and the gap between them is the measure of
+        how much a raw ACCEPT count was overstating.
+        """
+        return {
+            "opportunity_episodes": self.opportunity_episodes,
+            "accept_observations": self.accept_observations,
+            "distinct_market_direction_pairs": len(self._pairs),
+            "distinct_markets": len(self._markets),
+            "distinct_target_dates": len(self._dates),
+            "unique_opportunity_edge_sum": self.unique_opportunity_edge_sum,
+            "observation_edge_sum": self.observation_edge_sum,
+            "mean_episode_edge": (
+                self.unique_opportunity_edge_sum / self.opportunity_episodes
+                if self.opportunity_episodes
+                else None
+            ),
+            "statistical_scope": ["opportunity_episodes", "observation_all_accepts"],
+            "warnings": [
+                "Observation Edge Sum counts repeated evaluations of one opportunity; "
+                "it is not profit, not asset growth and not the expected return of "
+                "independent trades.",
+                "Unique Opportunity Edge Sum is the model's theoretical expectation "
+                "under its own probabilities; it is not realised profit.",
+            ],
+        }
+
+
+def summarize(episodes: Sequence[Episode]) -> dict[str, object]:
+    """The summary of a materialised episode list (see :class:`EpisodeSummary`)."""
+    summary = EpisodeSummary()
+    for episode in episodes:
+        summary.add(episode)
+    return summary.as_dict()

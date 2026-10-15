@@ -46,6 +46,7 @@ __all__ = [
     "IndependentResult",
     "NotExecutable",
     "PortfolioResult",
+    "PortfolioWalk",
     "SingleResult",
     "book_from_mapping",
     "simulate_independent",
@@ -414,6 +415,12 @@ class PortfolioResult:
     not_executable_count: int = 0
     backtestable: bool = True
     not_backtestable_reasons: list[str] = field(default_factory=list)
+    #: Running total of the executable results' expected net edges, folded as
+    #: each result is recorded. Kept here rather than recomputed from
+    #: ``results`` so a walk that never materialises them still reports the
+    #: same number - and the same rounding, since the fold order is the
+    #: episode order either way.
+    expected_net_edge_total: float = 0
 
     @property
     def utilization(self) -> float:
@@ -423,10 +430,14 @@ class PortfolioResult:
 
     @property
     def theoretical_expected_net_edge_usdc(self) -> float | None:
-        values = [r.theoretical_expected_net_edge_usdc for r in self.results if r.executable]
-        if not values:
+        if self.results:
+            values = [r.theoretical_expected_net_edge_usdc for r in self.results if r.executable]
+            if not values:
+                return None
+            return sum(v for v in values if v is not None)
+        if self.executable_count == 0:
             return None
-        return sum(v for v in values if v is not None)
+        return self.expected_net_edge_total
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -553,6 +564,163 @@ class IndependentResult:
         }
 
 
+class PortfolioWalk:
+    """Share one stake across episodes in the order time actually gave them.
+
+    One implementation, two drivers. :func:`simulate_portfolio` collects every
+    per-opportunity result and returns the whole record; the streaming engine
+    hands each result straight to the snapshot writer and keeps only the
+    running totals, so the reference-capital payload is produced without the
+    results ever being held.
+
+    The rules are the contract's and are unchanged: order by ``first_seen_utc``
+    (never by edge - ranking by the number under evaluation would let the best
+    outcome claim the capital first), a per-market cap shared by every episode
+    of that market, and capital released only when an episode settles, which
+    this module cannot observe, so nothing is released at all.
+    """
+
+    def __init__(
+        self,
+        *,
+        capital_usdc: float,
+        max_allocation_fraction: float = DEFAULT_MAX_ALLOCATION_FRACTION,
+        collect_results: bool = True,
+        **single_kwargs: object,
+    ) -> None:
+        if capital_usdc <= 0:
+            raise ValueError(f"capital_usdc must be > 0, got {capital_usdc!r}")
+        if not 0 < max_allocation_fraction <= 1:
+            raise ValueError(
+                f"max_allocation_fraction must be in (0, 1], got {max_allocation_fraction!r}"
+            )
+        self.outcome = PortfolioResult(
+            capital_usdc=capital_usdc, max_allocation_fraction=max_allocation_fraction
+        )
+        self.collect_results = collect_results
+        self.single_kwargs = single_kwargs
+        self.balance = capital_usdc
+        self.per_opportunity_cap = capital_usdc * max_allocation_fraction
+        # Contract section 3.3: episodes from the same market are the same
+        # correlated exposure. Giving each a fresh cap would let five signals on
+        # one bracket consume five times the share the risk assumption allowed.
+        self.allocated_by_market: dict[str, float] = {}
+        self.total_count = 0
+        self._funds_exhausted = False
+
+    def add(self, episode: Episode, book: OrderBook | None) -> SingleResult:
+        """Price one opportunity against what is left, and record the outcome."""
+        outcome = self.outcome
+        self.total_count += 1
+
+        # Decide what this episode may spend *before* pricing it. Pricing at
+        # the full cap and trimming the result afterwards leaves shares,
+        # fees and expected edge describing a position that was never
+        # funded - which is how a portfolio reports a profit on money it
+        # did not have.
+        market_id = episode.key.market_id
+        market_used = self.allocated_by_market.get(market_id, 0.0)
+        available = min(self.per_opportunity_cap - market_used, self.balance)
+        if available <= 0:
+            if not self._funds_exhausted:
+                outcome.not_backtestable_reasons.append(
+                    "capital exhausted before all opportunities were funded"
+                )
+                self._funds_exhausted = True
+            return self._record(
+                SingleResult(
+                    episode_id=episode.episode_id,
+                    executable=False,
+                    not_executable_reason=NotExecutable.NO_FUNDS,
+                    capital_usdc=self.per_opportunity_cap,
+                    theoretical_edge_per_share=episode.first_edge,
+                    notes=["no reference capital remained for this opportunity"],
+                )
+            )
+
+        single = simulate_single(
+            episode,
+            capital_usdc=available,
+            book=book,
+            **self.single_kwargs,  # type: ignore[arg-type]
+        )
+
+        if not single.executable:
+            return self._record(single)
+
+        used = single.capital_used_usdc
+        if used <= 0:
+            # Sized but not spendable: treat it as unfunded rather than
+            # counting a position that contributes nothing.
+            single.executable = False
+            single.not_executable_reason = NotExecutable.NO_FUNDS
+            return self._record(single)
+
+        if used > self.balance:  # pragma: no cover - guards the invariant
+            raise AssertionError(
+                f"allocated {used} exceeds the remaining balance {self.balance}: "
+                "pricing must never exceed the funds it was given"
+            )
+
+        outcome.executable_count += 1
+        if single.capacity_limited:
+            outcome.capacity_limited_count += 1
+        outcome.allocated_total_usdc += used
+        self.allocated_by_market[market_id] = market_used + used
+        self.balance -= used
+        outcome.peak_open_allocation_usdc = max(
+            outcome.peak_open_allocation_usdc, outcome.allocated_total_usdc
+        )
+        if single.theoretical_expected_net_edge_usdc is not None:
+            outcome.expected_net_edge_total += single.theoretical_expected_net_edge_usdc
+        return self._record(single)
+
+    def _record(self, single: SingleResult) -> SingleResult:
+        outcome = self.outcome
+        if not single.executable:
+            outcome.not_executable_count += 1
+        if self.collect_results:
+            outcome.results.append(single)
+        return single
+
+    def finish(self) -> PortfolioResult:
+        """Close the walk: invariants, honesty flags, and the running totals."""
+        outcome = self.outcome
+        outcome.balance_remaining_usdc = self.balance
+
+        # The core invariant, checked rather than asserted in prose.
+        if outcome.allocated_total_usdc > outcome.capital_usdc + 1e-9:
+            raise AssertionError(
+                f"allocated {outcome.allocated_total_usdc} exceeds the reference "
+                f"capital {outcome.capital_usdc}"
+            )
+
+        if outcome.executable_count == 0:
+            outcome.backtestable = False
+            outcome.not_backtestable_reasons.append(
+                "no episode could be sized from retained book levels"
+            )
+        if self.total_count and outcome.not_executable_count == self.total_count:
+            outcome.backtestable = False
+            outcome.not_backtestable_reasons.append(
+                "every opportunity lacked the evidence a fill needs"
+            )
+        # Capital is never released inside this pass. Settlement times are not
+        # carried on an episode, and neither the snapshot builder nor the
+        # reference-capital endpoint supplies them, so the capital timeline
+        # cannot be reconstructed. Holding every allocation to the end of the
+        # window is the conservative reading of that - it can only understate
+        # utilization - but "conservative" is not "validated". Anything with an
+        # executable book therefore cannot be presented as historically tested.
+        if outcome.executable_count:
+            outcome.backtestable = False
+            outcome.not_backtestable_reasons.append(
+                "settlement timing is not available, so the capital timeline "
+                "cannot be reconstructed and these results are theoretical only"
+            )
+        return outcome
+
+
 def simulate_portfolio(
     episodes: Sequence[Episode],
     *,
@@ -572,119 +740,11 @@ def simulate_portfolio(
     money to the pool early is exactly the assumption that makes a
     backtest look more liquid than the market ever was.
     """
-    if capital_usdc <= 0:
-        raise ValueError(f"capital_usdc must be > 0, got {capital_usdc!r}")
-    if not 0 < max_allocation_fraction <= 1:
-        raise ValueError(
-            f"max_allocation_fraction must be in (0, 1], got {max_allocation_fraction!r}"
-        )
-
-    outcome = PortfolioResult(
-        capital_usdc=capital_usdc, max_allocation_fraction=max_allocation_fraction
+    walk = PortfolioWalk(
+        capital_usdc=capital_usdc,
+        max_allocation_fraction=max_allocation_fraction,
+        **single_kwargs,
     )
-    balance = capital_usdc
-    per_opportunity_cap = capital_usdc * max_allocation_fraction
-    funds_exhausted = False
-    # Contract section 3.3: episodes from the same market are the same
-    # correlated exposure. Giving each a fresh cap would let five signals on
-    # one bracket consume five times the share the risk assumption allowed.
-    allocated_by_market: dict[str, float] = {}
-
     for episode in sorted(episodes, key=lambda e: e.first_seen_utc):
-        # Decide what this episode may spend *before* pricing it. Pricing at
-        # the full cap and trimming the result afterwards leaves shares,
-        # fees and expected edge describing a position that was never
-        # funded - which is how a portfolio reports a profit on money it
-        # did not have.
-        market_id = episode.key.market_id
-        market_used = allocated_by_market.get(market_id, 0.0)
-        available = min(per_opportunity_cap - market_used, balance)
-        if available <= 0:
-            if not funds_exhausted:
-                outcome.not_backtestable_reasons.append(
-                    "capital exhausted before all opportunities were funded"
-                )
-                funds_exhausted = True
-            outcome.results.append(
-                SingleResult(
-                    episode_id=episode.episode_id,
-                    executable=False,
-                    not_executable_reason=NotExecutable.NO_FUNDS,
-                    capital_usdc=per_opportunity_cap,
-                    theoretical_edge_per_share=episode.first_edge,
-                    notes=["no reference capital remained for this opportunity"],
-                )
-            )
-            outcome.not_executable_count += 1
-            continue
-
-        single = simulate_single(
-            episode,
-            capital_usdc=available,
-            book=book_for(episode),
-            **single_kwargs,  # type: ignore[arg-type]
-        )
-        outcome.results.append(single)
-
-        if not single.executable:
-            outcome.not_executable_count += 1
-            continue
-
-        used = single.capital_used_usdc
-        if used <= 0:
-            # Sized but not spendable: treat it as unfunded rather than
-            # counting a position that contributes nothing.
-            single.executable = False
-            single.not_executable_reason = NotExecutable.NO_FUNDS
-            outcome.not_executable_count += 1
-            continue
-
-        if used > balance:  # pragma: no cover - guards the invariant
-            raise AssertionError(
-                f"allocated {used} exceeds the remaining balance {balance}: "
-                "pricing must never exceed the funds it was given"
-            )
-
-        outcome.executable_count += 1
-        if single.capacity_limited:
-            outcome.capacity_limited_count += 1
-        outcome.allocated_total_usdc += used
-        allocated_by_market[market_id] = market_used + used
-        balance -= used
-        outcome.peak_open_allocation_usdc = max(
-            outcome.peak_open_allocation_usdc, outcome.allocated_total_usdc
-        )
-
-    outcome.balance_remaining_usdc = balance
-
-    # The core invariant, checked rather than asserted in prose.
-    if outcome.allocated_total_usdc > capital_usdc + 1e-9:
-        raise AssertionError(
-            f"allocated {outcome.allocated_total_usdc} exceeds the reference "
-            f"capital {capital_usdc}"
-        )
-
-    if outcome.executable_count == 0:
-        outcome.backtestable = False
-        outcome.not_backtestable_reasons.append(
-            "no episode could be sized from retained book levels"
-        )
-    if outcome.results and outcome.not_executable_count == len(outcome.results):
-        outcome.backtestable = False
-        outcome.not_backtestable_reasons.append(
-            "every opportunity lacked the evidence a fill needs"
-        )
-    # Capital is never released inside this pass. Settlement times are not
-    # carried on an episode, and neither the snapshot builder nor the
-    # reference-capital endpoint supplies them, so the capital timeline
-    # cannot be reconstructed. Holding every allocation to the end of the
-    # window is the conservative reading of that - it can only understate
-    # utilization - but "conservative" is not "validated". Anything with an
-    # executable book therefore cannot be presented as historically tested.
-    if outcome.executable_count:
-        outcome.backtestable = False
-        outcome.not_backtestable_reasons.append(
-            "settlement timing is not available, so the capital timeline "
-            "cannot be reconstructed and these results are theoretical only"
-        )
-    return outcome
+        walk.add(episode, book_for(episode))
+    return walk.finish()
