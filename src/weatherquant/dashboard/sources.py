@@ -232,10 +232,10 @@ class SnapshotSources:
             "(docs/performance-data-contract.md §7)"
         )
 
-        generation_dir, manifest = resolve_generation(root)
-        if generation_dir is None:
-            # No pointer at all: either nothing has been published, or this
-            # deployment still uses the flat layout the API always accepted.
+        generation = resolve_generation(root)
+        if generation.directory is None and generation.problem is None:
+            # Nothing has ever been published here, or this deployment still
+            # uses the flat layout the API always accepted.
             return self.read(
                 logical_name,
                 root / filename,
@@ -243,21 +243,20 @@ class SnapshotSources:
                 missing_reason=missing_reason,
                 now=now,
             )
-        if manifest is None:
-            # A pointer with no readable manifest is a broken publish, not an
+        if generation.directory is None:
+            # A pointer that cannot be honoured is a broken publish, not an
             # absent one. Saying "missing" would send someone to re-run a
             # backfill that already succeeded.
             return self.read(
                 logical_name,
-                generation_dir / filename,
+                root / filename,
                 stale_after_seconds=300.0,
-                missing_reason=(
-                    f"{logical_name} exists but its generation has no readable "
-                    "manifest; the publish is incomplete"
-                ),
+                missing_reason=f"{logical_name}: {generation.problem}",
                 now=now,
             )
 
+        generation_dir = generation.directory
+        manifest = generation.manifest or {}
         source = self.read(
             logical_name,
             generation_dir / filename,

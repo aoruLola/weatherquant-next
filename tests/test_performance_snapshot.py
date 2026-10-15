@@ -178,10 +178,10 @@ def _published(out: Path, name: str) -> Path:
     Snapshots now live under `generations/<id>/`; a test that read a flat
     path would be asserting the layout that was deliberately removed.
     """
-    generation_dir, manifest = resolve_generation(out)
-    assert generation_dir is not None, "nothing was published"
-    assert manifest is not None, "the published generation has no manifest"
-    return generation_dir / name
+    gen = resolve_generation(out)
+    assert gen.directory is not None, "nothing was published"
+    assert gen.manifest is not None, "the published generation has no manifest"
+    return gen.directory / name
 
 
 def test_publish_writes_every_declared_file(tmp_path: Path) -> None:
@@ -238,14 +238,14 @@ def test_every_file_carries_one_generation_id(tmp_path: Path) -> None:
     payloads = build_performance(decisions=_decisions(), now=NOW)
     publish_performance(payloads, tmp_path)
 
-    generation_dir, manifest = resolve_generation(tmp_path)
+    gen = resolve_generation(tmp_path)
     ids = set()
     for name in SNAPSHOT_FILES:
-        payload = json.loads((generation_dir / name).read_text(encoding="utf-8"))
+        payload = json.loads((gen.directory / name).read_text(encoding="utf-8"))
         ids.add(payload["generation_id"])
 
     assert len(ids) == 1, f"a published batch carries more than one generation: {ids}"
-    assert manifest["generation_id"] in ids
+    assert gen.manifest["generation_id"] in ids
 
 
 def test_the_manifest_records_what_the_batch_was(tmp_path: Path) -> None:
@@ -258,61 +258,83 @@ def test_the_manifest_records_what_the_batch_was(tmp_path: Path) -> None:
         coverage={"rows": 30},
     )
 
-    _, manifest = resolve_generation(tmp_path)
+    gen = resolve_generation(tmp_path)
 
-    assert manifest["dataset"] == "fixture"
-    assert manifest["source"] == "weatherquant-research"
-    assert manifest["watermark"] == ["2026-10-14T08:00:00+00:00", "id-0042"]
-    assert manifest["coverage"] == {"rows": 30}
-    assert manifest["published_at_utc"]
-    assert set(manifest["files"]) == set(SNAPSHOT_FILES)
+    assert gen.manifest["dataset"] == "fixture"
+    assert gen.manifest["source"] == "weatherquant-research"
+    assert gen.manifest["watermark"] == ["2026-10-14T08:00:00+00:00", "id-0042"]
+    assert gen.manifest["coverage"] == {"rows": 30}
+    assert gen.manifest["published_at_utc"]
+    assert set(gen.manifest["files"]) == set(SNAPSHOT_FILES)
 
 
 def test_a_second_publish_replaces_the_pointer_not_the_files(tmp_path: Path) -> None:
     """The previous generation stays intact - that is the rollback story."""
     publish_performance(build_performance(decisions=_decisions(n=10), now=NOW), tmp_path)
-    first, first_manifest = resolve_generation(tmp_path)
+    first_gen = resolve_generation(tmp_path)
 
     publish_performance(build_performance(decisions=_decisions(n=20), now=NOW), tmp_path)
-    second, second_manifest = resolve_generation(tmp_path)
+    second_gen = resolve_generation(tmp_path)
 
-    assert first != second, "a new publish must select a new generation"
-    assert first.exists(), "the previous generation was destroyed"
-    assert first_manifest["generation_id"] != second_manifest["generation_id"]
+    assert first_gen.directory != second_gen.directory, "a new publish must select a new generation"
+    assert first_gen.directory.exists(), "the previous generation was destroyed"
+    assert first_gen.manifest["generation_id"] != second_gen.manifest["generation_id"]
 
 
 def test_a_republish_of_the_same_data_keeps_the_same_id(tmp_path: Path) -> None:
     """The id names the batch, not the clock that wrote it."""
     payloads = build_performance(decisions=_decisions(), now=NOW)
     publish_performance(payloads, tmp_path, generation_id="fixed-id")
-    _, manifest = resolve_generation(tmp_path)
+    gen = resolve_generation(tmp_path)
 
-    assert manifest["generation_id"] == "fixed-id"
+    assert gen.manifest["generation_id"] == "fixed-id"
     assert (tmp_path / "generations" / "fixed-id" / "summary.json").exists()
 
 
 def test_a_pointer_to_an_incomplete_generation_is_refused(tmp_path: Path) -> None:
-    """A publish that died before its manifest must not become readable."""
+    """A publish that died before its manifest must not become readable.
+
+    And it must be reported as *broken*, not as absent: an operator told
+    "nothing has been published" goes looking for a backfill that already
+    ran. The three states - absent, readable, broken - are the reason
+    ``resolve_generation`` returns a Generation rather than a tuple.
+    """
     payloads = build_performance(decisions=_decisions(), now=NOW)
     publish_performance(payloads, tmp_path)
 
-    generation_dir, manifest = resolve_generation(tmp_path)
-    assert manifest is not None
-    (generation_dir / "manifest.json").unlink()
+    gen = resolve_generation(tmp_path)
+    assert gen.directory is not None and gen.manifest is not None
+    (gen.directory / "manifest.json").unlink()
 
-    resolved_dir, resolved_manifest = resolve_generation(tmp_path)
-    assert resolved_manifest is None
-    assert resolved_dir is None, (
-        "a generation without a manifest is an incomplete publish, not an "
-        "absent backfill"
-    )
+    broken = resolve_generation(tmp_path)
+    assert broken.directory is None
+    assert broken.manifest is None
+    assert broken.problem, "an incomplete publish must say so rather than read as absent"
 
 
 def test_an_unparseable_pointer_yields_nothing_rather_than_a_crash(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "current.json").write_text("{ not json", encoding="utf-8")
 
-    assert resolve_generation(tmp_path) == (None, None)
+    gen = resolve_generation(tmp_path)
+    assert gen.directory is None
+    assert gen.problem, "a pointer that cannot be read is a problem, not silence"
+
+
+def test_an_empty_directory_is_absent_not_broken(tmp_path: Path) -> None:
+    """A directory with nothing in it has not been published to yet.
+
+    This is the state a fresh deployment is in, and it is not a fault.
+    Conflating it with a broken publish is what an earlier two-tuple
+    encoding did, and it told the operator to look for a failed publish
+    that had never been attempted.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+
+    gen = resolve_generation(tmp_path)
+    assert gen.directory is None
+    assert gen.manifest is None
+    assert gen.problem is None, f"an empty directory is not a fault: {gen.problem}"
 
 
 def test_a_file_from_another_generation_is_refused_by_the_source(tmp_path: Path) -> None:
@@ -326,11 +348,11 @@ def test_a_file_from_another_generation_is_refused_by_the_source(tmp_path: Path)
     payloads = build_performance(decisions=_decisions(), now=NOW)
     publish_performance(payloads, root / "performance", generation_id="gen-a")
     # Tamper: leave a file that claims an older batch inside the current one.
-    directory, manifest = resolve_generation(root / "performance")
-    stale = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+    gen = resolve_generation(root / "performance")
+    stale = json.loads((gen.directory / "summary.json").read_text(encoding="utf-8"))
     stale["generation_id"] = "gen-000"
-    (directory / "summary.json").write_text(json.dumps(stale), encoding="utf-8")
-    assert manifest["generation_id"] == "gen-a"
+    (gen.directory / "summary.json").write_text(json.dumps(stale), encoding="utf-8")
+    assert gen.manifest["generation_id"] == "gen-a"
 
     from datetime import UTC, datetime
 

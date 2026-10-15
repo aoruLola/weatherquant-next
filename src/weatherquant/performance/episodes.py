@@ -254,8 +254,38 @@ def _timestamp(value: object) -> datetime:
     raise TypeError(f"decided_at_utc must be a datetime or ISO-8601 string, got {type(value).__name__}")
 
 
+#: One decision, two spellings. The API and the dashboard publish the
+#: public names; the decisions export (contract section 11) carries the
+#: engine's own column names, because it is a SELECT over shadow_decisions
+#: rather than a re-spelling of it. Only these two differ.
+_EXPORT_ALIASES: dict[str, tuple[str, ...]] = {
+    "decided_at_utc": ("decision_time_utc",),
+    "net_edge_usd": ("net_edge",),
+}
+
+
+def _field(row: Mapping[str, Any], name: str) -> Any:
+    """Read a public field, falling back to the export's name for it.
+
+    The export is append-only and already published, so its spelling is a
+    fact about data on disk rather than a choice this reader gets to make.
+    """
+    if name in row:
+        return row[name]
+    for alias in _EXPORT_ALIASES.get(name, ()):
+        if alias in row:
+            return row[alias]
+    return None
+
+
 def row_from_mapping(row: dict) -> _DecisionRow:
-    """Build a row from a decision dict (API shape or a database mapping)."""
+    """Build a row from a decision dict (API shape or a database mapping).
+
+    Accepts either spelling, so a decisions export feeds the performance
+    build directly. Each side was tested against its own vocabulary and
+    neither crossed the seam, which is how ``decided_at_utc`` and
+    ``decision_time_utc`` came to mean one thing under two names.
+    """
     return _DecisionRow(
         market_id=str(row.get("market_id") or ""),
         target_date=_normalise(row.get("target_date")),
@@ -263,8 +293,8 @@ def row_from_mapping(row: dict) -> _DecisionRow:
         direction=_normalise(row.get("direction")),
         mode=_normalise(row.get("mode")),
         state=_normalise(row.get("state")) or "",
-        decided_at_utc=_timestamp(row["decided_at_utc"]),
-        net_edge_usd=_finite(row.get("net_edge_usd")),
+        decided_at_utc=_timestamp(_field(row, "decided_at_utc")),
+        net_edge_usd=_finite(_field(row, "net_edge_usd")),
         market_price=_finite(row.get("market_price")),
         model_probability=_finite(row.get("model_probability")),
         available_depth_usd=_finite(row.get("available_depth_usd")),
