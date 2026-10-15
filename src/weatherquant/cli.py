@@ -533,13 +533,12 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
     """Turn a decisions export plus settlements into the six snapshots."""
     from weatherquant.performance.backfill import (
         build_performance_snapshots,
-        load_decisions,
+        load_decisions_with_watermark,
         load_settlements,
     )
-    from weatherquant.shadow.export import export_watermark
 
     try:
-        decisions = load_decisions(args.export)
+        decisions, watermark = load_decisions_with_watermark(args.export)
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"could not read decisions export: {exc}", file=sys.stderr)
         return 2
@@ -562,10 +561,10 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
             capital_usdc=float(args.capital_usdc),
             max_allocation_fraction=float(args.max_allocation_fraction),
             gap_window_seconds=float(args.gap_window_seconds),
-            # The input's own high-water mark, so the manifest can say which
-            # decisions the run could have seen rather than only which ones it
-            # happened to read. A file input has no cursor and stays null.
-            watermark=export_watermark(args.export),
+            # Read from the same enumeration as the rows, so the manifest can
+            # never advertise a cursor past the last decision it contains. A
+            # file input has no cursor and stays null.
+            watermark=watermark,
         )
     except (ValueError, RuntimeError) as exc:
         print(f"could not build performance snapshots: {exc}", file=sys.stderr)

@@ -62,6 +62,24 @@ def load_decisions(path: str | Path) -> list[dict[str, Any]]:
     installed - refusing rather than guessing at the format, because a
     silently misparsed export produces plausible-looking decisions.
     """
+    rows, _watermark = load_decisions_with_watermark(path)
+    return rows
+
+
+def load_decisions_with_watermark(
+    path: str | Path,
+) -> tuple[list[dict[str, Any]], list[str] | None]:
+    """Read a decisions export together with the cursor it had reached.
+
+    Both come from one enumeration of the parts. Scanning twice races the
+    engine, which keeps publishing: the second scan can see a part the first
+    did not, and a manifest built from the pair would advertise a watermark
+    past the last decision its snapshots contain - claiming coverage of rows
+    that were never read.
+
+    The second element is ``None`` for a file input, which has no cursor, and
+    for a directory that has published nothing.
+    """
     source = Path(path)
     if not source.exists():
         raise FileNotFoundError(f"decisions export not found: {source}")
@@ -70,36 +88,37 @@ def load_decisions(path: str | Path) -> list[dict[str, Any]]:
         # The shadow publishes append-only parts under this directory. A
         # directory is the production input; the flat formats below are for
         # hand-carried or legacy exports.
-        from weatherquant.shadow.export import read_export
+        from weatherquant.shadow.export import read_export_with_watermark
 
-        rows = read_export(source)
+        rows, watermark = read_export_with_watermark(source)
         if not rows:
             raise ValueError(
                 f"no exported decisions under {source}; run the shadow's "
                 "export first, or point --export at a file"
             )
-        return rows
+        return rows, watermark
 
     suffix = source.suffix.lower()
     if suffix in {".jsonl", ".ndjson"}:
         with source.open(encoding="utf-8") as handle:
-            return [json.loads(line) for line in handle if line.strip()]
-    if suffix == ".json":
+            rows = [json.loads(line) for line in handle if line.strip()]
+    elif suffix == ".json":
         with source.open(encoding="utf-8") as handle:
             payload = json.load(handle)
         if isinstance(payload, dict):
             for key in ("decisions", "rows", "data"):
                 if isinstance(payload.get(key), list):
-                    return payload[key]
-            raise ValueError(
-                "a JSON decisions export must be a list, or an object with a "
-                "'decisions', 'rows' or 'data' list"
-            )
-        if isinstance(payload, list):
-            return payload
-        raise ValueError("unsupported JSON decisions export shape")
-
-    if suffix in {".parquet", ".pq"}:
+                    payload = payload[key]
+                    break
+            else:
+                raise ValueError(
+                    "a JSON decisions export must be a list, or an object with a "
+                    "'decisions', 'rows' or 'data' list"
+                )
+        if not isinstance(payload, list):
+            raise ValueError("unsupported JSON decisions export shape")
+        rows = payload
+    elif suffix in {".parquet", ".pq"}:
         try:
             import pyarrow.parquet as pq
         except ImportError as exc:  # pragma: no cover - depends on install
@@ -107,9 +126,13 @@ def load_decisions(path: str | Path) -> list[dict[str, Any]]:
                 "reading a parquet export needs pyarrow; export to JSON or "
                 "JSONL instead"
             ) from exc
-        return pq.read_table(source).to_pylist()
+        rows = pq.read_table(source).to_pylist()
+    else:
+        raise ValueError(f"unsupported decisions export format: {suffix!r}")
 
-    raise ValueError(f"unsupported decisions export format: {suffix!r}")
+    # A file has no cursor. Saying so is the honest answer; a watermark here
+    # would describe a range nothing recorded.
+    return rows, None
 
 
 def load_settlements(path: str | Path) -> list[dict[str, Any]]:

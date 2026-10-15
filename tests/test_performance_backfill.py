@@ -23,6 +23,7 @@ from weatherquant.performance.backfill import (
     backfill_settlements,
     build_performance_snapshots,
     load_decisions,
+    load_decisions_with_watermark,
 )
 from weatherquant.performance.snapshot import SNAPSHOT_FILES, resolve_generation
 
@@ -452,7 +453,7 @@ def test_the_manifest_records_the_export_watermark_and_coverage(tmp_path) -> Non
     empty, so the auditability the doc described did not exist - and a reader
     could not tell a snapshot covering everything from one covering a slice.
     """
-    from weatherquant.shadow.export import _write_part, export_watermark
+    from weatherquant.shadow.export import _write_part
 
     parts = tmp_path / "export" / "parts"
     parts.mkdir(parents=True)
@@ -468,13 +469,14 @@ def test_the_manifest_records_the_export_watermark_and_coverage(tmp_path) -> Non
         ],
     )
 
+    decisions, watermark = load_decisions_with_watermark(tmp_path / "export")
     out = tmp_path / "performance"
     build_performance_snapshots(
-        decisions=load_decisions(tmp_path / "export"),
+        decisions=decisions,
         out_dir=out,
         dataset="live",
         now=NOW,
-        watermark=export_watermark(tmp_path / "export"),
+        watermark=watermark,
     )
 
     manifest = _manifest(out)
@@ -524,3 +526,39 @@ def test_coverage_of_nothing_is_null_not_zero(tmp_path) -> None:
     assert coverage["decisions"] == 0
     assert coverage["first_decision_utc"] is None
     assert coverage["last_decision_utc"] is None
+
+
+def test_the_watermark_describes_the_rows_that_were_actually_read(tmp_path) -> None:
+    """Scanning the parts twice races the engine, which keeps publishing.
+
+    A separate scan can see a part the first did not. The manifest would then
+    advertise a watermark past the last decision its snapshots contain -
+    claiming coverage of rows that were never read, which is the one thing the
+    metadata exists to rule out.
+    """
+    from weatherquant.shadow.export import _write_part
+
+    parts = tmp_path / "export" / "parts"
+    parts.mkdir(parents=True)
+    _write_part(
+        parts / "part-000000001.jsonl",
+        [_export_row(decision_id="d-0", decision_time_utc=NOW.isoformat())],
+    )
+
+    decisions, watermark = load_decisions_with_watermark(tmp_path / "export")
+
+    # The engine publishes while the research side is working.
+    _write_part(
+        parts / "part-000000002.jsonl",
+        [
+            _export_row(
+                decision_id="d-1",
+                decision_time_utc=(NOW + timedelta(hours=1)).isoformat(),
+            )
+        ],
+    )
+
+    assert [row["decision_id"] for row in decisions] == ["d-0"]
+    assert watermark == [NOW.isoformat(), "d-0"], (
+        "the cursor described a part that was not in the read"
+    )
