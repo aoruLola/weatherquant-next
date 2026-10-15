@@ -55,7 +55,7 @@ import statistics
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from operator import itemgetter
 from pathlib import Path
 from typing import Any
@@ -89,9 +89,14 @@ from weatherquant.performance.episodes import (
     row_from_mapping,
 )
 from weatherquant.performance.snapshot import (
+    DETAIL_MAX_EPISODES,
+    DETAIL_PARTITION_SIZE,
+    DETAIL_WINDOW_DAYS,
     SettlementRecord,
     _envelope,
     _settlement_index,
+    detail_warnings,
+    detail_window_descriptor,
     publish_performance,
     settlement_freshness,
     settlement_payload,
@@ -115,7 +120,7 @@ from weatherquant.performance.winrate import (
     outcome_for,
 )
 from weatherquant.shadow.export import _end_cursor_of, _index_of
-from weatherquant.shadow.publish import StreamedArray
+from weatherquant.shadow.publish import PartitionedArray
 
 __all__ = [
     "ExportPart",
@@ -142,6 +147,17 @@ EDGE_GROUP_SQL: dict[str, str] = {
 
 #: The five dimensions the win-rate payload splits by.
 WIN_RATE_DIMENSIONS = ("model", "direction", "mode", "target_date", "edge_band")
+
+#: The contract's edge bands as one SQL expression, so a band is grouped by the
+#: same rule ``band_of`` applies in Python. ``edge`` is always finite here -
+#: ``_finite`` refuses NaN and infinities before a row is stored - so the
+#: comparison chain is exhaustive.
+_BAND_SQL = (
+    "CASE WHEN edge < 0.02 THEN 'lt_0.02' "
+    "WHEN edge < 0.05 THEN '0.02_0.05' "
+    "WHEN edge < 0.10 THEN '0.05_0.10' "
+    "ELSE 'gte_0.10' END"
+)
 
 _OVERALL = "__overall__"
 
@@ -717,7 +733,10 @@ def _parts_for(
 
 
 def _distributions(
-    store: PerformanceStateStore, expression: str | None
+    store: PerformanceStateStore,
+    expression: str | None,
+    *,
+    ensure_keys: Sequence[str] | None = None,
 ) -> dict[str, dict[str, float | int | None]]:
     """Every group's distribution, in four passes over the edge table.
 
@@ -725,15 +744,24 @@ def _distributions(
     standard deviation each need their own streamed pass, and the quantiles
     need the order statistics by rank. None of the four holds more than a
     group's worth of anything.
+
+    ``ensure_keys`` names groups that must appear even with no observations.
+    A group whose key comes from the data (a model, a date) simply is not
+    there when it has none; the contract's edge bands are a fixed vocabulary,
+    and a band with nothing in it is a fact the payload states rather than
+    omits.
     """
     counts = _counts_and_extremes(store, expression)
     sums = _fsums(store, expression)
     stdevs = _population_stdev(store, expression, counts)
     ranks = _order_statistics(store, expression)
-    return {
+    out = {
         key: distribution_from_parts(_parts_for(key, counts, sums, stdevs, ranks))
-        for key in sorted(counts)
+        for key in counts
     }
+    for key in ensure_keys or ():
+        out.setdefault(key, distribution_from_parts(DistributionParts(count=0)))
+    return dict(sorted(out.items()))
 
 
 def _daily(store: PerformanceStateStore) -> list[dict[str, object]]:
@@ -759,30 +787,18 @@ def _daily(store: PerformanceStateStore) -> list[dict[str, object]]:
     return out
 
 
-def _band_stream(store: PerformanceStateStore, band: str) -> StreamedArray:
-    """One edge band's raw values, in input order, written as they are read.
+def _band_distributions(
+    store: PerformanceStateStore,
+) -> dict[str, dict[str, float | int | None]]:
+    """A distribution per band, not the band's values.
 
-    The values are published (the dashboard counts them), so they cannot be
-    summarised away. They are ordered by the row sequence rather than by value,
-    which is what the in-memory builder produced: the order rows arrived in.
+    The raw values were the whole of ``edge.json``'s size - 2.2 million floats
+    at five million decisions - and the only consumer counted them. A band is
+    just another grouping, so it is computed by the same four passes as the
+    model, direction and target-date groupings, and it is exact in the same
+    way.
     """
-    low, high = EDGE_BANDS[band]
-    clauses = []
-    if low is not None:
-        clauses.append(f"edge >= {low!r}")
-    if high is not None:
-        clauses.append(f"edge < {high!r}")
-    sql = (
-        "SELECT edge FROM performance_edge_observations WHERE "
-        + " AND ".join(clauses)
-        + " ORDER BY seq"
-    )
-
-    def factory() -> Iterator[float]:
-        for (value,) in _row_stream(store, sql):
-            yield value
-
-    return StreamedArray(factory, label=f"edge_band:{band}")
+    return _distributions(store, _BAND_SQL, ensure_keys=list(EDGE_BANDS))
 
 
 def _render(stored: StoredEpisode) -> Episode:
@@ -857,6 +873,8 @@ def build_streaming_payloads(
     max_allocation_fraction: float = DEFAULT_MAX_ALLOCATION_FRACTION,
     book_for: Callable[[Episode], Any] | None = None,
     gap_window_seconds: float = DEFAULT_GAP_WINDOW_SECONDS,
+    detail_max_episodes: int = DETAIL_MAX_EPISODES,
+    detail_window_days: int = DETAIL_WINDOW_DAYS,
 ) -> StreamingBuild:
     """Build all six snapshots from the store, holding nothing that grows.
 
@@ -928,7 +946,7 @@ def build_streaming_payloads(
         for name, expression in EDGE_GROUP_SQL.items()
     }
     daily = _daily(store)
-    bands = {band: _band_stream(store, band) for band in EDGE_BANDS}
+    bands = _band_distributions(store)
     models = sorted(store.distinct_values("performance_models_seen"))
 
     # -- reference capital: totals first, then the same walk streamed -------
@@ -949,13 +967,7 @@ def build_streaming_payloads(
         "settled_markets": rate.distinct_markets,
         "counts": rate.counts,
         "reference_capital_usdc": capital.capital_usdc,
-        "reference_capital": _capital_payload(
-            capital,
-            store=store,
-            capital_usdc=capital_usdc,
-            max_allocation_fraction=max_allocation_fraction,
-            book_for=book_for,
-        ),
+        "reference_capital": capital.as_dict(),
         "accept_observations": episode_summary_dict["accept_observations"],
         "opportunity_episodes": episode_summary_dict["opportunity_episodes"],
         "accept_opportunity_distinct_markets": episode_summary_dict["distinct_markets"],
@@ -1023,11 +1035,27 @@ def build_streaming_payloads(
         "warnings": rate.warnings,
     }
 
+    since, window = _detail_window(
+        store,
+        now=now,
+        max_episodes=detail_max_episodes,
+        days=detail_window_days,
+    )
     opportunities = {
-        "episodes": _opportunity_stream(store, answers=answers, verified=verified, book_for=book_for),
-        "total": episode_count,
-        "statistical_scope": ["opportunity_episodes"],
-        "warnings": episode_summary_dict["warnings"],
+        "episodes": _opportunity_stream(
+            store,
+            since=since,
+            limit=detail_max_episodes,
+            answers=answers,
+            verified=verified,
+            book_for=book_for,
+        ),
+        "total": window["episodes"],
+        "total_all": window["episodes_all"],
+        "window": window,
+        "statistical_scope": ["opportunity_episodes"]
+        + ([] if window["complete"] else [f"window:{window['days']}d"]),
+        "warnings": [*episode_summary_dict["warnings"], *detail_warnings(window)],
     }
 
     settlements_payload = settlement_payload(settlement_records, counts=rate.counts)
@@ -1066,8 +1094,9 @@ def build_streaming_payloads(
         ),
         "opportunities.json": _envelope(
             logical_name="performance-opportunities", data=opportunities,
-            sample_size=episode_count, statistical_scope=["opportunity_episodes"],
-            warnings=episode_summary_dict["warnings"], **common,
+            sample_size=window["episodes"],
+            statistical_scope=opportunities["statistical_scope"],
+            warnings=opportunities["warnings"], **common,
         ),
         "settlements.json": _envelope(
             logical_name="performance-settlements", data=settlements_payload,
@@ -1146,50 +1175,57 @@ def _walk_capital(
     return walk.finish()
 
 
-def _capital_payload(
-    capital: PortfolioResult,
-    *,
+def _detail_window(
     store: PerformanceStateStore,
-    capital_usdc: float,
-    max_allocation_fraction: float,
-    book_for: Callable[[Episode], Any] | None,
-) -> dict[str, Any]:
-    """The reference-capital block, with its per-episode results streamed.
+    *,
+    now: datetime,
+    max_episodes: int,
+    days: int,
+) -> tuple[datetime, dict[str, Any]]:
+    """The window the browsable detail covers, and its descriptor.
 
-    The walk is re-run rather than remembered: the totals above have to exist
-    before the payload is written, and holding every result to reuse it is the
-    thing this engine exists to avoid. Both walks are the same code over the
-    same ordered input, so they cannot disagree.
+    The store's twin of ``snapshot.detail_window``: the same cutoff, the same
+    order and the same cap, so the two engines publish the same window and the
+    equivalence test compares them rather than trusting them.
     """
-
-    def results() -> Iterator[dict[str, Any]]:
-        walk = PortfolioWalk(
-            capital_usdc=capital_usdc,
-            max_allocation_fraction=max_allocation_fraction,
-            collect_results=False,
-        )
-        for stored in store.iter_episodes():
-            episode = _render(stored)
-            result = walk.add(episode, book_for(episode) if book_for is not None else None)
-            yield result.as_dict()
-        walk.finish()
-
-    payload = capital.as_dict()
-    payload["results"] = StreamedArray(results, label="reference_capital.results")
-    return payload
+    since = now - timedelta(days=days)
+    in_window = store.count_episodes_since(since)
+    window_episodes = min(in_window, max_episodes)
+    first = store.fetchone(
+        "SELECT min(first_seen_utc), max(first_seen_utc) FROM "
+        "(SELECT first_seen_utc FROM performance_episodes WHERE first_seen_utc >= ? "
+        "ORDER BY first_seen_utc DESC, episode_id DESC LIMIT ?) AS w",
+        [since, max_episodes],
+    )
+    descriptor = detail_window_descriptor(
+        window_episodes=window_episodes,
+        all_episodes=store.count_episodes(),
+        max_episodes=max_episodes,
+        days=days,
+        first_seen_utc=_iso(first[1]) if first and first[1] else None,
+        last_seen_utc=_iso(first[0]) if first and first[0] else None,
+    )
+    return since, descriptor
 
 
 def _opportunity_stream(
     store: PerformanceStateStore,
     *,
+    since: datetime,
+    limit: int,
     answers: Mapping[tuple[str, str | None], SettlementAnswer],
     verified: frozenset[tuple[str, str | None]],
     book_for: Callable[[Episode], Any] | None,
-) -> StreamedArray:
-    """Every episode, written as it is read, with its outcome attached."""
+) -> PartitionedArray:
+    """The windowed detail, written as it is read, with outcomes attached.
+
+    Published as parts rather than as one array: a reader that wants fifty rows
+    reads one part, and the parts record their own sort keys so a cursor can be
+    located without opening them.
+    """
 
     def factory() -> Iterator[dict[str, Any]]:
-        for stored in store.iter_episodes():
+        for stored in store.iter_detail_window(since=since, limit=limit):
             episode = _render(stored)
             outcome, _reason = outcome_for(episode, answers=answers, verified=verified)
             row: dict[str, Any] = {**episode.as_dict(), "outcome": outcome}
@@ -1202,7 +1238,14 @@ def _opportunity_stream(
                     }
             yield row
 
-    return StreamedArray(factory, label="opportunities.episodes")
+    return PartitionedArray(
+        factory,
+        directory="opportunities",
+        collection="episodes",
+        partition_size=DETAIL_PARTITION_SIZE,
+        key_of=lambda row: [row["first_seen_utc"], row["episode_id"]],
+        label="opportunities.episodes",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1290,6 +1333,8 @@ def build_performance_streaming(
     max_allocation_fraction: float = DEFAULT_MAX_ALLOCATION_FRACTION,
     gap_window_seconds: float = DEFAULT_GAP_WINDOW_SECONDS,
     accepted_state: str = ACCEPT_STATE,
+    detail_max_episodes: int = DETAIL_MAX_EPISODES,
+    detail_window_days: int = DETAIL_WINDOW_DAYS,
     book_for: Callable[[Episode], Any] | None = None,
     now: datetime | None = None,
     memory_limit: str = DEFAULT_MEMORY_LIMIT,
@@ -1381,6 +1426,8 @@ def build_performance_streaming(
             max_allocation_fraction=max_allocation_fraction,
             book_for=book_for,
             gap_window_seconds=gap_window_seconds,
+            detail_max_episodes=detail_max_episodes,
+            detail_window_days=detail_window_days,
         )
         generation_id = streaming_generation_id(
             now,

@@ -211,23 +211,40 @@ def test_a_day_with_no_usable_edge_does_not_appear() -> None:
 
 
 def test_edges_land_in_the_contract_bands() -> None:
+    """Bands publish a distribution now, and the counts are the boundary proof.
+
+    The values themselves used to be published, and they were the largest field
+    in ``edge.json``: 2.2 million floats at five million decisions. The counts
+    answer the same question - how many evaluations fell where - and the
+    statistics answer the other one, so the boundary behaviour is still pinned
+    exactly: 0.01 and -0.02 in the lowest band, 0.03 next, and so on.
+    """
     rows = [
         _row(edge=0.01), _row(edge=0.03), _row(edge=0.07), _row(edge=0.20),
         _row(edge=-0.02),
     ]
     bands = edge_by_bin(rows)
 
-    assert bands["lt_0.02"] == pytest.approx([0.01, -0.02])
-    assert bands["0.02_0.05"] == pytest.approx([0.03])
-    assert bands["0.05_0.10"] == pytest.approx([0.07])
-    assert bands["gte_0.10"] == pytest.approx([0.20])
+    assert bands["lt_0.02"]["count"] == 2
+    assert bands["lt_0.02"]["min"] == pytest.approx(-0.02)
+    assert bands["lt_0.02"]["max"] == pytest.approx(0.01)
+    assert bands["0.02_0.05"]["count"] == 1
+    assert bands["0.02_0.05"]["mean"] == pytest.approx(0.03)
+    assert bands["0.05_0.10"]["count"] == 1
+    assert bands["0.05_0.10"]["sum"] == pytest.approx(0.07)
+    assert bands["gte_0.10"]["count"] == 1
+    assert bands["gte_0.10"]["max"] == pytest.approx(0.20)
 
 
 def test_every_edge_lands_in_exactly_one_band() -> None:
     rows = [_row(edge=e) for e in (0.0, 0.02, 0.05, 0.10, 1.0)]
     bands = edge_by_bin(rows)
 
-    assert sum(len(v) for v in bands.values()) == len(rows)
+    assert sum(band["count"] for band in bands.values()) == len(rows)
+    # The boundaries themselves: 0.02 starts the second band, 0.05 the third,
+    # 0.10 the fourth, and 0.0 is in the first.
+    assert [bands[name]["count"] for name in
+            ("lt_0.02", "0.02_0.05", "0.05_0.10", "gte_0.10")] == [1, 1, 1, 2]
 
 
 def test_a_sum_over_many_samples_is_computed_without_drift() -> None:

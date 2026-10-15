@@ -28,6 +28,7 @@ from test_performance_streaming import (
     _settlements,
     _strip,
     _write_parts,
+    published_episodes,
 )
 from weatherquant.performance.snapshot import resolve_generation
 from weatherquant.performance.state import (
@@ -442,7 +443,7 @@ def test_only_the_revised_market_changes(tmp_path) -> None:
     before = _read_generation(out)
     before_episodes = {
         row["episode_id"]: row["outcome"]
-        for row in before["opportunities.json"]["data"]["episodes"]
+        for row in published_episodes(tmp_path / "performance")
     }
     target = index[0]
     flipped = [
@@ -458,19 +459,13 @@ def test_only_the_revised_market_changes(tmp_path) -> None:
     after = _read_generation(out)
     after_episodes = {
         row["episode_id"]: row["outcome"]
-        for row in after["opportunities.json"]["data"]["episodes"]
+        for row in published_episodes(tmp_path / "performance")
     }
     changed = {key for key in before_episodes if before_episodes[key] != after_episodes[key]}
     affected = {
-        key
-        for key in before_episodes
-        if before["opportunities.json"]["data"]["episodes"]
-        and next(
-            row["market_id"]
-            for row in before["opportunities.json"]["data"]["episodes"]
-            if row["episode_id"] == key
-        )
-        == target["market_id"]
+        row["episode_id"]
+        for row in published_episodes(tmp_path / "performance")
+        if row["market_id"] == target["market_id"]
     }
     assert changed, "the revised market must change something"
     assert changed <= affected, "no other market may move"
@@ -522,14 +517,14 @@ def test_a_withdrawn_settlement_is_retracted_and_not_resurrected(tmp_path) -> No
     # market's other days keep theirs, because a retraction is per answer.
     retracted = [
         row
-        for row in after["opportunities.json"]["data"]["episodes"]
+        for row in published_episodes(tmp_path / "performance")
         if row["market_id"] == withdrawn["market_id"]
         and row["target_date"] == withdrawn["target_date"]
     ]
     assert retracted and all(row["outcome"] == "UNAVAILABLE" for row in retracted)
     still_scored = [
         row
-        for row in after["opportunities.json"]["data"]["episodes"]
+        for row in published_episodes(tmp_path / "performance")
         if row["market_id"] == withdrawn["market_id"]
         and row["target_date"] != withdrawn["target_date"]
     ]
@@ -815,3 +810,36 @@ def test_a_state_store_built_from_another_export_is_refused_by_the_command(
     )
     assert code == 2
     assert "does not match this run" in capsys.readouterr().err
+
+
+def test_the_detail_window_is_configurable_from_the_command(tmp_path, capsys) -> None:
+    """The window is an operator decision, and it is recorded in the manifest."""
+    from weatherquant.cli import main as research_main
+
+    rows = _dataset(seed=221, rows=300)
+    export = _write_parts(tmp_path, rows, 2)
+    out = tmp_path / "performance"
+    code = research_main(
+        [
+            "build-performance",
+            "--export", str(export),
+            "--out", str(out),
+            "--dataset", "fixture",
+            "--state-db", str(tmp_path / "state.duckdb"),
+            "--detail-window-episodes", "7",
+            "--detail-window-days", "3650",
+        ]
+    )
+    assert code == 0, capsys.readouterr().err
+
+    generation = resolve_generation(out)
+    assert generation.directory is not None
+    payload = json.loads((generation.directory / "opportunities.json").read_text())
+    window = payload["data"]["window"]
+    assert window["episodes"] == 7
+    assert window["max_episodes"] == 7
+    assert window["days"] == 3650
+    assert window["complete"] is False
+    assert payload["data"]["total_all"] > 7
+    assert any("window" in warning for warning in payload["data"]["warnings"])
+    assert any(scope.startswith("window:") for scope in payload["data"]["statistical_scope"])

@@ -218,6 +218,40 @@ class IngestState:
         }
 
 
+def _stored_episode(row: Sequence[Any]) -> StoredEpisode:
+    """Decode one row of ``PerformanceStateStore._EPISODE_SELECT``."""
+    return StoredEpisode(
+        open_ep=OpenEpisode(
+            key=EpisodeKey(
+                market_id=str(row[0]),
+                target_date=row[1],
+                model_name=row[2],
+                direction=row[3],
+                mode=row[4],
+            ),
+            first_seen=row[5],
+            last_seen=row[6],
+            count=int(row[7]),
+            edge_count=int(row[8]),
+            sum_edges=float(row[9]),
+            first_edge=float(row[10]),
+            last_edge=float(row[11]),
+            max_edge=float(row[12]),
+            min_edge=float(row[13]),
+            opened_seq=int(row[21]),
+            first_market_price=row[14],
+            first_model_probability=row[15],
+            first_available_depth_usd=row[16],
+            station=row[17],
+            bracket_label=row[18],
+            market_question=row[19],
+            fee_rate=row[20],
+        ),
+        is_open=bool(row[22]),
+        end_reason=row[23],
+    )
+
+
 def _iso(value: datetime | None) -> str | None:
     return value.astimezone(UTC).isoformat() if value is not None else None
 
@@ -701,6 +735,45 @@ class PerformanceStateStore:
             "performance_episodes", _EPISODE_COLUMNS, _EPISODE_SPECS, rows, replace=True
         )
 
+    #: Every column a published episode needs. One list, so the two cursors
+    #: below cannot disagree about the shape of a row.
+    _EPISODE_SELECT = (
+        "SELECT market_id, target_date, model_name, direction, mode, first_seen_utc, "
+        "last_seen_utc, observation_count, edge_count, sum_edges, first_edge, last_edge, "
+        "max_edge, min_edge, first_market_price, first_model_probability, "
+        "first_available_depth_usd, station, bracket_label, market_question, fee_rate, "
+        "opened_seq, is_open, end_reason FROM performance_episodes"
+    )
+
+    def iter_detail_window(
+        self, *, since: datetime, limit: int
+    ) -> Iterator[StoredEpisode]:
+        """The most recent episodes, newest first, capped.
+
+        The store's twin of ``snapshot.detail_window``: same predicate
+        (``first_seen_utc >= since``), same order (``first_seen_utc`` then
+        ``episode_id``, both descending) and the same cap. The order is total,
+        which is what lets a keyset cursor be reproducible.
+        """
+        cursor = self.cursor(
+            f"{self._EPISODE_SELECT} WHERE first_seen_utc >= ? "
+            "ORDER BY first_seen_utc DESC, episode_id DESC LIMIT ?",
+            [since, limit],
+        )
+        while True:
+            rows = cursor.fetchmany(1000)
+            if not rows:
+                return
+            for row in rows:
+                yield _stored_episode(row)
+
+    def count_episodes_since(self, since: datetime) -> int:
+        return int(
+            self.fetchone(
+                "SELECT count(*) FROM performance_episodes WHERE first_seen_utc >= ?", [since]
+            )[0]
+        )
+
     def iter_episodes(self) -> Iterator[StoredEpisode]:
         """Walk every episode in the order the whole-history builder published.
 
@@ -713,48 +786,15 @@ class PerformanceStateStore:
         sequence number the fold assigned.
         """
         cursor = self.cursor(
-            "SELECT market_id, target_date, model_name, direction, mode, first_seen_utc, "
-            "last_seen_utc, observation_count, edge_count, sum_edges, first_edge, last_edge, "
-            "max_edge, min_edge, first_market_price, first_model_probability, "
-            "first_available_depth_usd, station, bracket_label, market_question, fee_rate, "
-            "opened_seq, is_open, end_reason FROM performance_episodes "
+            f"{self._EPISODE_SELECT} "
             "ORDER BY first_seen_utc, is_open, COALESCE(closed_seq, opened_seq)"
         )
         while True:
             rows = cursor.fetchmany(1000)
             if not rows:
                 return
-            for r in rows:
-                yield StoredEpisode(
-                    open_ep=OpenEpisode(
-                        key=EpisodeKey(
-                            market_id=str(r[0]),
-                            target_date=r[1],
-                            model_name=r[2],
-                            direction=r[3],
-                            mode=r[4],
-                        ),
-                        first_seen=r[5],
-                        last_seen=r[6],
-                        count=int(r[7]),
-                        edge_count=int(r[8]),
-                        sum_edges=float(r[9]),
-                        first_edge=float(r[10]),
-                        last_edge=float(r[11]),
-                        max_edge=float(r[12]),
-                        min_edge=float(r[13]),
-                        opened_seq=int(r[21]),
-                        first_market_price=r[14],
-                        first_model_probability=r[15],
-                        first_available_depth_usd=r[16],
-                        station=r[17],
-                        bracket_label=r[18],
-                        market_question=r[19],
-                        fee_rate=r[20],
-                    ),
-                    is_open=bool(r[22]),
-                    end_reason=r[23],
-                )
+            for row in rows:
+                yield _stored_episode(row)
 
     def count_episodes(self) -> int:
         return int(self.fetchone("SELECT count(*) FROM performance_episodes")[0])

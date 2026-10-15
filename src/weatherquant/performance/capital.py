@@ -402,7 +402,15 @@ def simulate_single(
 
 @dataclass(slots=True)
 class PortfolioResult:
-    """One stake shared across every opportunity, not one per opportunity."""
+    """One stake shared across every opportunity, not one per opportunity.
+
+    The per-opportunity results are the part of this record that grows with the
+    history, and they are the part nothing downstream needs in full: a reader
+    wants the totals and *why* the rest were refused, not 240,000 rows of
+    ``NOT_EXECUTABLE``. So the counters and a bounded sample are accumulated as
+    results arrive (:meth:`record`) and the payload carries those, which is
+    what keeps ``summary.json`` from growing with the decision history.
+    """
 
     capital_usdc: float
     max_allocation_fraction: float
@@ -421,6 +429,35 @@ class PortfolioResult:
     #: same number - and the same rounding, since the fold order is the
     #: episode order either way.
     expected_net_edge_total: float = 0
+    #: Whether every result is kept. False for a walk that only needs the
+    #: totals, which is how the streaming publisher avoids holding them.
+    collect_results: bool = True
+    #: How many results the payload carries, and the reason histogram that
+    #: replaces the rest.
+    sample_size: int = 50
+    results_sample: list[SingleResult] = field(default_factory=list)
+    not_executable_reason_counts: dict[str, int] = field(default_factory=dict)
+
+    def record(self, single: SingleResult) -> None:
+        """Fold one result in. The only place the counters are updated."""
+        if single.executable:
+            self.executable_count += 1
+        else:
+            self.not_executable_count += 1
+            reason = single.not_executable_reason or "UNKNOWN"
+            self.not_executable_reason_counts[reason] = (
+                self.not_executable_reason_counts.get(reason, 0) + 1
+            )
+        if self.collect_results:
+            self.results.append(single)
+        elif len(self.results_sample) < self.sample_size:
+            self.results_sample.append(single)
+
+    @property
+    def sampled_results(self) -> list[SingleResult]:
+        """The results the payload carries: the same first N in both engines."""
+        source = self.results if self.collect_results else self.results_sample
+        return source[: self.sample_size]
 
     @property
     def utilization(self) -> float:
@@ -430,7 +467,7 @@ class PortfolioResult:
 
     @property
     def theoretical_expected_net_edge_usdc(self) -> float | None:
-        if self.results:
+        if self.collect_results:
             values = [r.theoretical_expected_net_edge_usdc for r in self.results if r.executable]
             if not values:
                 return None
@@ -440,6 +477,8 @@ class PortfolioResult:
         return self.expected_net_edge_total
 
     def as_dict(self) -> dict[str, object]:
+        total = self.executable_count + self.not_executable_count
+        sampled = self.sampled_results
         return {
             "capital_usdc": self.capital_usdc,
             "max_allocation_fraction": self.max_allocation_fraction,
@@ -450,6 +489,11 @@ class PortfolioResult:
             "capacity_limited_count": self.capacity_limited_count,
             "executable_count": self.executable_count,
             "not_executable_count": self.not_executable_count,
+            # Why the rest were refused, as a histogram. The full list of
+            # results is what made this payload grow with the history; a
+            # reader asking "how many were refused, and why" gets the whole
+            # answer from these counts.
+            "not_executable_reason_counts": dict(sorted(self.not_executable_reason_counts.items())),
             "theoretical_expected_net_edge_usdc": self.theoretical_expected_net_edge_usdc,
             "theoretical_expected_roi": (
                 self.theoretical_expected_net_edge_usdc / self.peak_open_allocation_usdc
@@ -464,8 +508,19 @@ class PortfolioResult:
                 "not a virtual position and not realised profit.",
                 "max_allocation_fraction is a stated assumption, not a validated risk rule.",
                 "Actual profit is N/A: this system places no orders.",
+                *(
+                    [
+                        f"Per-opportunity results are a sample of {len(sampled)} of {total}; "
+                        "the counts above are complete."
+                    ]
+                    if total > len(sampled)
+                    else []
+                ),
             ],
-            "results": [r.as_dict() for r in self.results],
+            "results_sampled": True,
+            "results_sample_size": self.sample_size,
+            "results_total": total,
+            "results_sample": [r.as_dict() for r in sampled],
         }
 
 
@@ -511,6 +566,9 @@ class IndependentResult:
 
     capital_usdc: float
     results: list[SingleResult] = field(default_factory=list)
+    #: How many per-opportunity edges the payload carries. Bounded because it
+    #: is one entry per executable opportunity.
+    sample_size: int = 50
 
     @property
     def executable_count(self) -> int:
@@ -525,16 +583,20 @@ class IndependentResult:
         return sum(1 for r in self.results if r.capacity_limited)
 
     @property
-    def per_opportunity_expected_edge(self) -> list[float]:
+    def per_opportunity_expected_edge_sample(self) -> list[float]:
         """Edges of the executable results, kept separate on purpose.
 
         Not summed: ten of these sharing one row would invite the reader to
         add them, and the sum has no referent - there is no account that
         held ten stakes at once.
+
+        Sampled, because this is one entry per executable opportunity and the
+        history only grows. ``executable_count`` is the complete answer; this
+        is the illustration.
         """
         return [
             r.theoretical_expected_net_edge_usdc
-            for r in self.results
+            for r in self.results[: self.sample_size]
             if r.executable and r.theoretical_expected_net_edge_usdc is not None
         ]
 
@@ -546,8 +608,11 @@ class IndependentResult:
             "executable_count": self.executable_count,
             "not_executable_count": self.not_executable_count,
             "capacity_limited_count": self.capacity_limited_count,
-            # A list, never a total: these are independent hypotheticals.
-            "per_opportunity_expected_edge": self.per_opportunity_expected_edge,
+            # A list, never a total: these are independent hypotheticals. A
+            # bounded list, because it is one entry per opportunity.
+            "per_opportunity_expected_edge_sample": self.per_opportunity_expected_edge_sample,
+            "per_opportunity_expected_edge_sampled": True,
+            "per_opportunity_expected_edge_sample_size": self.sample_size,
             "combined_expected_edge": None,
             "statistical_scope": ["reference_capital_hypothetical"],
             "warnings": [
@@ -559,6 +624,15 @@ class IndependentResult:
                 "Reference capital is a research assumption, not a funded "
                 "account, not a virtual position and not realised profit.",
                 "Actual profit is N/A: this system places no orders.",
+                *(
+                    [
+                        f"Per-opportunity edges are a sample of "
+                        f"{len(self.per_opportunity_expected_edge_sample)} of "
+                        f"{self.executable_count}; executable_count is complete."
+                    ]
+                    if self.executable_count > len(self.per_opportunity_expected_edge_sample)
+                    else []
+                ),
             ],
             "results": [r.as_dict() for r in self.results],
         }
@@ -595,7 +669,9 @@ class PortfolioWalk:
                 f"max_allocation_fraction must be in (0, 1], got {max_allocation_fraction!r}"
             )
         self.outcome = PortfolioResult(
-            capital_usdc=capital_usdc, max_allocation_fraction=max_allocation_fraction
+            capital_usdc=capital_usdc,
+            max_allocation_fraction=max_allocation_fraction,
+            collect_results=collect_results,
         )
         self.collect_results = collect_results
         self.single_kwargs = single_kwargs
@@ -662,7 +738,6 @@ class PortfolioWalk:
                 "pricing must never exceed the funds it was given"
             )
 
-        outcome.executable_count += 1
         if single.capacity_limited:
             outcome.capacity_limited_count += 1
         outcome.allocated_total_usdc += used
@@ -676,11 +751,7 @@ class PortfolioWalk:
         return self._record(single)
 
     def _record(self, single: SingleResult) -> SingleResult:
-        outcome = self.outcome
-        if not single.executable:
-            outcome.not_executable_count += 1
-        if self.collect_results:
-            outcome.results.append(single)
+        self.outcome.record(single)
         return single
 
     def finish(self) -> PortfolioResult:
