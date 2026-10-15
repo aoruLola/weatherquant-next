@@ -334,7 +334,11 @@ export interface PerformancePayload {
   data?: Record<string, any>
   items?: Record<string, any>[]
   total?: number
-  next_cursor?: number | null
+  // A cursor belongs to one published generation, so it is opaque: the API
+  // encodes the batch in it and refuses one from another batch.
+  next_cursor?: string | number | null
+  prev_cursor?: string | number | null
+  generation_id?: string | null
   // reference-capital
   mode?: string
   capital_usdc?: number

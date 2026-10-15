@@ -71,7 +71,7 @@ function mockAll(overrides: Record<string, any> = {}) {
         data: {
           overall: { mean: 0.05, median: 0.04, p05: 0.01, p95: 0.09, count: 42 },
           by_model: { calibrated: { mean: 0.06, count: 20 }, gfs_raw: { mean: 0.03, count: 22 } },
-          by_edge_band: { '0.05_0.10': [0.06, 0.07] },
+          by_edge_band: { '0.05_0.10': { count: 2, mean: 0.065, p95: 0.07 } },
         },
       }),
     ),
@@ -113,6 +113,19 @@ function mockAll(overrides: Record<string, any> = {}) {
         ],
         total: 1,
         next_cursor: null,
+        prev_cursor: null,
+        generation_id: 'gen-1',
+        data: {
+          collection: 'episodes',
+          returned: 1,
+          total: 1,
+          offset: 0,
+          limit: 50,
+          filters: {},
+          window: { episodes: 1, episodes_all: 1, days: 90, complete: true },
+          statistical_scope: ['opportunity_episodes'],
+          warnings: [],
+        },
       }),
     ),
     '/api/v1/performance/models': envelopeOf(
@@ -264,5 +277,156 @@ describe('Performance page', () => {
 
     await waitFor(() => expect(screen.getByTestId('performance-summary')).toBeInTheDocument())
     expect(screen.getByTestId('performance-summary')).toHaveTextContent('observation_all_accepts')
+  })
+
+  it('renders the edge band as a distribution, not as a list of values', async () => {
+    mockFetch(mockAll())
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('performance-edge')).toBeInTheDocument())
+    // The band used to publish every value and the UI counted them; it now
+    // publishes the count and the mean, and the page shows both.
+    expect(screen.getByTestId('performance-edge')).toHaveTextContent('2 次评估')
+  })
+})
+
+/**
+ * Paging is the point of this round: the browser must never receive the
+ * history. These tests hold that line from the UI side - a page request is a
+ * page request, and the filters travel in the query rather than being applied
+ * to rows the browser already has.
+ */
+describe('Performance page: paged detail', () => {
+  function pagedFetch() {
+    const rows = (from: number, count: number) =>
+      Array.from({ length: count }, (_, index) => ({
+        episode_id: `ep-${from + index}`,
+        first_seen_utc: `2026-10-13T12:${String(from + index).padStart(2, '0')}:00+00:00`,
+        target_date: '2026-10-14',
+        bracket_label: '81°F',
+        model_name: 'calibrated',
+        direction: 'buy_yes',
+        first_edge: 0.05,
+        duration_seconds: 600,
+        observation_count: 3,
+        outcome: 'WIN',
+      }))
+
+    const base = mockAll()
+    // mockFetch picks the longest matching prefix, so the single-page fixture
+    // has to go before the paged one can answer.
+    delete base['/api/v1/performance/opportunities?limit=50']
+    return mockFetch({
+      ...base,
+      '/api/v1/performance/models': envelopeOf(
+        payload({
+          kind: 'performance-models',
+          data: { models: ['calibrated', 'gfs_raw'], by_model_edge: {} },
+        }),
+      ),
+      '/api/v1/performance/opportunities': (path: string) => {
+        const query = new URLSearchParams(path.split('?')[1] ?? '')
+        const second = query.get('cursor') === 'cursor-2'
+        const filtered = query.has('model')
+        return envelopeOf(
+          payload({
+            kind: 'performance-opportunities',
+            generation_id: 'gen-1',
+            items: filtered ? [] : second ? rows(2, 2) : rows(0, 2),
+            total: filtered ? 0 : 4,
+            next_cursor: second || filtered ? null : 'cursor-2',
+            prev_cursor: second ? 'cursor-0' : null,
+            data: {
+              collection: 'episodes',
+              returned: 2,
+              total: filtered ? 0 : 4,
+              offset: second ? 2 : 0,
+              limit: 50,
+              filters: filtered ? { model: query.get('model') } : {},
+              window: { episodes: 4, episodes_all: 40, days: 90, complete: false },
+              statistical_scope: ['opportunity_episodes', 'window:90d'],
+              warnings: [],
+            },
+          }),
+        )
+      },
+    })
+  }
+
+  it('asks the server for the next page instead of slicing rows it has', async () => {
+    const fetchMock = pagedFetch()
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('opportunities')).toBeInTheDocument())
+    expect(screen.getAllByTestId('opportunity-row')).toHaveLength(2)
+    expect(screen.getByTestId('page-summary')).toHaveTextContent('1–2 / 4 条')
+
+    screen.getByTestId('page-next').click()
+
+    await waitFor(() => {
+      const urls = fetchMock.mock.calls.map((call: any[]) => String(call[0]))
+      expect(urls.some((url) => url.includes('cursor=cursor-2'))).toBe(true)
+    })
+    // Page two, and the row set changed: the server sent different rows.
+    await waitFor(() =>
+      expect(screen.getByTestId('page-summary')).toHaveTextContent('3–4 / 4 条'),
+    )
+  })
+
+  it('offers the previous page only when there is one', async () => {
+    pagedFetch()
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('opportunities')).toBeInTheDocument())
+    expect(screen.getByTestId('page-prev')).toBeDisabled()
+
+    screen.getByTestId('page-next').click()
+    await waitFor(() => expect(screen.getByTestId('page-prev')).not.toBeDisabled())
+
+    screen.getByTestId('page-prev').click()
+    await waitFor(() => expect(screen.getByTestId('page-summary')).not.toHaveTextContent('1–2 / 4'))
+  })
+
+  it('sends a filter to the server and returns to the first page', async () => {
+    const fetchMock = pagedFetch()
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('opportunities')).toBeInTheDocument())
+    screen.getByTestId('page-next').click()
+    await waitFor(() => expect(screen.getByTestId('page-prev')).not.toBeDisabled())
+
+    const select = screen.getByTestId('filter-model') as HTMLSelectElement
+    select.value = 'calibrated'
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+
+    await waitFor(() => {
+      const urls = fetchMock.mock.calls.map((call: any[]) => String(call[0]))
+      const last = urls[urls.length - 1] ?? ''
+      expect(last).toContain('model=calibrated')
+      expect(last).not.toContain('cursor=')
+    })
+    await waitFor(() => expect(screen.getByTestId('opportunities-empty')).toBeInTheDocument())
+  })
+
+  it('says the detail is a window, and that the aggregates are not', async () => {
+    pagedFetch()
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('window-note')).toBeInTheDocument())
+    expect(screen.getByTestId('window-note')).toHaveTextContent('共 40 条')
+    expect(screen.getByTestId('window-note')).toHaveTextContent('覆盖全部历史')
+  })
+
+  it('shows a reason when the window is empty after filtering', async () => {
+    pagedFetch()
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('opportunities')).toBeInTheDocument())
+    const select = screen.getByTestId('filter-model') as HTMLSelectElement
+    select.value = 'calibrated'
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+
+    await waitFor(() => expect(screen.getByTestId('opportunities-empty')).toBeInTheDocument())
+    expect(screen.getByTestId('opportunities-empty')).toHaveTextContent('没有符合条件')
   })
 })
