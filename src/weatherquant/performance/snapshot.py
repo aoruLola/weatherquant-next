@@ -37,7 +37,7 @@ from weatherquant.performance.winrate import (
     grouped_win_rate,
     win_rate,
 )
-from weatherquant.shadow.publish import atomic_write_json
+from weatherquant.shadow.publish import atomic_write_json, atomic_write_json_streaming
 
 __all__ = [
     "CURRENT_POINTER",
@@ -361,6 +361,7 @@ def publish_performance(
     generation_id: str | None = None,
     watermark: Any = None,
     coverage: Mapping[str, Any] | None = None,
+    extra_manifest: Mapping[str, Any] | None = None,
 ) -> list[Path]:
     """Publish six snapshots as one generation, then switch the pointer.
 
@@ -374,6 +375,11 @@ def publish_performance(
     A failure at any point before the pointer move leaves the previous
     generation current and intact. The half-written directory is inert - no
     reader follows it - and the next publish uses a fresh id.
+
+    The writer is the streaming one, so a payload may carry a
+    ``StreamedArray`` for a collection too large to hold (the edge bands and
+    the episode list). For a payload with none, the bytes written are
+    identical to what ``atomic_write_json`` would have produced.
     """
     target = Path(directory)
     now = datetime.now(tz=UTC)
@@ -389,7 +395,7 @@ def publish_performance(
         payload = dict(payloads[filename])
         payload["generation_id"] = gid
         path = generation_dir / filename
-        atomic_write_json(path, payload)
+        atomic_write_json_streaming(path, payload)
         written.append(path)
         files_meta[filename] = {"bytes": path.stat().st_size}
 
@@ -403,6 +409,7 @@ def publish_performance(
     manifest = {
         "generation_id": gid,
         "published_at_utc": now.astimezone(UTC).isoformat(),
+        "generated_at_utc": now.astimezone(UTC).isoformat(),
         "dataset": next(
             (p.get("dataset") for p in payloads.values() if p.get("dataset")), None
         ),
@@ -414,6 +421,12 @@ def publish_performance(
         "files": files_meta,
         "performance_schema_version": PERFORMANCE_SCHEMA_VERSION,
     }
+    if extra_manifest:
+        # Additive only. ``algorithm_version``, ``input_source`` and
+        # ``input_range`` describe *how* this batch was produced; a reader that
+        # predates them ignores them, and one that does not can tell two
+        # differently-built generations apart without diffing the payloads.
+        manifest.update(dict(extra_manifest))
     atomic_write_json(generation_dir / "manifest.json", manifest)
 
     # One rename publishes the batch. Before this line the previous
