@@ -205,9 +205,20 @@ class DecisionExporter:
                 state["next_part"] = max(
                     int(state.get("next_part") or 1), _index_of(last) + 1
                 )
-                state["rows_exported"] = max(
-                    int(state.get("rows_exported") or 0), _count_rows(existing)
-                )
+                # rows_exported is deliberately NOT recounted here.
+                #
+                # Counting it means reading every part, and this call happens
+                # inside the tick's wall-clock budget - so the count grew with
+                # the export until it outran the budget, and every tick broke
+                # out before writing anything. The export stalled at 700,000
+                # rows with no error, no watermark move and no quality event,
+                # because a tick that writes nothing is indistinguishable from
+                # a tick that is caught up.
+                #
+                # The watermark still comes from the parts, which is the fact
+                # that has to survive a crash. The row count is a running total
+                # this writer keeps, and verify() is where it is reconciled
+                # against the files - on demand, never on the hot path.
         return state
 
     def _save(self, state: dict[str, Any]) -> None:
@@ -241,7 +252,12 @@ class DecisionExporter:
                         f"stopped after {parts_written} part(s) by max_parts_per_run"
                     )
                     break
-                if time.monotonic() - started >= self.max_seconds:
+                # The budget bounds the *writing*, so it is only consulted once
+                # a part has been written. Checking it first means any slow
+                # setup - reading state, recovering the watermark - can consume
+                # the whole budget and starve the tick, which is what made a
+                # five-second budget stop a five-minute job from ever starting.
+                if parts_written and time.monotonic() - started >= self.max_seconds:
                     result.notes.append(
                         f"stopped after {parts_written} part(s) by the "
                         f"{self.max_seconds:g}s budget"

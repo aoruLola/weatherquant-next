@@ -638,6 +638,27 @@ class ShadowRunner:
                     result.parts_written,
                     result.watermark,
                 )
+            elif not result.caught_up and not any(
+                note.startswith("export failed") for note in result.notes
+            ):
+                # Nothing written and not caught up is a stalled export, and it
+                # is silent by construction: no exception, no watermark move, no
+                # log line. That is how a stall of hours went unnoticed while
+                # every cycle reported itself healthy. Recorded rather than left
+                # to be inferred from a state file nobody is watching.
+                detail = "; ".join(result.notes) or "no rows written and not caught up"
+                log.warning("decision export made no progress: %s", detail)
+                self.store.record_quality(
+                    [
+                        QualityEvent(
+                            kind="decision_export_no_progress",
+                            severity="warning",
+                            detail=detail,
+                            ts_utc=now,
+                        )
+                    ],
+                    run_id=self.run_id or "",
+                )
             if any(note.startswith("export failed") for note in result.notes):
                 self.store.record_quality(
                     [
