@@ -356,6 +356,215 @@ def test_rebuilding_without_touching_the_export_is_supported(tmp_path) -> None:
     assert _strip(second) == _strip(first)
 
 
+# ---------------------------------------------------------------------------
+# settlement provenance: a kept answer must not look like a fresh one
+# ---------------------------------------------------------------------------
+
+
+def test_a_kept_settlement_answer_carries_its_retrieval_time(tmp_path) -> None:
+    """Requirement 2: keeping an answer must not disguise its age.
+
+    The second run supplies no index at all. The win rate must still be there -
+    that is the point of the sticky layer - but the payload has to say when the
+    answers were retrieved, so a reader can tell "kept" from "just verified".
+    """
+    rows = _dataset(seed=171, rows=400)
+    index = _settlements(rows)
+    export = _write_parts(tmp_path, rows, 2)
+    state_db = tmp_path / "state.duckdb"
+    out = tmp_path / "performance"
+
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=index, now=NOW,
+    )
+    first = _read_generation(out)
+    answers = first["settlements.json"]["data"]["answers"]
+    assert answers and all(row["fetched_at_utc"] for row in answers)
+    assert all(row["verification_status"] == "VERIFIED" for row in answers)
+    assert all(row["resolution_source"] for row in answers) is False, (
+        "this fixture records no source; NULL means 'not recorded', and it must "
+        "stay NULL rather than be filled in"
+    )
+    freshness = first["settlements.json"]["data"]["freshness"]
+    assert freshness["answers_without_retrieval_time"] == 0
+    assert freshness["as_of_utc"] is not None
+    assert freshness["oldest_utc"] is not None
+    assert first["summary.json"]["data"]["settlement_freshness"] == freshness
+
+    # No index this time.
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture", now=NOW,
+    )
+    second = _read_generation(out)
+    assert second["win-rate.json"]["data"]["overall"]["valid_samples"] == (
+        first["win-rate.json"]["data"]["overall"]["valid_samples"]
+    )
+    assert second["settlements.json"]["data"]["freshness"] == freshness
+    assert second["settlements.json"]["data"]["answers"] == answers
+
+
+def test_an_answer_with_no_retrieval_time_says_so(tmp_path) -> None:
+    """A stored answer without a timestamp must not read as freshly verified."""
+    rows = _dataset(seed=181, rows=200)
+    index = [{key: value for key, value in row.items() if key != "fetched_at_utc"} for row in _settlements(rows)]
+    export = _write_parts(tmp_path, rows, 2)
+    state_db = tmp_path / "state.duckdb"
+    out = tmp_path / "performance"
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=index, now=NOW,
+    )
+    payload = _read_generation(out)["settlements.json"]
+    freshness = payload["data"]["freshness"]
+    assert freshness["answers_without_retrieval_time"] == freshness["answers"]
+    assert freshness["as_of_utc"] is None
+    assert any("retrieval time" in warning for warning in payload["warnings"])
+
+
+def test_only_the_revised_market_changes(tmp_path) -> None:
+    """Requirement 3: a revision recomputes what it touches, and only that."""
+    rows = _dataset(seed=191, rows=600)
+    index = _settlements(rows)
+    export = _write_parts(tmp_path, rows, 3)
+    state_db = tmp_path / "state.duckdb"
+    out = tmp_path / "performance"
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=index, now=NOW,
+    )
+    before = _read_generation(out)
+    before_episodes = {
+        row["episode_id"]: row["outcome"]
+        for row in before["opportunities.json"]["data"]["episodes"]
+    }
+    target = index[0]
+    flipped = [
+        {**row, "resolved_outcome": 1.0 - row["resolved_outcome"]}
+        if (row["market_id"], row["target_date"]) == (target["market_id"], target["target_date"])
+        else row
+        for row in index
+    ]
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=flipped, now=NOW,
+    )
+    after = _read_generation(out)
+    after_episodes = {
+        row["episode_id"]: row["outcome"]
+        for row in after["opportunities.json"]["data"]["episodes"]
+    }
+    changed = {key for key in before_episodes if before_episodes[key] != after_episodes[key]}
+    affected = {
+        key
+        for key in before_episodes
+        if before["opportunities.json"]["data"]["episodes"]
+        and next(
+            row["market_id"]
+            for row in before["opportunities.json"]["data"]["episodes"]
+            if row["episode_id"] == key
+        )
+        == target["market_id"]
+    }
+    assert changed, "the revised market must change something"
+    assert changed <= affected, "no other market may move"
+    assert before["summary.json"]["data"]["accept_observations"] == (
+        after["summary.json"]["data"]["accept_observations"]
+    ), "a settlement revision must not change a single episode aggregate"
+
+
+def test_a_withdrawn_settlement_is_retracted_and_not_resurrected(tmp_path) -> None:
+    """Requirement 4: an explicit withdrawal must survive later runs.
+
+    A union can express "this market resolved" but never "this market is no
+    longer scored", so retraction is an explicit act. Once retracted, the
+    answer must stay gone - a later run that supplies no index must not bring
+    it back from the cache.
+    """
+    rows = _dataset(seed=201, rows=600)
+    index = _settlements(rows)
+    export = _write_parts(tmp_path, rows, 3)
+    state_db = tmp_path / "state.duckdb"
+    out = tmp_path / "performance"
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=index, now=NOW,
+    )
+    before = _read_generation(out)
+    assert len(before["settlements.json"]["data"]["answers"]) == len(index)
+
+    withdrawn = index[0]
+    remaining = [
+        row
+        for row in index
+        if (row["market_id"], row["target_date"])
+        != (withdrawn["market_id"], withdrawn["target_date"])
+    ]
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=remaining, settlements_replace=True, now=NOW,
+    )
+    after = _read_generation(out)
+    answers = after["settlements.json"]["data"]["answers"]
+    assert len(answers) == len(remaining)
+    assert not any(
+        row["market_id"] == withdrawn["market_id"]
+        and row["target_date"] == withdrawn["target_date"]
+        for row in answers
+    )
+    # Only the withdrawn (market, target date) loses its outcome; the same
+    # market's other days keep theirs, because a retraction is per answer.
+    retracted = [
+        row
+        for row in after["opportunities.json"]["data"]["episodes"]
+        if row["market_id"] == withdrawn["market_id"]
+        and row["target_date"] == withdrawn["target_date"]
+    ]
+    assert retracted and all(row["outcome"] == "UNAVAILABLE" for row in retracted)
+    still_scored = [
+        row
+        for row in after["opportunities.json"]["data"]["episodes"]
+        if row["market_id"] == withdrawn["market_id"]
+        and row["target_date"] != withdrawn["target_date"]
+    ]
+    assert any(row["outcome"] in {"WIN", "LOSS"} for row in still_scored)
+
+    # A later run with no index keeps the retraction.
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture", now=NOW,
+    )
+    kept = _read_generation(out)["settlements.json"]["data"]["answers"]
+    assert len(kept) == len(remaining)
+    assert not any(
+        row["market_id"] == withdrawn["market_id"]
+        and row["target_date"] == withdrawn["target_date"]
+        for row in kept
+    )
+
+
+def test_the_settlement_layer_records_where_it_came_from(tmp_path) -> None:
+    """Requirement 5: source, retrieval time, verdict and version all travel."""
+    rows = _dataset(seed=211, rows=200)
+    index = [
+        {**row, "resolution_source": "clob:/v2/resolutions", "verification_status": "UNVERIFIED"}
+        for row in _settlements(rows, verified=False)
+    ]
+    export = _write_parts(tmp_path, rows, 2)
+    out = tmp_path / "performance"
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=tmp_path / "state.duckdb", dataset="fixture",
+        settlements=index, now=NOW,
+    )
+    payload = _read_generation(out)["settlements.json"]["data"]
+    assert all(row["resolution_source"] == "clob:/v2/resolutions" for row in payload["answers"])
+    assert all(row["verification_status"] == "UNVERIFIED" for row in payload["answers"])
+    assert payload["verified"] == [], "an UNVERIFIED answer must not enter the denominator"
+    manifest = resolve_generation(out).manifest
+    assert manifest["algorithm_version"]
+    assert manifest["generated_at_utc"]
+
+
+
 def test_the_manifest_describes_how_the_batch_was_built(tmp_path) -> None:
     rows = _dataset(seed=121, rows=300)
     export = _write_parts(tmp_path, rows, 2)

@@ -394,6 +394,95 @@ def test_ten_thousand_rows_still_agree(tmp_path) -> None:
     assert streamed == legacy
 
 
+def test_every_edge_statistic_matches_item_by_item(tmp_path, dataset) -> None:
+    """The statistics the review names one by one, compared one by one.
+
+    The whole-payload comparison above would pass even if a statistic were
+    dropped from both sides; this walks the groups and asserts each figure the
+    brief lists, so "identical" is shown rather than assumed.
+    """
+    settlements = _settlements(dataset)
+    legacy = build_performance(
+        decisions=dataset, settlements=settlements, now=NOW, dataset="fixture"
+    )
+    _run_streaming(tmp_path, dataset, settlements)
+    streamed = _strip(_read_generation(tmp_path / "performance"))
+
+    legacy_edge = legacy["edge.json"]["data"]
+    new_edge = streamed["edge.json"]["data"]
+    statistics = (
+        "count", "sum", "mean", "median", "min", "max", "std",
+        "p05", "p25", "p50", "p75", "p95",
+    )
+
+    for statistic in statistics:
+        assert new_edge["overall"][statistic] == legacy_edge["overall"][statistic], statistic
+    for group in ("by_model", "by_direction", "by_target_date"):
+        assert set(new_edge[group]) == set(legacy_edge[group]), group
+        for key, expected in legacy_edge[group].items():
+            for statistic in statistics:
+                assert new_edge[group][key][statistic] == expected[statistic], (group, key, statistic)
+    assert new_edge["daily"] == legacy_edge["daily"]
+    assert new_edge["by_edge_band"] == legacy_edge["by_edge_band"]
+    assert new_edge["refused"] == legacy_edge["refused"]
+
+    # The counts that describe three different populations.
+    legacy_summary = legacy["summary.json"]["data"]
+    new_summary = streamed["summary.json"]["data"]
+    for field in (
+        "accept_observations",
+        "opportunity_episodes",
+        "accept_opportunity_distinct_markets",
+        "accept_opportunity_distinct_target_dates",
+        "verified_opportunities",
+        "settled_markets",
+    ):
+        assert new_summary[field] == legacy_summary[field], field
+    assert streamed["models.json"]["data"]["models"] == legacy["models.json"]["data"]["models"]
+    assert streamed["models.json"]["data"]["by_model_win_rate"] == (
+        legacy["models.json"]["data"]["by_model_win_rate"]
+    )
+
+
+def test_live_and_replay_never_share_an_episode(tmp_path) -> None:
+    """Interleaved LIVE and REPLAY rows for one market stay two episodes.
+
+    Built by hand rather than sampled, so the assertion is about isolation and
+    nothing else: if ``mode`` were dropped from the identity key these six rows
+    would fold into one episode of six observations.
+    """
+    rows = []
+    instant = T0
+    for index in range(6):
+        instant = instant + timedelta(minutes=5)
+        rows.append(
+            {
+                "decision_id": f"d{index:05d}",
+                "decision_time_utc": instant.isoformat(),
+                "market_id": "m-81",
+                "target_date": "2026-10-13",
+                "model_name": "calibrated",
+                "direction": "buy_yes",
+                "mode": "LIVE" if index % 2 == 0 else "REPLAY",
+                "state": "ACCEPT",
+                "net_edge": 0.05,
+                "market_price": 0.6,
+                "model_probability": 0.65,
+                "available_depth_usd": 500.0,
+            }
+        )
+    legacy = build_performance(decisions=rows, now=NOW, dataset="fixture")
+    _run_streaming(tmp_path, rows, [])
+    streamed = _strip(_read_generation(tmp_path / "performance"))
+    assert streamed == legacy
+
+    episodes = streamed["opportunities.json"]["data"]["episodes"]
+    assert len(episodes) == 2
+    assert {row["mode"] for row in episodes} == {"LIVE", "REPLAY"}
+    assert {row["observation_count"] for row in episodes} == {3}
+    assert len({row["episode_id"] for row in episodes}) == 2
+
+
 # ---------------------------------------------------------------------------
 # the aggregators, in isolation
 # ---------------------------------------------------------------------------

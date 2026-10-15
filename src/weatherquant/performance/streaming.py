@@ -89,9 +89,12 @@ from weatherquant.performance.episodes import (
     row_from_mapping,
 )
 from weatherquant.performance.snapshot import (
+    SettlementRecord,
     _envelope,
     _settlement_index,
     publish_performance,
+    settlement_freshness,
+    settlement_payload,
 )
 from weatherquant.performance.state import (
     DEFAULT_MEMORY_LIMIT,
@@ -796,16 +799,34 @@ def _render(stored: StoredEpisode) -> Episode:
 
 def _stored_settlements(
     store: PerformanceStateStore,
-) -> tuple[dict[tuple[str, str | None], SettlementAnswer], frozenset[tuple[str, str | None]], list[dict[str, Any]]]:
+) -> tuple[
+    dict[tuple[str, str | None], SettlementAnswer],
+    frozenset[tuple[str, str | None]],
+    list[SettlementRecord],
+]:
+    """The store's settlement layer, in the shape both engines publish."""
     rows = store.load_settlements()
     answers: dict[tuple[str, str | None], SettlementAnswer] = {}
     verified: set[tuple[str, str | None]] = set()
+    records: list[SettlementRecord] = []
     for row in rows:
         key = (row["market_id"], row["target_date"])
         answers[key] = SettlementAnswer(status=row["status"], payout=row["payout"])
         if row["verified"]:
             verified.add(key)
-    return answers, frozenset(verified), rows
+        records.append(
+            SettlementRecord(
+                market_id=row["market_id"],
+                target_date=row["target_date"],
+                status=row["status"],
+                payout=row["payout"],
+                verified=bool(row["verified"]),
+                verification_status=row["verification_status"],
+                resolution_source=row["resolution_source"],
+                fetched_at_utc=_timestamp(row["fetched_at_utc"]) if row["fetched_at_utc"] else None,
+            )
+        )
+    return answers, frozenset(verified), records
 
 
 # ---------------------------------------------------------------------------
@@ -823,6 +844,7 @@ class StreamingBuild:
     manifest_extra: dict[str, Any]
     state: dict[str, Any]
     summary: dict[str, Any] = field(default_factory=dict)
+    settlement_records: list[SettlementRecord] = field(default_factory=list)
 
 
 def build_streaming_payloads(
@@ -851,7 +873,8 @@ def build_streaming_payloads(
             "the state store is empty; run an ingest before building snapshots"
         )
 
-    answers, verified, settlement_rows = _stored_settlements(store)
+    answers, verified, settlement_records = _stored_settlements(store)
+    freshness = settlement_freshness(settlement_records)
     distinct = store.distinct_counts()
 
     # -- one pass over the episodes: the summary and all six win rates ------
@@ -947,6 +970,11 @@ def build_streaming_payloads(
             "accepts_without_edge": state.accepts_without_edge_market,
             "open_at_end": _open_episode_count(store),
         },
+        # The settlement layer is kept across runs, so when it was retrieved is
+        # part of the number: a win rate whose settlements were fetched weeks
+        # ago is not the same claim as one fetched this morning, and the reader
+        # cannot tell the two apart from the rate alone.
+        "settlement_freshness": freshness,
         "confidence_interval": list(rate.confidence_interval) if rate.confidence_interval else None,
         "confidence_method": rate.method,
         "insufficient_reason": rate.reason,
@@ -1002,30 +1030,7 @@ def build_streaming_payloads(
         "warnings": episode_summary_dict["warnings"],
     }
 
-    settlements_payload = {
-        "answers": [
-            {
-                "market_id": row["market_id"],
-                "target_date": row["target_date"],
-                "status": row["status"],
-                "payout": row["payout"],
-            }
-            for row in sorted(settlement_rows, key=lambda r: (r["market_id"], r["target_date"] or ""))
-        ],
-        "verified": [
-            {"market_id": row["market_id"], "target_date": row["target_date"]}
-            for row in sorted(
-                (r for r in settlement_rows if r["verified"]),
-                key=lambda r: (r["market_id"], r["target_date"] or ""),
-            )
-        ],
-        "counts": rate.counts,
-        "statistical_scope": ["resolved_verified_only"],
-        "warnings": [
-            "Platform settlement and weather observation are stored separately; "
-            "neither substitutes for the other.",
-        ],
-    }
+    settlements_payload = settlement_payload(settlement_records, counts=rate.counts)
 
     models_payload = {
         "models": models,
@@ -1066,7 +1071,7 @@ def build_streaming_payloads(
         ),
         "settlements.json": _envelope(
             logical_name="performance-settlements", data=settlements_payload,
-            sample_size=len(settlement_rows), statistical_scope=["resolved_verified_only"],
+            sample_size=len(settlement_records), statistical_scope=["resolved_verified_only"],
             warnings=settlements_payload["warnings"], **common,
         ),
         "models.json": _envelope(
@@ -1108,6 +1113,7 @@ def build_streaming_payloads(
         manifest_extra=manifest_extra,
         state=state.as_dict(),
         summary=summary_data,
+        settlement_records=settlement_records,
     )
 
 
@@ -1218,7 +1224,7 @@ def streaming_generation_id(
     *,
     state: Mapping[str, Any],
     coverage: Mapping[str, Any],
-    settlements: Sequence[Mapping[str, Any]],
+    settlements: Sequence[SettlementRecord],
     capital_usdc: float,
     max_allocation_fraction: float,
     dataset: str,
@@ -1248,13 +1254,20 @@ def streaming_generation_id(
             "coverage": dict(coverage),
             "settlements": [
                 {
-                    "market_id": row.get("market_id"),
-                    "target_date": row.get("target_date"),
-                    "status": row.get("status"),
-                    "payout": row.get("payout"),
-                    "verified": row.get("verified"),
+                    "market_id": record.market_id,
+                    "target_date": record.target_date,
+                    "status": record.status,
+                    "payout": record.payout,
+                    "verified": record.verified,
+                    "verification_status": record.verification_status,
+                    "resolution_source": record.resolution_source,
+                    "fetched_at_utc": (
+                        record.fetched_at_utc.astimezone(UTC).isoformat()
+                        if record.fetched_at_utc is not None
+                        else None
+                    ),
                 }
-                for row in settlements
+                for record in settlements
             ],
             "capital_usdc": capital_usdc,
             "max_allocation_fraction": max_allocation_fraction,
@@ -1272,6 +1285,7 @@ def build_performance_streaming(
     dataset: str,
     state_db: str | Path = DEFAULT_PERFORMANCE_STATE_DB_PATH,
     settlements: Sequence[Any] = (),
+    settlements_replace: bool = False,
     capital_usdc: float = 100.0,
     max_allocation_fraction: float = DEFAULT_MAX_ALLOCATION_FRACTION,
     gap_window_seconds: float = DEFAULT_GAP_WINDOW_SECONDS,
@@ -1294,6 +1308,11 @@ def build_performance_streaming(
     export, which is the "partial recompute" path: a settlement that arrives
     days later changes outcomes and therefore the win rate, but it does not
     change a single episode, so nothing has to be re-read.
+
+    ``settlements_replace`` makes the index authoritative rather than additive.
+    The default is a union - an index covering today's markets must not erase
+    yesterday's answers - but a union cannot express a withdrawal, so
+    retraction is an explicit act.
     """
     dataset = _require_dataset(dataset)
     if capital_usdc <= 0:
@@ -1329,21 +1348,29 @@ def build_performance_streaming(
 
         # Settlements are upserted, never replaced wholesale: a settlement is an
         # external fact that gets revised, and a run without an index must not
-        # erase the answers an earlier run verified.
+        # erase the answers an earlier run verified. `replace=True` is the
+        # caller asserting that this index is *complete*, which is the only way
+        # to express a withdrawal - see PerformanceStateStore.replace_settlements.
         answers, verified = _settlement_index(settlements)
         if answers:
-            fetched_at = _settlement_fetched_at_map(settlements)
-            store.upsert_settlements(
-                {
-                    key: (
-                        answer.status,
-                        answer.payout,
-                        key in verified,
-                        fetched_at.get(key),
-                    )
-                    for key, answer in answers.items()
-                }
-            )
+            provenance = _settlement_provenance_map(settlements)
+            payload = {
+                key: (
+                    answer.status,
+                    answer.payout,
+                    key in verified,
+                    provenance.get(key, (None, None, None))[0],
+                    provenance.get(key, (None, None, None))[1],
+                    provenance.get(key, (None, None, None))[2],
+                )
+                for key, answer in answers.items()
+            }
+            if settlements_replace:
+                removed = store.replace_settlements(payload)
+                if removed and progress is not None:
+                    progress(f"retracted {removed} settlement answer(s) not in this index")
+            else:
+                store.upsert_settlements(payload)
 
         build = build_streaming_payloads(
             store,
@@ -1355,12 +1382,11 @@ def build_performance_streaming(
             book_for=book_for,
             gap_window_seconds=gap_window_seconds,
         )
-        _, _, settlement_rows = _stored_settlements(store)
         generation_id = streaming_generation_id(
             now,
             state=build.state,
             coverage=build.coverage,
-            settlements=settlement_rows,
+            settlements=build.settlement_records,
             capital_usdc=capital_usdc,
             max_allocation_fraction=max_allocation_fraction,
             dataset=dataset,
@@ -1390,16 +1416,17 @@ def build_performance_streaming(
     return result
 
 
-def _settlement_fetched_at_map(
+def _settlement_provenance_map(
     settlements: Sequence[Any],
-) -> dict[tuple[str, str | None], datetime | None]:
-    """The ``fetched_at_utc`` each settlement index entry recorded.
+) -> dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]]:
+    """What each settlement index entry says about its own evidence.
 
-    Built once rather than searched per key: the index is one row per
-    (market, target date), and looking each one up in the list would be
-    quadratic in the number of markets.
+    ``(verification_status, resolution_source, fetched_at_utc)`` per
+    ``(market, target date)``. Built once rather than searched per key: the
+    index is one row per market and date, and looking each one up in the list
+    would be quadratic in the number of markets.
     """
-    out: dict[tuple[str, str | None], datetime | None] = {}
+    out: dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]] = {}
     for item in settlements:
         if not isinstance(item, Mapping):
             continue
@@ -1409,11 +1436,17 @@ def _settlement_fetched_at_map(
         raw = item.get("target_date")
         key = (market_id, str(raw) if raw else None)
         stamp = item.get("fetched_at_utc")
-        if stamp is None:
-            out[key] = None
-            continue
-        try:
-            out[key] = _timestamp(stamp)
-        except (TypeError, ValueError):
-            out[key] = None
+        fetched: datetime | None = None
+        if stamp is not None:
+            try:
+                fetched = _timestamp(stamp)
+            except (TypeError, ValueError):
+                fetched = None
+        verdict = item.get("verification_status")
+        source = item.get("resolution_source")
+        out[key] = (
+            str(verdict) if verdict is not None else None,
+            str(source) if source is not None else None,
+            fetched,
+        )
     return out

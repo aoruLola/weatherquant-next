@@ -29,7 +29,12 @@ from typing import Any
 
 from weatherquant.performance.capital import simulate_portfolio
 from weatherquant.performance.edge import daily_edge, edge_by_bin, grouped_edge, observation_edge
-from weatherquant.performance.episodes import Episode, build_episodes, summarize
+from weatherquant.performance.episodes import (
+    Episode,
+    _timestamp,
+    build_episodes,
+    summarize,
+)
 from weatherquant.performance.settlement import classify, parse_resolutions
 from weatherquant.performance.winrate import (
     SettlementAnswer,
@@ -130,6 +135,141 @@ def _settlement_index(
     return answers, frozenset(verified)
 
 
+@dataclass(frozen=True, slots=True)
+class SettlementRecord:
+    """One settlement answer with the evidence that produced it.
+
+    The verdict and the source are carried verbatim rather than folded into a
+    boolean: "verified" is a conclusion, and a conclusion whose evidence was
+    discarded cannot be re-examined when the rules change. ``fetched_at_utc``
+    is what makes a *kept* answer distinguishable from a *fresh* one - the
+    state store holds settlements across runs, which is the point, and a reader
+    who cannot see the retrieval time cannot tell the two apart.
+    """
+
+    market_id: str
+    target_date: str | None
+    status: str
+    payout: float | None
+    verified: bool
+    verification_status: str | None = None
+    resolution_source: str | None = None
+    fetched_at_utc: datetime | None = None
+
+
+def settlement_records_from_index(payloads: Iterable[Any]) -> list[SettlementRecord]:
+    """The published records for a settlement index, in a stable order."""
+    answers, verified = _settlement_index(payloads)
+    provenance = _settlement_provenance(payloads)
+    records = [
+        SettlementRecord(
+            market_id=market_id,
+            target_date=target_date,
+            status=answer.status,
+            payout=answer.payout,
+            verified=(market_id, target_date) in verified,
+            verification_status=provenance.get((market_id, target_date), (None, None, None))[0],
+            resolution_source=provenance.get((market_id, target_date), (None, None, None))[1],
+            fetched_at_utc=provenance.get((market_id, target_date), (None, None, None))[2],
+        )
+        for (market_id, target_date), answer in answers.items()
+    ]
+    return sorted(records, key=lambda r: (r.market_id, r.target_date or ""))
+
+
+def _settlement_provenance(
+    payloads: Iterable[Any],
+) -> dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]]:
+    """``(verification_status, resolution_source, fetched_at)`` per answer."""
+    out: dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]] = {}
+    for item in payloads:
+        if not isinstance(item, Mapping):
+            continue
+        market_id = str(item.get("market_id") or "")
+        if not market_id:
+            continue
+        raw = item.get("target_date")
+        key = (market_id, str(raw) if raw else None)
+        stamp = item.get("fetched_at_utc")
+        fetched: datetime | None = None
+        if stamp is not None:
+            try:
+                fetched = _timestamp(stamp)
+            except (TypeError, ValueError):
+                fetched = None
+        verdict = item.get("verification_status")
+        source = item.get("resolution_source")
+        out[key] = (
+            str(verdict) if verdict is not None else None,
+            str(source) if source is not None else None,
+            fetched,
+        )
+    return out
+
+
+def settlement_freshness(records: Sequence[SettlementRecord]) -> dict[str, Any]:
+    """When the settlement layer was last retrieved, and whether it can be told.
+
+    A kept answer and a fresh one look identical from the win rate alone, so
+    the retrieval times travel with the answers and this block summarises them,
+    including how many have none at all.
+    """
+    stamps = [record.fetched_at_utc for record in records if record.fetched_at_utc is not None]
+    known = [stamp.astimezone(UTC).isoformat() for stamp in stamps]
+    return {
+        "answers": len(records),
+        "answers_without_retrieval_time": len(records) - len(known),
+        "as_of_utc": max(known) if known else None,
+        "oldest_utc": min(known) if known else None,
+    }
+
+
+def settlement_payload(
+    records: Sequence[SettlementRecord],
+    *,
+    counts: Mapping[str, int],
+) -> dict[str, Any]:
+    """The ``settlements.json`` data block, shared by both engines."""
+    freshness = settlement_freshness(records)
+    warnings = [
+        "Platform settlement and weather observation are stored separately; "
+        "neither substitutes for the other.",
+    ]
+    if freshness["answers_without_retrieval_time"]:
+        warnings.append(
+            f"{freshness['answers_without_retrieval_time']} settlement answer(s) carry no "
+            "retrieval time; their age cannot be judged and they must not be presented as "
+            "freshly verified."
+        )
+    return {
+        "answers": [
+            {
+                "market_id": record.market_id,
+                "target_date": record.target_date,
+                "status": record.status,
+                "payout": record.payout,
+                "verification_status": record.verification_status,
+                "resolution_source": record.resolution_source,
+                "fetched_at_utc": (
+                    record.fetched_at_utc.astimezone(UTC).isoformat()
+                    if record.fetched_at_utc is not None
+                    else None
+                ),
+            }
+            for record in records
+        ],
+        "verified": [
+            {"market_id": record.market_id, "target_date": record.target_date}
+            for record in records
+            if record.verified
+        ],
+        "counts": dict(counts),
+        "freshness": freshness,
+        "statistical_scope": ["resolved_verified_only"],
+        "warnings": warnings,
+    }
+
+
 def build_performance(
     *,
     decisions: Sequence[Mapping[str, Any]],
@@ -160,6 +300,7 @@ def build_performance(
         episode_counters = {"episodes_built": len(episodes)}
 
     answers, verified = _settlement_index(settlements)
+    settlement_records = settlement_records_from_index(settlements)
     scored = assign_outcomes(episodes, answers=answers, verified=verified)
 
     edge_summary = observation_edge(decisions)
@@ -202,6 +343,11 @@ def build_performance(
         "distinct_markets": episode_summary["distinct_markets"],
         "distinct_target_dates": episode_summary["distinct_target_dates"],
         "episode_build": episode_counters,
+        # The settlement layer can be kept across runs by the streaming engine,
+        # so when it was retrieved is part of the number: a win rate whose
+        # settlements were fetched weeks ago is not the same claim as one
+        # fetched this morning, and the rate alone cannot tell them apart.
+        "settlement_freshness": settlement_freshness(settlement_records),
         "confidence_interval": list(rate.confidence_interval) if rate.confidence_interval else None,
         "confidence_method": rate.method,
         "insufficient_reason": rate.reason,
@@ -273,19 +419,7 @@ def build_performance(
         "warnings": episode_summary["warnings"],
     }
 
-    settlements_payload = {
-        "answers": [
-            {"market_id": m, "target_date": d, "status": a.status, "payout": a.payout}
-            for (m, d), a in sorted(answers.items(), key=lambda kv: (kv[0][0], kv[0][1] or ""))
-        ],
-        "verified": [{"market_id": m, "target_date": d} for m, d in sorted(verified)],
-        "counts": rate.counts,
-        "statistical_scope": ["resolved_verified_only"],
-        "warnings": [
-            "Platform settlement and weather observation are stored separately; "
-            "neither substitutes for the other.",
-        ],
-    }
+    settlements_payload = settlement_payload(settlement_records, counts=rate.counts)
 
     models_payload = {
         "models": sorted({str(d.get("model_name") or "unknown") for d in decisions}),

@@ -302,10 +302,14 @@ _SETTLEMENT_COLUMNS = (
     "status",
     "payout",
     "verified",
+    "verification_status",
+    "resolution_source",
     "fetched_at_utc",
     "updated_at_utc",
 )
-_SETTLEMENT_SPECS = ("text", "text", "text", "text", "float", "bool", "ts", "ts")
+_SETTLEMENT_SPECS = (
+    "text", "text", "text", "text", "float", "bool", "text", "text", "ts", "ts",
+)
 
 _PART_COLUMNS = ("part_index", "rows", "end_cursor_time", "end_cursor_id", "sha256", "consumed_at_utc")
 _PART_SPECS = ("int", "int", "ts", "text", "text", "ts")
@@ -805,9 +809,18 @@ class PerformanceStateStore:
 
     def upsert_settlements(
         self,
-        answers: Mapping[tuple[str, str | None], tuple[str, float | None, bool, datetime | None]],
+        answers: Mapping[
+            tuple[str, str | None],
+            tuple[str, float | None, bool, str | None, str | None, datetime | None],
+        ],
     ) -> None:
-        """``(market, date) -> (status, payout, verified, fetched_at)``."""
+        """``(market, date) -> (status, payout, verified, verdict, source, fetched_at)``.
+
+        The verdict and the source are stored verbatim rather than folded into
+        the boolean: "verified" is a conclusion, and a conclusion whose
+        evidence has been discarded cannot be re-examined when the rules
+        change.
+        """
         if not answers:
             return
         now = datetime.now(tz=UTC)
@@ -819,19 +832,62 @@ class PerformanceStateStore:
                 status,
                 payout,
                 verified,
-                fetched_at or now,
+                verification_status,
+                resolution_source,
+                # NULL, not "now". The row records when it was *stored*
+                # (``updated_at_utc``) and, separately, when the answer was
+                # *retrieved*. Filling the second with the first would make an
+                # answer of unknown age indistinguishable from a fresh one -
+                # exactly the failure the sticky settlement layer has to avoid.
+                fetched_at,
                 now,
             ]
-            for (market_id, target_date), (status, payout, verified, fetched_at) in answers.items()
+            for (market_id, target_date), (
+                status,
+                payout,
+                verified,
+                verification_status,
+                resolution_source,
+                fetched_at,
+            ) in answers.items()
         ]
         self._insert_rows(
             "performance_settlements", _SETTLEMENT_COLUMNS, _SETTLEMENT_SPECS, rows, replace=True
         )
 
+    def replace_settlements(
+        self,
+        answers: Mapping[
+            tuple[str, str | None],
+            tuple[str, float | None, bool, str | None, str | None, datetime | None],
+        ],
+    ) -> int:
+        """Make the store's settlement set exactly this one. Returns rows removed.
+
+        The default upsert is a union, because an index that covers today's
+        markets must not erase yesterday's. But a union cannot express
+        *withdrawal*: a settlement that the platform retracted, or a market
+        that should no longer be scored at all, would survive every later run.
+        So retraction is an explicit act with its own flag, and it is the
+        caller's assertion that the index it is handing over is complete.
+        """
+        keep = {settlement_key_hash(market_id, date) for market_id, date in answers}
+        existing = {str(row[0]) for row in self.fetchall("SELECT key_hash FROM performance_settlements")}
+        removed = sorted(existing - keep)
+        if removed:
+            self.con.execute(
+                "DELETE FROM performance_settlements WHERE key_hash IN "
+                f"({', '.join(['?'] * len(removed))})",
+                removed,
+            )
+        self.upsert_settlements(answers)
+        return len(removed)
+
     def load_settlements(self) -> list[dict[str, Any]]:
         rows = self.fetchall(
-            "SELECT market_id, target_date, status, payout, verified, fetched_at_utc "
-            "FROM performance_settlements ORDER BY market_id, target_date"
+            "SELECT market_id, target_date, status, payout, verified, verification_status, "
+            "resolution_source, fetched_at_utc FROM performance_settlements "
+            "ORDER BY market_id, target_date"
         )
         return [
             {
@@ -840,7 +896,9 @@ class PerformanceStateStore:
                 "status": str(r[2]),
                 "payout": r[3],
                 "verified": bool(r[4]),
-                "fetched_at_utc": _iso(r[5]),
+                "verification_status": r[5],
+                "resolution_source": r[6],
+                "fetched_at_utc": _iso(r[7]),
             }
             for r in rows
         ]

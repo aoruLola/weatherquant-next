@@ -461,6 +461,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="rebuild the snapshots from the state store without reading the export",
     )
+    p.add_argument(
+        "--settlements-replace",
+        action="store_true",
+        help=(
+            "treat --settlements as the complete settlement set: answers it does "
+            "not contain are retracted. Without this the index is a union, so an "
+            "index covering today's markets cannot erase yesterday's answers"
+        ),
+    )
     p.add_argument("--memory-limit", default="1GB", help="DuckDB memory limit for the state store")
     p.add_argument("--temp-dir", help="where the state store spills when it exceeds the limit")
     p.add_argument(
@@ -674,6 +683,7 @@ def _build_performance_streaming(
             state_db=state_db,
             dataset=args.dataset,
             settlements=settlements,
+            settlements_replace=args.settlements_replace,
             capital_usdc=float(args.capital_usdc),
             max_allocation_fraction=float(args.max_allocation_fraction),
             gap_window_seconds=float(args.gap_window_seconds),
