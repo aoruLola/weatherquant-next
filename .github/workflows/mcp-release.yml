@@ -224,6 +224,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `type=ref,event=tag` emits a `latest` tag on its own: flavor.latest
+          # defaults to `auto`, and auto covers tag refs. That would be a fourth
+          # pointer nobody documented and nothing moves deliberately, so it is
+          # turned off - `mcp-stable` is the only mutable tag this workflow owns.
+          flavor: |
+            latest=false
           tags: |
             type=sha,format=long,prefix=sha-
             type=ref,event=tag
