@@ -1,0 +1,188 @@
+# 流式 Performance 与分页明细：生产上线方案（**需另行批准**）
+
+本文件是**方案**，不是执行记录。**本轮未部署、未回填、未重启任何容器、未触碰生产 NAS。**
+
+适用对象：
+- 研究进程（`weatherquant-research build-performance`，流式引擎 + 状态库）
+- Dashboard（`weatherquant-next-dashboard`，分页明细）
+- MCP（`weatherquant-next-mcp`，只转发 API）
+
+前提：PR #11（流式引擎）与 #12（有界明细 + 分页）均已审查合并。
+
+---
+
+## 1. 镜像与版本
+
+| 组件 | 镜像 | 说明 |
+|---|---|---|
+| Research Analytics | 无独立镜像 | CLI，随 `weatherquant-next`（`--group dev` 不需要，基础依赖即可） |
+| Dashboard | `ghcr.io/aorulola/weatherquant-next-dashboard:sha-<commit>` | 本轮唯一需要更新的生产镜像 |
+| Shadow / Collector | **不动** | 见 §10 |
+| MCP | `…-mcp:sha-<commit>` | 可选，且必须单独批准（本轮不批准发布） |
+
+**规则**：只部署带 `sha-<40 位 commit>` 的不可变标签；不使用 `latest`；部署前记录
+`docker inspect --format '{{index .RepoDigests 0}}'` 得到的 digest，写入变更单。
+
+**注意（本轮 CI 实况）**：`ci.yml` 的 `build-image` job 因 GitHub 账户
+**账单/额度**（"recent account payments have failed or your spending limit needs to be
+increased"）**未能启动**（3 秒失败、无任何 step）。其余 job（`lint-and-test`、
+`shadow-tests`、`dashboard-*`）正常通过。**在账单恢复前不得依赖 CI 的镜像构建结论**；
+本地已按同一 `Dockerfile` 复现构建与启动健康检查（见 §11 复验）。
+
+---
+
+## 2. 目录与挂载
+
+```
+/mnt/user/appdata/weatherquant-next/                     Collector（不动）
+/mnt/user/appdata/weatherquant-shadow/                   Shadow（不动）
+    reports/decisions-export/                            决策导出分片（流式引擎的输入，只读）
+/mnt/user/appdata/weatherquant-performance/              快照世代（Dashboard 只读挂载）
+    current.json
+    generations/<id>/{summary,edge,win-rate,opportunities,settlements,models}.json
+    generations/<id>/opportunities/part-*.json           明细分片（新增）
+/mnt/user/appdata/weatherquant-performance-state/        【新增】状态库目录
+    performance-state.duckdb                             可删可重建
+    duckdb-tmp/                                          溢出目录（同卷）
+```
+
+Dashboard compose **不需要新增挂载**：分片在 `performance/` 之下，既有
+`/sources/performance:ro` 已覆盖。**状态库不挂给 Dashboard**。
+
+---
+
+## 3. 旧快照保留
+
+- 每次发布新建 `generations/<id>/`，`current.json` 一次 rename 切换；失败时旧世代仍是 current。
+- **保留策略**：保留最近 14 个世代 + 每个自然月最后一个（约 6 GB 上限，按 1.5M 行
+  13.8 MB/世代估算，5M 行约 40 MB/世代）。清理**只删 `generations/` 下非 current 的目录**，
+  不删 `current.json`、不删状态库。
+- 回滚判据见 §8：任何回滚都**不需要删除**当前世代。
+
+---
+
+## 4. 首次回填与增量
+
+**首次回填**（一次性，离线窗口内执行）：
+
+```bash
+weatherquant-research build-performance \
+  --export /mnt/user/appdata/weatherquant-shadow/reports/decisions-export \
+  --out /mnt/user/appdata/weatherquant-performance \
+  --dataset live \
+  --state-db /mnt/user/appdata/weatherquant-performance-state/performance-state.duckdb \
+  --memory-limit 1GB \
+  --max-parts-per-run 40        # 分批：79 个分片分两次跑完，单次 < 2 分钟
+```
+
+- 状态库为空即从头开始；`--max-parts-per-run` 让首次回填可分段、可中断。
+- **不在 NAS 上跑旧版全内存构建器**（`--in-memory` 会打印警告，生产禁用）。
+- 预期：1.48M 行约 **80–120 秒**，峰值 RSS < 400 MB（隔离实测 1.5M 行 78 s / 299 MB）。
+
+**日常增量**（每 15–30 分钟一次，见 §6）：同一条命令**去掉** `--max-parts-per-run`。
+
+**结算修订**：带新的 `--settlements` 重跑（upsert）；要撤销用 `--settlements-replace`
+（仅在确认索引完整时）。不重读任何决策。
+
+---
+
+## 5. 资源限制
+
+| 资源 | 设置 | 理由 |
+|---|---|---|
+| 研究进程内存 | `--memory-limit 1GB`（DuckDB 缓冲池上限）+ 容器 `--memory=1.5g` | 实测 5M 行峰值 477 MB、10M 行 613 MB；上限是**上限**，不是期望值 |
+| 溢出目录 | `--temp-dir` 指向状态库同卷 | 溢出不得落在 tmpfs |
+| CPU | 容器 `--cpus=2`（NAS 4 核） | 排序/聚合是唯一的 CPU 密集段；留出余量给 Collector/Shadow |
+| I/O | 无显式限制，但：分片顺序读、无随机写、无 swap | 见 §9 监控 |
+| Dashboard 内存 | 容器 `--memory=512m` | 最坏一条端点（按需本金）峰值 49 MB，其余 < 5 MB |
+| 并发 | **同时只允许一个研究进程**（DuckDB 文件锁会拒绝第二个） | §6 |
+
+---
+
+## 6. 定时任务与互斥
+
+- 调度：Unraid User Scripts / cron，每 **20 分钟**一次，`nice -n 10 ionice -c2 -n7`。
+- **互斥**：状态库是单写者，第二个进程会被 DuckDB 文件锁拒绝（已由子进程测试验证）。
+  为让失败**可见**，脚本用 `flock -n` 包裹并记录退出码：
+
+```bash
+flock -n /var/lock/weatherquant-performance.lock \
+  weatherquant-research build-performance ... || echo "skipped: another run holds the lock"
+```
+
+- 运行时间远小于间隔（增量通常 < 10 秒；只有新分片落盘时才接近分钟级）。
+
+---
+
+## 7. 健康检查与新鲜度
+
+| 检查 | 期望 |
+|---|---|
+| `GET /healthz` | 三源 `fresh` |
+| `GET /api/v1/performance/summary` | `freshness.state == "fresh"`；`data.settlement_freshness.as_of_utc` 非空 |
+| `GET /api/v1/performance/opportunities?limit=50` | 200；`data.window.episodes > 0`；`items` 非空 |
+| `GET /api/v1/performance/reference-capital` | 200；`window` 存在；`results_total > 0` |
+| 状态库 | `performance_parts` 的 `part_index` 最大值 == 导出目录分片数 |
+| 新鲜度判据 | 快照 `stale_after_seconds`（默认 300 s）；研究进程每 20 分钟一次，故正常不会 stale |
+
+**告警**：连续 2 个周期没有新世代 → 检查状态库是否被锁、导出是否停摆。
+
+---
+
+## 8. 失败恢复与回滚
+
+| 情况 | 处置 |
+|---|---|
+| 研究进程崩溃/断电 | 直接重跑。同事务提交行与水位，未提交的分片会重读且**不重复计数** |
+| 分片缺失/被改写/乱序 | 拒绝并报错，水位不动 → 人工确认导出，必要时 `--reset` 重建 |
+| 换导出目录或升级算法 | 会因 `input_source` / `algorithm_version` 不符而拒绝 → 确认后 `--reset` |
+| 快照可疑 | 删除 `weatherquant-performance/` 目录 → Dashboard 显示 `missing`（不显示错误数据） |
+| Dashboard 回滚 | 改回上一个 `sha-<commit>` → Apply。旧版 Dashboard 忽略分片目录，**不会报错** |
+| 状态库损坏 | 删除状态库目录后重跑（全部内容都是派生物） |
+| MCP 回滚 | 改回上一个 `sha` → Apply（无状态、无数据） |
+
+**回滚判据**：`/api/v1/performance/*` 持续 5xx 或非 fresh 且无法解释；MCP 数值与
+Dashboard API 不一致；出现任何下单/钱包/私钥路径（立即回滚并保留日志）。
+
+---
+
+## 9. NAS 宿主资源监控
+
+- **内存**：Unraid Dashboard 的 Memory 面板 + `docker stats`。预期研究进程峰值 < 700 MB，
+  Dashboard < 200 MB。
+- **宿主可响应性**：压力测试期间并行采样空命令延迟，实测中位 **6 ms** / p95 **17 ms** /
+  最大 **32 ms**（对比旧构建期间 HTTP/SSH 全部超时 35 分钟）。
+- **磁盘**：`/mnt/user/appdata/weatherquant-performance/` 与状态库目录容量告警（80%）。
+  导出目录只读，不清理。
+- **I/O**：观察 `iowait`；研究进程只顺序读导出与写状态库，不触碰生产 DuckDB。
+- **不做**：不在 NAS 上跑 `scripts/bench_performance_streaming.py`（它会写 GB 级合成数据）。
+
+---
+
+## 10. 不影响 Collector / Shadow 的证明
+
+| 声明 | 依据 |
+|---|---|
+| 不打开生产 Shadow 库 | 研究进程只读 `reports/decisions-export/`；`--export` 指向目录时走流式引擎，代码路径中没有任何指向 `shadow.duckdb` 的连接 |
+| 不写生产库 | 状态库是**独立文件**（`weatherquant-performance-state/`），schema 由 `migrations_performance/` 管理 |
+| 不重启任何容器 | 本方案不要求重启 Collector/Shadow；Dashboard 的 Apply 只影响 Dashboard 容器 |
+| 不修改导出 | 研究进程对导出目录**只读**；分片指纹校验在检测到改写时**拒绝**而不是修复 |
+| 不抢占资源 | 增量运行 < 10 s、峰值 < 700 MB、`nice`/`ionice` 降级、`--cpus=2` |
+| 不共享文件锁 | 状态库与 Shadow 库是两个文件，锁互不相干 |
+
+**唯一的生产写动作**是创建 `weatherquant-performance-state/` 目录与写入快照世代目录。
+
+---
+
+## 11. 上线前复验清单
+
+| # | 检查 | 本轮状态 |
+|---|---|---|
+| 1 | `uv run pytest -q` | **1005 passed, 6 skipped** |
+| 2 | `uv run pytest dashboard/tests -q` | **101 passed** |
+| 3 | `npx tsc --noEmit` + `npm test` | 干净 / **87 passed** |
+| 4 | `uv run ruff check .` | 干净 |
+| 5 | 隔离压力测试 1.5M/3M/5M/10M | 见 `performance-deployment.md` §11 |
+| 6 | 端点延迟/体积/峰值 | 见 §12 |
+| 7 | CI | `lint-and-test` / `shadow-tests` / `dashboard-*` **通过**；`build-image` 因**账户账单**未启动，本地按同一 `Dockerfile` 复现（构建 + 容器健康检查） |
+| 8 | 生产部署 | **未执行**，等待批准 |
