@@ -1,0 +1,258 @@
+# Publish the MCP gateway image.
+#
+# This workflow can only ever touch `ghcr.io/aorulola/weatherquant-next-mcp`.
+# It has its own tag namespace (`mcp-v*`), its own mutable pointer
+# (`mcp-stable`), and it never writes the collector, shadow or dashboard
+# packages - each of those has its own workflow, its own image name and its
+# own `release` environment gate. A gateway release cannot move the engine
+# that feeds it.
+#
+# Tags produced, all of them on the -mcp package only:
+#   sha-<full commit sha>   immutable; the rollback target
+#   mcp-vX.Y.Z              the release
+#   mcp-stable              mutable pointer, moved only here, only after verify
+#
+# The verify job is where the security properties are held, because they are
+# properties of the *container* and not of the code alone: a gateway that
+# mounts a database, or that starts open on a LAN address, is not something
+# the unit tests can observe.
+
+name: mcp-release
+
+on:
+  push:
+    tags: ["mcp-v*"]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why is this being released manually?"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  actions: write
+
+concurrency:
+  group: mcp-release
+  cancel-in-progress: false   # never interrupt a release mid-publish
+
+env:
+  REGISTRY: ghcr.io
+  # Deliberately NOT github.repository: that resolves to the collector's image
+  # name, and publishing a gateway build to it would move the tag the NAS pulls.
+  IMAGE_NAME: ${{ github.repository }}-mcp
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image identifies itself by app_version, which comes from this file.
+      # If the tag and the version disagree, every running container reports
+      # the same string as the one it replaced, and "which build is live"
+      # becomes a question only the registry can answer.
+      - name: Release tag must match pyproject version
+        if: startsWith(github.ref, 'refs/tags/mcp-v')
+        run: |
+          set -euo pipefail
+          tagged="${GITHUB_REF_NAME#mcp-v}"
+          declared="$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)"
+          echo "tag mcp-v${tagged} vs pyproject ${declared}"
+          if [ "${tagged}" != "${declared}" ]; then
+            echo "::error::mcp-v${tagged} is tagged on pyproject version ${declared}."
+            echo "::error::Set version = \"${tagged}\" and commit before tagging, so a running container can identify itself."
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      # Covers the protocol-level claims: thirteen read-only tools, every one
+      # described, the allowlist covering all thirteen, origin and Host
+      # validation, the bearer check, and the rate limiter.
+      - name: Pytest
+        run: uv run pytest -q
+
+      - name: No tool in the registry can place, simulate or queue a trade
+        run: |
+          set -euo pipefail
+          uv run python - <<'PY'
+          import weatherquant.mcp.server as s
+          from weatherquant.mcp.main import build_gateway
+
+          gateway = build_gateway(base_url="http://127.0.0.1:9", inbound_token="probe")
+          names = {t.name for t in s.build_server(gateway)._tool_manager.list_tools()}
+          assert len(names) == 13, f"expected thirteen tools, got {len(names)}: {sorted(names)}"
+
+          forbidden = ("order", "trade", "buy", "sell", "execute", "cancel", "withdraw", "transfer")
+          offenders = sorted(n for n in names if any(w in n for w in forbidden))
+          assert not offenders, f"a mutating tool is registered: {offenders}"
+          print("tools:", ", ".join(sorted(names)))
+          PY
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.mcp
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: weatherquant-mcp:release-candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image declares no writable data mount
+        run: |
+          set -euo pipefail
+          volumes="$(docker inspect weatherquant-mcp:release-candidate --format '{{json .Config.Volumes}}')"
+          echo "Config.Volumes=$volumes"
+          test "$volumes" = "null" -o "$volumes" = "{}"
+          # The stack must not hand it a database, a socket or a credential.
+          ! grep -qE 'docker\.sock|\.duckdb|/portainer|Portainer' docker/compose.mcp.unraid.yaml
+
+      - name: The gateway refuses to start open on a non-loopback address
+        run: |
+          set -euo pipefail
+          # No WQ_MCP_TOKEN, bound to 0.0.0.0. `require_token` must stop it:
+          # an unauthenticated gateway on a LAN address is an audience nobody
+          # chose. A container that starts here is a container that ships open.
+          set +e
+          docker run --rm \
+            -e WQ_MCP_DASHBOARD_URL=http://127.0.0.1:9 \
+            -e WQ_MCP_PLAINTEXT_NETWORKS=127.0.0.0/8 \
+            weatherquant-mcp:release-candidate \
+            --transport streamable-http --host 0.0.0.0 --port 8788
+          code=$?
+          set -e
+          echo "exit code without a token: $code"
+          test "$code" -ne 0
+
+      - name: Runs non-root, becomes healthy, and rejects an unauthenticated caller
+        run: |
+          set -euo pipefail
+          # Every container-starting workflow here states its disk expectations,
+          # so a runner's nearly-full disk is never judged by the NAS thresholds.
+          # This image probes its own listener over a socket and reads neither
+          # value; they are declared rather than left to the default.
+          docker run -d --name mcp-rel \
+            -e WQ_MCP_DASHBOARD_URL=http://127.0.0.1:9 \
+            -e WQ_MCP_PLAINTEXT_NETWORKS=127.0.0.0/8 \
+            -e WQ_MCP_TOKEN=release-probe-token \
+            -e WQ_MCP_PORT=8788 \
+            -e WQ_DISK_WARN_PERCENT=10 \
+            -e WQ_DISK_CRITICAL_PERCENT=3 \
+            -p 127.0.0.1:18788:8788 \
+            weatherquant-mcp:release-candidate
+
+          uid=$(docker exec mcp-rel id -u)
+          echo "uid=$uid"
+          test "$uid" != "0"
+
+          for i in $(seq 1 45); do
+            if docker exec mcp-rel python -c "import socket;socket.create_connection(('127.0.0.1',8788),2).close()" 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec mcp-rel python -c "import socket;socket.create_connection(('127.0.0.1',8788),2).close()"
+
+          # Authentication is enforced *before* routing, so every path answers
+          # the same way to a caller who has not identified itself.
+          unauth="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18788/mcp)"
+          echo "unauthenticated status: $unauth"
+          test "$unauth" = "401"
+
+          wrong="$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer not-the-token' http://127.0.0.1:18788/mcp)"
+          echo "wrong-token status: $wrong"
+          test "$wrong" = "401"
+
+          # The right token gets past the guard and reaches routing, which is
+          # all this step claims: the tool surface itself is the unit tests'.
+          authed="$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer release-probe-token' http://127.0.0.1:18788/mcp)"
+          echo "authenticated status: $authed"
+          test "$authed" != "401"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker logs mcp-rel || true
+
+      - name: Stop the probe
+        if: always()
+        run: docker rm -f mcp-rel || true
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release   # gated behind a required reviewer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase the image name
+        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `type=ref,event=tag` emits a `latest` tag on its own: flavor.latest
+          # defaults to `auto`, and auto covers tag refs. That would be a fourth
+          # pointer nobody documented and nothing moves deliberately, so it is
+          # turned off - `mcp-stable` is the only mutable tag this workflow owns.
+          flavor: |
+            latest=false
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=ref,event=tag
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.mcp
+          platforms: linux/amd64
+          push: true
+          provenance: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Move the mcp-stable pointer
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME}"
+          sha="sha-${GITHUB_SHA}"
+          docker buildx imagetools create \
+            -t "${REGISTRY}/${IMAGE_NAME}:mcp-stable" \
+            "${REGISTRY}/${IMAGE_NAME}:${sha}"
+          echo "mcp-stable -> ${sha} (released as ${ref})"

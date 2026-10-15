@@ -182,7 +182,11 @@ def test_disk_overrides_reach_the_healthcheck_from_the_environment() -> None:
 # --- release tags must match the version the image will report ---------------
 
 
-RELEASE_TAG_GUARDS = ("shadow-release.yml", "dashboard-release.yml")
+RELEASE_TAG_GUARDS = (
+    "shadow-release.yml",
+    "dashboard-release.yml",
+    "mcp-release.yml",
+)
 
 
 def test_every_release_workflow_guards_its_own_tag() -> None:
@@ -216,6 +220,31 @@ def test_pyproject_version_is_a_single_declared_string() -> None:
     versions = re.findall(r'^version = "([^"]+)"$', text, flags=re.MULTILINE)
     assert len(versions) == 1, f"expected exactly one declared version, got {versions}"
     assert re.fullmatch(r"\d+\.\d+\.\d+", versions[0]), versions[0]
+
+
+def test_no_release_workflow_publishes_an_implicit_latest_tag() -> None:
+    """A tag ref through metadata-action adds `latest` unless it is turned off.
+
+    ``flavor.latest`` defaults to ``auto``, and ``auto`` covers tag refs - so
+    a workflow whose header lists three tags was publishing four, one of them
+    mutable and moved by nothing deliberate. The deployment plan already
+    forbids ``:latest`` for the stacks; this keeps the registry side of that
+    rule true rather than only the compose side.
+    """
+    checked = 0
+    for workflow in WORKFLOWS:
+        text = workflow.read_text(encoding="utf-8")
+        if "type=ref,event=tag" not in text:
+            continue
+        checked += 1
+        assert "latest=false" in text, (
+            f"{workflow.name} pushes a tag ref through metadata-action without "
+            "disabling the implicit `latest` tag it adds"
+        )
+    assert checked, (
+        "no workflow matches the rule, so this test is no longer exercising "
+        "anything - the tagging pattern probably changed"
+    )
 
 
 # --- production must run a pinned image, not a floating pointer -------------

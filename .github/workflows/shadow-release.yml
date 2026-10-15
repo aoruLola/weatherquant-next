@@ -216,6 +216,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `type=ref,event=tag` emits a `latest` tag on its own: flavor.latest
+          # defaults to `auto`, and auto covers tag refs. That is a fourth
+          # pointer the header above does not list and nothing moves on purpose,
+          # so it is turned off - `shadow-stable` is the only mutable tag here.
+          flavor: |
+            latest=false
           tags: |
             type=sha,format=long,prefix=sha-
             type=ref,event=tag
