@@ -27,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from weatherquant.performance.capital import simulate_portfolio
+from weatherquant.performance.capital import lifetime_portfolio_payload, simulate_portfolio
 from weatherquant.performance.edge import daily_edge, edge_by_bin, grouped_edge, observation_edge
 from weatherquant.performance.episodes import (
     Episode,
@@ -294,6 +294,32 @@ def _settlement_provenance(
     return out
 
 
+def _settlement_coverage(
+    records: Sequence[SettlementRecord], rate: Any
+) -> dict[str, Any]:
+    """How much of the episode set the settlement layer actually covers.
+
+    A capital figure and a win rate are both claims about the same episodes, and
+    neither is meaningful without knowing how many of them have an answer. This
+    block is the denominator, stated once and carried with the numbers.
+    """
+    freshness = settlement_freshness(records)
+    counts = getattr(rate, "counts", {}) or {}
+    decisive = int(counts.get("WIN", 0)) + int(counts.get("LOSS", 0))
+    episodes = int(getattr(rate, "valid_samples", 0)) + sum(
+        int(v) for k, v in counts.items() if k not in {"WIN", "LOSS"}
+    )
+    return {
+        "answers": freshness["answers"],
+        "verified": len([record for record in records if record.verified]),
+        "as_of_utc": freshness["as_of_utc"],
+        "answers_without_retrieval_time": freshness["answers_without_retrieval_time"],
+        "episodes": episodes,
+        "decisive_episodes": decisive,
+        "coverage_fraction": (decisive / episodes) if episodes else None,
+    }
+
+
 def settlement_freshness(records: Sequence[SettlementRecord]) -> dict[str, Any]:
     """When the settlement layer was last retrieved, and whether it can be told.
 
@@ -369,6 +395,7 @@ def build_performance(
     capital_usdc: float = 100.0,
     max_allocation_fraction: float = 0.10,
     book_for=None,
+    watermark: Sequence[str] | None = None,
     detail_max_episodes: int = DETAIL_MAX_EPISODES,
     detail_window_days: int = DETAIL_WINDOW_DAYS,
     detail_partition_size: int = DETAIL_PARTITION_SIZE,
@@ -417,7 +444,30 @@ def build_performance(
         "settled_markets": rate.distinct_markets,
         "counts": rate.counts,
         "reference_capital_usdc": capital.capital_usdc,
-        "reference_capital": capital.as_dict(),
+        # Labelled as the whole consumed history, simulated once here rather
+        # than per request. The windowed on-demand answer is a different thing
+        # and must never be read as a period of this one.
+        "reference_capital": lifetime_portfolio_payload(
+            capital,
+            watermark=watermark,
+            window=detail_window_descriptor(
+                window_episodes=len(episodes),
+                all_episodes=len(episodes),
+                max_episodes=len(episodes),
+                days=0,
+                first_seen_utc=(
+                    min((e.first_seen_utc for e in episodes), default=None).isoformat()
+                    if episodes
+                    else None
+                ),
+                last_seen_utc=(
+                    max((e.first_seen_utc for e in episodes), default=None).isoformat()
+                    if episodes
+                    else None
+                ),
+            ),
+            settlement_coverage=_settlement_coverage(settlement_records, rate),
+        ),
         "accept_observations": episode_summary["accept_observations"],
         "opportunity_episodes": episode_summary["opportunity_episodes"],
         # Scoped to opportunities, not to everything read. The old name was

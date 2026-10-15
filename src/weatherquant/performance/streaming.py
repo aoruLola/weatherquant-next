@@ -64,6 +64,7 @@ from weatherquant.performance.capital import (
     DEFAULT_MAX_ALLOCATION_FRACTION,
     PortfolioResult,
     PortfolioWalk,
+    lifetime_portfolio_payload,
 )
 from weatherquant.performance.edge import (
     ACCEPT_STATE,
@@ -94,6 +95,7 @@ from weatherquant.performance.snapshot import (
     DETAIL_WINDOW_DAYS,
     SettlementRecord,
     _envelope,
+    _settlement_coverage,
     _settlement_index,
     detail_warnings,
     detail_window_descriptor,
@@ -957,6 +959,17 @@ def build_streaming_payloads(
         book_for=book_for,
     )
 
+    build_watermark = state.last_end_cursor
+    lifetime_window = {
+        "episodes_all": episode_count,
+        "first_seen_utc_from": _iso(
+            store.fetchone("SELECT min(first_seen_utc) FROM performance_episodes")[0]
+        ),
+        "last_seen_utc_to": _iso(
+            store.fetchone("SELECT max(first_seen_utc) FROM performance_episodes")[0]
+        ),
+    }
+
     scope = ["observation_all_accepts", "opportunity_episodes", "database_lifetime"]
     summary_data = {
         "observation_edge_sum": overall_edge["sum"],
@@ -967,7 +980,12 @@ def build_streaming_payloads(
         "settled_markets": rate.distinct_markets,
         "counts": rate.counts,
         "reference_capital_usdc": capital.capital_usdc,
-        "reference_capital": capital.as_dict(),
+        "reference_capital": lifetime_portfolio_payload(
+            capital,
+            watermark=build_watermark,
+            window=lifetime_window,
+            settlement_coverage=_settlement_coverage(settlement_records, rate),
+        ),
         "accept_observations": episode_summary_dict["accept_observations"],
         "opportunity_episodes": episode_summary_dict["opportunity_episodes"],
         "accept_opportunity_distinct_markets": episode_summary_dict["distinct_markets"],
@@ -1397,7 +1415,30 @@ def build_performance_streaming(
         # caller asserting that this index is *complete*, which is the only way
         # to express a withdrawal - see PerformanceStateStore.replace_settlements.
         answers, verified = _settlement_index(settlements)
-        if answers:
+        if settlements_replace:
+            # An explicit "this index is complete" holds even when it is empty:
+            # that is how every answer is retracted, and skipping it because
+            # the mapping happens to be empty would make the one case where a
+            # retraction is total the one case that does nothing.
+            provenance = _settlement_provenance_map(settlements)
+            removed = store.replace_settlements(
+                {
+                    key: (
+                        answer.status,
+                        answer.payout,
+                        key in verified,
+                        provenance.get(key, (None, None, None))[0],
+                        provenance.get(key, (None, None, None))[1],
+                        provenance.get(key, (None, None, None))[2],
+                    )
+                    for key, answer in answers.items()
+                }
+            )
+            if progress is not None:
+                progress(
+                    f"replaced the settlement set: {len(answers)} kept, {removed} retracted"
+                )
+        elif answers:
             provenance = _settlement_provenance_map(settlements)
             payload = {
                 key: (
@@ -1410,12 +1451,7 @@ def build_performance_streaming(
                 )
                 for key, answer in answers.items()
             }
-            if settlements_replace:
-                removed = store.replace_settlements(payload)
-                if removed and progress is not None:
-                    progress(f"retracted {removed} settlement answer(s) not in this index")
-            else:
-                store.upsert_settlements(payload)
+            store.upsert_settlements(payload)
 
         build = build_streaming_payloads(
             store,

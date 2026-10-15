@@ -205,6 +205,7 @@ def _run_legacy(
     *,
     book_for=None,
     out_dir: Path | None = None,
+    watermark: list[str] | None = None,
 ) -> dict:
     """Publish the whole-history builder's six snapshots, and read them back.
 
@@ -220,6 +221,11 @@ def _run_legacy(
         dataset="fixture",
         book_for=book_for,
         now=NOW,
+        # The cursor the export had reached, so the lifetime capital block
+        # describes the same consumed range on both sides. A publish without
+        # one says `null`, which is a different (honest) claim, not a
+        # different statistic.
+        watermark=list(watermark) if watermark else None,
     )
     return _read_generation(out_dir or (tmp_path / "legacy"))
 
@@ -264,8 +270,11 @@ def test_every_published_payload_matches_the_in_memory_builder(tmp_path, dataset
     being N/A on both sides - an N/A comparison would prove nothing.
     """
     settlements = _settlements(dataset)
-    legacy = _run_legacy(tmp_path, dataset, settlements, book_for=_two_sided_book)
-    _run_streaming(tmp_path, dataset, settlements, book_for=_two_sided_book)
+    streamed_result = _run_streaming(tmp_path, dataset, settlements, book_for=_two_sided_book)
+    legacy = _run_legacy(
+        tmp_path, dataset, settlements, book_for=_two_sided_book,
+        watermark=streamed_result["watermark"],
+    )
     streamed = _read_generation(tmp_path / "performance")
 
     assert _strip(streamed) == _strip(legacy), "the streaming engine changed a published number"
@@ -297,8 +306,11 @@ def test_the_comparison_is_not_vacuous(tmp_path, dataset) -> None:
 def test_the_acceptance_items_match_one_by_one(tmp_path, dataset) -> None:
     """The brief's ten checks, asserted individually rather than in bulk."""
     settlements = _settlements(dataset)
-    legacy = _run_legacy(tmp_path, dataset, settlements, book_for=_two_sided_book)
-    _run_streaming(tmp_path, dataset, settlements, book_for=_two_sided_book)
+    streamed_result = _run_streaming(tmp_path, dataset, settlements, book_for=_two_sided_book)
+    legacy = _run_legacy(
+        tmp_path, dataset, settlements, book_for=_two_sided_book,
+        watermark=streamed_result["watermark"],
+    )
     streamed = _strip(_read_generation(tmp_path / "performance"))
 
     legacy_summary = legacy["summary.json"]["data"]
@@ -347,8 +359,8 @@ def test_the_acceptance_items_match_one_by_one(tmp_path, dataset) -> None:
 def test_no_settlement_data_is_still_na_not_zero(tmp_path) -> None:
     """Item 10 of the correctness list: N/A stays N/A."""
     rows = _dataset(seed=7, rows=200)
-    legacy = _strip(_run_legacy(tmp_path, rows, []))
-    _run_streaming(tmp_path, rows, [])
+    result = _run_streaming(tmp_path, rows, [])
+    legacy = _strip(_run_legacy(tmp_path, rows, [], watermark=result["watermark"]))
     streamed = _strip(_read_generation(tmp_path / "performance"))
 
     assert streamed == legacy
@@ -384,8 +396,8 @@ def test_a_history_with_nothing_to_score_publishes_empty_not_zero(tmp_path) -> N
                 "available_depth_usd": 500.0,
             }
         )
-    legacy = _strip(_run_legacy(tmp_path, rows, []))
-    _run_streaming(tmp_path, rows, [])
+    result = _run_streaming(tmp_path, rows, [])
+    legacy = _strip(_run_legacy(tmp_path, rows, [], watermark=result["watermark"]))
     streamed = _strip(_read_generation(tmp_path / "performance"))
 
     assert streamed == legacy
@@ -408,8 +420,8 @@ def test_a_history_with_nothing_to_score_publishes_empty_not_zero(tmp_path) -> N
 def test_a_missing_book_still_reports_not_executable(tmp_path, dataset) -> None:
     """Item 12: no retained levels means NOT_EXECUTABLE, never an invented fill."""
     settlements = _settlements(dataset)
-    legacy = _strip(_run_legacy(tmp_path, dataset, settlements))
-    _run_streaming(tmp_path, dataset, settlements)
+    result = _run_streaming(tmp_path, dataset, settlements)
+    legacy = _strip(_run_legacy(tmp_path, dataset, settlements, watermark=result["watermark"]))
     streamed = _strip(_read_generation(tmp_path / "performance"))
 
     assert streamed == legacy
@@ -425,8 +437,8 @@ def test_ten_thousand_rows_still_agree(tmp_path) -> None:
     """A larger run, to catch anything that only breaks past one fetch buffer."""
     rows = _dataset(seed=4242, rows=10_000)
     settlements = _settlements(rows)
-    legacy = _strip(_run_legacy(tmp_path, rows, settlements))
-    _run_streaming(tmp_path, rows, settlements, parts=7)
+    result = _run_streaming(tmp_path, rows, settlements, parts=7)
+    legacy = _strip(_run_legacy(tmp_path, rows, settlements, watermark=result["watermark"]))
     streamed = _strip(_read_generation(tmp_path / "performance"))
 
     assert streamed == legacy
@@ -509,8 +521,8 @@ def test_live_and_replay_never_share_an_episode(tmp_path) -> None:
                 "available_depth_usd": 500.0,
             }
         )
-    legacy = _strip(_run_legacy(tmp_path, rows, []))
-    _run_streaming(tmp_path, rows, [])
+    result = _run_streaming(tmp_path, rows, [])
+    legacy = _strip(_run_legacy(tmp_path, rows, [], watermark=result["watermark"]))
     streamed = _strip(_read_generation(tmp_path / "performance"))
     assert streamed == legacy
 

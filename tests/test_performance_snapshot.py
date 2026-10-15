@@ -137,7 +137,14 @@ def test_reference_capital_is_declared_hypothetical() -> None:
     capital = payloads["summary.json"]["data"]["reference_capital"]
 
     assert capital["capital_usdc"] == 100.0
-    assert capital["statistical_scope"] == ["reference_capital_hypothetical"]
+    # Labelled as the whole consumed history *and* as a hypothetical: the
+    # windowed on-demand answer exists now, so the two have to be told apart.
+    assert capital["scope"] == "lifetime"
+    assert capital["statistical_scope"] == [
+        "reference_capital_hypothetical",
+        "opportunity_episodes",
+        "database_lifetime",
+    ]
     assert any("not a funded account" in w for w in capital["warnings"])
 
 

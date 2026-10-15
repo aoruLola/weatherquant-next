@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import tracemalloc
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -843,3 +844,145 @@ def test_the_detail_window_is_configurable_from_the_command(tmp_path, capsys) ->
     assert payload["data"]["total_all"] > 7
     assert any("window" in warning for warning in payload["data"]["warnings"])
     assert any(scope.startswith("window:") for scope in payload["data"]["statistical_scope"])
+
+
+def test_an_empty_authoritative_index_retracts_everything(tmp_path) -> None:
+    """`--settlements-replace` with nothing in it means "none of these hold".
+
+    The case matters because it is the only one where a retraction is total,
+    and it is exactly the case a naive `if answers:` would skip - leaving every
+    answer in place while the operator believes they were withdrawn.
+    """
+    rows = _dataset(seed=231, rows=300)
+    index = _settlements(rows)
+    export = _write_parts(tmp_path, rows, 2)
+    state_db = tmp_path / "state.duckdb"
+    out = tmp_path / "performance"
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=index, now=NOW,
+    )
+    assert _read_generation(out)["settlements.json"]["data"]["answers"]
+
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=[], settlements_replace=True, now=NOW,
+    )
+    after = _read_generation(out)
+    assert after["settlements.json"]["data"]["answers"] == []
+    assert after["settlements.json"]["data"]["verified"] == []
+    outcome = after["win-rate.json"]["data"]["overall"]
+    episodes = after["summary.json"]["data"]["opportunity_episodes"]
+    assert episodes > 0
+    # No answer at all is UNAVAILABLE, not UNVERIFIABLE: nothing was resolved
+    # and then failed verification, there is simply nothing to score.
+    assert outcome["counts"]["UNAVAILABLE"] == episodes
+    assert outcome["valid_samples"] == 0
+    assert outcome["counts"]["WIN"] == 0 and outcome["counts"]["LOSS"] == 0
+    assert outcome["win_rate"] is None
+
+
+def test_an_authoritative_index_keeps_what_it_lists(tmp_path) -> None:
+    """Replacement is not deletion: what the index does list stays, revised."""
+    rows = _dataset(seed=241, rows=300)
+    index = _settlements(rows)
+    export = _write_parts(tmp_path, rows, 2)
+    state_db = tmp_path / "state.duckdb"
+    out = tmp_path / "performance"
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=index, now=NOW,
+    )
+    kept = index[: len(index) // 2]
+    flipped = [{**row, "resolved_outcome": 1.0 if not row["resolved_outcome"] else 0.0} for row in kept]
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=flipped, settlements_replace=True, now=NOW,
+    )
+    answers = _read_generation(out)["settlements.json"]["data"]["answers"]
+    assert len(answers) == len(kept)
+    assert {(row["market_id"], row["target_date"]) for row in answers} == {
+        (row["market_id"], row["target_date"]) for row in kept
+    }
+
+
+def test_a_store_from_the_previous_migration_upgrades_in_place(tmp_path) -> None:
+    """An old state store must migrate, not refuse to open.
+
+    A deployment that shipped the first version of this store has a
+    ``performance_settlements`` table with no ``verification_status``, no
+    ``resolution_source`` and a NOT NULL retrieval time. Migration 0002 adds
+    the columns and drops the NOT NULL, and the rows written before it must
+    still read - as "not recorded", which is what they are.
+    """
+    from weatherquant.performance.episodes import EpisodeKey
+    from weatherquant.performance.state import (
+        PERFORMANCE_MIGRATIONS_DIR,
+        episode_key_hash,
+        settlement_key_hash,
+    )
+    from weatherquant.storage.db import connect
+    from weatherquant.storage.migrator import available_migrations
+
+    state_db = tmp_path / "old-state.duckdb"
+    legacy = next(
+        spec for spec in available_migrations(PERFORMANCE_MIGRATIONS_DIR) if spec.version == "0001"
+    )
+    con = connect(state_db)
+    con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR PRIMARY KEY, "
+                "name VARCHAR NOT NULL, checksum VARCHAR NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+    con.execute(legacy.sql)
+    con.execute(
+        "INSERT INTO schema_migrations (version, name, checksum) VALUES (?, ?, ?)",
+        [legacy.version, legacy.name, legacy.checksum],
+    )
+    # A row the old schema could hold: a retrieval time (it was NOT NULL) and
+    # no provenance columns at all.
+    con.execute(
+        "INSERT INTO performance_settlements (key_hash, market_id, target_date, status, "
+        "payout, verified, fetched_at_utc, updated_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            settlement_key_hash("m-0", "2026-10-13"),
+            "m-0",
+            "2026-10-13",
+            "RESOLVED",
+            1.0,
+            True,
+            datetime(2026, 10, 12, tzinfo=UTC),
+            datetime(2026, 10, 12, tzinfo=UTC),
+        ],
+    )
+    con.execute(
+        "INSERT INTO performance_episodes (episode_id, key_hash, market_id, target_date, "
+        "model_name, direction, mode, first_seen_utc, last_seen_utc, observation_count, "
+        "edge_count, sum_edges, first_edge, last_edge, max_edge, min_edge, is_open, "
+        "opened_seq, ingested_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            "ep-old", episode_key_hash(EpisodeKey("m-0", "2026-10-13", "calibrated", "buy_yes", "LIVE")),
+            "m-0", "2026-10-13", "calibrated", "buy_yes", "LIVE",
+            datetime(2026, 10, 12, tzinfo=UTC), datetime(2026, 10, 12, 0, 5, tzinfo=UTC),
+            1, 1, 0.05, 0.05, 0.05, 0.05, 0.05, False, 0,
+            datetime(2026, 10, 12, tzinfo=UTC),
+        ],
+    )
+    con.close()
+
+    # Opening it with the current code applies 0002 and reads the old rows.
+    with PerformanceStateStore(state_db) as store:
+        applied = store.open()
+        rows = store.load_settlements()
+        assert rows == [
+            {
+                "market_id": "m-0",
+                "target_date": "2026-10-13",
+                "status": "RESOLVED",
+                "payout": 1.0,
+                "verified": True,
+                # Not recorded, and it says so rather than inventing a verdict.
+                "verification_status": None,
+                "resolution_source": None,
+                "fetched_at_utc": "2026-10-12T00:00:00+00:00",
+            }
+        ]
+        assert store.summary()["counts"]["episodes"] == 1
+    del applied

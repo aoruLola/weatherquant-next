@@ -293,6 +293,9 @@ def build_performance_snapshots(
         max_allocation_fraction=max_allocation_fraction,
         gap_window_seconds=gap_window_seconds,
         book_for=book_for,
+        # The same cursor the manifest carries, so the lifetime capital block
+        # can say which data it was simulated over.
+        watermark=list(watermark) if watermark else None,
     )
     # Every file built first; only then does anything touch the directory.
     missing = [name for name in SNAPSHOT_FILES if name not in payloads]
