@@ -10,7 +10,9 @@ inflates every statistic downstream without ever looking wrong.
 
 from __future__ import annotations
 
+import itertools
 import json
+import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -299,3 +301,212 @@ def test_an_invalid_batch_size_is_refused_rather_than_ignored(tmp_path, db):
         DecisionExporter(db.con, tmp_path / "e", batch_rows=0)
     with pytest.raises(ValueError, match="max_seconds"):
         DecisionExporter(db.con, tmp_path / "e", max_seconds=0)
+
+
+# --- the stall: setup must not be able to starve a tick ----------------------
+
+
+def test_loading_state_does_not_count_every_part(db, tmp_path, monkeypatch) -> None:
+    """The production stall, pinned.
+
+    Counting the parts means reading every one of them, and `_load()` runs
+    inside the tick's wall-clock budget. So the count grew with the export
+    until it outran the budget, and from then on every tick broke out before
+    writing a row. On the NAS that stopped the export at 700,000 rows for
+    hours: no error, no watermark move, no quality event.
+
+    The watermark still comes from the parts - that is the fact a crash has to
+    preserve - but the row count is not recounted on this path.
+    """
+    from weatherquant.shadow import export as export_module
+
+    ex = _exporter(db, tmp_path, batch_rows=5, max_parts_per_run=3)
+    for i in range(12):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i))
+    ex.run_batch()
+    assert list((tmp_path / "export" / "parts").glob("part-*.jsonl"))
+
+    def _boom(_paths):
+        raise AssertionError("_load() read every part to count rows")
+
+    monkeypatch.setattr(export_module, "_count_rows", _boom)
+
+    state = ex._load()
+
+    # The cheap reconciliation still happens: the parts remain the authority.
+    assert state["next_part"] == 4
+    assert state["watermark"] is not None
+
+
+def test_a_part_published_before_a_crash_is_counted_on_recovery(db, tmp_path) -> None:
+    """A crash between publishing a part and saving state must not lose the count.
+
+    The watermark is recovered from the part, and the row count has to be too.
+    Otherwise `verify()` reports an otherwise valid export as inconsistent -
+    and a check that cries wolf is a check nobody reads when it is right.
+    """
+    ex = _exporter(db, tmp_path, batch_rows=5)
+    for i in range(12):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i))
+    ex.run_batch()
+
+    # The state as it stood before the last part was accounted for.
+    state = json.loads(ex.state_path.read_text(encoding="utf-8"))
+    assert state["rows_exported"] == 12 and state["next_part"] == 4
+    state["rows_exported"] = 10  # parts 1 and 2 only
+    state["next_part"] = 3
+    ex.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    recovered = ex._load()
+
+    assert recovered["rows_exported"] == 12, "the unaccounted part was not counted"
+    assert recovered["next_part"] == 4
+    assert ex.verify()["consistent"] is True
+
+
+def test_a_lost_state_file_rebuilds_the_count_exactly(db, tmp_path) -> None:
+    """State is a cache. Losing it must cost a recount, not the count."""
+    ex = _exporter(db, tmp_path, batch_rows=5)
+    for i in range(12):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i))
+    ex.run_batch()
+
+    ex.state_path.unlink()
+    recovered = ex._load()
+
+    assert recovered["rows_exported"] == 12
+    assert recovered["next_part"] == 4
+    assert recovered["watermark"] is not None
+    assert ex.verify()["consistent"] is True
+
+
+def test_recovery_is_written_back_so_it_is_paid_for_once(
+    db, tmp_path, monkeypatch
+) -> None:
+    """A caught-up run never calls `_save()` - saving follows writing a part.
+
+    A reconciliation left in memory alone would therefore be redone on every
+    tick, rereading the whole export each time, forever. The recovered state
+    has to become durable on the path that recovered it.
+    """
+    from weatherquant.shadow import export as export_module
+
+    ex = _exporter(db, tmp_path, batch_rows=5)
+    for i in range(12):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i))
+    ex.run_batch()
+
+    ex.state_path.unlink()
+    ex._load()
+    assert ex.state_path.exists(), "the recovered state was not written back"
+
+    def _boom(_paths):
+        raise AssertionError("recovery was repeated instead of being persisted")
+
+    monkeypatch.setattr(export_module, "_count_rows", _boom)
+
+    state = ex._load()
+
+    assert state["rows_exported"] == 12
+
+
+def test_a_tick_still_writes_when_setup_has_eaten_the_budget(
+    db, tmp_path, monkeypatch
+) -> None:
+    """A budget that can be spent before any work is a budget that stops work.
+
+    The clock is driven explicitly rather than with a tiny `max_seconds`: on
+    Windows `time.monotonic()` is coarse enough that two calls can return the
+    same value, so a nanosecond budget reads as zero elapsed and the test would
+    pass against the very code it is meant to catch.
+    """
+    from weatherquant.shadow import export as export_module
+
+    clock = itertools.count(0.0, 1.0)  # every reading advances a full second
+    monkeypatch.setattr(export_module.time, "monotonic", lambda: next(clock))
+
+    ex = _exporter(db, tmp_path, max_seconds=0.5)
+    for i in range(10):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i))
+
+    result = ex.run_batch()
+
+    assert result.rows_exported == 10, "the budget starved a tick that had work"
+    assert result.parts_written == 1
+    # And the budget still stops it from running on: one part, then yield.
+    assert any("budget" in note for note in result.notes)
+
+
+def test_many_ticks_export_every_row_exactly_once(db, tmp_path) -> None:
+    """Catching up on a large table is many ticks, and none may repeat.
+
+    A re-exported decision is a duplicated "independent" opportunity
+    downstream, which inflates every statistic without ever looking wrong.
+    """
+    ex = _exporter(db, tmp_path, batch_rows=7, max_parts_per_run=2)
+
+    watermarks: list[tuple[str, str]] = []
+    next_i = 0
+    for _tick in range(12):
+        for _ in range(11):
+            _insert(db, i=next_i, when=NOW + timedelta(seconds=next_i))
+            next_i += 1
+        result = ex.run_batch()
+        if result.watermark is not None:
+            watermarks.append(result.watermark)
+
+    seen = _ids(tmp_path / "export")
+    assert len(seen) == next_i, "a tick dropped rows"
+    assert len(set(seen)) == len(seen), "a decision was exported twice"
+    assert sorted(seen) == sorted(f"id-{i:04d}" for i in range(next_i))
+    assert watermarks == sorted(watermarks), "the cursor went backwards"
+    assert ex.verify()["consistent"] is True
+
+
+def test_a_tick_that_writes_nothing_is_reported_not_silent(monkeypatch) -> None:
+    """A stalled export must not read as a caught-up one.
+
+    This is the observability half of the same defect: for eight hours the
+    engine reported itself healthy while the export had stopped, because a
+    no-progress tick produced no exception, no log line and no quality event.
+    """
+    from weatherquant.shadow import runner as runner_module
+    from weatherquant.shadow.export import ExportResult
+    from weatherquant.shadow.runner import ShadowRunner
+
+    def _run(notes: list[str], caught_up: bool) -> list:
+        recorded: list = []
+
+        class _Exporter:
+            def __init__(self, *_a, **_k): ...
+
+            def run_batch(self) -> ExportResult:
+                result = ExportResult()
+                result.caught_up = caught_up
+                result.notes.extend(notes)
+                return result
+
+        monkeypatch.setattr(runner_module, "DecisionExporter", _Exporter)
+        runner = object.__new__(ShadowRunner)
+        runner.store = types.SimpleNamespace(
+            record_quality=lambda events, run_id=None: recorded.extend(events)
+        )
+        runner.clock = lambda: NOW
+        runner._next_export = NOW - timedelta(seconds=1)
+        runner.run_id = "run-1"
+        runner.db = types.SimpleNamespace(con=None)
+        runner.shadow = types.SimpleNamespace(
+            shadow_report_path=Path("/tmp/wq/report.json"),
+            shadow_export_seconds=300.0,
+            shadow_export_rows=10,
+            shadow_export_max_seconds=5.0,
+            shadow_export_max_parts=5,
+        )
+        runner._export_decisions()
+        return [event.kind for event in recorded]
+
+    stalled = _run(["stopped after 0 part(s) by the 5s budget"], caught_up=False)
+    assert stalled == ["decision_export_no_progress"], stalled
+
+    # The positive control: being caught up is normal and must stay quiet.
+    assert _run([], caught_up=True) == []

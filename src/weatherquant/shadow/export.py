@@ -178,6 +178,11 @@ class DecisionExporter:
         range and duplicate every row in it. The last line of the newest
         part carries the cursor it ended on, so the watermark is recovered
         from the durable artifact rather than from the assumption.
+
+        Recovery is written back. It is paid for once rather than on every
+        tick: a caught-up run never reaches `_save()` - saving happens after
+        writing a part - so a reconciliation left in memory alone would be
+        redone forever, rereading the whole export each time.
         """
         state: dict[str, Any] = {
             "next_part": 1,
@@ -185,11 +190,13 @@ class DecisionExporter:
             "watermark": None,
             "last_run_at_utc": None,
         }
+        on_disk: dict[str, Any] | None = None
         if self.state_path.exists():
             # A corrupt state file must not stop the engine; the parts are
             # still the authority and the watermark is re-derived below.
             with contextlib.suppress(OSError, ValueError):
-                state.update(json.loads(self.state_path.read_text(encoding="utf-8")))
+                on_disk = json.loads(self.state_path.read_text(encoding="utf-8"))
+                state.update(on_disk)
 
         self.directory.mkdir(parents=True, exist_ok=True)
         self.parts_dir.mkdir(parents=True, exist_ok=True)
@@ -202,12 +209,38 @@ class DecisionExporter:
                 stored = tuple(state["watermark"]) if state.get("watermark") else None
                 if stored is None or _ahead(end, stored):
                     state["watermark"] = list(end)
-                state["next_part"] = max(
-                    int(state.get("next_part") or 1), _index_of(last) + 1
+                # Everything below `accounted` is already inside rows_exported.
+                #
+                # A state that names parts but counts no rows is not one this
+                # can trust - the two are written together - so it is treated as
+                # absent and the count is rebuilt.
+                accounted = (
+                    int(state.get("next_part") or 1) if state.get("rows_exported") else 1
                 )
-                state["rows_exported"] = max(
-                    int(state.get("rows_exported") or 0), _count_rows(existing)
-                )
+                state["next_part"] = max(accounted, _index_of(last) + 1)
+                # Only the parts the state does not already cover are counted.
+                #
+                # Counting them all means reading every part, and this call
+                # happens inside the tick's wall-clock budget - so the count grew
+                # with the export until it outran the budget, and every tick broke
+                # out before writing anything. The export stalled at 700,000 rows
+                # with no error, no watermark move and no quality event, because
+                # a tick that writes nothing is indistinguishable from a tick
+                # that is caught up.
+                #
+                # The unaccounted tail is normally empty, and after a crash
+                # between publishing a part and saving state it is that one part,
+                # so recovery stays exact without a full recount. A state lost
+                # entirely counts everything - once: the next write records the
+                # total again, and that tick still exports, because the budget is
+                # not consulted until a part has been written.
+                tail = [path for path in existing if _index_of(path) >= accounted]
+                if tail:
+                    state["rows_exported"] = int(
+                        state.get("rows_exported") or 0
+                    ) + _count_rows(tail)
+        if on_disk != state:
+            self._save(state)
         return state
 
     def _save(self, state: dict[str, Any]) -> None:
@@ -241,7 +274,12 @@ class DecisionExporter:
                         f"stopped after {parts_written} part(s) by max_parts_per_run"
                     )
                     break
-                if time.monotonic() - started >= self.max_seconds:
+                # The budget bounds the *writing*, so it is only consulted once
+                # a part has been written. Checking it first means any slow
+                # setup - reading state, recovering the watermark - can consume
+                # the whole budget and starve the tick, which is what made a
+                # five-second budget stop a five-minute job from ever starting.
+                if parts_written and time.monotonic() - started >= self.max_seconds:
                     result.notes.append(
                         f"stopped after {parts_written} part(s) by the "
                         f"{self.max_seconds:g}s budget"
