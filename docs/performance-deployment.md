@@ -146,6 +146,9 @@ weatherquant-research build-performance \
 | `--verify-parts` | 重新哈希**全部**已消费分片（默认只验边界分片） |
 | `--max-parts-per-run` | 单次最多消费的分片数（首次回填可分批） |
 | `--in-memory` | 强制使用全内存构建器（会打印警告，见 §10.2） |
+| `--detail-window-episodes` | 可浏览明细的条数上限，默认 20000（契约 §14.1） |
+| `--detail-window-days` | 可浏览明细的时间窗，默认 90 天 |
+| `--settlements-replace` | 把 `--settlements` 当作**完整**结算集：其中没有的答案会被撤销 |
 
 输出是**一个世代**：`performance/generations/<id>/` 内放六份快照与 `manifest.json`，
 最后以一次 rename 切换 `performance/current.json` 指针（契约 §7.1）。
@@ -473,11 +476,66 @@ WQ_MCP_PLAINTEXT_NETWORKS=172.16.0.0/12,192.168.0.0/16,10.0.0.0/8
 uv run python scripts/bench_performance_streaming.py --all --work-dir /path/to/scratch
 uv run python scripts/bench_performance_streaming.py --rows 5000000 --no-generate \
   --reset --memory-limit 256MB
+uv run python scripts/bench_performance_api.py --generation /path/to/performance
 ```
 
 产物：`report-<rows>.json`（每个规模的墙钟、峰值 RSS、落盘体积、状态库计数、
 六份 payload 的关键统计），可直接作为验收证据附在 PR 上。
 
 > 脚本会写入 `--work-dir` 下的合成分片（5M 行约 2 GB），**不要指向生产目录**。
+
+---
+
+## 12. 明细体积与 Dashboard 读取（v0.1.5 分页）
+
+§11 解决的是**研究进程**的内存。快照本身仍然随历史增长，而 Dashboard 会整文件读取它：
+实测 500 万行时 `summary.json` 131 MB、`opportunities.json` 163 MB、`edge.json` 23 MB，
+于是 `/summary` 返回 131 MB、`/opportunities` **解析 163 MB 只为返回 50 行**。
+
+修复见契约 §14：明细变成**窗口**（默认 20,000 条 / 90 天）并按**分片**发布，
+Edge 分带改为分布，参考本金只发汇总与有界样本。
+
+### 12.1 落盘体积（1,500,000 行，实测）
+
+| 文件 | 修复前 | 修复后 |
+|---|---|---|
+| `summary.json` | 39.6 MB | **31 KB** |
+| `opportunities.json` + `opportunities/` | 49.1 MB | **5.6 KB + 13 MB** |
+| `edge.json` | 6.8 MB | **18 KB** |
+| `win-rate.json` / `models.json` / `settlements.json` | 0.2 MB | 0.2 MB |
+| **世代合计** | **95.8 MB** | **13.8 MB** |
+
+统计结果**逐位不变**（同一次运行：73,188 episode、673,582 ACCEPT 观测、
+胜率 0.6720234347195225），构建墙钟 78 s → 75 s，峰值 RSS 299 MB → 306 MB。
+
+### 12.2 Dashboard 端点（1,500,000 行，本机，12 次采样）
+
+| 端点 | 响应体 | 中位 | p95 | 单次请求峰值分配 |
+|---|---|---|---|---|
+| `/summary` | 29.7 KB | 1.5 ms | 2.0 ms | 0.11 MB |
+| `/edge` | 17.4 KB | 1.2 ms | 1.3 ms | 0.08 MB |
+| `/win-rate` | 33.0 KB | 2.0 ms | 2.1 ms | 0.11 MB |
+| `/opportunities`（第 1 页，50 条） | 33.1 KB | 10.7 ms | 14.0 ms | 2.48 MB |
+| `/opportunities`（第 2 页） | 33.3 KB | 10.8 ms | 11.0 ms | 2.48 MB |
+| `/opportunities`（带筛选） | 33.3 KB | 166 ms | 168 ms | 4.35 MB |
+| `/opportunities`（limit=200） | 126 KB | 12.3 ms | 12.7 ms | 2.48 MB |
+| `/settlements` | 10.5 KB | 5.2 ms | 5.7 ms | 0.56 MB |
+| `/models` | 4.2 KB | 2.6 ms | 2.7 ms | 0.04 MB |
+| `/reference-capital`（按需本金） | 27.3 KB | 484 ms | 515 ms | 49 MB |
+
+三点说明：
+
+1. **无筛选分页只打开需要的分片**：请求第 2400 条时只读 `part-00002.json`
+   （有测试断言这一点）。带筛选的请求必须扫描窗口——不可变文件没有索引，
+   而"扫窗口"正是窗口存在的意义；代价是 166 ms，与历史长度无关。
+2. **`/reference-capital` 是最慢的一条**：它要重建明细窗口（默认 20,000 条）才能按新本金
+   重跑资金模拟，峰值 49 MB 由窗口而非历史决定。UI 已把它从 60 s 轮询改为 300 s
+   （改动本金/模式会立即重新请求）。要更小就调小 `--detail-window-episodes`。
+3. **任何端点的响应体都不随历史增长**：页面是页面。
+
+### 12.3 内存与宿主
+
+Dashboard 容器因此不需要为"解析快照"留出与历史成比例的内存：最坏一条
+（`/reference-capital`）由窗口决定，其余都在几 MB 以内。
 
 

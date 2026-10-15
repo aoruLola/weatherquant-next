@@ -471,6 +471,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--memory-limit", default="1GB", help="DuckDB memory limit for the state store")
+    p.add_argument(
+        "--detail-window-episodes",
+        type=int,
+        default=20000,
+        help=(
+            "how many episodes the dashboard can page through, most recent first "
+            "(default 20000). The aggregates always cover the whole history; this "
+            "bounds the browsable detail, and with it every page request"
+        ),
+    )
+    p.add_argument(
+        "--detail-window-days",
+        type=int,
+        default=90,
+        help="how far back the browsable detail reaches, in days (default 90)",
+    )
     p.add_argument("--temp-dir", help="where the state store spills when it exceeds the limit")
     p.add_argument(
         "--verify-parts",
@@ -687,6 +703,8 @@ def _build_performance_streaming(
             capital_usdc=float(args.capital_usdc),
             max_allocation_fraction=float(args.max_allocation_fraction),
             gap_window_seconds=float(args.gap_window_seconds),
+            detail_max_episodes=args.detail_window_episodes,
+            detail_window_days=args.detail_window_days,
             memory_limit=args.memory_limit,
             temp_directory=args.temp_dir,
             reset=args.reset,

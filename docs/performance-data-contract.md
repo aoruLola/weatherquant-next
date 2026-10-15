@@ -29,6 +29,7 @@
 
 3. **一切统计都带 `statistical_scope`**，见 §9。
 4. **快照只放窗口，不放全表**：默认 ≤500 行 / ≤90 天；禁止把 GB 级数据搬进快照。
+   v0.1.5 起由 §14 落实：明细是窗口（默认 20000 条 / 90 天）且按分片发布，汇总覆盖全历史。
 5. **禁止** Dashboard / MCP 直接打开任何 `.duckdb`。
 6. **禁止** 任何模块自行重算另一模块已定义的指标——单一实现。
 
@@ -379,10 +380,10 @@ Win Rate = WIN / (WIN + LOSS)
 | `GET /api/v1/performance/summary` | `performance/summary.json` |
 | `GET /api/v1/performance/edge` | `performance/edge.json` |
 | `GET /api/v1/performance/win-rate` | `performance/win-rate.json` |
-| `GET /api/v1/performance/opportunities` | `performance/opportunities.json`（分页） |
+| `GET /api/v1/performance/opportunities` | `performance/opportunities.json` 描述符 + `opportunities/part-*.json`（服务端分页 + 筛选，§14.4） |
 | `GET /api/v1/performance/settlements` | `performance/settlements.json`（分页） |
 | `GET /api/v1/performance/models` | `performance/models.json` |
-| `GET /api/v1/performance/reference-capital` | **纯函数** `capital.simulate(...)`，参数：`capital_usdc`(默认100,>0)、`mode`、`start_date`、`end_date`、`model`、`direction`、`max_allocation_fraction` |
+| `GET /api/v1/performance/reference-capital` | **纯函数** `capital.simulate(...)`，参数：`capital_usdc`(默认100,>0)、`mode`、`max_allocation_fraction`。返回汇总 + 有界样本，总体为明细窗口（§14.6） |
 
 **快照缺失时**：`freshness.state = "missing"` + 原因，**禁止返回伪造数据**。
 
@@ -643,4 +644,129 @@ data/research/performance-state.duckdb        # 可用 WQ_PERFORMANCE_STATE_DB_P
 **形状不变**，因此落盘体积仍随历史线性增长；改变的是**研究容器的峰值内存**
 （流式写出，不再全量驻留）。契约 §0.4 的"≤500 行"窗口仍未实现，
 属既有偏差，见审计文档 §9 风险 3。
+
+---
+
+## 14. 有界明细与分页（v0.1.5 新增）
+
+§13 解决了**研究进程**的内存，但没有解决**快照体积**：它仍随历史线性增长，
+Dashboard 读一个快照就要把整段历史读进内存。实测（500 万行）：
+
+| 文件 | 修复前 | 全部体积来自 |
+|---|---|---|
+| `summary.json` | 131.3 MB | `reference_capital.results[]` |
+| `opportunities.json` | 162.9 MB | `episodes[]` |
+| `edge.json` | 22.6 MB | `by_edge_band.*[]` |
+
+`/api/v1/performance/summary` 因此返回 131 MB，`/opportunities` 解析 163 MB 只为返回 50 行。
+本节是修复后的契约。
+
+### 14.1 明细是一个**窗口**，并且明说
+
+**§0.4 现在被真正实现**：可浏览的明细只覆盖最近一段历史。
+
+```json
+"window": {
+  "episodes": 20000,          // 窗口内条数（= 可分页的 total）
+  "episodes_all": 242570,     // 全部 episode 数
+  "max_episodes": 20000,      // 发布时的上限
+  "days": 90,                 // 发布时的时间窗
+  "first_seen_utc_from": "…", "last_seen_utc_to": "…",
+  "complete": false           // false = 明细是窗口，汇总才是全历史
+}
+```
+
+- 窗口由发布参数决定：`--detail-window-episodes`（默认 20000）、`--detail-window-days`（默认 90）。
+- 选择规则（两个引擎共用）：`first_seen_utc >= now - days`，按
+  `(first_seen_utc, episode_id)` **降序**取前 N 条。
+- **汇总类指标（总数、Edge 分布、胜率、置信区间、参考本金汇总）始终覆盖全部历史。**
+- 窗口不完整时：`data.warnings` 有一条说明，`statistical_scope` 增加 `window:<n>d`。
+
+### 14.2 明细按**分片**发布
+
+```
+generations/<id>/
+    opportunities.json           # 描述符：窗口 + 分片清单 + 每片首末排序键
+    opportunities/part-00000.json  # ≤1000 条，按 (first_seen_utc, episode_id) 降序
+    opportunities/part-00001.json
+```
+
+`opportunities.json` 的 `data.episodes` **不再是数组**，而是描述符：
+
+```json
+{"collection":"episodes","partitioned":true,"directory":"opportunities",
+ "partition_size":1000,"total":20000,
+ "partitions":[{"file":"part-00000.json","items":1000,"bytes":712345,
+                "first_key":["2026-10-15T…","<episode_id>"],
+                "last_key":["2026-10-14T…","<episode_id>"]}]}
+```
+
+分片写在**世代目录内、指针切换之前**，所以批量发布仍是原子的。
+
+### 14.3 其余体积修复
+
+| 字段 | 变更 | 理由 |
+|---|---|---|
+| `edge.data.by_edge_band.<band>` | **数组 → 分布**（`count/sum/mean/median/min/max/std/p05…p95`，与其它分组同形） | 只被用来计数；原本是 `edge.json` 的全部体积 |
+| `summary.data.reference_capital.results` | **移除**，改为 `results_sample`（≤50 条）+ `not_executable_reason_counts` + `results_total` + `results_sampled` | 计数才是读者要的答案；逐条结果随历史线性增长 |
+| `reference-capital` 响应的 `per_opportunity_expected_edge` | 改名 `per_opportunity_expected_edge_sample`（≤50）+ `_sampled`/`_sample_size` | 每个可执行机会一条，同样随历史增长 |
+| `summary.data.settlement_freshness` / `settlements.data.freshness` | **新增** | 粘性结算层必须能区分"沿用"与"刚验证"（§13.8） |
+
+### 14.4 `GET /api/v1/performance/opportunities`
+
+| 参数 | 取值 | 默认 |
+|---|---|---|
+| `limit` | 1..200 | 50 |
+| `cursor` | 不透明游标（见下） | 首页 |
+| `model` | 模型名 | 全部 |
+| `direction` | `buy_yes` / `sell_yes` | 全部 |
+| `mode` | `LIVE` / `REPLAY` | 全部 |
+| `target_date` | `YYYY-MM-DD` | 全部 |
+| `outcome` | `WIN`/`LOSS`/`PENDING`/`DISPUTED`/`UNVERIFIABLE`/`UNAVAILABLE` | 全部 |
+| `min_edge` / `max_edge` | 浮点，作用在 `first_edge` 上 | 不限 |
+
+**排序**：`(first_seen_utc, episode_id)` 降序——**全序**，因此分页无遗漏、无重复。
+
+**游标**：`base64url("<generation_id>|<offset>")`。
+
+- 游标**属于某一批次**：批次变化后使用旧游标返回 **409**，不得静默改写为新区间的偏移。
+- 传纯整数（旧式 offset）仍然接受，视为当前批次，标注为兼容用法。
+- 非法游标返回 **422**。
+- `limit` 超过 200 一律 **422**，不能通过放大 `limit` 绕过。
+
+**响应**（信封内，除 `items`/`total`/`next_cursor`/`prev_cursor` 外）：
+
+```json
+"data": {"collection":"episodes","returned":50,"total":20000,"offset":0,"limit":50,
+         "cursor":null,"filters":{"model":"calibrated"},
+         "window":{…},"total_all":242570,
+         "statistical_scope":[…],"warnings":[…]}
+```
+
+`total` = **窗口内**符合筛选的条数（精确）；`total_all` = 全部 episode 数。
+无筛选时按分片清单的累计条数直接定位页所在分片（**只打开需要的分片**）；
+有筛选时扫描窗口内分片（**有界**，因为窗口有界）。
+
+### 14.5 `GET /api/v1/performance/settlements`
+
+分页保持 offset 游标（该文件天然有界：一个市场一个目标日一行，不是一条决策一行），
+新增 `status` 与 `market_id` 筛选。
+
+### 14.6 `GET /api/v1/performance/reference-capital`
+
+- 仍复用 `weatherquant.performance.capital`（**同一实现**），仍支持 `capital_usdc` / `mode` /
+  `max_allocation_fraction`。
+- 返回**汇总统计 + 有界样本**，不再复制逐条结果。
+- 计算总体是**已发布的明细窗口**（不是全历史），响应里带 `window`，窗口不完整时追加一条
+  warning 指明"已发布的 100 USDC 汇总是全历史的"。
+
+### 14.7 MCP
+
+MCP 仍**只调 Dashboard API**，不新增任何统计逻辑：
+
+- `get_opportunities` 增加同样的筛选参数，`limit` 上限 200；
+- 只发送调用方实际给出的筛选（不把"未筛选"变成空串筛选）；
+- 响应仍带 `generation_id` / `dataset` / `as_of_utc` / `freshness` / `statistical_scope` /
+  `sample_size` / `warnings`；批次变化时游标返回 409，**不得拼接两批数据**。
+
 
