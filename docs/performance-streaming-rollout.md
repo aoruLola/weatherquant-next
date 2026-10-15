@@ -131,18 +131,104 @@ flock -n /var/lock/weatherquant-performance.lock \
 
 ## 8. 失败恢复与回滚
 
+### 8.1 数据层恢复（不需要回滚镜像）
+
 | 情况 | 处置 |
 |---|---|
 | 研究进程崩溃/断电 | 直接重跑。同事务提交行与水位，未提交的分片会重读且**不重复计数** |
-| 分片缺失/被改写/乱序 | 拒绝并报错，水位不动 → 人工确认导出，必要时 `--reset` 重建 |
+| 分片缺失/被改写/乱序 | 拒绝并报错，水位不动 → 人工确认导出，必要时 `--reset` 重建状态库 |
 | 换导出目录或升级算法 | 会因 `input_source` / `algorithm_version` 不符而拒绝 → 确认后 `--reset` |
-| 快照可疑 | 删除 `weatherquant-performance/` 目录 → Dashboard 显示 `missing`（不显示错误数据） |
-| Dashboard 回滚 | 改回上一个 `sha-<commit>` → Apply。旧版 Dashboard 忽略分片目录，**不会报错** |
-| 状态库损坏 | 删除状态库目录后重跑（全部内容都是派生物） |
-| MCP 回滚 | 改回上一个 `sha` → Apply（无状态、无数据） |
+| 状态库损坏 | **删除状态库目录**后重跑（它全部是派生物，删除它不丢任何原始数据） |
+| 本次发布可疑 | 用 §8.2 的指针回退；**不删除世代目录** |
 
-**回滚判据**：`/api/v1/performance/*` 持续 5xx 或非 fresh 且无法解释；MCP 数值与
-Dashboard API 不一致；出现任何下单/钱包/私钥路径（立即回滚并保留日志）。
+### 8.2 快照回退：移动指针（**不是删除**）
+
+新研究构建任务 → 禁用：
+
+```bash
+# 1) 停掉调度（cron / Unraid User Scripts 里禁用那一条），确认没有研究进程在跑
+flock -n /var/lock/weatherquant-performance.lock true && echo "no run in flight"
+```
+
+**保留**状态库与故障日志（不要删——调查需要它，而且下一次回退可能还要用它）：
+
+```bash
+cp -a /mnt/user/appdata/weatherquant-performance-state/ \
+      /mnt/user/appdata/weatherquant-performance-state.faulty-$(date +%Y%m%dT%H%M%SZ)/
+```
+
+查看可选世代与它们的**格式族**，然后**先 dry run** 再移动指针：
+
+```bash
+uv run python scripts/pin_performance_generation.py \
+  --performance /mnt/user/appdata/weatherquant-performance --list
+
+uv run python scripts/pin_performance_generation.py \
+  --performance /mnt/user/appdata/weatherquant-performance \
+  --generation <上一个已验证的世代 id>            # 默认 dry run
+
+uv run python scripts/pin_performance_generation.py \
+  --performance /mnt/user/appdata/weatherquant-performance \
+  --generation <上一个已验证的世代 id> --apply
+```
+
+工具会拒绝：世代不完整（缺任一快照文件）、格式无法识别（没有 Dashboard 能与之匹配）。
+它**只**原子改写 `current.json`；`generations/`、状态库、导出目录一个字节都不动。
+
+### 8.3 ⚠️ 镜像与快照必须成对回退
+
+v0.1.5 改变了 JSON 契约：`opportunities.episodes` 由**内联数组**变为**分片描述符**，
+`summary.reference_capital.results` 被 `results_sample` 取代。因此：
+
+| 方向 | 是否可读 | 证据 |
+|---|---|---|
+| **新** Dashboard + **旧** 快照 | ✅ 可读 | `dashboard/tests/test_performance_rollback.py::test_the_new_reader_still_reads_a_legacy_snapshot` —— 因此**首次上线是安全的**（新 Dashboard 先上线，读旧世代） |
+| **旧** Dashboard + **新** 快照 | ❌ **不可读** | 同文件 `test_a_new_snapshot_breaks_the_old_reader`：旧读取逻辑对描述符执行 `list()` 得到键、再当行取字段 —— 这正是旧 `performance.py` 的原表达式 |
+
+**所以回退顺序是：**
+
+1. 停掉研究构建任务（§8.2 第一步）。
+2. **先**把 Dashboard 切回与目标世代格式匹配的镜像（`DASHBOARD_SHA=<上一个 sha>` → Apply）。
+3. **再**按 §8.2 移动指针到该镜像能读的世代。
+4. 验证（§8.4）。
+5. 不删除 Shadow / Collector / 历史导出 / 任何世代目录。
+6. 把问题世代**隔离保留**（留在 `generations/` 里即可——指针不指向它，读者就不会读它）。
+
+反向（先移动指针、后回退镜像）会在两者都完成之前留出一个旧 Dashboard 读新快照的窗口，
+那段时间 `/api/v1/performance/opportunities` 与 `/reference-capital` 会 500。
+
+### 8.4 回退后的验证
+
+```bash
+curl -sf localhost:8787/healthz | jq '.sources'                       # 三源 fresh
+curl -sf localhost:8787/api/v1/performance/summary | jq '.data.generation_id, .data.data.opportunity_episodes'
+curl -sf "localhost:8787/api/v1/performance/opportunities?limit=1" | jq '.data.data.window, .items|length'
+curl -sf "localhost:8787/api/v1/performance/reference-capital" | jq '.data.scope, .data.window_completeness'
+```
+
+判据：`generation_id` == 指针指向的世代；`items` 非空；`freshness.state != "missing"`；
+`reference-capital` 的 `scope == "window"` 且带 `window_start`/`window_end`。
+
+**回滚判据（何时执行 §8.2）**：`/api/v1/performance/*` 持续 5xx 或非 fresh 且无法解释；
+MCP 数值与 Dashboard API 不一致；出现任何下单/钱包/私钥路径（立即回滚并保留日志）。
+
+### 8.5 回滚演练结果（隔离环境）
+
+在隔离目录用两个已发布世代实测（`dashboard/tests/test_performance_rollback.py`）：
+
+| 步骤 | 结果 |
+|---|---|
+| 发布两代（5 个 / 40 个 episode，market 前缀不同） | 指针在第二代 |
+| `--list` | 两代均 `bounded-detail complete`，`detail_parts` 正确 |
+| `--generation <第一代>`（dry run） | 指针未变 |
+| `--apply` | 指针移动；**`generations/` 目录列表逐项不变**，第二代文件仍在 |
+| 移动后取 `/opportunities?limit=200` | `generation_id` == 第一代；items 为第一代的 5 条；market 前缀全为 `old` |
+| 移动后取 `/summary` | 同一世代；`opportunity_episodes == 5` |
+| 用**第二代**的游标请求 | **409**（拒绝跨世代偏移） |
+| 缺文件 / 格式不明的世代 | 拒绝，指针不动 |
+| 旧读取逻辑对新快照 | `TypeError`（即"必须成对回退"的证据） |
+| 新读取逻辑对旧格式快照 | 正常返回分页与按需本金 |
+
 
 ---
 
