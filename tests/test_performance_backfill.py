@@ -13,7 +13,7 @@ single-writer rule stated as a test.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -23,6 +23,7 @@ from weatherquant.performance.backfill import (
     backfill_settlements,
     build_performance_snapshots,
     load_decisions,
+    load_decisions_with_watermark,
 )
 from weatherquant.performance.snapshot import SNAPSHOT_FILES, resolve_generation
 
@@ -436,3 +437,156 @@ def test_the_backfill_cli_writes_an_index(tmp_path, capsys) -> None:
         payload = json.loads(out.read_text(encoding="utf-8"))
         assert isinstance(payload, list)
         assert payload[0]["dataset"] == "fixture"
+
+
+# --- the manifest has to say what the run could see ---------------------------
+
+
+def _manifest(out: Path) -> dict:
+    return json.loads(_published(out, "manifest.json").read_text(encoding="utf-8"))
+
+
+def test_the_manifest_records_the_export_watermark_and_coverage(tmp_path) -> None:
+    """`watermark: null` and `coverage: {}` is not what the deployment doc claims.
+
+    It promises both so a batch can be audited and traced back. Both were
+    empty, so the auditability the doc described did not exist - and a reader
+    could not tell a snapshot covering everything from one covering a slice.
+    """
+    from weatherquant.shadow.export import _write_part
+
+    parts = tmp_path / "export" / "parts"
+    parts.mkdir(parents=True)
+    _write_part(
+        parts / "part-000000001.jsonl",
+        [
+            _export_row(
+                decision_id=f"d-{i}",
+                market_id=f"m-{i % 3}",
+                decision_time_utc=(NOW + timedelta(minutes=i)).isoformat(),
+            )
+            for i in range(9)
+        ],
+    )
+
+    decisions, watermark = load_decisions_with_watermark(tmp_path / "export")
+    out = tmp_path / "performance"
+    build_performance_snapshots(
+        decisions=decisions,
+        out_dir=out,
+        dataset="live",
+        now=NOW,
+        watermark=watermark,
+    )
+
+    manifest = _manifest(out)
+
+    # The input's high-water mark, read from the parts rather than invented.
+    assert manifest["watermark"] == ["2026-10-13T12:08:00+00:00", "d-8"]
+
+    coverage = manifest["coverage"]
+    assert coverage["decisions"] == 9
+    assert coverage["distinct_markets"] == 3
+    assert coverage["first_decision_utc"] == NOW.isoformat()
+    assert coverage["last_decision_utc"] == (NOW + timedelta(minutes=8)).isoformat()
+
+
+def test_a_file_input_records_no_watermark_rather_than_inventing_one(tmp_path) -> None:
+    """A hand-carried JSONL has no cursor, and `null` is the honest answer.
+
+    A guessed range would read as a claim about coverage that nothing backs.
+    """
+    out = tmp_path / "performance"
+    build_performance_snapshots(
+        decisions=load_decisions(_export(tmp_path)),
+        out_dir=out,
+        dataset="live",
+        now=NOW,
+    )
+
+    manifest = _manifest(out)
+    assert manifest["watermark"] is None
+    assert manifest["coverage"]["decisions"] == 30
+
+
+def test_no_export_means_no_watermark(tmp_path) -> None:
+    """Only a published parts directory has a cursor."""
+    from weatherquant.shadow.export import export_watermark
+
+    assert export_watermark(tmp_path / "nope") is None
+    assert export_watermark(_export(tmp_path)) is None, "a file is not an export"
+
+
+def test_coverage_of_nothing_is_null_not_zero(tmp_path) -> None:
+    """No rows means no range. A zero instant would read as a covered one."""
+    out = tmp_path / "performance"
+    build_performance_snapshots(decisions=[], out_dir=out, dataset="live", now=NOW)
+
+    coverage = _manifest(out)["coverage"]
+    assert coverage["decisions"] == 0
+    assert coverage["first_decision_utc"] is None
+    assert coverage["last_decision_utc"] is None
+
+
+def test_the_watermark_describes_the_rows_that_were_actually_read(tmp_path) -> None:
+    """Scanning the parts twice races the engine, which keeps publishing.
+
+    A separate scan can see a part the first did not. The manifest would then
+    advertise a watermark past the last decision its snapshots contain -
+    claiming coverage of rows that were never read, which is the one thing the
+    metadata exists to rule out.
+    """
+    from weatherquant.shadow.export import _write_part
+
+    parts = tmp_path / "export" / "parts"
+    parts.mkdir(parents=True)
+    _write_part(
+        parts / "part-000000001.jsonl",
+        [_export_row(decision_id="d-0", decision_time_utc=NOW.isoformat())],
+    )
+
+    decisions, watermark = load_decisions_with_watermark(tmp_path / "export")
+
+    # The engine publishes while the research side is working.
+    _write_part(
+        parts / "part-000000002.jsonl",
+        [
+            _export_row(
+                decision_id="d-1",
+                decision_time_utc=(NOW + timedelta(hours=1)).isoformat(),
+            )
+        ],
+    )
+
+    assert [row["decision_id"] for row in decisions] == ["d-0"]
+    assert watermark == [NOW.isoformat(), "d-0"], (
+        "the cursor described a part that was not in the read"
+    )
+
+
+def test_a_gap_in_the_parts_is_refused_not_read_past(tmp_path) -> None:
+    """A missing part must not become a watermark that claims its rows.
+
+    The cursor is a high-water mark, so with part 2 gone the remaining parts
+    still yield a cursor from part 3 onward - and the manifest would claim
+    coverage through it while the snapshots omit everything part 2 held. No
+    count in `coverage` would show which range disappeared, so this is the one
+    case where refusing is the only honest answer.
+    """
+    from weatherquant.shadow.export import _write_part
+
+    parts = tmp_path / "export" / "parts"
+    parts.mkdir(parents=True)
+    for index in (1, 3):
+        _write_part(
+            parts / f"part-{index:09d}.jsonl",
+            [
+                _export_row(
+                    decision_id=f"d-{index}",
+                    decision_time_utc=(NOW + timedelta(hours=index)).isoformat(),
+                )
+            ],
+        )
+
+    with pytest.raises(ValueError, match="gap"):
+        load_decisions_with_watermark(tmp_path / "export")

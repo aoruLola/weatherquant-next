@@ -42,7 +42,9 @@ __all__ = [
     "EXPORT_COLUMNS",
     "DecisionExporter",
     "ExportResult",
+    "export_watermark",
     "read_export",
+    "read_export_with_watermark",
 ]
 
 #: Everything a decision carries that Episode, Edge, win rate and reference
@@ -460,13 +462,76 @@ def read_export(directory: str | Path) -> list[dict[str, Any]]:
     The research side's only view of the decision history. Parts are already
     written in order, so this is a concatenation rather than a merge.
     """
+    rows, _cursor = read_export_with_watermark(directory)
+    return rows
+
+
+def read_export_with_watermark(
+    directory: str | Path,
+) -> tuple[list[dict[str, Any]], list[str] | None]:
+    """Read the parts, and the cursor they reached, from one enumeration.
+
+    Reading them in two passes races the engine, which keeps publishing while
+    the research side reads: the second pass can see a part the first did not.
+    A manifest built that way advertises a watermark past the last decision
+    its snapshots actually contain - claiming coverage of rows it never read.
+
+    Parts are immutable once published, so the last line of the newest one in
+    this enumeration is the cursor of exactly the set just read.
+
+    A gap in the part sequence is refused rather than read past. The cursor is
+    a high-water mark: with part 3 missing, the remaining parts still produce a
+    cursor from part 4 onward, and the manifest would claim coverage through it
+    while the snapshots silently omit everything part 3 held. No count in
+    `coverage` would reveal which range disappeared, so this is the one case
+    where refusing is the only honest answer.
+    """
     root = Path(directory) / "parts"
     if not root.exists():
-        return []
+        return [], None
+    parts = sorted(root.glob("part-*.jsonl"))
+    indices = [_index_of(path) for path in parts]
+    if indices != list(range(1, len(indices) + 1)):
+        missing = sorted(set(range(1, len(indices) + 1)) - set(indices))
+        raise ValueError(
+            f"the decisions export has a gap: part index(es) {missing} are "
+            f"missing from {root}. A watermark taken from the highest part "
+            "would claim coverage of rows that are not here, so the export is "
+            "refused rather than published under a cursor it never reached."
+        )
     rows: list[dict[str, Any]] = []
-    for path in sorted(root.glob("part-*.jsonl")):
+    for path in parts:
         with path.open(encoding="utf-8") as handle:
             for line in handle:
                 if line.strip():
                     rows.append(json.loads(line))
-    return rows
+    if not parts:
+        return rows, None
+    end = _end_cursor_of(parts[-1])
+    return rows, list(end) if end is not None else None
+
+
+def export_watermark(directory: str | Path) -> list[str] | None:
+    """The cursor the export has reached, for a caller that wants only that.
+
+    Not to be paired with a separate `read_export`: the two would enumerate the
+    parts at different instants, and the pair could describe a range no single
+    read ever covered. A manifest must use
+    :func:`read_export_with_watermark` instead.
+
+    Taken from the last line of the newest part rather than from `state.json`,
+    for the same reason the writer recovers it that way: state is a cache, and
+    a watermark read from a cache would be a claim about the data rather than a
+    fact about it.
+
+    ``None`` when there is no export here - a hand-carried JSONL has no cursor,
+    and inventing one would put a range in the manifest that nothing backs.
+    """
+    parts = Path(directory) / "parts"
+    if not parts.is_dir():
+        return None
+    existing = sorted(parts.glob("part-*.jsonl"))
+    if not existing:
+        return None
+    end = _end_cursor_of(existing[-1])
+    return list(end) if end is not None else None
