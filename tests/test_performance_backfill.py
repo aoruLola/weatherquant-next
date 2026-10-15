@@ -562,3 +562,31 @@ def test_the_watermark_describes_the_rows_that_were_actually_read(tmp_path) -> N
     assert watermark == [NOW.isoformat(), "d-0"], (
         "the cursor described a part that was not in the read"
     )
+
+
+def test_a_gap_in_the_parts_is_refused_not_read_past(tmp_path) -> None:
+    """A missing part must not become a watermark that claims its rows.
+
+    The cursor is a high-water mark, so with part 2 gone the remaining parts
+    still yield a cursor from part 3 onward - and the manifest would claim
+    coverage through it while the snapshots omit everything part 2 held. No
+    count in `coverage` would show which range disappeared, so this is the one
+    case where refusing is the only honest answer.
+    """
+    from weatherquant.shadow.export import _write_part
+
+    parts = tmp_path / "export" / "parts"
+    parts.mkdir(parents=True)
+    for index in (1, 3):
+        _write_part(
+            parts / f"part-{index:09d}.jsonl",
+            [
+                _export_row(
+                    decision_id=f"d-{index}",
+                    decision_time_utc=(NOW + timedelta(hours=index)).isoformat(),
+                )
+            ],
+        )
+
+    with pytest.raises(ValueError, match="gap"):
+        load_decisions_with_watermark(tmp_path / "export")

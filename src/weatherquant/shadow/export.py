@@ -440,11 +440,27 @@ def read_export_with_watermark(
 
     Parts are immutable once published, so the last line of the newest one in
     this enumeration is the cursor of exactly the set just read.
+
+    A gap in the part sequence is refused rather than read past. The cursor is
+    a high-water mark: with part 3 missing, the remaining parts still produce a
+    cursor from part 4 onward, and the manifest would claim coverage through it
+    while the snapshots silently omit everything part 3 held. No count in
+    `coverage` would reveal which range disappeared, so this is the one case
+    where refusing is the only honest answer.
     """
     root = Path(directory) / "parts"
     if not root.exists():
         return [], None
     parts = sorted(root.glob("part-*.jsonl"))
+    indices = [_index_of(path) for path in parts]
+    if indices != list(range(1, len(indices) + 1)):
+        missing = sorted(set(range(1, len(indices) + 1)) - set(indices))
+        raise ValueError(
+            f"the decisions export has a gap: part index(es) {missing} are "
+            f"missing from {root}. A watermark taken from the highest part "
+            "would claim coverage of rows that are not here, so the export is "
+            "refused rather than published under a cursor it never reached."
+        )
     rows: list[dict[str, Any]] = []
     for path in parts:
         with path.open(encoding="utf-8") as handle:
