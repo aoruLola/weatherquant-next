@@ -170,12 +170,22 @@ def test_opportunities_are_paginated(published) -> None:
     first = published.get("/api/v1/performance/opportunities?limit=2").json()["data"]
 
     assert len(first["items"]) <= 2
+    assert first["data"]["limit"] == 2
+    assert first["data"]["offset"] == 0
     if first["next_cursor"] is not None:
         second = published.get(
             f"/api/v1/performance/opportunities?limit=2&cursor={first['next_cursor']}"
         ).json()["data"]
         assert second["items"], "a declared next_cursor must lead somewhere"
         assert second["items"][0]["episode_id"] != first["items"][0]["episode_id"]
+        assert second["data"]["offset"] == 2
+        # And back again, from the page's own prev_cursor.
+        back = published.get(
+            f"/api/v1/performance/opportunities?limit=2&cursor={second['prev_cursor']}"
+        ).json()["data"]
+        assert [row["episode_id"] for row in back["items"]] == [
+            row["episode_id"] for row in first["items"]
+        ]
 
 
 def test_settlements_are_paginated_too(published) -> None:
@@ -251,7 +261,8 @@ def test_single_opportunity_mode_reports_both_views(tmp_path, settings_for) -> N
     # No combined total: ten "if I staked N here" answers are not one
     # account holding ten stakes, so the sum is deliberately withheld.
     assert data.get("combined_expected_edge") is None
-    assert data["per_opportunity_expected_edge"]
+    assert data["per_opportunity_expected_edge_sample"] is not None
+    assert data["per_opportunity_expected_edge_sampled"] is True
     assert any("independently" in w for w in data["warnings"])
 
 
