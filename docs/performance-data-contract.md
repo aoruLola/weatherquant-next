@@ -544,3 +544,103 @@ shadow/reports/decisions-export/
 
 默认仅监听内网/本机；远程接入必须走认证 HTTPS（反向代理或受控隧道）。
 **无认证的 MCP / Dashboard / Portainer / 生产库禁止暴露公网。**
+
+---
+
+## 13. 流式增量引擎（v0.1.5 新增）
+
+审计与状态模型全文见 [`performance-streaming-audit.md`](performance-streaming-audit.md)。
+本节只规定**对外可见的契约**：状态存哪、水位怎么算、哪些字段新增、哪些行为改变。
+
+### 13.1 状态存储
+
+```
+data/research/performance-state.duckdb        # 可用 WQ_PERFORMANCE_STATE_DB_PATH 覆盖
+```
+
+- **独立文件**，与生产 Shadow 库、与 `weather-research.duckdb` 都不是同一个。
+- **全部内容都是派生物**：删除它不会丢任何原始数据，下一次运行会从导出重建。
+- 单写者：第二个进程打开会被 DuckDB 拒绝（文件锁），不是静默并发写。
+- 内存上限由 `memory_limit`（默认 `1GB`）+ `temp_directory` 显式限定，超出即落盘。
+
+### 13.2 消费水位
+
+水位 = **已消费分片的游标 + 分片指纹**，不是时间戳：
+
+| 字段 | 含义 |
+|---|---|
+| `last_part_index` | 已消费的最后一个分片序号；下一个待读 = +1 |
+| `last_end_cursor` | 该分片末行的 `(decision_time_utc, decision_id)` |
+| `performance_parts[index]` | `(rows, end_cursor, sha256, consumed_at)` |
+
+规则（均为硬约束，违反即拒绝运行）：
+
+1. 分片序号必须 `1..N` **连续**；缺一个就**不读后面的**（游标是高水位，越过缺口即谎报覆盖）。
+2. 分片内容必须按 `(decision_time_utc, decision_id)` **非降**；违反即拒绝（这也是 REPLAY 迟到写入的可观测化）。
+3. 已消费分片的 `sha256`/行数变化 → 拒绝，要求重建（发布后的分片不可变）。
+4. **行、Episode 状态、计数器、分片记录、游标在同一个事务内提交**；崩溃回滚全部，重跑不会重复计数。
+
+### 13.3 增量与局部重算
+
+- 输入层（Episode / Edge 观测 / 计数器）：**增量**，只处理水位之后的分片。
+- 派生层（outcome / 胜率 / 置信区间 / 参考本金）：**每次发布重算**，不落库。
+  因此**结算修订不需要重读任何决策**——它只改派生层。
+- `--no-ingest`：不读导出，仅从状态库重算并发布。
+- `--reset`：清空状态库并完整回填。
+
+### 13.4 行为改变（**唯一一处**）
+
+**结算索引现在是粘性的。** 不带 `--settlements` 运行，会沿用状态库里已有的结算答案，
+而不是像 v0.1.4 那样把本次运行的结算集当作全部（即"不给就全丢"）。
+
+理由：结算是外部事实且会被修订；一次不带索引的运行不应抹掉上一次已核验的结论。
+带索引运行时按 `(market_id, target_date)` **upsert**，新值覆盖旧值。
+
+### 13.5 manifest 新增字段（纯新增，旧读者忽略）
+
+```json
+{
+  "generated_at_utc": "…",
+  "algorithm_version": "performance-streaming-1",
+  "input_source": "/path/to/decisions-export",
+  "input_range": {"first_decision_utc": "…", "last_decision_utc": "…"},
+  "streaming": {
+    "parts_consumed": 79, "rows_consumed": 1481414, "row_seq": 1481414,
+    "episodes": 0, "open_episodes": 16,
+    "gap_window_seconds": 900.0, "accepted_state": "ACCEPT",
+    "state_db": "…/performance-state.duckdb"
+  }
+}
+```
+
+`algorithm_version` 变化后**不得**继续增量（状态库里的聚合会是两个算法的混合物），
+必须 `--reset` 重建。`gap_window_seconds` / `accepted_state` / `input_source` 同理。
+
+### 13.6 统计口径不变（含"逐位相等"承诺）
+
+流式实现**没有**改变任何公式。逐项对照：
+
+| 量 | 实现 | 相等性 |
+|---|---|---|
+| `sum` | `math.fsum`（对游标流式） | 逐位（fsum 与顺序无关、正确舍入） |
+| `mean` | `sum / count` | 逐位 |
+| `std` | `statistics.pstdev`（对游标流式，单趟精确有理数） | 逐位 |
+| `median` | 按秩取中间两个顺序统计量，`(a+b)/2` | 逐位 |
+| `p05…p95` | 按秩取上下邻居，`a*(1-w)+b*w` | 逐位 |
+| `min`/`max`/`count` | SQL | 精确 |
+| `episode.mean_edge` | 增量左折叠 `sum_edges` | 逐位（累加顺序相同） |
+| `unique_opportunity_edge_sum` | 内建 `sum` 左折叠，发布顺序复刻原稳定排序 | 逐位 |
+| 胜率 / 聚类 bootstrap | 同一段 bootstrap 代码，簇插入序复刻（先 WIN 后 LOSS） | 逐位 |
+| 参考本金 | 同一段走账代码（`PortfolioWalk`） | 逐位 |
+
+**明确不使用**：DuckDB `quantile_cont`（实测 1200 次抽样中 74 次差 1 ULP，
+插值算式不同）、DuckDB `sum`（相对差 ~1.7e-14）。
+分位数一律由**按秩取顺序统计量 + 现有插值函数**得到。
+
+### 13.7 落盘体积
+
+`by_edge_band`（全量数值数组）与 `opportunities.episodes`（全量 episode）
+**形状不变**，因此落盘体积仍随历史线性增长；改变的是**研究容器的峰值内存**
+（流式写出，不再全量驻留）。契约 §0.4 的"≤500 行"窗口仍未实现，
+属既有偏差，见审计文档 §9 风险 3。
+

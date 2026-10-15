@@ -35,9 +35,12 @@
 /mnt/user/appdata/weatherquant-next/        Collector（不变）
 /mnt/user/appdata/weatherquant-shadow/      Shadow（不变）
     reports/                                明细快照（既有）
+    reports/decisions-export/               决策导出分片（既有，流式引擎的输入）
 /mnt/user/appdata/weatherquant-performance/ 【新增】Performance 快照
     summary.json  edge.json  win-rate.json
     opportunities.json  settlements.json  models.json
+/mnt/user/appdata/weatherquant-performance-state/   【新增】流式引擎状态库
+    performance-state.duckdb                可删可重建，见 §3.4
 ```
 
 Dashboard 需要新增一条只读挂载：
@@ -48,6 +51,10 @@ Dashboard 需要新增一条只读挂载：
 
 **MCP Gateway 不挂载任何目录。** 这是安全属性，不是遗漏——它只经 HTTP
 调用 Dashboard，因此被攻破也无法触及 DuckDB。
+
+> **状态库不要挂给 Dashboard。** 它是研究进程的私有状态，不是发布物；
+> Dashboard 只读 `weatherquant-performance/` 下的世代目录。
+
 
 ---
 
@@ -114,19 +121,31 @@ weatherquant-research build-performance \
   --settlements /tmp/settlements.json \
   --out /mnt/user/appdata/weatherquant-performance \
   --dataset live \
+  --state-db /mnt/user/appdata/weatherquant-performance-state/performance-state.duckdb \
   --capital-usdc 100 \
   --max-allocation-fraction 0.10
 ```
 
+**`--export` 指向目录时走流式引擎**（生产路径）：一次只读一个分片，状态存进
+`--state-db`，崩溃可续跑，内存由 `--memory-limit`（默认 1GB）限定而不是由历史长度决定。
+`--export` 指向**文件**时走全内存构建器——那是**参考实现**，不是生产路径。
+
 | 参数 | 说明 |
 |---|---|
-| `--export` | **必填**。决策导出，支持 `.json` / `.jsonl` / `.parquet`（parquet 需 pyarrow） |
+| `--export` | **必填**。目录 = 流式引擎（生产）；`.json`/`.jsonl`/`.parquet` = 全内存构建器 |
 | `--out` | **必填**。快照输出目录 |
 | `--dataset` | **必填**，`live` 或 `fixture`。**没有默认值** |
-| `--settlements` | 可选。§3.2 产出的结算索引 |
+| `--state-db` | 状态库路径，默认 `WQ_PERFORMANCE_STATE_DB_PATH` |
+| `--settlements` | 可选。§3.2 产出的结算索引。**不给则沿用状态库里已有的结算**（v0.1.5 起） |
 | `--capital-usdc` | 默认 100，必须 > 0 |
 | `--max-allocation-fraction` | 默认 0.10，研究假设而非已验证的风险规则 |
-| `--gap-window-seconds` | 默认 900 |
+| `--gap-window-seconds` | 默认 900。**改变它必须 `--reset`**（episode 边界依赖它） |
+| `--memory-limit` | DuckDB 内存上限，默认 `1GB`；超出即落盘到 `--temp-dir` |
+| `--reset` | 清空状态库并完整回填（首次回填、算法升级、换导出目录时使用） |
+| `--no-ingest` | 不读导出，仅从状态库重算并发布（结算修订后使用） |
+| `--verify-parts` | 重新哈希**全部**已消费分片（默认只验边界分片） |
+| `--max-parts-per-run` | 单次最多消费的分片数（首次回填可分批） |
+| `--in-memory` | 强制使用全内存构建器（会打印警告，见 §10.2） |
 
 输出是**一个世代**：`performance/generations/<id>/` 内放六份快照与 `manifest.json`，
 最后以一次 rename 切换 `performance/current.json` 指针（契约 §7.1）。
@@ -134,12 +153,24 @@ weatherquant-research build-performance \
 中途失败时新世代无人跟随，上一批仍然 current。
 
 `manifest.json` 记录 `dataset`、输入水位 `watermark`、覆盖范围 `coverage`、
-生成时间与各文件大小 —— 每一批都可被审计与回溯。
-
-`--export` 同时接受目录（生产路径）与 `.json` / `.jsonl` / `.parquet` 文件。
+`algorithm_version`、`input_source`、`input_range`、`streaming` 与各文件大小 —— 每一批都可被审计与回溯（契约 §13.5）。
 
 **不发布快照 ≠ 出错。** Dashboard 会显示 `missing` + "回填尚未产生该快照"，
 不会显示 0，也不会编造图表。
+
+### 3.4 状态库的运维
+
+| 情况 | 做法 |
+|---|---|
+| 首次回填 | 直接运行（状态库为空 = 从头开始）。分片多时可用 `--max-parts-per-run` 分批 |
+| 日常增量 | 同一命令重复运行；已消费的分片不再读，只处理新的 |
+| 崩溃/断电 | 直接重跑。**同一事务**提交行与水位，未提交的分片会重读且不会重复计数 |
+| 换导出目录 | 会因 `input_source` 不符而拒绝 → 确认无误后 `--reset` |
+| 升级算法 | `algorithm_version` 变化后必须 `--reset` |
+| 结算修订 | 带新的 `--settlements` 重跑，或 `--no-ingest` 只重算发布 |
+| 怀疑状态库损坏 | 直接删除状态库目录后重跑（全部内容都是派生物） |
+
+**禁止**：手工编辑状态库；在两次运行之间修改已发布的分片（会被检出并拒绝）。
 
 验证命令确实存在：
 
@@ -147,6 +178,7 @@ weatherquant-research build-performance \
 weatherquant-research --help          # 应列出 backfill-settlements 与 build-performance
 weatherquant-research build-performance --help
 ```
+
 
 ---
 
@@ -369,4 +401,76 @@ WQ_MCP_PLAINTEXT_NETWORKS=172.16.0.0/12,192.168.0.0/16,10.0.0.0/8
 
 > 判断依据不是"有没有加 `--memory` 上限"：上限只保证容器被杀而不是主机被杀，
 > 不保证主机保持可响应。7.5 GB 那次容器没有 OOM，主机仍然失联 35 分钟。
+
+---
+
+## 11. 流式引擎的隔离压力测试（v0.1.5）
+
+**全部在隔离机器上执行，未触碰生产 NAS、未打开生产库、未重启任何容器。**
+
+脚本：`scripts/bench_performance_streaming.py`。合成历史按生产导出的**分片尺寸**
+（约 19,000 行/分片）生成，含 24 个市场、3 个模型、两种 direction、LIVE/REPLAY、
+以及会超过 gap 窗口的全局静默段。每个规模**独立进程**运行，峰值取
+`ru_maxrss`（内核高水位，含 DuckDB 原生分配）。
+
+| 决策行数 | 分片 | 墙钟 | **峰值 RSS** | 状态库 | 快照落盘 | episode | ACCEPT 观测 |
+|---|---|---|---|---|---|---|---|
+| 1,500,000 | 79 | **78 s** | **299 MB** | 28 MB | 96 MB | 73,188 | 673,582 |
+| 3,000,000 | 158 | **169 s** | **368 MB** | 32 MB | 191 MB | 146,110 | 1,345,160 |
+| 5,000,000 | 264 | **261 s** | **477 MB** | 70 MB | 317 MB | 242,570 | 2,236,360 |
+
+对照：旧的 `build_performance()` 在 960,000 行、7.5 GB 上限下耗时 35 分钟且主机失联
+（§10.2）；它在生产规模上**从未完成过**，因此没有可比的峰值数字。
+
+### 11.1 上界来自 `memory_limit`，不是来自历史
+
+5,000,000 行、**同一个输入**，只把 `--memory-limit` 从 1GB 改成 256MB：
+
+| 配置 | 峰值 RSS | 墙钟 | `generation_id` |
+|---|---|---|---|
+| `--memory-limit 1GB` | 477 MB | 261 s | `20261015T120000Z-77c65e614411` |
+| `--memory-limit 256MB` | **437 MB** | 359 s | `20261015T120000Z-77c65e614411`（**相同**） |
+
+三点结论：
+
+1. **上限缩小 4 倍，结果完全不变**（同一 `generation_id`，同一份 summary）——
+   内存上限只决定**落盘多少**，不决定算出来什么。
+2. 代价是时间（261 s → 359 s），也就是溢出的代价，而不是正确性的代价。
+3. 峰值并没有随上限线性下降，因为峰值里还有两项与**批**同阶的常数：
+   Python 侧的分片缓冲（一个分片 ≈ 19,000 行）与 DuckDB 物化的**一个结果集**。
+   两者都与历史长度无关。
+
+**与历史的对照**（默认 1GB 上限）：1.5M → 299 MB，3M → 368 MB，5M → 477 MB。
+若随历史线性增长，1.5M → 5M（3.3 倍行数）应是约 1000 MB；实测 1.6 倍。
+增长来自 DuckDB 缓冲池的预热（被 `memory_limit` 封顶）与更大的单个结果集，
+不是"记住更多历史"。
+
+### 11.2 宿主可响应性
+
+压力测试（5M 行 / 256MB 上限）期间，在同一台机器上每秒采样一次空命令的端到端延迟：
+
+| 指标 | 值 |
+|---|---|
+| 采样数 | 354 |
+| 中位延迟 | **6 ms** |
+| p95 延迟 | **17 ms** |
+| 最大延迟 | **32 ms** |
+
+对比 §10.2：旧构建期间主机 ping 通，但 HTTP 与 SSH 全部超时，持续 35 分钟。
+本轮压力测试期间宿主的交互式命令**没有出现可观测的停顿**——
+上面这份采样与 5M 行构建是并行的。
+
+### 11.3 复现
+
+```bash
+uv run python scripts/bench_performance_streaming.py --all --work-dir /path/to/scratch
+uv run python scripts/bench_performance_streaming.py --rows 5000000 --no-generate \
+  --reset --memory-limit 256MB
+```
+
+产物：`report-<rows>.json`（每个规模的墙钟、峰值 RSS、落盘体积、状态库计数、
+六份 payload 的关键统计），可直接作为验收证据附在 PR 上。
+
+> 脚本会写入 `--work-dir` 下的合成分片（5M 行约 2 GB），**不要指向生产目录**。
+
 
