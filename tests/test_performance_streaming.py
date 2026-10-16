@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from weatherquant.markets.models import BookLevel, OrderBook
+from weatherquant.performance.backfill import build_performance_snapshots
 from weatherquant.performance.capital import simulate_portfolio
 from weatherquant.performance.edge import distribution, observation_edge
 from weatherquant.performance.episodes import build_episodes, summarize
@@ -166,6 +167,27 @@ def _read_generation(directory: Path) -> dict[str, dict]:
     }
 
 
+def published_episodes(directory: Path) -> list[dict]:
+    """Every episode in the published detail, reassembled from its parts.
+
+    The detail is published as parts rather than as one array (that is the
+    whole point of this round), so a test that wants the rows has to read the
+    descriptor and then the parts - exactly as the dashboard does.
+    """
+    generation = resolve_generation(directory)
+    assert generation.directory is not None, "nothing was published"
+    payload = json.loads((generation.directory / "opportunities.json").read_text(encoding="utf-8"))
+    descriptor = payload["data"]["episodes"]
+    assert descriptor["partitioned"] is True, descriptor
+    rows: list[dict] = []
+    for part in descriptor["partitions"]:
+        rows.extend(
+            json.loads((generation.directory / descriptor["directory"] / part["file"]).read_text(encoding="utf-8"))
+        )
+    assert len(rows) == descriptor["total"], (len(rows), descriptor["total"])
+    return rows
+
+
 def _strip(payloads: dict[str, dict]) -> dict[str, dict]:
     """Drop the fields a *publication* adds and a builder does not."""
     cleaned = {}
@@ -174,6 +196,38 @@ def _strip(payloads: dict[str, dict]) -> dict[str, dict]:
         copy.pop("generation_id", None)
         cleaned[name] = copy
     return cleaned
+
+
+def _run_legacy(
+    tmp_path: Path,
+    rows: list[dict],
+    settlements: list[dict],
+    *,
+    book_for=None,
+    out_dir: Path | None = None,
+    watermark: list[str] | None = None,
+) -> dict:
+    """Publish the whole-history builder's six snapshots, and read them back.
+
+    Comparing *published* output on both sides is the honest comparison: it is
+    what a reader sees, it exercises the same writer, and it is the only way to
+    compare a detail that is published as parts - the builder hands back a
+    marker and the files are what a consumer can actually read.
+    """
+    build_performance_snapshots(
+        decisions=rows,
+        settlements=settlements,
+        out_dir=out_dir or (tmp_path / "legacy"),
+        dataset="fixture",
+        book_for=book_for,
+        now=NOW,
+        # The cursor the export had reached, so the lifetime capital block
+        # describes the same consumed range on both sides. A publish without
+        # one says `null`, which is a different (honest) claim, not a
+        # different statistic.
+        watermark=list(watermark) if watermark else None,
+    )
+    return _read_generation(out_dir or (tmp_path / "legacy"))
 
 
 def _run_streaming(
@@ -216,17 +270,14 @@ def test_every_published_payload_matches_the_in_memory_builder(tmp_path, dataset
     being N/A on both sides - an N/A comparison would prove nothing.
     """
     settlements = _settlements(dataset)
-    legacy = build_performance(
-        decisions=dataset,
-        settlements=settlements,
-        now=NOW,
-        dataset="fixture",
-        book_for=_two_sided_book,
+    streamed_result = _run_streaming(tmp_path, dataset, settlements, book_for=_two_sided_book)
+    legacy = _run_legacy(
+        tmp_path, dataset, settlements, book_for=_two_sided_book,
+        watermark=streamed_result["watermark"],
     )
-    _run_streaming(tmp_path, dataset, settlements, book_for=_two_sided_book)
     streamed = _read_generation(tmp_path / "performance")
 
-    assert _strip(streamed) == legacy, "the streaming engine changed a published number"
+    assert _strip(streamed) == _strip(legacy), "the streaming engine changed a published number"
 
 
 def test_the_comparison_is_not_vacuous(tmp_path, dataset) -> None:
@@ -255,11 +306,11 @@ def test_the_comparison_is_not_vacuous(tmp_path, dataset) -> None:
 def test_the_acceptance_items_match_one_by_one(tmp_path, dataset) -> None:
     """The brief's ten checks, asserted individually rather than in bulk."""
     settlements = _settlements(dataset)
-    legacy = build_performance(
-        decisions=dataset, settlements=settlements, now=NOW, dataset="fixture",
-        book_for=_two_sided_book,
+    streamed_result = _run_streaming(tmp_path, dataset, settlements, book_for=_two_sided_book)
+    legacy = _run_legacy(
+        tmp_path, dataset, settlements, book_for=_two_sided_book,
+        watermark=streamed_result["watermark"],
     )
-    _run_streaming(tmp_path, dataset, settlements, book_for=_two_sided_book)
     streamed = _strip(_read_generation(tmp_path / "performance"))
 
     legacy_summary = legacy["summary.json"]["data"]
@@ -271,9 +322,11 @@ def test_the_acceptance_items_match_one_by_one(tmp_path, dataset) -> None:
     assert new_summary["accept_observations"] == legacy_summary["accept_observations"]
     # 2. episode count and identity, in the published order
     assert new_summary["opportunity_episodes"] == legacy_summary["opportunity_episodes"]
-    assert [
-        row["episode_id"] for row in streamed["opportunities.json"]["data"]["episodes"]
-    ] == [row["episode_id"] for row in legacy["opportunities.json"]["data"]["episodes"]]
+    # The detail is published as parts; the rows come back in the same order
+    # the whole-history builder produced, which is what the cursor pages over.
+    assert [row["episode_id"] for row in published_episodes(tmp_path / "performance")] == [
+        row["episode_id"] for row in published_episodes(tmp_path / "legacy")
+    ]
     # 3. Observation Edge Sum
     assert new_summary["observation_edge_sum"] == legacy_summary["observation_edge_sum"]
     # 4. Unique Opportunity Edge Sum
@@ -288,14 +341,16 @@ def test_the_acceptance_items_match_one_by_one(tmp_path, dataset) -> None:
     assert new_win["confidence_interval"] == legacy_win["confidence_interval"]
     assert new_win["method"] == legacy_win["method"]
     # 7. 100 USDC reference capital
-    assert (
-        new_summary["reference_capital"]["allocated_total_usdc"]
-        == legacy_summary["reference_capital"]["allocated_total_usdc"]
+    new_capital = new_summary["reference_capital"]
+    legacy_capital = legacy_summary["reference_capital"]
+    assert new_capital["allocated_total_usdc"] == legacy_capital["allocated_total_usdc"]
+    assert new_capital["peak_open_allocation_usdc"] == legacy_capital["peak_open_allocation_usdc"]
+    assert new_capital["balance_remaining_usdc"] == legacy_capital["balance_remaining_usdc"]
+    assert new_capital["executable_count"] == legacy_capital["executable_count"]
+    assert new_capital["not_executable_reason_counts"] == (
+        legacy_capital["not_executable_reason_counts"]
     )
-    assert (
-        new_summary["reference_capital"]["results"]
-        == legacy_summary["reference_capital"]["results"]
-    )
+    assert new_capital["results_sample"] == legacy_capital["results_sample"]
     # 10. generation, watermark and coverage agree (watermark is asserted in
     # the state tests, where the export cursor is known).
     assert streamed["summary.json"]["sample_size"] == legacy["summary.json"]["sample_size"]
@@ -304,8 +359,8 @@ def test_the_acceptance_items_match_one_by_one(tmp_path, dataset) -> None:
 def test_no_settlement_data_is_still_na_not_zero(tmp_path) -> None:
     """Item 10 of the correctness list: N/A stays N/A."""
     rows = _dataset(seed=7, rows=200)
-    legacy = build_performance(decisions=rows, now=NOW, dataset="fixture")
-    _run_streaming(tmp_path, rows, [])
+    result = _run_streaming(tmp_path, rows, [])
+    legacy = _strip(_run_legacy(tmp_path, rows, [], watermark=result["watermark"]))
     streamed = _strip(_read_generation(tmp_path / "performance"))
 
     assert streamed == legacy
@@ -341,8 +396,8 @@ def test_a_history_with_nothing_to_score_publishes_empty_not_zero(tmp_path) -> N
                 "available_depth_usd": 500.0,
             }
         )
-    legacy = build_performance(decisions=rows, now=NOW, dataset="fixture")
-    _run_streaming(tmp_path, rows, [])
+    result = _run_streaming(tmp_path, rows, [])
+    legacy = _strip(_run_legacy(tmp_path, rows, [], watermark=result["watermark"]))
     streamed = _strip(_read_generation(tmp_path / "performance"))
 
     assert streamed == legacy
@@ -354,41 +409,36 @@ def test_a_history_with_nothing_to_score_publishes_empty_not_zero(tmp_path) -> N
     assert summary["unique_opportunity_edge_sum"] == 0.0
     assert summary["realized_directional_win_rate"] is None
     assert streamed["edge.json"]["data"]["overall"]["count"] == 0
-    assert streamed["edge.json"]["data"]["by_edge_band"] == {
-        "lt_0.02": [], "0.02_0.05": [], "0.05_0.10": [], "gte_0.10": []
-    }
-    assert streamed["opportunities.json"]["data"]["episodes"] == []
+    assert {
+        band: stats["count"]
+        for band, stats in streamed["edge.json"]["data"]["by_edge_band"].items()
+    } == {"lt_0.02": 0, "0.02_0.05": 0, "0.05_0.10": 0, "gte_0.10": 0}
+    assert published_episodes(tmp_path / "performance") == []
     assert streamed["opportunities.json"]["data"]["total"] == 0
 
 
 def test_a_missing_book_still_reports_not_executable(tmp_path, dataset) -> None:
     """Item 12: no retained levels means NOT_EXECUTABLE, never an invented fill."""
     settlements = _settlements(dataset)
-    legacy = build_performance(
-        decisions=dataset, settlements=settlements, now=NOW, dataset="fixture"
-    )
-    _run_streaming(tmp_path, dataset, settlements)
+    result = _run_streaming(tmp_path, dataset, settlements)
+    legacy = _strip(_run_legacy(tmp_path, dataset, settlements, watermark=result["watermark"]))
     streamed = _strip(_read_generation(tmp_path / "performance"))
 
     assert streamed == legacy
     capital = streamed["summary.json"]["data"]["reference_capital"]
     assert capital["executable_count"] == 0
     assert capital["backtestable"] is False
-    reasons = {
-        row["not_executable_reason"] for row in capital["results"]
-    }
-    assert reasons <= {"NO_BOOK", "DEPTH_NOT_MEASURED"}, reasons
-    assert all("book" not in row for row in streamed["opportunities.json"]["data"]["episodes"])
+    assert set(capital["not_executable_reason_counts"]) <= {"NO_BOOK", "DEPTH_NOT_MEASURED"}
+    assert capital["results_sample"], "the sample must still show why they were refused"
+    assert all("book" not in row for row in published_episodes(tmp_path / "performance"))
 
 
 def test_ten_thousand_rows_still_agree(tmp_path) -> None:
     """A larger run, to catch anything that only breaks past one fetch buffer."""
     rows = _dataset(seed=4242, rows=10_000)
     settlements = _settlements(rows)
-    legacy = build_performance(
-        decisions=rows, settlements=settlements, now=NOW, dataset="fixture"
-    )
-    _run_streaming(tmp_path, rows, settlements, parts=7)
+    result = _run_streaming(tmp_path, rows, settlements, parts=7)
+    legacy = _strip(_run_legacy(tmp_path, rows, settlements, watermark=result["watermark"]))
     streamed = _strip(_read_generation(tmp_path / "performance"))
 
     assert streamed == legacy
@@ -471,12 +521,12 @@ def test_live_and_replay_never_share_an_episode(tmp_path) -> None:
                 "available_depth_usd": 500.0,
             }
         )
-    legacy = build_performance(decisions=rows, now=NOW, dataset="fixture")
-    _run_streaming(tmp_path, rows, [])
+    result = _run_streaming(tmp_path, rows, [])
+    legacy = _strip(_run_legacy(tmp_path, rows, [], watermark=result["watermark"]))
     streamed = _strip(_read_generation(tmp_path / "performance"))
     assert streamed == legacy
 
-    episodes = streamed["opportunities.json"]["data"]["episodes"]
+    episodes = published_episodes(tmp_path / "performance")
     assert len(episodes) == 2
     assert {row["mode"] for row in episodes} == {"LIVE", "REPLAY"}
     assert {row["observation_count"] for row in episodes} == {3}

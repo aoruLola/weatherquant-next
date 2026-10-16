@@ -16,7 +16,7 @@
  * 3. Actual profit is N/A. There is no real trading, so there is no
  *    realised return to show, and no chart that implies one.
  */
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { usePoll } from '../api/client'
 import { FreshnessPill } from '../components/status'
 import PageHeader from '../components/PageHeader'
@@ -62,15 +62,36 @@ function MissingCard({ payload, title }: { payload?: PerformancePayload | null; 
 export default function Performance() {
   const [capital, setCapital] = useState('100')
   const [mode, setMode] = useState('portfolio')
+  // The detail table is paged and filtered on the *server*: the browser never
+  // receives the history, so it cannot be asked to slice it.
+  const [pageSize, setPageSize] = useState('50')
+  const [cursor, setCursor] = useState<string | null>(null)
+  const [model, setModel] = useState('')
+  const [direction, setDirection] = useState('')
+  const [modeFilter, setModeFilter] = useState('')
+  const [outcome, setOutcome] = useState('')
+  const [targetDate, setTargetDate] = useState('')
+  const [lastGeneration, setLastGeneration] = useState<string | null>(null)
 
   const summary = usePoll<PerformancePayload>('/api/v1/performance/summary', 30000)
   const edge = usePoll<PerformancePayload>('/api/v1/performance/edge', 30000)
   const winRate = usePoll<PerformancePayload>('/api/v1/performance/win-rate', 60000)
-  const opportunities = usePoll<PerformancePayload>(
-    '/api/v1/performance/opportunities?limit=50',
-    60000,
-  )
+
+  const opportunitiesQuery = useMemo(() => {
+    const params = new URLSearchParams()
+    params.set('limit', pageSize)
+    if (cursor) params.set('cursor', cursor)
+    if (model) params.set('model', model)
+    if (direction) params.set('direction', direction)
+    if (modeFilter) params.set('mode', modeFilter)
+    if (outcome) params.set('outcome', outcome)
+    if (targetDate) params.set('target_date', targetDate)
+    return `/api/v1/performance/opportunities?${params.toString()}`
+  }, [pageSize, cursor, model, direction, modeFilter, outcome, targetDate])
+
+  const opportunities = usePoll<PerformancePayload>(opportunitiesQuery, 60000)
   const models = usePoll<PerformancePayload>('/api/v1/performance/models', 60000)
+
 
   const capitalQuery = useMemo(() => {
     const parsed = Number(capital)
@@ -83,7 +104,10 @@ export default function Performance() {
     return `/api/v1/performance/reference-capital?${params.toString()}`
   }, [capital, mode])
 
-  const capitalResult = usePoll<PerformancePayload>(capitalQuery ?? '', 60000, {
+  // Slower than the rest on purpose: the on-demand stake is sized over the
+  // published detail window, and it only changes when the snapshot does. A
+  // change to the stake or the mode refetches immediately through the path.
+  const capitalResult = usePoll<PerformancePayload>(capitalQuery ?? '', 300000, {
     enabled: capitalQuery !== null,
   })
 
@@ -91,8 +115,24 @@ export default function Performance() {
   const edgeData = edge.envelope?.data?.data ?? {}
   const winRateData = winRate.envelope?.data?.data ?? {}
   const opportunityRows = opportunities.envelope?.data?.items ?? []
+  const opportunityPage = opportunities.envelope?.data?.data ?? {}
+  const window = opportunityPage.window ?? {}
+  const opportunityFilters = opportunityPage.filters ?? {}
   // Loose on purpose: the payload is a snapshot, not a fixed schema.
   const capitalData: Record<string, any> = capitalResult.envelope?.data ?? {}
+  // The published whole-history block, and the on-demand window answer. Two
+  // different accounts; never one row.
+  const lifetimeCapital: Record<string, any> = summaryData.reference_capital ?? {}
+
+  const generation = opportunities.envelope?.data?.generation_id ?? null
+  const generationChanged =
+    generation !== null && lastGeneration !== null && generation !== lastGeneration && cursor !== null
+  useEffect(() => {
+    if (generation !== null && generation !== lastGeneration) setLastGeneration(generation)
+  }, [generation, lastGeneration])
+
+  const anyFilter = Boolean(model || direction || modeFilter || outcome || targetDate)
+  const resetToFirstPage = () => setCursor(null)
 
   const theoretical = [
     summary.envelope?.data,
@@ -240,10 +280,13 @@ export default function Performance() {
               <div>
                 <div className="mb-2 text-xs font-medium text-ink">按 Edge 区间</div>
                 <ul className="space-y-1.5 text-xs">
-                  {Object.entries((edgeData.by_edge_band as any) ?? {}).map(([band, values]) => (
+                  {Object.entries((edgeData.by_edge_band as any) ?? {}).map(([band, stats]) => (
                     <li key={band} className="flex justify-between gap-3">
                       <span className="text-muted">{band}</span>
-                      <span className="tnum">{fmtInt((values as unknown[]).length)} 次评估</span>
+                      <span className="tnum">
+                        {fmtInt((stats as any)?.count)} 次评估 · mean{' '}
+                        {fmtUsd((stats as any)?.mean)}
+                      </span>
                     </li>
                   ))}
                 </ul>
@@ -276,7 +319,91 @@ export default function Performance() {
 
       {/* ---- Reference capital ---- */}
       <SectionTitle hint="研究假设，非真实资金 · 复用 execution/pricing.py">参考本金</SectionTitle>
+      {/*
+        Two simulations live on this page and they are not the same account.
+        The upper block is the *lifetime* figure the research engine published:
+        every episode it has consumed, simulated once at publish time. The
+        lower one is what the stake and mode below produce, sized over the
+        published detail window. They are labelled, and their counts are never
+        mixed into one row.
+      */}
+      <Card testId="lifetime-capital" className="mb-4">
+        <div className="mb-2 flex flex-wrap items-baseline gap-2">
+          <span className="text-sm font-medium">全历史参考本金（终身）</span>
+          <span className="rounded border border-line px-1.5 py-0.5 text-[10px] text-muted">
+            scope = {String(lifetimeCapital.scope ?? 'lifetime')}
+          </span>
+          <span className="text-xs text-muted">
+            覆盖全部已消费历史 · 发布时模拟一次，不由本页每次请求重算
+          </span>
+        </div>
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <StatCard label="参考本金" value={fmtUsd(lifetimeCapital.capital_usdc)} sub="hypothetical" />
+          <StatCard
+            label="可执行 / 不可执行"
+            value={`${fmtInt(lifetimeCapital.executable_count ?? 0)} / ${fmtInt(
+              lifetimeCapital.not_executable_count ?? 0,
+            )}`}
+            sub={`资金状态 ${String(lifetimeCapital.funding_state ?? '—')}`}
+          />
+          <StatCard
+            label="峰值资金利用率"
+            value={fmtPct(Number(lifetimeCapital.peak_utilization ?? lifetimeCapital.utilization ?? 0))}
+            sub="peak open / capital"
+          />
+          <StatCard
+            label="全历史模拟净收益"
+            value={
+              lifetimeCapital.simulated_net_profit_usdc == null
+                ? 'N/A'
+                : fmtUsd(Number(lifetimeCapital.simulated_net_profit_usdc))
+            }
+            sub={
+              lifetimeCapital.simulated_net_profit_usdc == null
+                ? String(lifetimeCapital.funding_state_reason ?? '证据不足')
+                : '已结算'
+            }
+          />
+        </div>
+        <div className="mt-2 space-y-0.5 text-xs text-muted" data-testid="lifetime-capital-detail">
+          <div>
+            统计区间 {String(lifetimeCapital.statistical_window?.first_seen_utc_from ?? '—')} →{' '}
+            {String(lifetimeCapital.statistical_window?.last_seen_utc_to ?? '—')} · episode{' '}
+            {fmtInt(lifetimeCapital.statistical_window?.episodes_simulated ?? 0)}
+          </div>
+          <div>
+            数据水位 {String((lifetimeCapital.data_watermark ?? [])[0] ?? '—')} · 结算覆盖{' '}
+            {fmtInt(lifetimeCapital.settlement_coverage?.decisive_episodes ?? 0)} /{' '}
+            {fmtInt(lifetimeCapital.settlement_coverage?.episodes ?? 0)} 个 episode 有定论
+          </div>
+          <div>
+            不可执行原因：{' '}
+            {Object.entries((lifetimeCapital.not_executable_reason_counts as any) ?? {}).length === 0
+              ? '无'
+              : Object.entries((lifetimeCapital.not_executable_reason_counts as any) ?? {})
+                  .map(([reason, count]) => `${reason} ${fmtInt(Number(count))}`)
+                  .join(' · ')}
+          </div>
+        </div>
+        <div className="mt-2 border-t border-line pt-2">
+          {(lifetimeCapital.warnings as string[] | undefined)?.map((w, i) => (
+            <div key={i} className="text-xs text-muted">
+              · {w}
+            </div>
+          ))}
+        </div>
+      </Card>
+
       <Card testId="reference-capital" className="mb-4">
+        <div className="mb-2 flex flex-wrap items-baseline gap-2">
+          <span className="text-sm font-medium">按窗口模拟</span>
+          <span className="rounded border border-line px-1.5 py-0.5 text-[10px] text-muted">
+            scope = window
+          </span>
+          <span className="text-xs text-muted">
+            只覆盖明细窗口 · 独立本金假设，不是终身账户某段时间的余额
+          </span>
+        </div>
         <div className="mb-3 flex flex-wrap items-end gap-3">
           <label className="flex flex-col gap-1">
             <span className="text-xs text-muted">Reference Capital (USDC)</span>
@@ -308,6 +435,8 @@ export default function Performance() {
 
         {capitalQuery === null ? (
           <Banner tone="warn" title="参考本金必须大于 0" testId="capital-invalid" />
+        ) : capitalResult.loading && !capitalResult.envelope ? (
+          <EmptyState title="正在计算" reason="按当前本金与模式模拟" testId="capital-loading" />
         ) : capitalResult.error ? (
           <EmptyState title="无法获取" reason={capitalResult.error} testId="capital-error" />
         ) : (
@@ -406,79 +535,274 @@ export default function Performance() {
       <SectionTitle hint="去重后的独立机会 · 同市场多 episode 不是独立结算事件">
         历史机会
       </SectionTitle>
-      {isMissing(opportunities.envelope?.data) ? (
-        <MissingCard payload={opportunities.envelope?.data} title="机会列表" />
-      ) : opportunityRows.length === 0 ? (
+      {opportunities.loading && !opportunities.envelope ? (
+        <Card>
+          <EmptyState title="正在加载" reason="读取已发布的机会分页" testId="opportunities-loading" />
+        </Card>
+      ) : opportunities.error ? (
         <Card>
           <EmptyState
-            title="尚无独立机会"
-            reason={opportunities.envelope?.data?.reason ?? '等待 ACCEPT 积累并形成 episode'}
-            testId="opportunities-empty"
+            title="无法获取"
+            reason={
+              opportunities.status === 409
+                ? '游标属于上一个已发布批次；请回到第一页重新开始'
+                : `请求失败（${opportunities.error}）`
+            }
+            testId="opportunities-error"
           />
         </Card>
+      ) : isMissing(opportunities.envelope?.data) ? (
+        <MissingCard payload={opportunities.envelope?.data} title="机会列表" />
       ) : (
         <Card testId="opportunities-table">
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[900px] text-sm" data-testid="opportunities">
-              <thead>
-                <tr className="border-b border-line text-left text-xs text-muted">
-                  <th className="pb-2 font-medium">首次 ACCEPT</th>
-                  <th className="pb-2 font-medium">目标日</th>
-                  <th className="pb-2 font-medium">市场 / 区间</th>
-                  <th className="pb-2 font-medium">模型</th>
-                  <th className="pb-2 font-medium">方向</th>
-                  <th className="pb-2 text-right font-medium">理论净 Edge</th>
-                  <th className="pb-2 text-right font-medium">模型概率</th>
-                  <th className="pb-2 text-right font-medium">评估价格</th>
-                  <th className="pb-2 text-right font-medium">持续</th>
-                  <th className="pb-2 text-right font-medium">重复</th>
-                  <th className="pb-2 font-medium">结算</th>
-                </tr>
-              </thead>
-              <tbody>
-                {opportunityRows.map((row: Record<string, any>) => (
-                  <tr
-                    key={row.episode_id}
-                    className="border-b border-line/50 last:border-0"
-                    data-testid="opportunity-row"
-                  >
-                    <td className="py-2 text-xs">{row.first_seen_utc ?? '—'}</td>
-                    <td className="py-2 text-xs">{row.target_date ?? '—'}</td>
-                    <td className="max-w-[220px] truncate text-xs">
-                      {row.bracket_label ?? '—'}
-                    </td>
-                    <td className="py-2 text-xs">{row.model_name ?? '—'}</td>
-                    <td className="py-2 text-xs">{row.direction ?? '—'}</td>
-                    <td className="tnum py-2 text-right text-xs">{fmtUsd(row.first_edge)}</td>
-                    <td className="tnum py-2 text-right text-xs">
-                      {row.first_model_probability == null
-                        ? '—'
-                        : fmtPct(row.first_model_probability)}
-                    </td>
-                    <td className="tnum py-2 text-right text-xs">
-                      {row.first_market_price == null ? '—' : fmtUsd(row.first_market_price)}
-                    </td>
-                    <td className="tnum py-2 text-right text-xs">
-                      {row.duration_seconds == null
-                        ? '—'
-                        : `${Math.round(Number(row.duration_seconds) / 60)}m`}
-                    </td>
-                    <td className="tnum py-2 text-right text-xs">
-                      {fmtInt(row.observation_count)}
-                    </td>
-                    <td className="py-2 text-xs">
-                      {row.outcome ?? <span className="text-muted">未结算</span>}
-                    </td>
-                  </tr>
+          <div className="mb-3 flex flex-wrap items-end gap-2 text-xs">
+            <label className="flex flex-col gap-1">
+              <span className="text-muted">模型</span>
+              <select
+                className={inputClass}
+                value={model}
+                onChange={(e) => {
+                  setModel(e.target.value)
+                  resetToFirstPage()
+                }}
+                data-testid="filter-model"
+              >
+                <option value="">全部</option>
+                {((models.envelope?.data?.data?.models as string[]) ?? []).map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
                 ))}
-              </tbody>
-            </table>
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-muted">方向</span>
+              <select
+                className={inputClass}
+                value={direction}
+                onChange={(e) => {
+                  setDirection(e.target.value)
+                  resetToFirstPage()
+                }}
+                data-testid="filter-direction"
+              >
+                <option value="">全部</option>
+                <option value="buy_yes">buy_yes</option>
+                <option value="sell_yes">sell_yes</option>
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-muted">模式</span>
+              <select
+                className={inputClass}
+                value={modeFilter}
+                onChange={(e) => {
+                  setModeFilter(e.target.value)
+                  resetToFirstPage()
+                }}
+                data-testid="filter-mode"
+              >
+                <option value="">全部</option>
+                <option value="LIVE">LIVE</option>
+                <option value="REPLAY">REPLAY</option>
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-muted">结算</span>
+              <select
+                className={inputClass}
+                value={outcome}
+                onChange={(e) => {
+                  setOutcome(e.target.value)
+                  resetToFirstPage()
+                }}
+                data-testid="filter-outcome"
+              >
+                <option value="">全部</option>
+                {['WIN', 'LOSS', 'PENDING', 'DISPUTED', 'UNVERIFIABLE', 'UNAVAILABLE'].map(
+                  (value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ),
+                )}
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-muted">目标日</span>
+              <input
+                type="date"
+                className={inputClass}
+                value={targetDate}
+                onChange={(e) => {
+                  setTargetDate(e.target.value)
+                  resetToFirstPage()
+                }}
+                data-testid="filter-target-date"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-muted">每页</span>
+              <select
+                className={inputClass}
+                value={pageSize}
+                onChange={(e) => {
+                  setPageSize(e.target.value)
+                  resetToFirstPage()
+                }}
+                data-testid="page-size"
+              >
+                {['25', '50', '100', '200'].map((value) => (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {anyFilter && (
+              <button
+                type="button"
+                className="rounded border border-line px-2 py-1 text-muted"
+                onClick={() => {
+                  setModel('')
+                  setDirection('')
+                  setModeFilter('')
+                  setOutcome('')
+                  setTargetDate('')
+                  resetToFirstPage()
+                }}
+                data-testid="filter-clear"
+              >
+                清除筛选
+              </button>
+            )}
           </div>
-          {opportunities.envelope?.data?.next_cursor != null && (
-            <div className="mt-3 text-xs text-muted">
-              仅显示前 {fmtInt(opportunityRows.length)} 条；完整列表见 API 分页参数。
+
+          {generationChanged && (
+            <div className="mb-3 rounded border border-line bg-panel px-3 py-2 text-xs text-muted" data-testid="generation-changed">
+              研究批次已更新（{lastGeneration} → {generation}）。游标属于上一批，页码不通用；
+              请回到第一页。
+              <button
+                type="button"
+                className="ml-2 underline"
+                onClick={resetToFirstPage}
+                data-testid="generation-reset"
+              >
+                回到第一页
+              </button>
             </div>
           )}
+
+          {opportunityRows.length === 0 ? (
+            <EmptyState
+              title={anyFilter ? '没有符合条件的机会' : '尚无独立机会'}
+              reason={
+                opportunities.envelope?.data?.reason ??
+                (anyFilter ? '筛选条件下该窗口内没有 episode' : '等待 ACCEPT 积累并形成 episode')
+              }
+              testId="opportunities-empty"
+            />
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[900px] text-sm" data-testid="opportunities">
+                <thead>
+                  <tr className="border-b border-line text-left text-xs text-muted">
+                    <th className="pb-2 font-medium">首次 ACCEPT</th>
+                    <th className="pb-2 font-medium">目标日</th>
+                    <th className="pb-2 font-medium">市场 / 区间</th>
+                    <th className="pb-2 font-medium">模型</th>
+                    <th className="pb-2 font-medium">方向</th>
+                    <th className="pb-2 text-right font-medium">理论净 Edge</th>
+                    <th className="pb-2 text-right font-medium">模型概率</th>
+                    <th className="pb-2 text-right font-medium">评估价格</th>
+                    <th className="pb-2 text-right font-medium">持续</th>
+                    <th className="pb-2 text-right font-medium">重复</th>
+                    <th className="pb-2 font-medium">结算</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {opportunityRows.map((row: Record<string, any>) => (
+                    <tr
+                      key={row.episode_id}
+                      className="border-b border-line/50 last:border-0"
+                      data-testid="opportunity-row"
+                    >
+                      <td className="py-2 text-xs">{row.first_seen_utc ?? '—'}</td>
+                      <td className="py-2 text-xs">{row.target_date ?? '—'}</td>
+                      <td className="max-w-[220px] truncate text-xs">
+                        {row.bracket_label ?? '—'}
+                      </td>
+                      <td className="py-2 text-xs">{row.model_name ?? '—'}</td>
+                      <td className="py-2 text-xs">{row.direction ?? '—'}</td>
+                      <td className="tnum py-2 text-right text-xs">{fmtUsd(row.first_edge)}</td>
+                      <td className="tnum py-2 text-right text-xs">
+                        {row.first_model_probability == null
+                          ? '—'
+                          : fmtPct(row.first_model_probability)}
+                      </td>
+                      <td className="tnum py-2 text-right text-xs">
+                        {row.first_market_price == null ? '—' : fmtUsd(row.first_market_price)}
+                      </td>
+                      <td className="tnum py-2 text-right text-xs">
+                        {row.duration_seconds == null
+                          ? '—'
+                          : `${Math.round(Number(row.duration_seconds) / 60)}m`}
+                      </td>
+                      <td className="tnum py-2 text-right text-xs">
+                        {fmtInt(row.observation_count)}
+                      </td>
+                      <td className="py-2 text-xs">
+                        {row.outcome ?? <span className="text-muted">未结算</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
+            <span data-testid="page-summary">
+              {opportunityRows.length === 0
+                ? '本页 0 条'
+                : `${fmtInt(Number(opportunityPage.offset ?? 0) + 1)}–${fmtInt(
+                    Number(opportunityPage.offset ?? 0) + opportunityRows.length,
+                  )} / ${fmtInt(opportunities.envelope?.data?.total ?? 0)} 条`}
+              {Object.keys(opportunityFilters).length > 0 && (
+                <> · 筛选 {Object.entries(opportunityFilters).map(([k, v]) => `${k}=${v}`).join(' · ')}</>
+              )}
+            </span>
+            <span className="flex items-center gap-2">
+              <button
+                type="button"
+                className="rounded border border-line px-2 py-1 disabled:opacity-40"
+                disabled={opportunities.envelope?.data?.prev_cursor == null}
+                onClick={() => setCursor(String(opportunities.envelope?.data?.prev_cursor))}
+                data-testid="page-prev"
+              >
+                上一页
+              </button>
+              <button
+                type="button"
+                className="rounded border border-line px-2 py-1 disabled:opacity-40"
+                disabled={opportunities.envelope?.data?.next_cursor == null}
+                onClick={() => setCursor(String(opportunities.envelope?.data?.next_cursor))}
+                data-testid="page-next"
+              >
+                下一页
+              </button>
+            </span>
+          </div>
+
+          {window && window.complete === false && (
+            <div className="mt-2 text-xs text-muted" data-testid="window-note">
+              明细仅覆盖最近 {fmtInt(window.episodes)} 条（{fmtInt(window.days)} 天窗口，共{' '}
+              {fmtInt(window.episodes_all)} 条）。上方汇总、Edge 分布与胜率覆盖全部历史。
+            </div>
+          )}
+          <div className="mt-2 border-t border-line pt-2">
+            <ScopeLine payload={opportunities.envelope?.data} />
+          </div>
         </Card>
       )}
 

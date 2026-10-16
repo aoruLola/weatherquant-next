@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import tracemalloc
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,7 @@ from test_performance_streaming import (
     _settlements,
     _strip,
     _write_parts,
+    published_episodes,
 )
 from weatherquant.performance.snapshot import resolve_generation
 from weatherquant.performance.state import (
@@ -442,7 +444,7 @@ def test_only_the_revised_market_changes(tmp_path) -> None:
     before = _read_generation(out)
     before_episodes = {
         row["episode_id"]: row["outcome"]
-        for row in before["opportunities.json"]["data"]["episodes"]
+        for row in published_episodes(tmp_path / "performance")
     }
     target = index[0]
     flipped = [
@@ -458,19 +460,13 @@ def test_only_the_revised_market_changes(tmp_path) -> None:
     after = _read_generation(out)
     after_episodes = {
         row["episode_id"]: row["outcome"]
-        for row in after["opportunities.json"]["data"]["episodes"]
+        for row in published_episodes(tmp_path / "performance")
     }
     changed = {key for key in before_episodes if before_episodes[key] != after_episodes[key]}
     affected = {
-        key
-        for key in before_episodes
-        if before["opportunities.json"]["data"]["episodes"]
-        and next(
-            row["market_id"]
-            for row in before["opportunities.json"]["data"]["episodes"]
-            if row["episode_id"] == key
-        )
-        == target["market_id"]
+        row["episode_id"]
+        for row in published_episodes(tmp_path / "performance")
+        if row["market_id"] == target["market_id"]
     }
     assert changed, "the revised market must change something"
     assert changed <= affected, "no other market may move"
@@ -522,14 +518,14 @@ def test_a_withdrawn_settlement_is_retracted_and_not_resurrected(tmp_path) -> No
     # market's other days keep theirs, because a retraction is per answer.
     retracted = [
         row
-        for row in after["opportunities.json"]["data"]["episodes"]
+        for row in published_episodes(tmp_path / "performance")
         if row["market_id"] == withdrawn["market_id"]
         and row["target_date"] == withdrawn["target_date"]
     ]
     assert retracted and all(row["outcome"] == "UNAVAILABLE" for row in retracted)
     still_scored = [
         row
-        for row in after["opportunities.json"]["data"]["episodes"]
+        for row in published_episodes(tmp_path / "performance")
         if row["market_id"] == withdrawn["market_id"]
         and row["target_date"] != withdrawn["target_date"]
     ]
@@ -548,19 +544,14 @@ def test_a_withdrawn_settlement_is_retracted_and_not_resurrected(tmp_path) -> No
     )
 
 
-def test_an_empty_settlement_index_retracts_nothing(tmp_path) -> None:
-    """`--settlements-replace` with an empty index must be inert, not a wipe.
+def test_an_empty_settlement_index_is_refused_without_confirmation(tmp_path) -> None:
+    """Replace + empty is the one way to retract everything, so it needs asking.
 
-    Replace makes the index authoritative, so an empty one reads as "no
-    settlement exists" and would delete every answer - including ones the
-    platform confirmed. An index comes out empty for ordinary reasons: the
-    backfill matched no markets, or the platform was unreachable. Neither is
-    an assertion that yesterday's answers were wrong.
-
-    The guard is `if answers:` before the write. Without a test it is one
-    refactor away from being "tidied" into an unconditional call, and the
-    loss would be silent: the snapshots would simply stop scoring, with
-    `UNAVAILABLE` where a resolved market used to be.
+    An index comes out empty for ordinary reasons - the backfill matched no
+    markets, or the platform was unreachable - and the settlement layer cannot
+    be rebuilt from the export, because rebuilding it needs the network. So the
+    default is to refuse, and a refusal has to leave *nothing* moved: no
+    settlement removed, no watermark advanced, no generation published.
     """
     rows = _dataset(seed=211, rows=600)
     index = _settlements(rows)
@@ -573,20 +564,204 @@ def test_an_empty_settlement_index_retracts_nothing(tmp_path) -> None:
     )
     before = _read_generation(out)
     assert len(before["settlements.json"]["data"]["answers"]) == len(index)
+    with PerformanceStateStore(state_db) as store:
+        watermark_before = store.load_state()
 
-    build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=[], settlements_replace=True, now=NOW,
-    )
+    with pytest.raises(PerformanceStateError, match="refusing to replace"):
+        build_performance_streaming(
+            export=export, out_dir=out, state_db=state_db, dataset="fixture",
+            settlements=[], settlements_replace=True, now=NOW,
+        )
 
     after = _read_generation(out)
     assert len(after["settlements.json"]["data"]["answers"]) == len(index), (
-        "an empty index wiped the settlement layer"
+        "a refused retraction still wiped the settlement layer"
     )
-    outcomes = {
-        row["outcome"] for row in after["opportunities.json"]["data"]["episodes"]
+    # Nothing moved, not just nothing settled: the refusal is raised before the
+    # store is opened, so the watermark cannot have advanced either.
+    with PerformanceStateStore(state_db) as store:
+        assert store.load_state() == watermark_before
+    assert not list(tmp_path.glob("*.retracted-*.json")), (
+        "a refused retraction wrote a backup, so it did something"
+    )
+
+
+def test_a_confirmed_empty_retraction_retracts_and_leaves_a_backup(tmp_path) -> None:
+    """With the confirmation, a total retraction is allowed - and recoverable.
+
+    The backup is the point. Every other settlement operation can be redone
+    from the index; this one cannot, so the rows, the count, the input and the
+    reason go to disk before anything is deleted.
+    """
+    rows = _dataset(seed=211, rows=600)
+    index = _settlements(rows)
+    export = _write_parts(tmp_path, rows, 3)
+    state_db = tmp_path / "state.duckdb"
+    out = tmp_path / "performance"
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=index, now=NOW,
+    )
+    assert len(_read_generation(out)["settlements.json"]["data"]["answers"]) == len(index)
+
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=[], settlements_replace=True, confirm_empty_retraction=True,
+        settlements_source="/tmp/settlements.json",
+        retraction_reason="platform returned no resolutions for this window",
+        now=NOW,
+    )
+
+    after = _read_generation(out)
+    assert after["settlements.json"]["data"]["answers"] == [], (
+        "the confirmed retraction did not retract"
+    )
+    rate = after["win-rate.json"]["data"]["overall"]
+    assert rate["counts"]["WIN"] == 0 and rate["counts"]["LOSS"] == 0, (
+        "a retracted answer was still scored"
+    )
+    assert rate["valid_samples"] == 0
+
+    backups = list(tmp_path.glob("*.retracted-*.json"))
+    assert len(backups) == 1, backups
+    payload = json.loads(backups[0].read_text(encoding="utf-8"))
+    assert payload["rows_retracted"] == len(index)
+    assert payload["input_source"] == "/tmp/settlements.json"
+    assert payload["reason"] == "platform returned no resolutions for this window"
+    # Recoverable: every answer that was deleted is in the file, with its
+    # payout and its provenance intact.
+    assert len(payload["settlements"]) == len(index)
+    assert {(r["market_id"], r["target_date"]) for r in payload["settlements"]} == {
+        (r["market_id"], r["target_date"]) for r in index
     }
-    assert outcomes & {"WIN", "LOSS"}, "an empty index un-scored every episode"
+
+
+def test_a_reason_is_recorded_as_null_rather_than_invented(tmp_path) -> None:
+    """An audit line that guesses a motive is worse than one that admits none."""
+    rows = _dataset(seed=211, rows=200)
+    export = _write_parts(tmp_path, rows, 2)
+    state_db = tmp_path / "state.duckdb"
+    build_performance_streaming(
+        export=export, out_dir=tmp_path / "p", state_db=state_db,
+        dataset="fixture", settlements=_settlements(rows), now=NOW,
+    )
+    build_performance_streaming(
+        export=export, out_dir=tmp_path / "p", state_db=state_db,
+        dataset="fixture", settlements=[], settlements_replace=True,
+        confirm_empty_retraction=True, now=NOW,
+    )
+    payload = json.loads(
+        next(tmp_path.glob("*.retracted-*.json")).read_text(encoding="utf-8")
+    )
+    assert payload["reason"] is None
+    assert payload["input_source"] is None
+
+
+def test_confirm_empty_retraction_alone_is_refused(tmp_path, capsys) -> None:
+    """It confirms nothing on its own, and accepting it would imply it did.
+
+    One of these two flags can delete every settlement answer and the other
+    cannot. Letting the harmless one stand in for the dangerous one is how a
+    script ends up holding the wrong one.
+    """
+    from weatherquant.cli import main as research_main
+
+    rows = _dataset(seed=251, rows=200)
+    export = _write_parts(tmp_path, rows, 2)
+
+    code = research_main(
+        [
+            "build-performance",
+            "--export", str(export),
+            "--out", str(tmp_path / "out"),
+            "--dataset", "fixture",
+            "--state-db", str(tmp_path / "state.duckdb"),
+            "--confirm-empty-retraction",
+        ]
+    )
+    assert code == 2
+    assert "--settlements-replace" in capsys.readouterr().err
+
+
+def test_the_empty_retraction_refusal_reaches_the_command(tmp_path, capsys) -> None:
+    """The CLI refuses an unconfirmed empty replace, and says why."""
+    from weatherquant.cli import main as research_main
+
+    rows = _dataset(seed=261, rows=200)
+    export = _write_parts(tmp_path, rows, 2)
+    state_db = tmp_path / "state.duckdb"
+    index = tmp_path / "settlements.json"
+    index.write_text(json.dumps(_settlements(rows)), encoding="utf-8")
+    empty = tmp_path / "empty.json"
+    empty.write_text("[]", encoding="utf-8")
+
+    assert (
+        research_main(
+            [
+                "build-performance", "--export", str(export),
+                "--out", str(tmp_path / "out"), "--dataset", "fixture",
+                "--state-db", str(state_db), "--settlements", str(index),
+            ]
+        )
+        == 0
+    )
+
+    code = research_main(
+        [
+            "build-performance", "--export", str(export),
+            "--out", str(tmp_path / "out"), "--dataset", "fixture",
+            "--state-db", str(state_db),
+            "--settlements", str(empty), "--settlements-replace",
+        ]
+    )
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "refusing to replace" in err
+    assert "--confirm-empty-retraction" in err
+    # The refusal must be actionable, not just a refusal.
+    assert "Nothing was read, written or retracted" in err
+
+
+def test_an_existing_state_database_keeps_working(tmp_path) -> None:
+    """Migration regression: a store built before this change still opens.
+
+    No migration was added for the retraction guard - it is CLI and control
+    flow, not schema - so the check that matters is that an existing database
+    is not disturbed: the migration set is unchanged, reopening re-applies
+    nothing, and the settlement rows survive.
+    """
+    from weatherquant.performance.state import PERFORMANCE_MIGRATIONS_DIR
+    from weatherquant.storage.migrator import applied_migrations, available_migrations
+
+    rows = _dataset(seed=271, rows=200)
+    export = _write_parts(tmp_path, rows, 2)
+    state_db = tmp_path / "state.duckdb"
+    build_performance_streaming(
+        export=export, out_dir=tmp_path / "p", state_db=state_db,
+        dataset="fixture", settlements=_settlements(rows), now=NOW,
+    )
+
+    versions = [spec.version for spec in available_migrations(PERFORMANCE_MIGRATIONS_DIR)]
+    assert versions == sorted(versions, key=int), versions
+    assert versions == ["0001", "0002"], (
+        "the retraction guard needed no migration; a new one here would mean "
+        "an existing state database has to be upgraded before it can be read"
+    )
+
+    # Reopen: migrations are idempotent and nothing is lost.
+    with PerformanceStateStore(state_db) as store:
+        assert set(applied_migrations(store.con)) == set(versions)
+        before = store.load_settlements()
+    assert before
+
+    build_performance_streaming(
+        export=export, out_dir=tmp_path / "p", state_db=state_db,
+        dataset="fixture", now=NOW,
+    )
+    with PerformanceStateStore(state_db) as store:
+        assert len(store.load_settlements()) == len(before), (
+            "reopening an existing state database changed the settlement layer"
+        )
 
 
 def test_the_settlement_layer_records_where_it_came_from(tmp_path) -> None:
@@ -815,3 +990,183 @@ def test_a_state_store_built_from_another_export_is_refused_by_the_command(
     )
     assert code == 2
     assert "does not match this run" in capsys.readouterr().err
+
+
+def test_the_detail_window_is_configurable_from_the_command(tmp_path, capsys) -> None:
+    """The window is an operator decision, and it is recorded in the manifest."""
+    from weatherquant.cli import main as research_main
+
+    rows = _dataset(seed=221, rows=300)
+    export = _write_parts(tmp_path, rows, 2)
+    out = tmp_path / "performance"
+    code = research_main(
+        [
+            "build-performance",
+            "--export", str(export),
+            "--out", str(out),
+            "--dataset", "fixture",
+            "--state-db", str(tmp_path / "state.duckdb"),
+            "--detail-window-episodes", "7",
+            "--detail-window-days", "3650",
+        ]
+    )
+    assert code == 0, capsys.readouterr().err
+
+    generation = resolve_generation(out)
+    assert generation.directory is not None
+    payload = json.loads((generation.directory / "opportunities.json").read_text())
+    window = payload["data"]["window"]
+    assert window["episodes"] == 7
+    assert window["max_episodes"] == 7
+    assert window["days"] == 3650
+    assert window["complete"] is False
+    assert payload["data"]["total_all"] > 7
+    assert any("window" in warning for warning in payload["data"]["warnings"])
+    assert any(scope.startswith("window:") for scope in payload["data"]["statistical_scope"])
+
+
+def test_an_empty_authoritative_index_retracts_everything(tmp_path) -> None:
+    """`--settlements-replace` with nothing in it means "none of these hold".
+
+    The case matters because it is the only one where a retraction is total,
+    and it is exactly the case a naive `if answers:` would skip - leaving every
+    answer in place while the operator believes they were withdrawn.
+
+    It now also needs `confirm_empty_retraction`, because the same input is
+    what a *failed* backfill produces, and this test is about what a
+    confirmed retraction does rather than about whether one is allowed.
+    """
+    rows = _dataset(seed=231, rows=300)
+    index = _settlements(rows)
+    export = _write_parts(tmp_path, rows, 2)
+    state_db = tmp_path / "state.duckdb"
+    out = tmp_path / "performance"
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=index, now=NOW,
+    )
+    assert _read_generation(out)["settlements.json"]["data"]["answers"]
+
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=[], settlements_replace=True, confirm_empty_retraction=True,
+        now=NOW,
+    )
+    after = _read_generation(out)
+    assert after["settlements.json"]["data"]["answers"] == []
+    assert after["settlements.json"]["data"]["verified"] == []
+    outcome = after["win-rate.json"]["data"]["overall"]
+    episodes = after["summary.json"]["data"]["opportunity_episodes"]
+    assert episodes > 0
+    # No answer at all is UNAVAILABLE, not UNVERIFIABLE: nothing was resolved
+    # and then failed verification, there is simply nothing to score.
+    assert outcome["counts"]["UNAVAILABLE"] == episodes
+    assert outcome["valid_samples"] == 0
+    assert outcome["counts"]["WIN"] == 0 and outcome["counts"]["LOSS"] == 0
+    assert outcome["win_rate"] is None
+
+
+def test_an_authoritative_index_keeps_what_it_lists(tmp_path) -> None:
+    """Replacement is not deletion: what the index does list stays, revised."""
+    rows = _dataset(seed=241, rows=300)
+    index = _settlements(rows)
+    export = _write_parts(tmp_path, rows, 2)
+    state_db = tmp_path / "state.duckdb"
+    out = tmp_path / "performance"
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=index, now=NOW,
+    )
+    kept = index[: len(index) // 2]
+    flipped = [{**row, "resolved_outcome": 1.0 if not row["resolved_outcome"] else 0.0} for row in kept]
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=flipped, settlements_replace=True, now=NOW,
+    )
+    answers = _read_generation(out)["settlements.json"]["data"]["answers"]
+    assert len(answers) == len(kept)
+    assert {(row["market_id"], row["target_date"]) for row in answers} == {
+        (row["market_id"], row["target_date"]) for row in kept
+    }
+
+
+def test_a_store_from_the_previous_migration_upgrades_in_place(tmp_path) -> None:
+    """An old state store must migrate, not refuse to open.
+
+    A deployment that shipped the first version of this store has a
+    ``performance_settlements`` table with no ``verification_status``, no
+    ``resolution_source`` and a NOT NULL retrieval time. Migration 0002 adds
+    the columns and drops the NOT NULL, and the rows written before it must
+    still read - as "not recorded", which is what they are.
+    """
+    from weatherquant.performance.episodes import EpisodeKey
+    from weatherquant.performance.state import (
+        PERFORMANCE_MIGRATIONS_DIR,
+        episode_key_hash,
+        settlement_key_hash,
+    )
+    from weatherquant.storage.db import connect
+    from weatherquant.storage.migrator import available_migrations
+
+    state_db = tmp_path / "old-state.duckdb"
+    legacy = next(
+        spec for spec in available_migrations(PERFORMANCE_MIGRATIONS_DIR) if spec.version == "0001"
+    )
+    con = connect(state_db)
+    con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR PRIMARY KEY, "
+                "name VARCHAR NOT NULL, checksum VARCHAR NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+    con.execute(legacy.sql)
+    con.execute(
+        "INSERT INTO schema_migrations (version, name, checksum) VALUES (?, ?, ?)",
+        [legacy.version, legacy.name, legacy.checksum],
+    )
+    # A row the old schema could hold: a retrieval time (it was NOT NULL) and
+    # no provenance columns at all.
+    con.execute(
+        "INSERT INTO performance_settlements (key_hash, market_id, target_date, status, "
+        "payout, verified, fetched_at_utc, updated_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            settlement_key_hash("m-0", "2026-10-13"),
+            "m-0",
+            "2026-10-13",
+            "RESOLVED",
+            1.0,
+            True,
+            datetime(2026, 10, 12, tzinfo=UTC),
+            datetime(2026, 10, 12, tzinfo=UTC),
+        ],
+    )
+    con.execute(
+        "INSERT INTO performance_episodes (episode_id, key_hash, market_id, target_date, "
+        "model_name, direction, mode, first_seen_utc, last_seen_utc, observation_count, "
+        "edge_count, sum_edges, first_edge, last_edge, max_edge, min_edge, is_open, "
+        "opened_seq, ingested_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            "ep-old", episode_key_hash(EpisodeKey("m-0", "2026-10-13", "calibrated", "buy_yes", "LIVE")),
+            "m-0", "2026-10-13", "calibrated", "buy_yes", "LIVE",
+            datetime(2026, 10, 12, tzinfo=UTC), datetime(2026, 10, 12, 0, 5, tzinfo=UTC),
+            1, 1, 0.05, 0.05, 0.05, 0.05, 0.05, False, 0,
+            datetime(2026, 10, 12, tzinfo=UTC),
+        ],
+    )
+    con.close()
+
+    # Opening it with the current code applies 0002 and reads the old rows.
+    with PerformanceStateStore(state_db) as store:
+        applied = store.open()
+        rows = store.load_settlements()
+        assert rows == [
+            {
+                "market_id": "m-0",
+                "target_date": "2026-10-13",
+                "status": "RESOLVED",
+                "payout": 1.0,
+                "verified": True,
+                # Not recorded, and it says so rather than inventing a verdict.
+                "verification_status": None,
+                "resolution_source": None,
+                "fetched_at_utc": "2026-10-12T00:00:00+00:00",
+            }
+        ]
+        assert store.summary()["counts"]["episodes"] == 1
+    del applied

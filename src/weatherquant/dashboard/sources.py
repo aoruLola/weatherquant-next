@@ -26,7 +26,7 @@ from typing import Any
 
 from weatherquant.dashboard.config import DashboardSettings
 from weatherquant.dashboard.contracts import Freshness, FreshnessState
-from weatherquant.performance.snapshot import resolve_generation
+from weatherquant.performance.snapshot import CURRENT_POINTER, Generation, resolve_generation
 
 __all__ = ["JsonSource", "SnapshotSources", "age_seconds", "freshness_of", "parse_utc"]
 
@@ -107,6 +107,31 @@ class SnapshotSources:
     settings: DashboardSettings
     _cache: dict[str, _CacheEntry] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    #: Which generation the pointer names, cached by the pointer's own mtime.
+    #: A paged read resolves the generation once and then reads several files
+    #: out of it; resolving per file would let a publish land in the middle and
+    #: hand the caller two generations stitched together.
+    _generation: Generation | None = None
+    _generation_key: tuple[int, int] | None = None
+    _generation_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def performance_generation(self) -> Generation:
+        """The published generation, re-resolved only when the pointer moves."""
+        root = self.settings.performance_snapshots_dir
+        try:
+            stat = (root / CURRENT_POINTER).stat()
+            key: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            key = None
+        if key is not None:
+            with self._generation_lock:
+                if key == self._generation_key and self._generation is not None:
+                    return self._generation
+        generation = resolve_generation(root)
+        with self._generation_lock:
+            self._generation = generation
+            self._generation_key = key
+        return generation
 
     # -- public ------------------------------------------------------------
     def read(
@@ -232,7 +257,7 @@ class SnapshotSources:
             "(docs/performance-data-contract.md §7)"
         )
 
-        generation = resolve_generation(root)
+        generation = self.performance_generation()
         if generation.directory is None and generation.problem is None:
             # Nothing has ever been published here, or this deployment still
             # uses the flat layout the API always accepted.

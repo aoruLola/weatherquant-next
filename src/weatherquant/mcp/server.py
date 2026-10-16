@@ -308,14 +308,43 @@ def build_server(gateway: Gateway) -> Any:
             "去重后的独立机会(Opportunity Episode)：首次/末次 ACCEPT 时间、"
             "持续时长、重复次数、代表 Edge、模型概率、评估价格、结算与 WIN/LOSS。\n\n"
             "回答「去重后有多少独立机会」时用这个，不要用 ACCEPT 观测次数。\n"
-            "同一市场的多个 episode 不是独立结算事件。"
+            "同一市场的多个 episode 不是独立结算事件。\n\n"
+            "分页：默认 25 条，单次最多 200 条。用返回的 next_cursor 取下一页，"
+            "prev_cursor 取上一页；游标属于某一批次，批次变了会返回 409，"
+            "此时必须从第一页重新开始，不得拼接两批数据。\n"
+            "筛选：model / direction / mode / target_date / outcome / min_edge / max_edge。"
         ),
     )
-    def get_opportunities(limit: int = 25, cursor: int = 0) -> dict[str, Any]:
+    def get_opportunities(
+        limit: int = 25,
+        cursor: str | None = None,
+        model: str | None = None,
+        direction: str | None = None,
+        mode: str | None = None,
+        target_date: str | None = None,
+        outcome: str | None = None,
+        min_edge: float | None = None,
+        max_edge: float | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": max(1, min(limit, 200))}
+        for name, value in (
+            ("cursor", cursor),
+            ("model", model),
+            ("direction", direction),
+            ("mode", mode),
+            ("target_date", target_date),
+            ("outcome", outcome),
+            ("min_edge", min_edge),
+            ("max_edge", max_edge),
+        ):
+            # Absent filters are not sent at all: an empty string is a filter
+            # value, and "no filter" is not the same request.
+            if value is not None:
+                params[name] = value
         return gateway.call_raw(
             "get_opportunities",
             "/api/v1/performance/opportunities",
-            params={"limit": max(1, min(limit, 200)), "cursor": max(0, cursor)},
+            params=params,
         )
 
     @server.tool(

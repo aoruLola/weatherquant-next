@@ -23,11 +23,11 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from weatherquant.performance.capital import simulate_portfolio
+from weatherquant.performance.capital import lifetime_portfolio_payload, simulate_portfolio
 from weatherquant.performance.edge import daily_edge, edge_by_bin, grouped_edge, observation_edge
 from weatherquant.performance.episodes import (
     Episode,
@@ -42,7 +42,11 @@ from weatherquant.performance.winrate import (
     grouped_win_rate,
     win_rate,
 )
-from weatherquant.shadow.publish import atomic_write_json, atomic_write_json_streaming
+from weatherquant.shadow.publish import (
+    PartitionedArray,
+    atomic_write_json,
+    atomic_write_json_streaming,
+)
 
 __all__ = [
     "CURRENT_POINTER",
@@ -57,6 +61,23 @@ __all__ = [
 
 PERFORMANCE_SCHEMA_VERSION = 1
 
+#: The detail window: how many episodes the dashboard can page through, and how
+#: far back. The contract (§0.4) says a snapshot holds a window rather than the
+#: whole table, and this is that window - the aggregates cover the whole
+#: history, the browsable detail covers the recent end of it.
+#:
+#: It is bounded because a page request must be bounded: with 240,000 episodes
+#: published as one array, serving fifty rows meant parsing 163 MB.
+DETAIL_MAX_EPISODES = 20_000
+DETAIL_WINDOW_DAYS = 90
+#: Rows per published part. A page of 50 never reads more than one part, and a
+#: filtered request reads them one at a time.
+DETAIL_PARTITION_SIZE = 1_000
+#: How many per-opportunity capital results travel with the summary. The counts
+#: are complete; the list is an illustration.
+CAPITAL_RESULT_SAMPLE = 50
+
+
 #: filename -> logical name, so a reader never invents a naming scheme.
 SNAPSHOT_FILES: dict[str, str] = {
     "summary.json": "performance-summary",
@@ -66,6 +87,72 @@ SNAPSHOT_FILES: dict[str, str] = {
     "settlements.json": "performance-settlements",
     "models.json": "performance-models",
 }
+
+
+def detail_window_descriptor(
+    *,
+    window_episodes: int,
+    all_episodes: int,
+    max_episodes: int,
+    days: int,
+    first_seen_utc: str | None,
+    last_seen_utc: str | None,
+) -> dict[str, Any]:
+    """What the browsable detail covers, stated rather than implied.
+
+    A reader that sees fifty rows out of 240,000 has to be told which fifty and
+    what is missing. ``complete`` is the honest flag: false means the detail is
+    a window and the aggregates - not this list - are the whole history.
+    """
+    return {
+        "episodes": window_episodes,
+        "episodes_all": all_episodes,
+        "max_episodes": max_episodes,
+        "days": days,
+        "first_seen_utc_from": first_seen_utc,
+        "last_seen_utc_to": last_seen_utc,
+        "complete": window_episodes == all_episodes,
+    }
+
+
+def detail_window(
+    episodes: Sequence[Episode],
+    *,
+    now: datetime,
+    max_episodes: int = DETAIL_MAX_EPISODES,
+    days: int = DETAIL_WINDOW_DAYS,
+) -> tuple[list[Episode], dict[str, Any]]:
+    """The most recent slice of a materialised episode set, newest first.
+
+    The list-based twin of the store query in the streaming engine: same
+    predicate, same order, same cap. Two implementations of "what the dashboard
+    can page through" would be two answers, so the equivalence test compares
+    them on the same input.
+    """
+    cutoff = now - timedelta(days=days)
+    recent = [episode for episode in episodes if episode.first_seen_utc >= cutoff]
+    recent.sort(key=lambda e: (e.first_seen_utc, e.episode_id), reverse=True)
+    window = recent[:max_episodes]
+    descriptor = detail_window_descriptor(
+        window_episodes=len(window),
+        all_episodes=len(episodes),
+        max_episodes=max_episodes,
+        days=days,
+        first_seen_utc=window[0].first_seen_utc.isoformat() if window else None,
+        last_seen_utc=window[-1].first_seen_utc.isoformat() if window else None,
+    )
+    return window, descriptor
+
+
+def detail_warnings(window: Mapping[str, Any]) -> list[str]:
+    """The sentence a windowed detail owes its reader."""
+    if window.get("complete"):
+        return []
+    return [
+        f"Only the most recent {window['episodes']} episode(s) "
+        f"({window['days']} day window) are published in full; the totals, the "
+        "edge distributions and the win rates cover the whole history.",
+    ]
 
 
 def _envelope(
@@ -207,6 +294,32 @@ def _settlement_provenance(
     return out
 
 
+def _settlement_coverage(
+    records: Sequence[SettlementRecord], rate: Any
+) -> dict[str, Any]:
+    """How much of the episode set the settlement layer actually covers.
+
+    A capital figure and a win rate are both claims about the same episodes, and
+    neither is meaningful without knowing how many of them have an answer. This
+    block is the denominator, stated once and carried with the numbers.
+    """
+    freshness = settlement_freshness(records)
+    counts = getattr(rate, "counts", {}) or {}
+    decisive = int(counts.get("WIN", 0)) + int(counts.get("LOSS", 0))
+    episodes = int(getattr(rate, "valid_samples", 0)) + sum(
+        int(v) for k, v in counts.items() if k not in {"WIN", "LOSS"}
+    )
+    return {
+        "answers": freshness["answers"],
+        "verified": len([record for record in records if record.verified]),
+        "as_of_utc": freshness["as_of_utc"],
+        "answers_without_retrieval_time": freshness["answers_without_retrieval_time"],
+        "episodes": episodes,
+        "decisive_episodes": decisive,
+        "coverage_fraction": (decisive / episodes) if episodes else None,
+    }
+
+
 def settlement_freshness(records: Sequence[SettlementRecord]) -> dict[str, Any]:
     """When the settlement layer was last retrieved, and whether it can be told.
 
@@ -282,6 +395,10 @@ def build_performance(
     capital_usdc: float = 100.0,
     max_allocation_fraction: float = 0.10,
     book_for=None,
+    watermark: Sequence[str] | None = None,
+    detail_max_episodes: int = DETAIL_MAX_EPISODES,
+    detail_window_days: int = DETAIL_WINDOW_DAYS,
+    detail_partition_size: int = DETAIL_PARTITION_SIZE,
 ) -> dict[str, dict[str, Any]]:
     """Build all six snapshots from one pass over the data.
 
@@ -327,7 +444,30 @@ def build_performance(
         "settled_markets": rate.distinct_markets,
         "counts": rate.counts,
         "reference_capital_usdc": capital.capital_usdc,
-        "reference_capital": capital.as_dict(),
+        # Labelled as the whole consumed history, simulated once here rather
+        # than per request. The windowed on-demand answer is a different thing
+        # and must never be read as a period of this one.
+        "reference_capital": lifetime_portfolio_payload(
+            capital,
+            watermark=watermark,
+            window=detail_window_descriptor(
+                window_episodes=len(episodes),
+                all_episodes=len(episodes),
+                max_episodes=len(episodes),
+                days=0,
+                first_seen_utc=(
+                    min((e.first_seen_utc for e in episodes), default=None).isoformat()
+                    if episodes
+                    else None
+                ),
+                last_seen_utc=(
+                    max((e.first_seen_utc for e in episodes), default=None).isoformat()
+                    if episodes
+                    else None
+                ),
+            ),
+            settlement_coverage=_settlement_coverage(settlement_records, rate),
+        ),
         "accept_observations": episode_summary["accept_observations"],
         "opportunity_episodes": episode_summary["opportunity_episodes"],
         # Scoped to opportunities, not to everything read. The old name was
@@ -392,14 +532,19 @@ def build_performance(
     }
 
     resolver = book_for or (lambda _e: None)
+    outcomes = {item.episode.episode_id: item.outcome for item in scored}
+    window_episodes, window = detail_window(
+        episodes,
+        now=now,
+        max_episodes=detail_max_episodes,
+        days=detail_window_days,
+    )
     opportunity_rows = []
-    for episode in episodes:
+    for episode in window_episodes:
         book = resolver(episode)
         row = {
             **episode.as_dict(),
-            "outcome": next(
-                (s.outcome for s in scored if s.episode.episode_id == episode.episode_id), None
-            ),
+            "outcome": outcomes.get(episode.episode_id),
         }
         # Levels travel with the episode so the API can size against a
         # different stake without re-deriving a book it no longer has. When
@@ -413,10 +558,20 @@ def build_performance(
         opportunity_rows.append(row)
 
     opportunities = {
-        "episodes": opportunity_rows,
-        "total": len(episodes),
-        "statistical_scope": ["opportunity_episodes"],
-        "warnings": episode_summary["warnings"],
+        "episodes": PartitionedArray(
+            lambda: iter(opportunity_rows),
+            directory="opportunities",
+            collection="episodes",
+            partition_size=detail_partition_size,
+            key_of=lambda row: [row["first_seen_utc"], row["episode_id"]],
+            label="opportunities.episodes",
+        ),
+        "total": len(window_episodes),
+        "total_all": len(episodes),
+        "window": window,
+        "statistical_scope": ["opportunity_episodes"]
+        + ([] if window["complete"] else [f"window:{window['days']}d"]),
+        "warnings": [*episode_summary["warnings"], *detail_warnings(window)],
     }
 
     settlements_payload = settlement_payload(settlement_records, counts=rate.counts)
@@ -454,8 +609,9 @@ def build_performance(
         ),
         "opportunities.json": _envelope(
             logical_name="performance-opportunities", data=opportunities,
-            sample_size=len(episodes), statistical_scope=["opportunity_episodes"],
-            warnings=episode_summary["warnings"], **common,
+            sample_size=len(window_episodes),
+            statistical_scope=opportunities["statistical_scope"],
+            warnings=opportunities["warnings"], **common,
         ),
         "settlements.json": _envelope(
             logical_name="performance-settlements", data=settlements_payload,
@@ -529,7 +685,7 @@ def publish_performance(
         payload = dict(payloads[filename])
         payload["generation_id"] = gid
         path = generation_dir / filename
-        atomic_write_json_streaming(path, payload)
+        atomic_write_json_streaming(path, payload, root=generation_dir)
         written.append(path)
         files_meta[filename] = {"bytes": path.stat().st_size}
 

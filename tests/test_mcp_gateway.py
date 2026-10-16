@@ -118,6 +118,69 @@ def test_the_envelope_survives_the_round_trip() -> None:
         assert key in result, key
 
 
+# --- the paged detail ----------------------------------------------------------
+
+
+def _tool(server, name):
+    for tool in server._tool_manager.list_tools():  # type: ignore[attr-defined]
+        if tool.name == name:
+            return tool
+    raise AssertionError(f"no tool {name}")
+
+
+def test_the_opportunities_tool_passes_filters_through() -> None:
+    """The gateway forwards the filters and the cap; it does not re-implement
+    paging, and it does not decide what a filter means."""
+    seen: dict = {}
+
+    def handler(request):
+        seen.update(dict(request.url.params))
+        return _payload({"items": [], "total": 0})
+
+    server = build_server(_gateway(handler))
+    result = _tool(server, "get_opportunities").fn(
+        limit=999, model="fusion", direction="buy_yes", mode="LIVE",
+        target_date="2026-10-14", outcome="WIN", min_edge=0.02, max_edge=0.10,
+    )
+
+    assert seen["limit"] == "200", "a caller cannot lift the cap"
+    assert seen["model"] == "fusion"
+    assert seen["direction"] == "buy_yes"
+    assert seen["mode"] == "LIVE"
+    assert seen["target_date"] == "2026-10-14"
+    assert seen["outcome"] == "WIN"
+    assert seen["min_edge"] == "0.02"
+    assert seen["max_edge"] == "0.1"
+    assert result["source_endpoint"] == "/api/v1/performance/opportunities"
+
+
+def test_the_opportunities_tool_sends_only_the_filters_it_was_given() -> None:
+    """"No filter" must not become an empty filter value."""
+    seen: dict = {}
+
+    def handler(request):
+        seen.update(dict(request.url.params))
+        return _payload({"items": [], "total": 0})
+
+    server = build_server(_gateway(handler))
+    _tool(server, "get_opportunities").fn(limit=10)
+
+    assert seen == {"limit": "10"}, seen
+
+
+def test_the_opportunities_tool_accepts_a_cursor() -> None:
+    seen: dict = {}
+
+    def handler(request):
+        seen.update(dict(request.url.params))
+        return _payload({"items": [], "total": 0})
+
+    server = build_server(_gateway(handler))
+    _tool(server, "get_opportunities").fn(limit=10, cursor="MjAyNjEwfDUw")
+
+    assert seen["cursor"] == "MjAyNjEwfDUw"
+
+
 # --- staleness and provenance --------------------------------------------------
 
 

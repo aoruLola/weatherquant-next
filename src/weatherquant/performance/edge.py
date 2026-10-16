@@ -346,8 +346,14 @@ def edge_by_bin(
     rows: Iterable[_DecisionRow | dict],
     *,
     edges: Mapping[str, tuple[float | None, float | None]] | None = None,
-) -> dict[str, list[float]]:
+) -> dict[str, dict[str, float | int | None]]:
     """Split ACCEPT edges into bands, for comparing edge against outcome.
+
+    Each band publishes a *distribution*, not the values themselves. The raw
+    values were the largest field in ``edge.json`` (2.2M floats at five million
+    decisions, 22 MB) and nothing downstream needed them: a reader asks how
+    many evaluations fell in a band and what they looked like, and the same
+    statistics the other groupings publish answer both.
 
     The default bands are the contract's. Open-ended on the last band so a
     genuinely large edge lands in one rather than falling off the end.
@@ -364,6 +370,6 @@ def edge_by_bin(
             if (low is None or value >= low) and (high is None or value < high):
                 out[name].append(value)
                 break
-    return out
+    return {name: distribution(values) for name, values in out.items()}
 
 

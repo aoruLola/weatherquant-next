@@ -55,7 +55,7 @@ import statistics
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from operator import itemgetter
 from pathlib import Path
 from typing import Any
@@ -64,6 +64,7 @@ from weatherquant.performance.capital import (
     DEFAULT_MAX_ALLOCATION_FRACTION,
     PortfolioResult,
     PortfolioWalk,
+    lifetime_portfolio_payload,
 )
 from weatherquant.performance.edge import (
     ACCEPT_STATE,
@@ -89,9 +90,15 @@ from weatherquant.performance.episodes import (
     row_from_mapping,
 )
 from weatherquant.performance.snapshot import (
+    DETAIL_MAX_EPISODES,
+    DETAIL_PARTITION_SIZE,
+    DETAIL_WINDOW_DAYS,
     SettlementRecord,
     _envelope,
+    _settlement_coverage,
     _settlement_index,
+    detail_warnings,
+    detail_window_descriptor,
     publish_performance,
     settlement_freshness,
     settlement_payload,
@@ -115,7 +122,7 @@ from weatherquant.performance.winrate import (
     outcome_for,
 )
 from weatherquant.shadow.export import _end_cursor_of, _index_of
-from weatherquant.shadow.publish import StreamedArray
+from weatherquant.shadow.publish import PartitionedArray, atomic_write_json
 
 __all__ = [
     "ExportPart",
@@ -142,6 +149,17 @@ EDGE_GROUP_SQL: dict[str, str] = {
 
 #: The five dimensions the win-rate payload splits by.
 WIN_RATE_DIMENSIONS = ("model", "direction", "mode", "target_date", "edge_band")
+
+#: The contract's edge bands as one SQL expression, so a band is grouped by the
+#: same rule ``band_of`` applies in Python. ``edge`` is always finite here -
+#: ``_finite`` refuses NaN and infinities before a row is stored - so the
+#: comparison chain is exhaustive.
+_BAND_SQL = (
+    "CASE WHEN edge < 0.02 THEN 'lt_0.02' "
+    "WHEN edge < 0.05 THEN '0.02_0.05' "
+    "WHEN edge < 0.10 THEN '0.05_0.10' "
+    "ELSE 'gte_0.10' END"
+)
 
 _OVERALL = "__overall__"
 
@@ -717,7 +735,10 @@ def _parts_for(
 
 
 def _distributions(
-    store: PerformanceStateStore, expression: str | None
+    store: PerformanceStateStore,
+    expression: str | None,
+    *,
+    ensure_keys: Sequence[str] | None = None,
 ) -> dict[str, dict[str, float | int | None]]:
     """Every group's distribution, in four passes over the edge table.
 
@@ -725,15 +746,24 @@ def _distributions(
     standard deviation each need their own streamed pass, and the quantiles
     need the order statistics by rank. None of the four holds more than a
     group's worth of anything.
+
+    ``ensure_keys`` names groups that must appear even with no observations.
+    A group whose key comes from the data (a model, a date) simply is not
+    there when it has none; the contract's edge bands are a fixed vocabulary,
+    and a band with nothing in it is a fact the payload states rather than
+    omits.
     """
     counts = _counts_and_extremes(store, expression)
     sums = _fsums(store, expression)
     stdevs = _population_stdev(store, expression, counts)
     ranks = _order_statistics(store, expression)
-    return {
+    out = {
         key: distribution_from_parts(_parts_for(key, counts, sums, stdevs, ranks))
-        for key in sorted(counts)
+        for key in counts
     }
+    for key in ensure_keys or ():
+        out.setdefault(key, distribution_from_parts(DistributionParts(count=0)))
+    return dict(sorted(out.items()))
 
 
 def _daily(store: PerformanceStateStore) -> list[dict[str, object]]:
@@ -759,30 +789,18 @@ def _daily(store: PerformanceStateStore) -> list[dict[str, object]]:
     return out
 
 
-def _band_stream(store: PerformanceStateStore, band: str) -> StreamedArray:
-    """One edge band's raw values, in input order, written as they are read.
+def _band_distributions(
+    store: PerformanceStateStore,
+) -> dict[str, dict[str, float | int | None]]:
+    """A distribution per band, not the band's values.
 
-    The values are published (the dashboard counts them), so they cannot be
-    summarised away. They are ordered by the row sequence rather than by value,
-    which is what the in-memory builder produced: the order rows arrived in.
+    The raw values were the whole of ``edge.json``'s size - 2.2 million floats
+    at five million decisions - and the only consumer counted them. A band is
+    just another grouping, so it is computed by the same four passes as the
+    model, direction and target-date groupings, and it is exact in the same
+    way.
     """
-    low, high = EDGE_BANDS[band]
-    clauses = []
-    if low is not None:
-        clauses.append(f"edge >= {low!r}")
-    if high is not None:
-        clauses.append(f"edge < {high!r}")
-    sql = (
-        "SELECT edge FROM performance_edge_observations WHERE "
-        + " AND ".join(clauses)
-        + " ORDER BY seq"
-    )
-
-    def factory() -> Iterator[float]:
-        for (value,) in _row_stream(store, sql):
-            yield value
-
-    return StreamedArray(factory, label=f"edge_band:{band}")
+    return _distributions(store, _BAND_SQL, ensure_keys=list(EDGE_BANDS))
 
 
 def _render(stored: StoredEpisode) -> Episode:
@@ -857,6 +875,8 @@ def build_streaming_payloads(
     max_allocation_fraction: float = DEFAULT_MAX_ALLOCATION_FRACTION,
     book_for: Callable[[Episode], Any] | None = None,
     gap_window_seconds: float = DEFAULT_GAP_WINDOW_SECONDS,
+    detail_max_episodes: int = DETAIL_MAX_EPISODES,
+    detail_window_days: int = DETAIL_WINDOW_DAYS,
 ) -> StreamingBuild:
     """Build all six snapshots from the store, holding nothing that grows.
 
@@ -928,7 +948,7 @@ def build_streaming_payloads(
         for name, expression in EDGE_GROUP_SQL.items()
     }
     daily = _daily(store)
-    bands = {band: _band_stream(store, band) for band in EDGE_BANDS}
+    bands = _band_distributions(store)
     models = sorted(store.distinct_values("performance_models_seen"))
 
     # -- reference capital: totals first, then the same walk streamed -------
@@ -938,6 +958,17 @@ def build_streaming_payloads(
         max_allocation_fraction=max_allocation_fraction,
         book_for=book_for,
     )
+
+    build_watermark = state.last_end_cursor
+    lifetime_window = {
+        "episodes_all": episode_count,
+        "first_seen_utc_from": _iso(
+            store.fetchone("SELECT min(first_seen_utc) FROM performance_episodes")[0]
+        ),
+        "last_seen_utc_to": _iso(
+            store.fetchone("SELECT max(first_seen_utc) FROM performance_episodes")[0]
+        ),
+    }
 
     scope = ["observation_all_accepts", "opportunity_episodes", "database_lifetime"]
     summary_data = {
@@ -949,12 +980,11 @@ def build_streaming_payloads(
         "settled_markets": rate.distinct_markets,
         "counts": rate.counts,
         "reference_capital_usdc": capital.capital_usdc,
-        "reference_capital": _capital_payload(
+        "reference_capital": lifetime_portfolio_payload(
             capital,
-            store=store,
-            capital_usdc=capital_usdc,
-            max_allocation_fraction=max_allocation_fraction,
-            book_for=book_for,
+            watermark=build_watermark,
+            window=lifetime_window,
+            settlement_coverage=_settlement_coverage(settlement_records, rate),
         ),
         "accept_observations": episode_summary_dict["accept_observations"],
         "opportunity_episodes": episode_summary_dict["opportunity_episodes"],
@@ -1023,11 +1053,27 @@ def build_streaming_payloads(
         "warnings": rate.warnings,
     }
 
+    since, window = _detail_window(
+        store,
+        now=now,
+        max_episodes=detail_max_episodes,
+        days=detail_window_days,
+    )
     opportunities = {
-        "episodes": _opportunity_stream(store, answers=answers, verified=verified, book_for=book_for),
-        "total": episode_count,
-        "statistical_scope": ["opportunity_episodes"],
-        "warnings": episode_summary_dict["warnings"],
+        "episodes": _opportunity_stream(
+            store,
+            since=since,
+            limit=detail_max_episodes,
+            answers=answers,
+            verified=verified,
+            book_for=book_for,
+        ),
+        "total": window["episodes"],
+        "total_all": window["episodes_all"],
+        "window": window,
+        "statistical_scope": ["opportunity_episodes"]
+        + ([] if window["complete"] else [f"window:{window['days']}d"]),
+        "warnings": [*episode_summary_dict["warnings"], *detail_warnings(window)],
     }
 
     settlements_payload = settlement_payload(settlement_records, counts=rate.counts)
@@ -1066,8 +1112,9 @@ def build_streaming_payloads(
         ),
         "opportunities.json": _envelope(
             logical_name="performance-opportunities", data=opportunities,
-            sample_size=episode_count, statistical_scope=["opportunity_episodes"],
-            warnings=episode_summary_dict["warnings"], **common,
+            sample_size=window["episodes"],
+            statistical_scope=opportunities["statistical_scope"],
+            warnings=opportunities["warnings"], **common,
         ),
         "settlements.json": _envelope(
             logical_name="performance-settlements", data=settlements_payload,
@@ -1146,50 +1193,57 @@ def _walk_capital(
     return walk.finish()
 
 
-def _capital_payload(
-    capital: PortfolioResult,
-    *,
+def _detail_window(
     store: PerformanceStateStore,
-    capital_usdc: float,
-    max_allocation_fraction: float,
-    book_for: Callable[[Episode], Any] | None,
-) -> dict[str, Any]:
-    """The reference-capital block, with its per-episode results streamed.
+    *,
+    now: datetime,
+    max_episodes: int,
+    days: int,
+) -> tuple[datetime, dict[str, Any]]:
+    """The window the browsable detail covers, and its descriptor.
 
-    The walk is re-run rather than remembered: the totals above have to exist
-    before the payload is written, and holding every result to reuse it is the
-    thing this engine exists to avoid. Both walks are the same code over the
-    same ordered input, so they cannot disagree.
+    The store's twin of ``snapshot.detail_window``: the same cutoff, the same
+    order and the same cap, so the two engines publish the same window and the
+    equivalence test compares them rather than trusting them.
     """
-
-    def results() -> Iterator[dict[str, Any]]:
-        walk = PortfolioWalk(
-            capital_usdc=capital_usdc,
-            max_allocation_fraction=max_allocation_fraction,
-            collect_results=False,
-        )
-        for stored in store.iter_episodes():
-            episode = _render(stored)
-            result = walk.add(episode, book_for(episode) if book_for is not None else None)
-            yield result.as_dict()
-        walk.finish()
-
-    payload = capital.as_dict()
-    payload["results"] = StreamedArray(results, label="reference_capital.results")
-    return payload
+    since = now - timedelta(days=days)
+    in_window = store.count_episodes_since(since)
+    window_episodes = min(in_window, max_episodes)
+    first = store.fetchone(
+        "SELECT min(first_seen_utc), max(first_seen_utc) FROM "
+        "(SELECT first_seen_utc FROM performance_episodes WHERE first_seen_utc >= ? "
+        "ORDER BY first_seen_utc DESC, episode_id DESC LIMIT ?) AS w",
+        [since, max_episodes],
+    )
+    descriptor = detail_window_descriptor(
+        window_episodes=window_episodes,
+        all_episodes=store.count_episodes(),
+        max_episodes=max_episodes,
+        days=days,
+        first_seen_utc=_iso(first[1]) if first and first[1] else None,
+        last_seen_utc=_iso(first[0]) if first and first[0] else None,
+    )
+    return since, descriptor
 
 
 def _opportunity_stream(
     store: PerformanceStateStore,
     *,
+    since: datetime,
+    limit: int,
     answers: Mapping[tuple[str, str | None], SettlementAnswer],
     verified: frozenset[tuple[str, str | None]],
     book_for: Callable[[Episode], Any] | None,
-) -> StreamedArray:
-    """Every episode, written as it is read, with its outcome attached."""
+) -> PartitionedArray:
+    """The windowed detail, written as it is read, with outcomes attached.
+
+    Published as parts rather than as one array: a reader that wants fifty rows
+    reads one part, and the parts record their own sort keys so a cursor can be
+    located without opening them.
+    """
 
     def factory() -> Iterator[dict[str, Any]]:
-        for stored in store.iter_episodes():
+        for stored in store.iter_detail_window(since=since, limit=limit):
             episode = _render(stored)
             outcome, _reason = outcome_for(episode, answers=answers, verified=verified)
             row: dict[str, Any] = {**episode.as_dict(), "outcome": outcome}
@@ -1202,7 +1256,14 @@ def _opportunity_stream(
                     }
             yield row
 
-    return StreamedArray(factory, label="opportunities.episodes")
+    return PartitionedArray(
+        factory,
+        directory="opportunities",
+        collection="episodes",
+        partition_size=DETAIL_PARTITION_SIZE,
+        key_of=lambda row: [row["first_seen_utc"], row["episode_id"]],
+        label="opportunities.episodes",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1278,6 +1339,38 @@ def streaming_generation_id(
     return f"{now.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}-{digest[:12]}"
 
 
+def _write_retraction_backup(
+    rows: list[dict[str, Any]],
+    *,
+    state_db: str | Path,
+    source: str | None,
+    reason: str | None,
+    now: datetime,
+) -> Path:
+    """Write out the settlement answers a total retraction is about to delete.
+
+    Beside the state database, named for the instant, and returned so the
+    caller can print the path. `reason` is recorded as ``None`` when the
+    operator did not give one, rather than guessed at: an audit line that
+    invents a motive is worse than one that admits it does not have it.
+    """
+    stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+    state_path = Path(state_db)
+    path = state_path.with_name(f"{state_path.stem}.retracted-{stamp}.json")
+    atomic_write_json(
+        path,
+        {
+            "retracted_at_utc": now.astimezone(UTC).isoformat(),
+            "rows_retracted": len(rows),
+            "input_source": source,
+            "reason": reason,
+            "state_db": str(state_path),
+            "settlements": rows,
+        },
+    )
+    return path
+
+
 def build_performance_streaming(
     *,
     export: str | Path,
@@ -1286,10 +1379,15 @@ def build_performance_streaming(
     state_db: str | Path = DEFAULT_PERFORMANCE_STATE_DB_PATH,
     settlements: Sequence[Any] = (),
     settlements_replace: bool = False,
+    confirm_empty_retraction: bool = False,
+    settlements_source: str | None = None,
+    retraction_reason: str | None = None,
     capital_usdc: float = 100.0,
     max_allocation_fraction: float = DEFAULT_MAX_ALLOCATION_FRACTION,
     gap_window_seconds: float = DEFAULT_GAP_WINDOW_SECONDS,
     accepted_state: str = ACCEPT_STATE,
+    detail_max_episodes: int = DETAIL_MAX_EPISODES,
+    detail_window_days: int = DETAIL_WINDOW_DAYS,
     book_for: Callable[[Episode], Any] | None = None,
     now: datetime | None = None,
     memory_limit: str = DEFAULT_MEMORY_LIMIT,
@@ -1326,6 +1424,23 @@ def build_performance_streaming(
         )
     now = now or datetime.now(tz=UTC)
 
+    # Resolved here, and the empty-index refusal raised here, both *before* the
+    # store is opened. A rejection that had already ingested parts would have
+    # advanced the watermark and recorded a generation, so the run would look
+    # like it had done something - and "refused" has to mean nothing moved.
+    answers, verified = _settlement_index(settlements)
+    if settlements_replace and not answers and not confirm_empty_retraction:
+        raise PerformanceStateError(
+            "refusing to replace the settlement set with an empty index: that "
+            "would retract every answer. An empty index is what a failed "
+            "backfill looks like at least as often as it is what a genuine "
+            "total retraction looks like - the platform may have been "
+            "unreachable, or no market may have matched - and the settlement "
+            "layer cannot be rebuilt from the export, because rebuilding it "
+            "needs the network. Pass --confirm-empty-retraction to mean it. "
+            "Nothing was read, written or retracted."
+        )
+
     with PerformanceStateStore(
         state_db, memory_limit=memory_limit, temp_directory=temp_directory
     ) as store:
@@ -1351,8 +1466,44 @@ def build_performance_streaming(
         # erase the answers an earlier run verified. `replace=True` is the
         # caller asserting that this index is *complete*, which is the only way
         # to express a withdrawal - see PerformanceStateStore.replace_settlements.
-        answers, verified = _settlement_index(settlements)
-        if answers:
+        if settlements_replace:
+            if not answers:
+                # The one operation that cannot be undone from anywhere else:
+                # the export carries decisions, not settlements, and
+                # re-deriving them needs the platform. So everything about to
+                # be deleted is written out first, with the count, where the
+                # index came from and why - a retraction nobody can reverse is
+                # not a retraction, it is a loss. Written before the delete,
+                # and written even when there is nothing to delete, so the
+                # audit line exists either way.
+                backup = _write_retraction_backup(
+                    store.load_settlements(),
+                    state_db=state_db,
+                    source=settlements_source,
+                    reason=retraction_reason,
+                    now=now,
+                )
+                if progress is not None:
+                    progress(f"retraction backup written to {backup}")
+            provenance = _settlement_provenance_map(settlements)
+            removed = store.replace_settlements(
+                {
+                    key: (
+                        answer.status,
+                        answer.payout,
+                        key in verified,
+                        provenance.get(key, (None, None, None))[0],
+                        provenance.get(key, (None, None, None))[1],
+                        provenance.get(key, (None, None, None))[2],
+                    )
+                    for key, answer in answers.items()
+                }
+            )
+            if progress is not None:
+                progress(
+                    f"replaced the settlement set: {len(answers)} kept, {removed} retracted"
+                )
+        elif answers:
             provenance = _settlement_provenance_map(settlements)
             payload = {
                 key: (
@@ -1365,12 +1516,7 @@ def build_performance_streaming(
                 )
                 for key, answer in answers.items()
             }
-            if settlements_replace:
-                removed = store.replace_settlements(payload)
-                if removed and progress is not None:
-                    progress(f"retracted {removed} settlement answer(s) not in this index")
-            else:
-                store.upsert_settlements(payload)
+            store.upsert_settlements(payload)
 
         build = build_streaming_payloads(
             store,
@@ -1381,6 +1527,8 @@ def build_performance_streaming(
             max_allocation_fraction=max_allocation_fraction,
             book_for=book_for,
             gap_window_seconds=gap_window_seconds,
+            detail_max_episodes=detail_max_episodes,
+            detail_window_days=detail_window_days,
         )
         generation_id = streaming_generation_id(
             now,

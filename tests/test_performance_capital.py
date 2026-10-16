@@ -17,6 +17,7 @@ from weatherquant.markets.models import BookLevel, OrderBook
 from weatherquant.performance.capital import (
     DEFAULT_MAX_ALLOCATION_FRACTION,
     NotExecutable,
+    PortfolioWalk,
     simulate_portfolio,
     simulate_single,
 )
@@ -621,3 +622,155 @@ def test_episodes_from_one_market_share_the_allocation_cap() -> None:
     assert spread.allocated_total_usdc > 10.0 + 1e-9, (
         "five distinct markets should be able to take more than one market's cap"
     )
+
+
+# ---------------------------------------------------------------------------
+# whole history versus window: two simulations, told apart on the payload
+# ---------------------------------------------------------------------------
+
+
+def test_an_unfilled_portfolio_reports_na_not_zero() -> None:
+    """Nothing was sized, so the balance is not a result.
+
+    The failure this guards is the most reassuring possible one: a portfolio
+    that filled nothing reports a balance equal to its stake, which reads as
+    "flat" - a measurement nobody made. N/A with a reason is the honest answer.
+    """
+    outcome = simulate_portfolio(
+        [_episode()], capital_usdc=100.0, book_for=lambda _e: None
+    ).as_dict()
+
+    assert outcome["funding_state"] == "no_fills_simulated"
+    assert outcome["executable_count"] == 0
+    assert outcome["simulated_net_profit_usdc"] is None, "0 would be a claim"
+    assert outcome["simulated_roi"] is None
+    assert outcome["final_balance"]["value"] is None
+    assert "not a profit and loss" in outcome["final_balance"]["reason"]
+    assert outcome["settled_count"] == 0
+    assert any("N/A rather than zero" in w for w in outcome["warnings"])
+    # The unallocated capital is still reported - it is a real quantity.
+    assert outcome["balance_remaining_usdc"] == 100.0
+
+
+def test_a_filled_but_unsettled_portfolio_reports_na() -> None:
+    """A position was opened; nothing has resolved, so there is no result."""
+    outcome = simulate_portfolio(
+        [_episode()], capital_usdc=100.0, book_for=lambda _e: _book(), fee_rate=0.0
+    ).as_dict()
+
+    assert outcome["funding_state"] == "fills_unsettled"
+    assert outcome["executable_count"] == 1
+    assert outcome["allocated_total_usdc"] > 0
+    assert outcome["simulated_net_profit_usdc"] is None
+    assert outcome["simulated_roi"] is None
+    assert outcome["balance_remaining_usdc"] < 100.0, "the capital is committed, not spent"
+    assert "still committed" in outcome["funding_state_reason"]
+
+
+def test_a_fully_settled_portfolio_reports_a_number() -> None:
+    """The rule is evidence-driven, not a hardcoded N/A.
+
+    Give the walk a settlement for every sized position and a realised figure
+    appears. That is the difference between "we do not know" and "we will not
+    say", and it is the reason the field exists at all.
+    """
+    outcome = simulate_portfolio(
+        [
+            _episode(),
+            # A different market: one market's episodes share its cap, so two
+            # on the same bracket would compete for one allocation.
+            _episode(market="m-82", episode_id="ep-2", first_seen=NOW + timedelta(hours=1)),
+        ],
+        capital_usdc=100.0,
+        book_for=lambda _e: _book(),
+        fee_rate=0.0,
+        settlement_payout=1.0,
+    ).as_dict()
+
+    assert outcome["funding_state"] == "fully_settled"
+    assert outcome["settled_count"] == outcome["executable_count"] == 2
+    assert outcome["simulated_net_profit_usdc"] is not None
+    assert outcome["simulated_roi"] is not None
+    assert outcome["simulated_result_reason"] is None
+    assert not any("N/A rather than zero" in w for w in outcome["warnings"])
+
+
+def test_a_half_settled_portfolio_is_incomplete_not_rounded() -> None:
+    """One settled position out of two is not a result for the pair."""
+    episodes = [
+        _episode(),
+        _episode(market="m-82", episode_id="ep-2", first_seen=NOW + timedelta(hours=1)),
+    ]
+    walk = PortfolioWalk(capital_usdc=100.0, fee_rate=0.0)
+    walk.add(episodes[0], _book(), settlement_payout=1.0)
+    walk.add(episodes[1], _book())
+    outcome = walk.finish().as_dict()
+
+    assert outcome["funding_state"] == "incomplete"
+    assert outcome["settled_count"] == 1
+    assert outcome["simulated_net_profit_usdc"] is None
+
+
+def test_the_lifetime_block_names_itself_and_its_range() -> None:
+    """The published block is the whole consumed history, and says so."""
+    from weatherquant.performance.capital import lifetime_portfolio_payload
+    from weatherquant.performance.snapshot import detail_window_descriptor
+
+    result = simulate_portfolio([_episode()], capital_usdc=100.0, book_for=lambda _e: None)
+    payload = lifetime_portfolio_payload(
+        result,
+        watermark=["2026-10-15T05:45:04+00:00", "d000001"],
+        window=detail_window_descriptor(
+            window_episodes=1, all_episodes=1, max_episodes=1, days=0,
+            first_seen_utc="2026-10-13T12:00:00+00:00",
+            last_seen_utc="2026-10-13T12:00:00+00:00",
+        ),
+        settlement_coverage={"answers": 1, "verified": 1, "decisive_episodes": 0, "episodes": 1},
+    )
+
+    assert payload["scope"] == "lifetime"
+    assert payload["simulation_mode"] == "portfolio"
+    assert payload["statistical_scope"] == [
+        "reference_capital_hypothetical",
+        "opportunity_episodes",
+        "database_lifetime",
+    ]
+    assert payload["statistical_window"]["episodes_simulated"] == 1
+    assert payload["statistical_window"]["first_seen_utc_from"]
+    assert payload["data_watermark"] == ["2026-10-15T05:45:04+00:00", "d000001"]
+    assert payload["settlement_coverage"]["episodes"] == 1
+    assert any("whole consumed history" in w for w in payload["warnings"])
+    assert "window" not in payload
+
+
+def test_the_window_block_names_itself_and_its_range() -> None:
+    """A window answer is a separate stake, and says which window."""
+    from weatherquant.performance.capital import window_portfolio_payload
+
+    result = simulate_portfolio([_episode()], capital_usdc=250.0, book_for=lambda _e: None)
+    window = {
+        "episodes": 15, "episodes_all": 400, "max_episodes": 20,
+        "days": 90, "complete": False,
+        "first_seen_utc_from": "2026-10-13T12:00:00+00:00",
+        "last_seen_utc_to": "2026-10-01T00:00:00+00:00",
+    }
+    payload = window_portfolio_payload(
+        result, window=window, generation_id="gen-7", mode="portfolio",
+        initial_capital_usdc=250.0,
+    )
+
+    assert payload["scope"] == "window"
+    assert payload["window_start"] == "2026-10-13T12:00:00+00:00"
+    assert payload["window_end"] == "2026-10-01T00:00:00+00:00"
+    assert payload["window_episode_limit"] == 20
+    assert payload["total_episodes_in_window"] == 15
+    assert payload["window_completeness"] == "truncated"
+    assert payload["generation_id"] == "gen-7"
+    assert payload["initial_capital_assumption_usdc"] == 250.0
+    assert payload["statistical_scope"] == [
+        "reference_capital_hypothetical",
+        "opportunity_episodes",
+        "window:90d",
+    ]
+    assert any("not a period of the lifetime account" in w for w in payload["warnings"])
+    assert "data_watermark" not in payload, "a window is not a whole-history claim"

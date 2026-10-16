@@ -24,9 +24,10 @@ inventing the levels it is missing.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 from weatherquant.execution.pricing import (
     ExecutionRefused,
@@ -49,9 +50,11 @@ __all__ = [
     "PortfolioWalk",
     "SingleResult",
     "book_from_mapping",
+    "lifetime_portfolio_payload",
     "simulate_independent",
     "simulate_portfolio",
     "simulate_single",
+    "window_portfolio_payload",
 ]
 
 #: A research assumption, not a validated risk rule. The contract says so
@@ -176,6 +179,90 @@ class SingleResult:
             "price_time_matched": self.price_time_matched,
             "notes": list(self.notes),
         }
+
+
+def _capital_scope_note(scope: str) -> str:
+    if scope == "lifetime":
+        return (
+            "This is the whole consumed history, simulated once at publish time. It is "
+            "not re-derived per request, and it is not a period of the window simulation."
+        )
+    return (
+        "This is a separate reference stake over the published detail window. It is not "
+        "a period of the lifetime account's balance curve, and it is not comparable with "
+        "the lifetime figures published in the summary."
+    )
+
+
+def lifetime_portfolio_payload(
+    result: PortfolioResult,
+    *,
+    watermark: Sequence[str] | None,
+    window: Mapping[str, Any],
+    settlement_coverage: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The published (whole-history) capital block, labelled as such.
+
+    It is computed once, at publish time, over every episode the research engine
+    has consumed - the Dashboard never re-walks the history to produce it. The
+    label exists because a windowed answer is now available on demand, and the
+    two must never be read as one account.
+    """
+    payload = result.as_dict()
+    payload["scope"] = "lifetime"
+    payload["scope_note"] = _capital_scope_note("lifetime")
+    payload["simulation_mode"] = "portfolio"
+    payload["statistical_scope"] = [
+        "reference_capital_hypothetical",
+        "opportunity_episodes",
+        "database_lifetime",
+    ]
+    payload["statistical_window"] = {
+        "first_seen_utc_from": window.get("first_seen_utc_from"),
+        "last_seen_utc_to": window.get("first_seen_utc_to"),
+        "episodes": window.get("episodes_all"),
+        "episodes_simulated": window.get("episodes_all"),
+    }
+    payload["data_watermark"] = list(watermark) if watermark else None
+    if settlement_coverage is not None:
+        payload["settlement_coverage"] = dict(settlement_coverage)
+    payload["warnings"] = [*payload["warnings"], _capital_scope_note("lifetime")]
+    return payload
+
+
+def window_portfolio_payload(
+    result: PortfolioResult,
+    *,
+    window: Mapping[str, Any],
+    generation_id: str | None,
+    mode: str,
+    initial_capital_usdc: float,
+) -> dict[str, Any]:
+    """A capital simulation over an explicit window, and nothing else.
+
+    Every field needed to read it honestly travels with it: which window, how
+    complete it is, which generation it came from, what stake was assumed, and
+    the fact that the stake is separate from the published one.
+    """
+    payload = result.as_dict()
+    payload["scope"] = "window"
+    payload["scope_note"] = _capital_scope_note("window")
+    payload["simulation_mode"] = mode
+    payload["statistical_scope"] = [
+        "reference_capital_hypothetical",
+        "opportunity_episodes",
+        *([] if window.get("complete") else [f"window:{window.get('days')}d"]),
+    ]
+    payload["window"] = dict(window)
+    payload["window_start"] = window.get("first_seen_utc_from")
+    payload["window_end"] = window.get("last_seen_utc_to")
+    payload["window_episode_limit"] = window.get("max_episodes")
+    payload["total_episodes_in_window"] = window.get("episodes")
+    payload["window_completeness"] = "complete" if window.get("complete") else "truncated"
+    payload["generation_id"] = generation_id
+    payload["initial_capital_assumption_usdc"] = initial_capital_usdc
+    payload["warnings"] = [*payload["warnings"], _capital_scope_note("window")]
+    return payload
 
 
 def _max_shares_for(book: OrderBook, side: Side, capital: float) -> tuple[float, bool]:
@@ -402,7 +489,15 @@ def simulate_single(
 
 @dataclass(slots=True)
 class PortfolioResult:
-    """One stake shared across every opportunity, not one per opportunity."""
+    """One stake shared across every opportunity, not one per opportunity.
+
+    The per-opportunity results are the part of this record that grows with the
+    history, and they are the part nothing downstream needs in full: a reader
+    wants the totals and *why* the rest were refused, not 240,000 rows of
+    ``NOT_EXECUTABLE``. So the counters and a bounded sample are accumulated as
+    results arrive (:meth:`record`) and the payload carries those, which is
+    what keeps ``summary.json`` from growing with the decision history.
+    """
 
     capital_usdc: float
     max_allocation_fraction: float
@@ -421,6 +516,107 @@ class PortfolioResult:
     #: same number - and the same rounding, since the fold order is the
     #: episode order either way.
     expected_net_edge_total: float = 0
+    #: Whether every result is kept. False for a walk that only needs the
+    #: totals, which is how the streaming publisher avoids holding them.
+    collect_results: bool = True
+    #: How many results the payload carries, and the reason histogram that
+    #: replaces the rest.
+    sample_size: int = 50
+    results_sample: list[SingleResult] = field(default_factory=list)
+    not_executable_reason_counts: dict[str, int] = field(default_factory=dict)
+    #: Results whose settlement was applied, and what they came to. Zero here
+    #: means "no settlement evidence", which is not the same as "no profit":
+    #: the first is an absence of data, the second is a measurement.
+    settled_count: int = 0
+    realised_net_usdc_total: float = 0.0
+
+    def record(self, single: SingleResult) -> None:
+        """Fold one result in. The only place the counters are updated."""
+        if single.executable:
+            self.executable_count += 1
+            # A realised figure exists only when a settlement was applied to
+            # this position. Absent that, the walk has a theoretical edge and
+            # an allocation, and nothing that can be called a result.
+            if single.win_net_usdc is not None:
+                self.settled_count += 1
+                self.realised_net_usdc_total += single.win_net_usdc
+            elif single.loss_net_usdc is not None:
+                self.settled_count += 1
+                self.realised_net_usdc_total += single.loss_net_usdc
+        else:
+            self.not_executable_count += 1
+            reason = single.not_executable_reason or "UNKNOWN"
+            self.not_executable_reason_counts[reason] = (
+                self.not_executable_reason_counts.get(reason, 0) + 1
+            )
+        if self.collect_results:
+            self.results.append(single)
+        elif len(self.results_sample) < self.sample_size:
+            self.results_sample.append(single)
+
+    @property
+    def funding_state(self) -> tuple[str, str]:
+        """What actually happened to the capital, and why - as a pair.
+
+        Four states, and they are different claims:
+
+        * ``no_fills_simulated`` - nothing could be sized, so no position was
+          opened and the balance did not move. The balance equalling the stake
+          here means "nothing happened", not "the strategy broke even".
+        * ``fills_unsettled`` - positions were sized but no settlement was
+          applied, so the capital is still committed and no result exists.
+        * ``fully_settled`` - every sized position was settled; only here can a
+          realised figure be computed.
+        * ``incomplete`` - some were settled and some were not.
+        """
+        if self.executable_count == 0:
+            return (
+                "no_fills_simulated",
+                "no opportunity could be sized from the evidence available, so no "
+                "position was opened and the capital was never committed",
+            )
+        if self.settled_count == 0:
+            return (
+                "fills_unsettled",
+                f"{self.executable_count} position(s) were sized but no settlement was "
+                "applied, so the capital is still committed and no realised result exists",
+            )
+        if self.settled_count < self.executable_count:
+            return (
+                "incomplete",
+                f"{self.settled_count} of {self.executable_count} sized position(s) were "
+                "settled; the rest are still committed",
+            )
+        return (
+            "fully_settled",
+            f"all {self.executable_count} sized position(s) were settled",
+        )
+
+    @property
+    def simulated_net_profit_usdc(self) -> float | None:
+        """The simulated realised result, or ``None`` - never a fabricated zero.
+
+        A number here requires two things the system rarely has together: at
+        least one position that could actually be sized, and a settlement for
+        every one of them. Without both, the honest answer is N/A, and reporting
+        ``0`` would be a measurement claim nobody made.
+        """
+        if self.executable_count == 0 or self.settled_count != self.executable_count:
+            return None
+        return self.realised_net_usdc_total
+
+    @property
+    def simulated_roi(self) -> float | None:
+        profit = self.simulated_net_profit_usdc
+        if profit is None or self.capital_usdc <= 0:
+            return None
+        return profit / self.capital_usdc
+
+    @property
+    def sampled_results(self) -> list[SingleResult]:
+        """The results the payload carries: the same first N in both engines."""
+        source = self.results if self.collect_results else self.results_sample
+        return source[: self.sample_size]
 
     @property
     def utilization(self) -> float:
@@ -430,7 +626,7 @@ class PortfolioResult:
 
     @property
     def theoretical_expected_net_edge_usdc(self) -> float | None:
-        if self.results:
+        if self.collect_results:
             values = [r.theoretical_expected_net_edge_usdc for r in self.results if r.executable]
             if not values:
                 return None
@@ -440,16 +636,56 @@ class PortfolioResult:
         return self.expected_net_edge_total
 
     def as_dict(self) -> dict[str, object]:
+        total = self.executable_count + self.not_executable_count
+        sampled = self.sampled_results
+        state, state_reason = self.funding_state
+        profit = self.simulated_net_profit_usdc
         return {
             "capital_usdc": self.capital_usdc,
+            "initial_capital_usdc": self.capital_usdc,
             "max_allocation_fraction": self.max_allocation_fraction,
             "allocated_total_usdc": self.allocated_total_usdc,
             "peak_open_allocation_usdc": self.peak_open_allocation_usdc,
+            "peak_utilization": self.utilization,
             "balance_remaining_usdc": self.balance_remaining_usdc,
             "utilization": self.utilization,
+            # The balance is not a result. Saying "the balance is unchanged"
+            # next to a strategy reads as "it broke even", and when nothing was
+            # filled that is exactly the wrong claim.
+            "final_balance": {
+                "value": None,
+                "reason": (
+                    "the reference balance is capital that was not committed, not a "
+                    f"profit and loss; {state_reason}"
+                ),
+            },
+            "settled_count": self.settled_count,
+            "funding_state": state,
+            "funding_state_reason": state_reason,
+            # N/A, not 0. See simulated_net_profit_usdc: a number needs fills
+            # *and* settlements.
+            "simulated_net_profit_usdc": profit,
+            "simulated_roi": self.simulated_roi,
+            "simulated_result_reason": (
+                None
+                if profit is not None
+                else (
+                    "no simulated profit is reported: "
+                    + (
+                        "nothing could be sized from the retained book levels"
+                        if self.executable_count == 0
+                        else "capital is still committed because no settlement was applied"
+                    )
+                )
+            ),
             "capacity_limited_count": self.capacity_limited_count,
             "executable_count": self.executable_count,
             "not_executable_count": self.not_executable_count,
+            # Why the rest were refused, as a histogram. The full list of
+            # results is what made this payload grow with the history; a
+            # reader asking "how many were refused, and why" gets the whole
+            # answer from these counts.
+            "not_executable_reason_counts": dict(sorted(self.not_executable_reason_counts.items())),
             "theoretical_expected_net_edge_usdc": self.theoretical_expected_net_edge_usdc,
             "theoretical_expected_roi": (
                 self.theoretical_expected_net_edge_usdc / self.peak_open_allocation_usdc
@@ -464,8 +700,28 @@ class PortfolioResult:
                 "not a virtual position and not realised profit.",
                 "max_allocation_fraction is a stated assumption, not a validated risk rule.",
                 "Actual profit is N/A: this system places no orders.",
+                *(
+                    [
+                        "A simulated profit is N/A rather than zero: "
+                        + state_reason
+                        + "."
+                    ]
+                    if profit is None
+                    else []
+                ),
+                *(
+                    [
+                        f"Per-opportunity results are a sample of {len(sampled)} of {total}; "
+                        "the counts above are complete."
+                    ]
+                    if total > len(sampled)
+                    else []
+                ),
             ],
-            "results": [r.as_dict() for r in self.results],
+            "results_sampled": True,
+            "results_sample_size": self.sample_size,
+            "results_total": total,
+            "results_sample": [r.as_dict() for r in sampled],
         }
 
 
@@ -511,6 +767,9 @@ class IndependentResult:
 
     capital_usdc: float
     results: list[SingleResult] = field(default_factory=list)
+    #: How many per-opportunity edges the payload carries. Bounded because it
+    #: is one entry per executable opportunity.
+    sample_size: int = 50
 
     @property
     def executable_count(self) -> int:
@@ -525,16 +784,20 @@ class IndependentResult:
         return sum(1 for r in self.results if r.capacity_limited)
 
     @property
-    def per_opportunity_expected_edge(self) -> list[float]:
+    def per_opportunity_expected_edge_sample(self) -> list[float]:
         """Edges of the executable results, kept separate on purpose.
 
         Not summed: ten of these sharing one row would invite the reader to
         add them, and the sum has no referent - there is no account that
         held ten stakes at once.
+
+        Sampled, because this is one entry per executable opportunity and the
+        history only grows. ``executable_count`` is the complete answer; this
+        is the illustration.
         """
         return [
             r.theoretical_expected_net_edge_usdc
-            for r in self.results
+            for r in self.results[: self.sample_size]
             if r.executable and r.theoretical_expected_net_edge_usdc is not None
         ]
 
@@ -546,8 +809,11 @@ class IndependentResult:
             "executable_count": self.executable_count,
             "not_executable_count": self.not_executable_count,
             "capacity_limited_count": self.capacity_limited_count,
-            # A list, never a total: these are independent hypotheticals.
-            "per_opportunity_expected_edge": self.per_opportunity_expected_edge,
+            # A list, never a total: these are independent hypotheticals. A
+            # bounded list, because it is one entry per opportunity.
+            "per_opportunity_expected_edge_sample": self.per_opportunity_expected_edge_sample,
+            "per_opportunity_expected_edge_sampled": True,
+            "per_opportunity_expected_edge_sample_size": self.sample_size,
             "combined_expected_edge": None,
             "statistical_scope": ["reference_capital_hypothetical"],
             "warnings": [
@@ -559,6 +825,15 @@ class IndependentResult:
                 "Reference capital is a research assumption, not a funded "
                 "account, not a virtual position and not realised profit.",
                 "Actual profit is N/A: this system places no orders.",
+                *(
+                    [
+                        f"Per-opportunity edges are a sample of "
+                        f"{len(self.per_opportunity_expected_edge_sample)} of "
+                        f"{self.executable_count}; executable_count is complete."
+                    ]
+                    if self.executable_count > len(self.per_opportunity_expected_edge_sample)
+                    else []
+                ),
             ],
             "results": [r.as_dict() for r in self.results],
         }
@@ -595,7 +870,9 @@ class PortfolioWalk:
                 f"max_allocation_fraction must be in (0, 1], got {max_allocation_fraction!r}"
             )
         self.outcome = PortfolioResult(
-            capital_usdc=capital_usdc, max_allocation_fraction=max_allocation_fraction
+            capital_usdc=capital_usdc,
+            max_allocation_fraction=max_allocation_fraction,
+            collect_results=collect_results,
         )
         self.collect_results = collect_results
         self.single_kwargs = single_kwargs
@@ -608,9 +885,17 @@ class PortfolioWalk:
         self.total_count = 0
         self._funds_exhausted = False
 
-    def add(self, episode: Episode, book: OrderBook | None) -> SingleResult:
-        """Price one opportunity against what is left, and record the outcome."""
+    def add(
+        self, episode: Episode, book: OrderBook | None, **single_kwargs: Any
+    ) -> SingleResult:
+        """Price one opportunity against what is left, and record the outcome.
+
+        ``single_kwargs`` reaches ``simulate_single``, which is how a caller
+        supplies a settlement payout when one exists. Without it the walk has
+        the position and no result, which is what ``funding_state`` reports.
+        """
         outcome = self.outcome
+        single_kwargs = {**self.single_kwargs, **single_kwargs}
         self.total_count += 1
 
         # Decide what this episode may spend *before* pricing it. Pricing at
@@ -642,7 +927,7 @@ class PortfolioWalk:
             episode,
             capital_usdc=available,
             book=book,
-            **self.single_kwargs,  # type: ignore[arg-type]
+            **single_kwargs,  # type: ignore[arg-type]
         )
 
         if not single.executable:
@@ -662,7 +947,6 @@ class PortfolioWalk:
                 "pricing must never exceed the funds it was given"
             )
 
-        outcome.executable_count += 1
         if single.capacity_limited:
             outcome.capacity_limited_count += 1
         outcome.allocated_total_usdc += used
@@ -676,11 +960,7 @@ class PortfolioWalk:
         return self._record(single)
 
     def _record(self, single: SingleResult) -> SingleResult:
-        outcome = self.outcome
-        if not single.executable:
-            outcome.not_executable_count += 1
-        if self.collect_results:
-            outcome.results.append(single)
+        self.outcome.record(single)
         return single
 
     def finish(self) -> PortfolioResult:
