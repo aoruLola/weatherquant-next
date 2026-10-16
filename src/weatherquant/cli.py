@@ -462,6 +462,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="rebuild the snapshots from the state store without reading the export",
     )
     p.add_argument(
+        "--no-publish",
+        action="store_true",
+        help=(
+            "consume what is new but do not publish a snapshot. Use with a 5-minute "
+            "cadence to separate ingest from publish (e.g., ingest every 5 min, "
+            "publish every 20 min)"
+        ),
+    )
+    p.add_argument(
         "--settlements-replace",
         action="store_true",
         help=(
@@ -744,6 +753,7 @@ def _build_performance_streaming(
             temp_directory=args.temp_dir,
             reset=args.reset,
             ingest=not args.no_ingest,
+            publish=not args.no_publish,
             deep_verify=args.verify_parts,
             max_parts_per_run=args.max_parts_per_run,
             progress=progress,
