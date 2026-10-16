@@ -290,7 +290,13 @@ def test_a_second_process_is_refused_rather_than_corrupting_the_store(tmp_path) 
             text=True,
         )
     assert attempt.returncode != 0
-    assert "Conflicting lock" in (attempt.stderr or attempt.stdout)
+    message = (attempt.stderr or attempt.stdout).lower()
+    # The wording is platform-specific - DuckDB says "Conflicting lock is held"
+    # on Linux and "File is already open in" on Windows - so asserting one of
+    # them makes this test pass or fail on the operating system rather than on
+    # the behaviour. What has to hold is that the second process is refused,
+    # and refused for *this* reason rather than an unrelated one.
+    assert "lock" in message or "already open" in message, message
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +546,47 @@ def test_a_withdrawn_settlement_is_retracted_and_not_resurrected(tmp_path) -> No
         and row["target_date"] == withdrawn["target_date"]
         for row in kept
     )
+
+
+def test_an_empty_settlement_index_retracts_nothing(tmp_path) -> None:
+    """`--settlements-replace` with an empty index must be inert, not a wipe.
+
+    Replace makes the index authoritative, so an empty one reads as "no
+    settlement exists" and would delete every answer - including ones the
+    platform confirmed. An index comes out empty for ordinary reasons: the
+    backfill matched no markets, or the platform was unreachable. Neither is
+    an assertion that yesterday's answers were wrong.
+
+    The guard is `if answers:` before the write. Without a test it is one
+    refactor away from being "tidied" into an unconditional call, and the
+    loss would be silent: the snapshots would simply stop scoring, with
+    `UNAVAILABLE` where a resolved market used to be.
+    """
+    rows = _dataset(seed=211, rows=600)
+    index = _settlements(rows)
+    export = _write_parts(tmp_path, rows, 3)
+    state_db = tmp_path / "state.duckdb"
+    out = tmp_path / "performance"
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=index, now=NOW,
+    )
+    before = _read_generation(out)
+    assert len(before["settlements.json"]["data"]["answers"]) == len(index)
+
+    build_performance_streaming(
+        export=export, out_dir=out, state_db=state_db, dataset="fixture",
+        settlements=[], settlements_replace=True, now=NOW,
+    )
+
+    after = _read_generation(out)
+    assert len(after["settlements.json"]["data"]["answers"]) == len(index), (
+        "an empty index wiped the settlement layer"
+    )
+    outcomes = {
+        row["outcome"] for row in after["opportunities.json"]["data"]["episodes"]
+    }
+    assert outcomes & {"WIN", "LOSS"}, "an empty index un-scored every episode"
 
 
 def test_the_settlement_layer_records_where_it_came_from(tmp_path) -> None:
