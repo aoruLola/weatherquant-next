@@ -35,6 +35,8 @@ function payload(overrides: Partial<PerformancePayload> = {}): PerformancePayloa
       counts: { WIN: 0, LOSS: 0, PENDING: 12 },
       opportunity_episodes: 7,
       accept_observations: 42,
+      accept_opportunity_distinct_markets: 4,
+      accept_opportunity_distinct_target_dates: 5,
       distinct_markets: 4,
       distinct_target_dates: 5,
       insufficient_reason: 'N/A — insufficient resolved independent samples',

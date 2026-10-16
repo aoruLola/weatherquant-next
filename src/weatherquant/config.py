@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # often enough that sharing a file with the order-book history would be a
     # poor trade. See weatherquant.storage.research.
     research_db_path: Path = Path("data/research/weather-research.duckdb")
+    #: The streaming performance engine's own state (docs/performance-streaming-audit.md).
+    #: A separate file from the research database: different writer, different
+    #: lifetime, and safe to delete because everything in it is derived from the
+    #: decisions export.
+    performance_state_db_path: Path = Path("data/research/performance-state.duckdb")
     research_raw_dir: Path = Path("data/research/raw")
 
     # --- market definition -------------------------------------------------

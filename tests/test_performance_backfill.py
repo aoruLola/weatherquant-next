@@ -486,7 +486,8 @@ def test_the_manifest_records_the_export_watermark_and_coverage(tmp_path) -> Non
 
     coverage = manifest["coverage"]
     assert coverage["decisions"] == 9
-    assert coverage["distinct_markets"] == 3
+    assert coverage["all_decision_distinct_markets"] == 3
+    assert coverage["all_decision_distinct_target_dates"] == 1
     assert coverage["first_decision_utc"] == NOW.isoformat()
     assert coverage["last_decision_utc"] == (NOW + timedelta(minutes=8)).isoformat()
 
@@ -526,6 +527,40 @@ def test_coverage_of_nothing_is_null_not_zero(tmp_path) -> None:
     assert coverage["decisions"] == 0
     assert coverage["first_decision_utc"] is None
     assert coverage["last_decision_utc"] is None
+
+
+def test_the_two_distinct_market_counts_are_named_for_their_populations(
+    tmp_path,
+) -> None:
+    """One word meant two populations in one generation - 55 here, 28 there.
+
+    `coverage` counts every decision read; the summary counts opportunities.
+    Neither name said which, so a reader had to guess. They now do. The
+    summary keeps the old name as an alias because a deployed dashboard still
+    reads it, and a payload cannot ask its readers to upgrade.
+    """
+    from weatherquant.shadow.export import _row_as_dict
+
+    decisions = [
+        _row_as_dict(_export_row(decision_id="d-1", market_id="m-1", state="ACCEPT")),
+        _row_as_dict(_export_row(decision_id="d-2", market_id="m-2", state="NO_TRADE")),
+        _row_as_dict(_export_row(decision_id="d-3", market_id="m-3", state="NO_TRADE")),
+    ]
+    out = tmp_path / "performance"
+    build_performance_snapshots(decisions=decisions, out_dir=out, dataset="live", now=NOW)
+
+    coverage = _manifest(out)["coverage"]
+    summary = json.loads(_published(out, "summary.json").read_text(encoding="utf-8"))["data"]
+
+    # Every decision was read, but only one market produced an opportunity.
+    assert coverage["all_decision_distinct_markets"] == 3
+    assert summary["accept_opportunity_distinct_markets"] == 1
+    assert coverage["all_decision_distinct_markets"] != summary[
+        "accept_opportunity_distinct_markets"
+    ], "the two populations collapsed into one, so the rename bought nothing"
+
+    # The deprecated alias still carries the opportunity-scoped number.
+    assert summary["distinct_markets"] == summary["accept_opportunity_distinct_markets"]
 
 
 def test_the_watermark_describes_the_rows_that_were_actually_read(tmp_path) -> None:

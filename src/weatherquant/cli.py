@@ -428,7 +428,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--export",
         required=True,
-        help="decisions export (.json / .jsonl / .parquet) published by the shadow",
+        help=(
+            "the shadow's decisions-export directory (streaming engine), or a "
+            ".json / .jsonl / .parquet file for the in-memory builder"
+        ),
     )
     p.add_argument("--settlements", help="settlement index written by backfill-settlements")
     p.add_argument("--out", required=True, help="directory to publish the six snapshots into")
@@ -441,6 +444,54 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--capital-usdc", default="100")
     p.add_argument("--max-allocation-fraction", default="0.10")
     p.add_argument("--gap-window-seconds", default="900")
+    p.add_argument(
+        "--state-db",
+        help=(
+            "research state store for the streaming engine "
+            "(default: WQ_PERFORMANCE_STATE_DB_PATH)"
+        ),
+    )
+    p.add_argument(
+        "--reset",
+        action="store_true",
+        help="drop the state store first and rebuild it from the export",
+    )
+    p.add_argument(
+        "--no-ingest",
+        action="store_true",
+        help="rebuild the snapshots from the state store without reading the export",
+    )
+    p.add_argument(
+        "--settlements-replace",
+        action="store_true",
+        help=(
+            "treat --settlements as the complete settlement set: answers it does "
+            "not contain are retracted. Without this the index is a union, so an "
+            "index covering today's markets cannot erase yesterday's answers"
+        ),
+    )
+    p.add_argument("--memory-limit", default="1GB", help="DuckDB memory limit for the state store")
+    p.add_argument("--temp-dir", help="where the state store spills when it exceeds the limit")
+    p.add_argument(
+        "--verify-parts",
+        action="store_true",
+        help="re-hash every consumed part, not only the boundary one",
+    )
+    p.add_argument(
+        "--max-parts-per-run",
+        type=int,
+        help="consume at most this many parts in one run (a first backfill can be split)",
+    )
+    p.add_argument(
+        "--in-memory",
+        action="store_true",
+        help=(
+            "use the whole-history builder instead of the streaming engine. "
+            "It holds every decision in memory (~6.8 KB each) and cannot scale; "
+            "it exists as the reference implementation the streaming engine is "
+            "checked against"
+        ),
+    )
     return parser
 
 
@@ -530,17 +581,29 @@ def _atomic_write_json(path: Path, payload) -> None:
 
 
 def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
-    """Turn a decisions export plus settlements into the six snapshots."""
+    """Turn a decisions export plus settlements into the six snapshots.
+
+    Two engines, chosen by what the input is:
+
+    * a **directory** is the shadow's published export, and it is built by the
+      streaming engine - one part at a time, resuming from a state store, with
+      memory bounded by the batch rather than by the history;
+    * a **file** is a hand-carried export with no parts and no cursor, and it is
+      built by the whole-history builder, which is also the reference the
+      streaming engine is checked against.
+
+    ``--in-memory`` forces the second path for a directory, and refuses to do so
+    quietly: that path is what took the host offline at 960,000 rows.
+    """
     from weatherquant.performance.backfill import (
         build_performance_snapshots,
         load_decisions_with_watermark,
         load_settlements,
     )
 
-    try:
-        decisions, watermark = load_decisions_with_watermark(args.export)
-    except (OSError, ValueError, RuntimeError) as exc:
-        print(f"could not read decisions export: {exc}", file=sys.stderr)
+    export = Path(args.export)
+    if not export.exists():
+        print(f"could not read decisions export: not found: {export}", file=sys.stderr)
         return 2
 
     settlements: list[dict] = []
@@ -550,6 +613,31 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
         except (OSError, ValueError) as exc:
             print(f"could not read settlement index: {exc}", file=sys.stderr)
             return 2
+
+    streaming = export.is_dir() and not args.in_memory
+    if streaming:
+        return _build_performance_streaming(settings, args, settlements)
+    if args.state_db and not export.is_dir():
+        print(
+            f"--state-db was given but {export} is a file, not a directory of "
+            "published parts. The streaming engine consumes the shadow's export "
+            "parts; drop --state-db to use the in-memory builder on this file.",
+            file=sys.stderr,
+        )
+        return 2
+    if export.is_dir() and args.in_memory:
+        print(
+            "WARNING: --in-memory holds every decision as a Python dict (~6.8 KB "
+            "each) and has taken a 16 GB host offline at 960,000 rows. It is the "
+            "reference implementation, not the production path.",
+            file=sys.stderr,
+        )
+
+    try:
+        decisions, watermark = load_decisions_with_watermark(export)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"could not read decisions export: {exc}", file=sys.stderr)
+        return 2
 
     out = Path(args.out)
     try:
@@ -573,6 +661,66 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
     print(f"published {len(written)} snapshot(s) to {out} (dataset={args.dataset})")
     for path in written:
         print(f"  {path.name}")
+    return 0
+
+
+def _build_performance_streaming(
+    settings: Settings, args: argparse.Namespace, settlements: list[dict]
+) -> int:
+    """The production path: ingest what is new, then publish one generation."""
+    from weatherquant.performance.state import PerformanceStateError, StateMismatch
+    from weatherquant.performance.streaming import build_performance_streaming
+
+    state_db = Path(args.state_db) if args.state_db else settings.performance_state_db_path
+
+    def progress(message: str) -> None:
+        print(f"  {message}")
+
+    try:
+        result = build_performance_streaming(
+            export=args.export,
+            out_dir=args.out,
+            state_db=state_db,
+            dataset=args.dataset,
+            settlements=settlements,
+            settlements_replace=args.settlements_replace,
+            capital_usdc=float(args.capital_usdc),
+            max_allocation_fraction=float(args.max_allocation_fraction),
+            gap_window_seconds=float(args.gap_window_seconds),
+            memory_limit=args.memory_limit,
+            temp_directory=args.temp_dir,
+            reset=args.reset,
+            ingest=not args.no_ingest,
+            deep_verify=args.verify_parts,
+            max_parts_per_run=args.max_parts_per_run,
+            progress=progress,
+        )
+    except StateMismatch as exc:
+        print(f"the state store does not match this run: {exc}", file=sys.stderr)
+        return 2
+    except (PerformanceStateError, ValueError, RuntimeError) as exc:
+        print(f"could not build performance snapshots: {exc}", file=sys.stderr)
+        return 2
+
+    ingest = result["ingest"]
+    if ingest is not None:
+        print(
+            f"consumed {ingest['rows_consumed']} row(s) from {ingest['parts_consumed']} of "
+            f"{ingest['parts_available']} part(s)"
+        )
+    else:
+        print("no ingest requested; rebuilding from the state store")
+    print(f"watermark: {result['watermark']}")
+    print(f"state store: {state_db}")
+    print(f"published {len(result['written'])} snapshot(s) to {args.out} (dataset={args.dataset})")
+    print(f"generation: {result['generation_id']}")
+    summary = result["summary"]
+    print(
+        "  episodes {opportunity_episodes}, accept observations {accept_observations}, "
+        "win rate {win_rate}".format(
+            win_rate=summary["realized_directional_win_rate"], **summary
+        )
+    )
     return 0
 
 
