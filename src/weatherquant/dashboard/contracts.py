@@ -72,11 +72,45 @@ class FreshnessState(StrEnum):
 
 
 class Freshness(BaseModel):
+    """How current one source is, and - for performance snapshots - which
+    layer of the pipeline is responsible when it is not.
+
+    The four ``*_lag_seconds`` fields are populated for performance snapshots
+    and left ``None`` for every other source, whose freshness really is just
+    "how old is this file". ``age_seconds``/``as_of_utc`` keep their original
+    meaning so a consumer written before the layers existed still reads a
+    correct answer.
+
+    ``lagging_layer`` names which layer the verdict is about:
+    ``shadow_export``, ``ingestion``, ``publication`` or ``publish_interval``.
+    ``None`` means nothing is behind.
+    """
+
     state: FreshnessState
     age_seconds: float | None = None
     as_of_utc: datetime | None = None
     stale_after_seconds: float | None = None
     reason: str | None = None
+
+    # -- multi-layer performance freshness ---------------------------------
+    #: How long since the shadow export produced new data (live read).
+    export_data_lag_seconds: float | None = None
+    #: Export watermark minus the watermark this snapshot consumed.
+    ingestion_lag_seconds: float | None = None
+    #: Publish time minus the watermark this snapshot consumed.
+    publication_lag_seconds: float | None = None
+    #: Now minus the publish time. Expected to reach the publish interval.
+    snapshot_age_seconds: float | None = None
+    #: The live shadow export watermark, as read from the export itself.
+    export_watermark_utc: datetime | None = None
+    #: The watermark the current snapshot consumed (from its manifest).
+    consumed_watermark_utc: datetime | None = None
+    #: When the current snapshot was published.
+    published_at_utc: datetime | None = None
+    #: Which layer the verdict names, or None when nothing is behind.
+    lagging_layer: str | None = None
+    #: The publish interval this snapshot is judged against, when known.
+    publish_interval_seconds: float | None = None
 
 
 class Envelope[T](BaseModel):

@@ -41,7 +41,17 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from weatherquant.dashboard.config import DashboardSettings
-from weatherquant.dashboard.sources import JsonSource, SnapshotSources, freshness_of
+from weatherquant.dashboard.contracts import Freshness
+from weatherquant.dashboard.performance_freshness import (
+    evaluate_layers,
+    read_export_state,
+    read_ingest_state,
+)
+from weatherquant.dashboard.sources import (
+    JsonSource,
+    SnapshotSources,
+    parse_utc,
+)
 from weatherquant.performance.capital import (
     book_from_mapping,
     simulate_independent,
@@ -94,6 +104,19 @@ class CursorGenerationChanged(RuntimeError):
     """
 
 
+def _watermark_time(manifest: Mapping[str, Any]) -> str | None:
+    """The business-time half of a manifest watermark, if it carries one.
+
+    The manifest stores ``[timestamp, cursor_hash]``. A generation published
+    before the watermark was recorded has ``None`` here, and the caller falls
+    back to the payload's own ``as_of_utc``.
+    """
+    watermark = manifest.get("watermark")
+    if isinstance(watermark, (list, tuple)) and watermark:
+        return str(watermark[0]) if watermark[0] else None
+    return None
+
+
 class PerformancePayload(BaseModel):
     """One performance snapshot, passed through with its envelope checked.
 
@@ -133,14 +156,53 @@ class PerformanceState:
                 source.freshness,
             )
         payload = PerformancePayload.model_validate(source.payload)
-        # Re-stamp freshness from the file's own clock: the snapshot is the
-        # source of truth for how old it is, not the moment we read it.
-        as_of = payload.as_of_utc or payload.generated_at_utc
-        stale = payload.stale_after_seconds or 300.0
-        freshness = freshness_of(
-            as_of, now, stale_after_seconds=stale + 60.0, missing_reason=source.freshness.reason or ""
+        return payload, self._layered_freshness(payload, source, now)
+
+    def _layered_freshness(self, payload: PerformancePayload, source: JsonSource, now) -> Freshness:
+        """Freshness across the four layers, not just the file's age.
+
+        The snapshot's own age is the least interesting of the four: with a
+        20-minute publish cadence a healthy snapshot is routinely 19 minutes
+        old. What an operator needs to know is *which* layer stopped, so the
+        verdict names it.
+        """
+        generation = self.sources.performance_generation()
+        manifest = generation.manifest or {}
+        published_at = parse_utc(manifest.get("published_at_utc")) or payload.generated_at_utc
+        consumed_at = payload.as_of_utc or parse_utc(_watermark_time(manifest))
+        interval = (
+            self.settings.performance_publish_interval_seconds
+            + self.settings.performance_publish_grace_seconds
         )
-        return payload, freshness
+        layers = evaluate_layers(
+            now=now,
+            export_state=read_export_state(self.settings.shadow_export_dir),
+            ingest_state=read_ingest_state(self.settings.performance_snapshots_dir),
+            snapshot_consumed_time=consumed_at,
+            published_at_utc=published_at,
+            publish_interval_seconds=interval,
+            export_stale_after_seconds=self.settings.shadow_export_stale_seconds,
+            ingest_stale_after_seconds=self.settings.performance_ingest_stale_seconds,
+            publication_stale_after_seconds=self.settings.performance_publication_stale_seconds,
+        )
+        return Freshness(
+            state=layers.state,
+            # Kept for readers written before the layers existed: still the
+            # snapshot's age, still the timestamp it is measured from.
+            age_seconds=layers.snapshot_age_seconds,
+            as_of_utc=published_at,
+            stale_after_seconds=interval,
+            reason=layers.reason or source.freshness.reason,
+            export_data_lag_seconds=layers.export_data_lag_seconds,
+            ingestion_lag_seconds=layers.ingestion_lag_seconds,
+            publication_lag_seconds=layers.publication_lag_seconds,
+            snapshot_age_seconds=layers.snapshot_age_seconds,
+            export_watermark_utc=layers.export_watermark_time,
+            consumed_watermark_utc=layers.consumed_watermark_time,
+            published_at_utc=layers.published_at_utc,
+            lagging_layer=layers.lagging_layer,
+            publish_interval_seconds=interval,
+        )
 
     def generation_directory(self) -> Path | None:
         """Where the parts of the current generation live, or None.

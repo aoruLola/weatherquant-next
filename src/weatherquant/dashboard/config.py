@@ -66,6 +66,28 @@ class DashboardSettings(BaseSettings):
     book_stale_seconds: float = Field(default=900.0, gt=0)
     """An order book older than this is shown as STALE, not as a live quote."""
 
+    # --- performance multi-layer freshness (seconds) -----------------------
+    # These judge the *layers*, not the snapshot's age, so a healthy publish
+    # interval is never reported as a fault. See performance_freshness.py.
+    performance_publish_interval_seconds: float = Field(default=1200.0, gt=0)
+    """How often the publish job runs. A snapshot up to this old is normal."""
+
+    performance_publish_grace_seconds: float = Field(default=300.0, ge=0)
+    """Slack added to the publish interval before snapshot age reads as stale."""
+
+    shadow_export_stale_seconds: float = Field(default=900.0, gt=0)
+    """No new export data for this long means the shadow export has stopped."""
+
+    performance_ingest_stale_seconds: float = Field(default=900.0, gt=0)
+    """The engine falling this far behind the export means ingest has stopped."""
+
+    performance_publication_stale_seconds: float = Field(default=1500.0, gt=0)
+    """How far the published snapshot may trail what ingest has consumed.
+
+    Defaults to the publish interval plus grace: with publish running every 20
+    minutes the snapshot is *expected* to be up to that far behind the ingest
+    position, so a smaller threshold would flag every healthy interval."""
+
     # --- bounded archive reads ---------------------------------------------
     archive_tail_bytes: int = Field(default=512 * 1024, ge=4096)
     """How much of each archive file is read per refresh. Never a full scan."""
@@ -115,12 +137,23 @@ class DashboardSettings(BaseSettings):
     @property
     def shadow_snapshots_dir(self) -> Path:
         """Where the shadow-side producer will publish detail snapshots.
-
         Part of the data contract (docs/dashboard-data-contract.md); the files
         appear once the shadow engine integrates the producer. Until then the
         API reports them as ``unavailable`` with that exact reason.
         """
         return self.shadow_data_dir / "reports"
+
+    @property
+    def shadow_export_dir(self) -> Path:
+        """The shadow's decisions export, read live for upstream freshness.
+
+        Only ``state.json`` is read, and only to answer "is the shadow still
+        producing data". The Dashboard never infers this from a snapshot's
+        manifest: a manifest watermark records what was consumed at build
+        time, and treating it as the export's current position would make a
+        stopped export look caught up.
+        """
+        return self.shadow_data_dir / "reports" / "decisions-export"
 
     @property
     def performance_snapshots_dir(self) -> Path:
