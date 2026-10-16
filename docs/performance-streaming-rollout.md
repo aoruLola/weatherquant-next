@@ -81,8 +81,30 @@ weatherquant-research build-performance \
 
 **日常增量**（每 15–30 分钟一次，见 §6）：同一条命令**去掉** `--max-parts-per-run`。
 
-**结算修订**：带新的 `--settlements` 重跑（upsert）；要撤销用 `--settlements-replace`
-（仅在确认索引完整时）。不重读任何决策。
+**结算修订**：带新的 `--settlements` 重跑（upsert），不重读任何决策。
+
+要**撤销**用 `--settlements-replace`（仅在确认索引完整时）。替换是完整语义：
+索引里没有的答案会被删除。因此：
+
+| 输入 | 结果 |
+|---|---|
+| `--settlements-replace` + 非空索引 | 完整替换（索引里没有的被撤销） |
+| `--settlements-replace` + **空索引** | **拒绝**，返回退出码 2，不修改任何东西 |
+| `--settlements-replace` + 空索引 + `--confirm-empty-retraction` | 允许全部撤销 |
+| `--confirm-empty-retraction` 单独使用 | **拒绝** |
+
+**为什么空索引默认拒绝**：空索引至少有同样多的概率来自**失败的回填**——平台不可达、
+或没有任何市场匹配——而不是来自"确实全部撤销"。结算层是状态库里唯一**无法从导出重建**
+的东西（重建要联网），所以宁可拒绝。拒绝发生在**状态库被打开之前**：水位不推进、
+不发布世代、不写备份，即"拒绝"必须意味着什么都没动。
+
+**全部撤销会先写备份**：`<state-db>.retracted-<UTC>.json`，含 `rows_retracted`、
+`input_source`（`--settlements` 的路径）、`reason`（`--retraction-reason`，未给则为
+`null`，不猜）以及被删除的每一行。这是唯一无法从别处重做的结算操作。
+
+**定时任务不得添加 `--settlements-replace`、`--confirm-empty-retraction` 或
+`--retraction-reason`。** 这三者是人工操作，不是日常增量的一部分：调度器无法判断
+一次空索引是"平台故障"还是"真的全部撤销"。
 
 ---
 
@@ -111,6 +133,10 @@ flock -n /var/lock/weatherquant-performance.lock \
 ```
 
 - 运行时间远小于间隔（增量通常 < 10 秒；只有新分片落盘时才接近分钟级）。
+- **定时任务的命令里不得出现 `--settlements-replace`、`--confirm-empty-retraction`
+  或 `--retraction-reason`。** 日常增量只做 upsert：一个自动化脚本没有能力判断
+  一次空索引是"平台故障"还是"确实全部撤销"，而这两者的后果不对称——猜错的代价是
+  清空整个结算层，且无法从导出重建。撤销是人工操作，见 §4。
 
 ---
 

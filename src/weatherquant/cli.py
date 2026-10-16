@@ -467,7 +467,29 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "treat --settlements as the complete settlement set: answers it does "
             "not contain are retracted. Without this the index is a union, so an "
-            "index covering today's markets cannot erase yesterday's answers"
+            "index covering today's markets cannot erase yesterday's answers. An "
+            "empty index is refused unless --confirm-empty-retraction is also given"
+        ),
+    )
+    p.add_argument(
+        "--confirm-empty-retraction",
+        action="store_true",
+        help=(
+            "required in addition to --settlements-replace when the index is "
+            "empty, because that retracts every answer. An empty index is what a "
+            "failed backfill looks like at least as often as it is what a genuine "
+            "total retraction looks like: the platform may have been unreachable, "
+            "or no market may have matched. Refusing is the default because the "
+            "settlement layer cannot be rebuilt from the export"
+        ),
+    )
+    p.add_argument(
+        "--retraction-reason",
+        default=None,
+        help=(
+            "recorded in the backup a total retraction writes, so the audit "
+            "says why the settlement layer was emptied. Recorded as null when "
+            "omitted, never guessed"
         ),
     )
     p.add_argument("--memory-limit", default="1GB", help="DuckDB memory limit for the state store")
@@ -617,6 +639,16 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
         load_settlements,
     )
 
+    if args.confirm_empty_retraction and not args.settlements_replace:
+        print(
+            "--confirm-empty-retraction only means something together with "
+            "--settlements-replace: on its own it confirms nothing. Refusing it "
+            "keeps the two flags from looking interchangeable, because one of "
+            "them can delete every settlement answer and the other cannot.",
+            file=sys.stderr,
+        )
+        return 2
+
     export = Path(args.export)
     if not export.exists():
         print(f"could not read decisions export: not found: {export}", file=sys.stderr)
@@ -700,6 +732,9 @@ def _build_performance_streaming(
             dataset=args.dataset,
             settlements=settlements,
             settlements_replace=args.settlements_replace,
+            confirm_empty_retraction=args.confirm_empty_retraction,
+            settlements_source=args.settlements,
+            retraction_reason=args.retraction_reason,
             capital_usdc=float(args.capital_usdc),
             max_allocation_fraction=float(args.max_allocation_fraction),
             gap_window_seconds=float(args.gap_window_seconds),

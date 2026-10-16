@@ -122,7 +122,7 @@ from weatherquant.performance.winrate import (
     outcome_for,
 )
 from weatherquant.shadow.export import _end_cursor_of, _index_of
-from weatherquant.shadow.publish import PartitionedArray
+from weatherquant.shadow.publish import PartitionedArray, atomic_write_json
 
 __all__ = [
     "ExportPart",
@@ -1339,6 +1339,38 @@ def streaming_generation_id(
     return f"{now.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}-{digest[:12]}"
 
 
+def _write_retraction_backup(
+    rows: list[dict[str, Any]],
+    *,
+    state_db: str | Path,
+    source: str | None,
+    reason: str | None,
+    now: datetime,
+) -> Path:
+    """Write out the settlement answers a total retraction is about to delete.
+
+    Beside the state database, named for the instant, and returned so the
+    caller can print the path. `reason` is recorded as ``None`` when the
+    operator did not give one, rather than guessed at: an audit line that
+    invents a motive is worse than one that admits it does not have it.
+    """
+    stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+    state_path = Path(state_db)
+    path = state_path.with_name(f"{state_path.stem}.retracted-{stamp}.json")
+    atomic_write_json(
+        path,
+        {
+            "retracted_at_utc": now.astimezone(UTC).isoformat(),
+            "rows_retracted": len(rows),
+            "input_source": source,
+            "reason": reason,
+            "state_db": str(state_path),
+            "settlements": rows,
+        },
+    )
+    return path
+
+
 def build_performance_streaming(
     *,
     export: str | Path,
@@ -1347,6 +1379,9 @@ def build_performance_streaming(
     state_db: str | Path = DEFAULT_PERFORMANCE_STATE_DB_PATH,
     settlements: Sequence[Any] = (),
     settlements_replace: bool = False,
+    confirm_empty_retraction: bool = False,
+    settlements_source: str | None = None,
+    retraction_reason: str | None = None,
     capital_usdc: float = 100.0,
     max_allocation_fraction: float = DEFAULT_MAX_ALLOCATION_FRACTION,
     gap_window_seconds: float = DEFAULT_GAP_WINDOW_SECONDS,
@@ -1389,6 +1424,23 @@ def build_performance_streaming(
         )
     now = now or datetime.now(tz=UTC)
 
+    # Resolved here, and the empty-index refusal raised here, both *before* the
+    # store is opened. A rejection that had already ingested parts would have
+    # advanced the watermark and recorded a generation, so the run would look
+    # like it had done something - and "refused" has to mean nothing moved.
+    answers, verified = _settlement_index(settlements)
+    if settlements_replace and not answers and not confirm_empty_retraction:
+        raise PerformanceStateError(
+            "refusing to replace the settlement set with an empty index: that "
+            "would retract every answer. An empty index is what a failed "
+            "backfill looks like at least as often as it is what a genuine "
+            "total retraction looks like - the platform may have been "
+            "unreachable, or no market may have matched - and the settlement "
+            "layer cannot be rebuilt from the export, because rebuilding it "
+            "needs the network. Pass --confirm-empty-retraction to mean it. "
+            "Nothing was read, written or retracted."
+        )
+
     with PerformanceStateStore(
         state_db, memory_limit=memory_limit, temp_directory=temp_directory
     ) as store:
@@ -1414,12 +1466,25 @@ def build_performance_streaming(
         # erase the answers an earlier run verified. `replace=True` is the
         # caller asserting that this index is *complete*, which is the only way
         # to express a withdrawal - see PerformanceStateStore.replace_settlements.
-        answers, verified = _settlement_index(settlements)
         if settlements_replace:
-            # An explicit "this index is complete" holds even when it is empty:
-            # that is how every answer is retracted, and skipping it because
-            # the mapping happens to be empty would make the one case where a
-            # retraction is total the one case that does nothing.
+            if not answers:
+                # The one operation that cannot be undone from anywhere else:
+                # the export carries decisions, not settlements, and
+                # re-deriving them needs the platform. So everything about to
+                # be deleted is written out first, with the count, where the
+                # index came from and why - a retraction nobody can reverse is
+                # not a retraction, it is a loss. Written before the delete,
+                # and written even when there is nothing to delete, so the
+                # audit line exists either way.
+                backup = _write_retraction_backup(
+                    store.load_settlements(),
+                    state_db=state_db,
+                    source=settlements_source,
+                    reason=retraction_reason,
+                    now=now,
+                )
+                if progress is not None:
+                    progress(f"retraction backup written to {backup}")
             provenance = _settlement_provenance_map(settlements)
             removed = store.replace_settlements(
                 {

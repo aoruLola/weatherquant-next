@@ -148,7 +148,9 @@ weatherquant-research build-performance \
 | `--in-memory` | 强制使用全内存构建器（会打印警告，见 §10.2） |
 | `--detail-window-episodes` | 可浏览明细的条数上限，默认 20000（契约 §14.1） |
 | `--detail-window-days` | 可浏览明细的时间窗，默认 90 天 |
-| `--settlements-replace` | 把 `--settlements` 当作**完整**结算集：其中没有的答案会被撤销 |
+| `--settlements-replace` | 把 `--settlements` 当作**完整**结算集：其中没有的答案会被撤销。**空索引会被拒绝** |
+| `--confirm-empty-retraction` | 与 `--settlements-replace` 合用、且索引为空时才需要：确认"全部撤销" |
+| `--retraction-reason` | 记录进全部撤销的备份，说明为什么清空结算层；不给则记 `null`，不猜 |
 
 输出是**一个世代**：`performance/generations/<id>/` 内放六份快照与 `manifest.json`，
 最后以一次 rename 切换 `performance/current.json` 指针（契约 §7.1）。
