@@ -103,6 +103,38 @@ export function ModeBadge({ mode }: { mode?: string | null }) {
   )
 }
 
+/** Which layer stopped, in the operator's terms. */
+const LAYER_LABEL: Record<NonNullable<Freshness['lagging_layer']>, string> = {
+  shadow_export: '导出停摆',
+  ingestion: '摄入滞后',
+  publication: '发布滞后',
+  publish_interval: '发布超期',
+}
+
+/**
+ * The full layer breakdown, for the tooltip.
+ *
+ * `snapshot_age` is labelled as an age, never as a fault: with a 20-minute
+ * publish cadence a healthy snapshot is routinely 19 minutes old, and the
+ * backend only calls it a fault once it passes the publish interval.
+ */
+function layerTitle(freshness: Freshness): string | undefined {
+  const lines: string[] = []
+  const lag = (label: string, value: number | null | undefined) => {
+    if (typeof value === 'number') lines.push(`${label}：${fmtAge(value)}`)
+  }
+  if (freshness.lagging_layer) lines.push(`滞后层：${LAYER_LABEL[freshness.lagging_layer]}`)
+  lag('导出数据滞后', freshness.export_data_lag_seconds)
+  lag('摄入滞后', freshness.ingestion_lag_seconds)
+  lag('发布滞后', freshness.publication_lag_seconds)
+  lag('快照年龄', freshness.snapshot_age_seconds)
+  if (typeof freshness.publish_interval_seconds === 'number') {
+    lines.push(`发布间隔：${fmtAge(freshness.publish_interval_seconds)}`)
+  }
+  if (freshness.reason) lines.push(freshness.reason)
+  return lines.length ? lines.join('\n') : undefined
+}
+
 export function FreshnessPill({
   freshness,
   now,
@@ -129,7 +161,7 @@ export function FreshnessPill({
           ? 'danger'
           : 'muted'
 
-  const text =
+  const base =
     state === 'fresh'
       ? `更新于 ${fmtAge(age)}`
       : state === 'stale'
@@ -140,12 +172,19 @@ export function FreshnessPill({
             ? '数据损坏'
             : '暂未接入'
 
+  // Naming the layer is the whole point: "stale" alone sends an operator
+  // looking at the wrong service. Only shown when something is behind.
+  const text = freshness.lagging_layer
+    ? `${base} · ${LAYER_LABEL[freshness.lagging_layer]}`
+    : base
+
   return (
     <span
       className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium ${TONE_CLASS[tone]}`}
-      title={freshness.reason ?? undefined}
+      title={layerTitle(freshness)}
       data-testid={testId ?? 'freshness-pill'}
       data-state={state}
+      data-lagging-layer={freshness.lagging_layer ?? undefined}
     >
       {text}
     </span>

@@ -19,7 +19,21 @@ export interface Freshness {
   as_of_utc?: string | null
   stale_after_seconds?: number | null
   reason?: string | null
+  // Multi-layer freshness. Only the performance snapshots populate these;
+  // every other source leaves them absent, so consumers must tolerate null.
+  export_data_lag_seconds?: number | null
+  ingestion_lag_seconds?: number | null
+  publication_lag_seconds?: number | null
+  snapshot_age_seconds?: number | null
+  export_watermark_utc?: string | null
+  consumed_watermark_utc?: string | null
+  published_at_utc?: string | null
+  lagging_layer?: LaggingLayer | null
+  publish_interval_seconds?: number | null
 }
+
+/** Which layer of the performance pipeline the freshness verdict is about. */
+export type LaggingLayer = 'shadow_export' | 'ingestion' | 'publication' | 'publish_interval'
 
 export interface Envelope<T> {
   schema_version: number

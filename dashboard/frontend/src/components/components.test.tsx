@@ -80,6 +80,101 @@ describe('FreshnessPill', () => {
     rerender(<FreshnessPill freshness={{ state: 'unavailable' }} testId="pill" />)
     expect(container.querySelector('[data-testid="pill"]')).toHaveTextContent('暂未接入')
   })
+
+  // --- multi-layer performance freshness ---------------------------------
+
+  it('stays quiet when nothing is behind, even with the layer fields present', () => {
+    const { container } = render(
+      <FreshnessPill
+        freshness={{
+          state: 'fresh',
+          age_seconds: 1140,
+          lagging_layer: null,
+          export_data_lag_seconds: 60,
+          ingestion_lag_seconds: 0,
+          publication_lag_seconds: 1140,
+          snapshot_age_seconds: 1140,
+          publish_interval_seconds: 1500,
+        }}
+        now={Date.now()}
+        testId="pill"
+      />,
+    )
+    const pill = container.querySelector('[data-testid="pill"]')!
+    expect(pill).toHaveTextContent('更新于')
+    // A snapshot 19 minutes old on a 20-minute cadence is normal, so the pill
+    // must not name any layer.
+    expect(pill).not.toHaveTextContent('导出停摆')
+    expect(pill).not.toHaveTextContent('摄入滞后')
+    expect(pill).not.toHaveTextContent('发布滞后')
+    expect(pill).not.toHaveTextContent('发布超期')
+    expect(pill).not.toHaveAttribute('data-lagging-layer')
+  })
+
+  it.each([
+    ['shadow_export', '导出停摆'],
+    ['ingestion', '摄入滞后'],
+    ['publication', '发布滞后'],
+    ['publish_interval', '发布超期'],
+  ] as const)('names the lagging layer: %s', (layer, label) => {
+    const { container } = render(
+      <FreshnessPill
+        freshness={{
+          state: 'stale',
+          age_seconds: 5000,
+          lagging_layer: layer,
+          reason: 'the shadow export has produced no new data for 4000s (limit 900s)',
+        }}
+        now={Date.now()}
+        testId="pill"
+      />,
+    )
+    const pill = container.querySelector('[data-testid="pill"]')!
+    expect(pill).toHaveTextContent('STALE')
+    expect(pill).toHaveTextContent(label)
+    expect(pill).toHaveAttribute('data-lagging-layer', layer)
+  })
+
+  it('puts the four lags in the tooltip, without calling the snapshot age a fault', () => {
+    const { container } = render(
+      <FreshnessPill
+        freshness={{
+          state: 'stale',
+          lagging_layer: 'shadow_export',
+          export_data_lag_seconds: 4000,
+          ingestion_lag_seconds: 60,
+          publication_lag_seconds: 1140,
+          snapshot_age_seconds: 1140,
+          publish_interval_seconds: 1500,
+          reason: 'the shadow export has produced no new data for 4000s (limit 900s)',
+        }}
+        now={Date.now()}
+        testId="pill"
+      />,
+    )
+    const title = container.querySelector('[data-testid="pill"]')!.getAttribute('title') ?? ''
+    expect(title).toContain('滞后层：导出停摆')
+    expect(title).toContain('导出数据滞后')
+    expect(title).toContain('摄入滞后')
+    expect(title).toContain('发布滞后')
+    // Labelled as an age, not as a problem.
+    expect(title).toContain('快照年龄')
+    expect(title).toContain('the shadow export has produced no new data')
+  })
+
+  it('renders a non-performance source with no layer fields exactly as before', () => {
+    const { container } = render(
+      <FreshnessPill
+        freshness={{ state: 'fresh', age_seconds: 5, reason: null }}
+        now={Date.now()}
+        testId="pill"
+      />,
+    )
+    const pill = container.querySelector('[data-testid="pill"]')!
+    expect(pill).toHaveTextContent('更新于')
+    expect(pill).not.toHaveAttribute('data-lagging-layer')
+    expect(pill.getAttribute('title')).toBeNull()
+  })
 })
 
 describe('DistributionBar', () => {
