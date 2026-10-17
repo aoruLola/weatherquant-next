@@ -407,6 +407,46 @@ WQ_MCP_PLAINTEXT_NETWORKS=172.16.0.0/12,192.168.0.0/16,10.0.0.0/8
 > 判断依据不是"有没有加 `--memory` 上限"：上限只保证容器被杀而不是主机被杀，
 > 不保证主机保持可响应。7.5 GB 那次容器没有 OOM，主机仍然失联 35 分钟。
 
+### 10.3 两次死机的根因：syslog 洪泛（2026-10-16 定位）
+
+两次失联（10-15 01:34 起、10-16）的根因不是构建，是日志洪泛：
+
+| 事实 | 实测值 |
+|---|---|
+| 触发客户端 | `192.168.10.126` —— 挂着 Unraid WebUI 的本机 |
+| 请求次数 | 同一个缺失资源 `question.png` 被请求 **4,364,181** 次 |
+| `/var/log` | **128 MB tmpfs**（在 RAM 里） |
+| 反馈环 | tmpfs 写满 → rsyslog 写失败 → 把失败本身写进同一个文件 |
+| flash 镜像 | `/boot/logs/syslog-previous` 涨到 **2.75 GB / 8,651,633 行** |
+| 后果 | 16 GB RAM 无 swap 耗尽 → 用户态停摆，内核仍接受 TCP → 非正常重启 |
+
+`question.png` 现在存在且返回 302，7 个 Unraid 托管图标全部 200/302，所以那些 404
+更像是内存耗尽的结果而不是起因。
+
+**已做的处置（2026-10-16）**：
+
+- 删除 `/boot/logs/syslog-previous`（2.75 GB）。flash 占用 3.8 G → 1.2 G，剩 14 G。
+  根因与时间线已提取记录在本节，日志本身不再需要。
+- 移除了此前写入 `/boot/config/rsyslog.conf` 的一条**无效指令**
+  `global(SysSock.RateLimit.Interval=…)` —— rsyslog 8.2102 拒绝该参数，
+  留着会让配置文件解析失败。
+
+**仍然开放的**（不要当成已解决）：
+
+- **限流没有生效。** 三种写法都试过：`$SystemLogRateLimitInterval`（v8.2102 报
+  unknown command）、`global(SysSock.RateLimit.*)`（报 parameter not known）、
+  `module(load="imuxsock" SysSock.RateLimit.*)`（**能通过校验但不丢弃**）。
+  实测：`module()` 写法下 3000/3000 条 `user.info` 全部落盘，debug/info/notice/warning
+  各 2000/2000 也全部落盘。模块二进制里确实有 `syssock.ratelimit.*` 符号，所以是
+  行为问题而不是拼写问题。**当前配置没有任何限流。**
+- **文件大小上限没有装上。** logrotate 的 `/var/log/syslog { size 1M }` 只在每天
+  04:40 由 `cron.daily` 跑一次，拦不住突发。`rotation.sizeLimit` 在 8.2102 上
+  "parameter not known"；`$outchannel` **可用**（隔离实测：到上限触发 rotate，
+  20000/20000 条一条不丢），但需要 /etc/rc.d 下的脚本 + `/boot/config/go` 开机重建，
+  这步未完成。**目前日志仍可再次涨到填满 128 MB tmpfs。**
+- 因此当前的缓解只有两条：删掉了那 2.75 GB，以及触发客户端已停止刷图。
+  这两条都不构成上限。
+
 ---
 
 ## 11. 流式引擎的隔离压力测试（v0.1.5）

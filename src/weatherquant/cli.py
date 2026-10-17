@@ -462,6 +462,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="rebuild the snapshots from the state store without reading the export",
     )
     p.add_argument(
+        "--no-publish",
+        action="store_true",
+        help=(
+            "consume what is new but do not publish a snapshot. Use with a 5-minute "
+            "cadence to separate ingest from publish (e.g., ingest every 5 min, "
+            "publish every 20 min)"
+        ),
+    )
+    p.add_argument(
+        "--publish-interval-seconds",
+        type=float,
+        default=1200.0,
+        help=(
+            "how often this snapshot is republished, baked into the published "
+            "stale_after_seconds so the Dashboard and the manifest agree on what "
+            "that field means (default 1200 = 20 minutes)"
+        ),
+    )
+    p.add_argument(
         "--settlements-replace",
         action="store_true",
         help=(
@@ -649,6 +668,17 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
         )
         return 2
 
+    if args.no_publish and args.no_ingest:
+        print(
+            "--no-publish and --no-ingest together would do nothing at all: one "
+            "skips publishing, the other skips reading the export, so the run "
+            "would open the state store, write nothing, and exit 0 - looking "
+            "like a successful cycle in the log. Refusing it. Nothing was read, "
+            "written or published.",
+            file=sys.stderr,
+        )
+        return 2
+
     export = Path(args.export)
     if not export.exists():
         print(f"could not read decisions export: not found: {export}", file=sys.stderr)
@@ -744,6 +774,8 @@ def _build_performance_streaming(
             temp_directory=args.temp_dir,
             reset=args.reset,
             ingest=not args.no_ingest,
+            publish=not args.no_publish,
+            publish_interval_seconds=args.publish_interval_seconds,
             deep_verify=args.verify_parts,
             max_parts_per_run=args.max_parts_per_run,
             progress=progress,

@@ -1,6 +1,8 @@
-# 流式 Performance 与分页明细：生产上线方案（**需另行批准**）
+# 流式 Performance 与分页明细：生产上线方案
 
-本文件是**方案**，不是执行记录。**本轮未部署、未回填、未重启任何容器、未触碰生产 NAS。**
+本文件是方案，外加 §12 的一次执行记录。**2026-10-16 已按本方案部署（§12）**：
+Dashboard 已切到 `be5ea9c`，首次回填已完成，增量已挂 5 分钟 cron。
+未部署 MCP，未停 Collector / Shadow，未删除任何世代。**世代清理尚未有人负责，见 §4。**
 
 适用对象：
 - 研究进程（`weatherquant-research build-performance`，流式引擎 + 状态库）
@@ -72,12 +74,22 @@ weatherquant-research build-performance \
   --dataset live \
   --state-db /mnt/user/appdata/weatherquant-performance-state/performance-state.duckdb \
   --memory-limit 1GB \
-  --max-parts-per-run 40        # 分批：79 个分片分两次跑完，单次 < 2 分钟
+  --max-parts-per-run 40        # 分批：见下方"实际分片数"
 ```
 
 - 状态库为空即从头开始；`--max-parts-per-run` 让首次回填可分段、可中断。
 - **不在 NAS 上跑旧版全内存构建器**（`--in-memory` 会打印警告，生产禁用）。
-- 预期：1.48M 行约 **80–120 秒**，峰值 RSS < 400 MB（隔离实测 1.5M 行 78 s / 299 MB）。
+
+**实际分片数与耗时**（2026-10-16 首次回填实测，见 §12）：导出已是 **379 个分片 /
+1,967,350 行**，不是本方案最初估的 79 个。分片大小极不均匀：追平时的分片是
+20,000 行 / 约 32 MB，日常 tick 的分片只有约 1,500–1,800 行 / 约 2.6 MB。所以
+"按分片数分批"不等于"按行数分批"：前 40 个分片就吃掉 800,000 行（41 s），
+后 335 个分片合计只有 1,167,350 行。
+
+**每次运行都会发布一个世代，即使没有新行。** 增量运行消费 0 行时仍会重写六个快照
+并发布一个内容相同的世代（generation id 里的内容哈希不变）。因此世代数量等于运行
+次数：5 分钟一次即 288 个/天，约 2.2 GB/天。**CLI 没有 prune/retention 参数**，
+本方案 §3 的保留策略目前只能人工执行。在启用调度前必须先决定由谁清理。
 
 **日常增量**（每 15–30 分钟一次，见 §6）：同一条命令**去掉** `--max-parts-per-run`。
 
@@ -123,7 +135,16 @@ weatherquant-research build-performance \
 
 ## 6. 定时任务与互斥
 
-- 调度：Unraid User Scripts / cron，每 **20 分钟**一次，`nice -n 10 ionice -c2 -n7`。
+- 调度：cron，每 **5 分钟**一次，`nice -n 10 ionice -c2 -n7`。
+  - 落地位置：runner 在 flash 上 `/boot/config/wq-performance-incremental.sh`；
+    cron 条目是 `/etc/cron.d/weatherquant-performance`，由 `/boot/config/go` 在每次开机时重建
+    （`/etc` 在 RAM rootfs 上，重启即丢）。
+  - **不是本方案最初写的 20 分钟。** 快照自带 `stale_after_seconds=300`，Dashboard 再加
+    60 s 宽限（`performance.py` 的 `stale + 60.0`），所以 20 分钟一次会让 Performance 页在
+    大部分时间里显示 stale —— 实测发布后 397 s 即报 stale（上限 360 s）。导出本身约每
+    5 分钟落一个分片，因此 5 分钟一次正好每次消费约一个分片。
+  - Unraid 的 user.scripts 插件只提供 hourly/weekly/daily/monthly/boot 粒度，做不到 5 分钟，
+    所以走 `/etc/cron.d` 而不是插件。
 - **互斥**：状态库是单写者，第二个进程会被 DuckDB 文件锁拒绝（已由子进程测试验证）。
   为让失败**可见**，脚本用 `flock -n` 包裹并记录退出码：
 
@@ -149,7 +170,7 @@ flock -n /var/lock/weatherquant-performance.lock \
 | `GET /api/v1/performance/opportunities?limit=50` | 200；`data.window.episodes > 0`；`items` 非空 |
 | `GET /api/v1/performance/reference-capital` | 200；`window` 存在；`results_total > 0` |
 | 状态库 | `performance_parts` 的 `part_index` 最大值 == 导出目录分片数 |
-| 新鲜度判据 | 快照 `stale_after_seconds`（默认 300 s）；研究进程每 20 分钟一次，故正常不会 stale |
+| 新鲜度判据 | 快照 `stale_after_seconds`（默认 300 s）+ Dashboard 的 60 s 宽限 = **360 s**；研究进程每 5 分钟一次，故正常不会 stale |
 
 **告警**：连续 2 个周期没有新世代 → 检查状态库是否被锁、导出是否停摆。
 
@@ -290,11 +311,31 @@ MCP 数值与 Dashboard API 不一致；出现任何下单/钱包/私钥路径�
 
 | # | 检查 | 本轮状态 |
 |---|---|---|
-| 1 | `uv run pytest -q` | **1005 passed, 6 skipped** |
-| 2 | `uv run pytest dashboard/tests -q` | **101 passed** |
-| 3 | `npx tsc --noEmit` + `npm test` | 干净 / **87 passed** |
+| 1 | `uv run pytest -q` | **1020 passed, 6 skipped**（2026-10-16 复跑，含本轮新增的撤回语义与导出测试） |
+| 2 | `uv run pytest dashboard/tests -q` | **109 passed** |
+| 3 | `npx tsc --noEmit` + `npm test` | 干净 / **89 passed** |
 | 4 | `uv run ruff check .` | 干净 |
 | 5 | 隔离压力测试 1.5M/3M/5M/10M | 见 `performance-deployment.md` §11 |
 | 6 | 端点延迟/体积/峰值 | 见 §12 |
-| 7 | CI | `lint-and-test` / `shadow-tests` / `dashboard-*` **通过**；`build-image` 因**账户账单**未启动，本地按同一 `Dockerfile` 复现（构建 + 容器健康检查） |
-| 8 | 生产部署 | **未执行**，等待批准 |
+| 7 | CI | `lint-and-test` / `shadow-tests` / `dashboard-*` **通过**；`build-image` 因**账户账单**未启动，改为在 NAS 上按同一 `Dockerfile.dashboard` 本地构建（见 §12） |
+| 8 | 生产部署 | **已执行 2026-10-16**，见 §12 |
+
+---
+
+## 12. 生产部署记录（2026-10-16）
+
+| 项目 | 值 |
+|---|---|
+| 部署提交 | `be5ea9c0d24dd04aa36192ccf9d37e0cf5efae98`（PR #11 + #12 合并后的 main） |
+| Dashboard 镜像 | `ghcr.io/aorulola/weatherquant-next-dashboard:sha-be5ea9c…`，image id `sha256:f67662641a52…`，485 MB，在 NAS 上构建 |
+| 研究镜像 | `ghcr.io/aorulola/weatherquant-next:sha-be5ea9c…`，image id `sha256:848f6e2b99ee…`（只作为 CLI，不替换 Collector 的 `:stable`） |
+| 回滚目标 | Dashboard `sha-e6698dfd…`（digest `sha256:838b5af27de1…`），stack.env 备份 `stack.env.bak-20261016T103220Z` |
+| 部署方式 | Portainer 当时未运行（`Exited (255)`），改为在 stack 目录用 `docker compose -p weatherquant-next-dashboard --env-file stack.env up -d --pull never dashboard`；只改 `stack.env` 的 `DASHBOARD_SHA`，挂载与端口逐项未变 |
+| 首次回填 | 379 分片 / 1,967,350 行，分 3 次（40 / 190 / 145 分片），41 s + 60 s + 27 s，峰值可用内存始终 > 6.5 GB |
+| 状态库 | `/mnt/user/appdata/weatherquant-performance-state/performance-state.duckdb`，14.4 MB |
+| 当前世代 | `20261016T110659Z-02108d731722`，10,480 episode，`open_episodes=30`，watermark `2026-10-16T11:02:46Z` |
+| 增量调度 | `/etc/cron.d/weatherquant-performance`，`*/5 * * * *`，runner 在 flash |
+| 两轮增量验证 | 第 1 轮消费 4 个分片 / 6,248 行（13 s）；第 2 轮消费 0 行；锁被占用时输出 `skipped: another run holds the lock` |
+| 端点 | 13 个端点全部 200；六个 SPA 路由 200；`/healthz` 三源 fresh |
+| 跨世代游标 | 用旧世代的游标请求 `/opportunities` → **409**，指针不动 |
+| 未做 | 未停 Collector / Shadow；未部署 MCP；未删除任何世代；未清理世代（见 §4 的 churn 说明） |

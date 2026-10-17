@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import math
 import statistics
 from collections import deque
@@ -1371,6 +1372,54 @@ def _write_retraction_backup(
     return path
 
 
+def _export_watermark_at_build(export_path: Path) -> list[str] | None:
+    """The export's own watermark as it stood when this batch was built.
+
+    Recorded for audit only. The Dashboard must NOT use this to decide whether
+    the export is still producing: it is a fact about build time, and a
+    stopped export would look caught-up forever. The Dashboard reads the
+    export live instead (see dashboard/performance_freshness.py).
+    """
+    try:
+        raw = json.loads((export_path / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    watermark = raw.get("watermark")
+    if not isinstance(watermark, (list, tuple)) or not watermark:
+        return None
+    return [str(part) for part in watermark]
+
+
+#: Where the ingest position is recorded, beside the published pointer.
+INGEST_STATE_FILE = "ingest-state.json"
+
+
+def _write_ingest_state(
+    out_dir: str | Path, watermark: Any, ingest_result: Any, now: datetime
+) -> None:
+    """Record where ingest has got to, separately from what was published.
+
+    The published snapshot's watermark is frozen at publish time, so it cannot
+    answer "is ingest keeping up" - between two publishes it is *expected* to
+    fall a whole publish interval behind the live export. This file is the
+    ingest position, advanced by every run whether or not it publishes, and it
+    is what lets the Dashboard tell an ingest stall apart from a normal
+    publish interval.
+
+    Written into the published directory (not the state directory) because
+    that is the one the Dashboard has mounted, and it is a small JSON rename
+    like every other file here.
+    """
+    target = Path(out_dir) / INGEST_STATE_FILE
+    payload = {
+        "watermark": watermark,
+        "committed_at_utc": now.astimezone(UTC).isoformat(),
+        "rows_consumed": getattr(ingest_result, "rows_consumed", None),
+        "parts_consumed": getattr(ingest_result, "parts_consumed", None),
+    }
+    atomic_write_json(target, payload)
+
+
 def build_performance_streaming(
     *,
     export: str | Path,
@@ -1395,6 +1444,7 @@ def build_performance_streaming(
     reset: bool = False,
     ingest: bool = True,
     publish: bool = True,
+    publish_interval_seconds: float = 1200.0,
     deep_verify: bool = False,
     max_parts_per_run: int | None = None,
     source: str = "weatherquant-research",
@@ -1543,13 +1593,25 @@ def build_performance_streaming(
 
         written: list[Path] = []
         if publish:
+            # The published cadence, so the manifest and the Dashboard agree on
+            # what `stale_after_seconds` means. Both builders default to the
+            # same value, so a run that does not override one keeps the two
+            # engines' payloads identical.
+            for payload in build.payloads.values():
+                payload["stale_after_seconds"] = publish_interval_seconds
+            manifest_extra = dict(build.manifest_extra or {})
+            # Audit only - see _export_watermark_at_build. The Dashboard reads
+            # the export live rather than trusting this.
+            manifest_extra.setdefault(
+                "export_watermark_at_build", _export_watermark_at_build(export_path)
+            )
             written = publish_performance(
                 build.payloads,
                 out_dir,
                 generation_id=generation_id,
                 watermark=build.watermark,
                 coverage=build.coverage,
-                extra_manifest=build.manifest_extra,
+                extra_manifest=manifest_extra,
             )
 
     result = {
@@ -1561,6 +1623,10 @@ def build_performance_streaming(
         "summary": build.summary,
         "ingest": ingest_result.as_dict() if ingest_result is not None else None,
     }
+    if ingest_result is not None:
+        # Only when this run actually ingested: a publish-only run must not
+        # restamp the ingest position, or an ingest stall would erase itself.
+        _write_ingest_state(out_dir, build.watermark, ingest_result, now)
     return result
 
 
