@@ -1444,6 +1444,7 @@ def build_performance_streaming(
     reset: bool = False,
     ingest: bool = True,
     publish: bool = True,
+    publish_interval_seconds: float = 1200.0,
     deep_verify: bool = False,
     max_parts_per_run: int | None = None,
     source: str = "weatherquant-research",
@@ -1592,6 +1593,12 @@ def build_performance_streaming(
 
         written: list[Path] = []
         if publish:
+            # The published cadence, so the manifest and the Dashboard agree on
+            # what `stale_after_seconds` means. Both builders default to the
+            # same value, so a run that does not override one keeps the two
+            # engines' payloads identical.
+            for payload in build.payloads.values():
+                payload["stale_after_seconds"] = publish_interval_seconds
             manifest_extra = dict(build.manifest_extra or {})
             # Audit only - see _export_watermark_at_build. The Dashboard reads
             # the export live rather than trusting this.

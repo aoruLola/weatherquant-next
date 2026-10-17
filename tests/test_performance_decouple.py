@@ -576,3 +576,124 @@ def test_manifest_records_the_export_watermark_at_build():
             "2026-10-16T10:00:19+00:00",
             "hash-part-002",
         ]
+
+
+# --------------------------------------------------------------------------
+# an impossible combination is refused, and refuses without side effects
+# --------------------------------------------------------------------------
+
+
+def test_no_publish_with_no_ingest_is_refused(capsys):
+    """Both flags together would do nothing while exiting 0, which reads as a
+    successful cycle in the log."""
+    from weatherquant.cli import main
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        export_dir = base / "export"
+        out_dir = base / "out"
+        state_db = base / "state" / "test.duckdb"
+        state_db.parent.mkdir()
+        _make_minimal_export(export_dir, num_parts=2, rows_per_part=10)
+
+        rc = main(
+            [
+                "build-performance",
+                "--export",
+                str(export_dir),
+                "--out",
+                str(out_dir),
+                "--dataset",
+                "fixture",
+                "--state-db",
+                str(state_db),
+                "--memory-limit",
+                "128MB",
+                "--no-publish",
+                "--no-ingest",
+            ]
+        )
+
+    assert rc != 0
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "would do nothing at all" in captured.err
+
+
+def test_a_refused_combination_touches_nothing():
+    """The refusal must happen before the store is opened: no watermark move,
+    no ingest position, no pointer."""
+    from weatherquant.cli import main
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        export_dir = base / "export"
+        out_dir = base / "out"
+        state_db = base / "state" / "test.duckdb"
+        state_db.parent.mkdir()
+        _make_minimal_export(export_dir, num_parts=2, rows_per_part=10)
+
+        # A real run first, so there is state worth protecting.
+        build_performance_streaming(
+            export=export_dir,
+            out_dir=out_dir,
+            dataset="fixture",
+            state_db=state_db,
+            ingest=True,
+            publish=True,
+            memory_limit="128MB",
+        )
+        pointer_before = (out_dir / "current.json").read_text()
+        ingest_before = (out_dir / "ingest-state.json").read_text()
+        db_bytes_before = state_db.read_bytes()
+
+        rc = main(
+            [
+                "build-performance",
+                "--export",
+                str(export_dir),
+                "--out",
+                str(out_dir),
+                "--dataset",
+                "fixture",
+                "--state-db",
+                str(state_db),
+                "--memory-limit",
+                "128MB",
+                "--no-publish",
+                "--no-ingest",
+            ]
+        )
+
+        assert rc == 2
+        assert (out_dir / "current.json").read_text() == pointer_before
+        assert (out_dir / "ingest-state.json").read_text() == ingest_before
+        assert state_db.read_bytes() == db_bytes_before
+
+
+def test_publish_interval_is_stamped_into_the_published_payloads():
+    """`stale_after_seconds` means the republish cadence, in the manifest and
+    in the Dashboard alike - not the builder's 300s default."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        export_dir = base / "export"
+        out_dir = base / "out"
+        state_db = base / "state" / "test.duckdb"
+        state_db.parent.mkdir()
+        _make_minimal_export(export_dir, num_parts=2, rows_per_part=10)
+
+        build_performance_streaming(
+            export=export_dir,
+            out_dir=out_dir,
+            dataset="fixture",
+            state_db=state_db,
+            ingest=True,
+            publish=True,
+            publish_interval_seconds=1200.0,
+            memory_limit="128MB",
+        )
+
+        gid = json.loads((out_dir / "current.json").read_text())["generation_id"]
+        for name in ("summary.json", "edge.json", "opportunities.json"):
+            payload = json.loads((out_dir / "generations" / gid / name).read_text())
+            assert payload["stale_after_seconds"] == 1200.0, name

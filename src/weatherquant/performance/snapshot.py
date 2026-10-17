@@ -155,6 +155,17 @@ def detail_warnings(window: Mapping[str, Any]) -> list[str]:
     ]
 
 
+#: How long a published snapshot stays current, in seconds.
+#:
+#: This is the *publish cadence*, and it is what ``stale_after_seconds`` means
+#: in every performance payload. Both builders emit it, so the manifest and
+#: the Dashboard cannot disagree about the field: the snapshot declares how
+#: often it is republished, and the reader adds only its own grace. The old
+#: 300s default described a cadence nobody ran, which made a working 20-minute
+#: publish read as stale for most of every interval.
+PUBLISH_INTERVAL_SECONDS = 1200.0
+
+
 def _envelope(
     *,
     logical_name: str,
@@ -164,7 +175,7 @@ def _envelope(
     sample_size: int,
     statistical_scope: Sequence[str],
     warnings: Sequence[str],
-    stale_after_seconds: float = 300.0,
+    stale_after_seconds: float = PUBLISH_INTERVAL_SECONDS,
     dataset: str = "live",
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:

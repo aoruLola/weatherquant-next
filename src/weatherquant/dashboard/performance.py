@@ -168,12 +168,21 @@ class PerformanceState:
         """
         generation = self.sources.performance_generation()
         manifest = generation.manifest or {}
-        published_at = parse_utc(manifest.get("published_at_utc")) or payload.generated_at_utc
+        # The snapshot's own clock first: it is what the file records about
+        # itself, and it is what a backdated snapshot must be judged by. The
+        # manifest's publish time is the fallback for a generation that has no
+        # payload-level timestamp.
+        published_at = payload.generated_at_utc or parse_utc(manifest.get("published_at_utc"))
         consumed_at = payload.as_of_utc or parse_utc(_watermark_time(manifest))
-        interval = (
-            self.settings.performance_publish_interval_seconds
-            + self.settings.performance_publish_grace_seconds
+        # The snapshot declares the cadence it is republished on; the Dashboard
+        # only adds its grace. One meaning for `stale_after_seconds` on both
+        # sides, rather than the manifest saying 300 and the reader saying 1500.
+        declared = (
+            payload.stale_after_seconds
+            if payload.stale_after_seconds is not None
+            else self.settings.performance_publish_interval_seconds
         )
+        interval = declared + self.settings.performance_publish_grace_seconds
         layers = evaluate_layers(
             now=now,
             export_state=read_export_state(self.settings.shadow_export_dir),

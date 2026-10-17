@@ -325,3 +325,125 @@ def test_export_lag_is_measured_even_when_ingest_is_unreadable():
     assert layers.ingestion_lag_seconds is None
     assert layers.state is FreshnessState.STALE
     assert layers.lagging_layer == "shadow_export"
+
+
+# --------------------------------------------------------------------------
+# boundary behaviour: the verdict flips exactly at the threshold, not before
+# --------------------------------------------------------------------------
+
+
+def test_export_lag_just_before_the_threshold_is_fresh():
+    layers = _evaluate(
+        export_state=_healthy_export(ago=EXPORT_STALE - 1),
+        ingest_ago=EXPORT_STALE - 1,
+        consumed_ago=EXPORT_STALE - 1,
+        published_ago=100,
+    )
+    assert layers.state is FreshnessState.FRESH
+    assert layers.lagging_layer is None
+
+
+def test_export_lag_exactly_at_the_threshold_is_still_fresh():
+    """The comparison is `>`, so the threshold itself is not a fault."""
+    layers = _evaluate(
+        export_state=_healthy_export(ago=EXPORT_STALE),
+        ingest_ago=EXPORT_STALE,
+        consumed_ago=EXPORT_STALE,
+        published_ago=100,
+    )
+    assert layers.state is FreshnessState.FRESH
+    assert layers.lagging_layer is None
+
+
+def test_export_lag_one_second_past_the_threshold_is_stale():
+    layers = _evaluate(
+        export_state=_healthy_export(ago=EXPORT_STALE + 1),
+        ingest_ago=EXPORT_STALE + 1,
+        consumed_ago=EXPORT_STALE + 1,
+        published_ago=100,
+    )
+    assert layers.state is FreshnessState.STALE
+    assert layers.lagging_layer == "shadow_export"
+
+
+def test_ingest_lag_just_before_the_threshold_is_fresh():
+    layers = _evaluate(
+        export_state=_healthy_export(ago=0),
+        ingest_ago=INGEST_STALE - 1,
+        consumed_ago=INGEST_STALE - 1,
+        published_ago=100,
+    )
+    assert layers.state is FreshnessState.FRESH
+
+
+def test_ingest_lag_exactly_at_the_threshold_is_still_fresh():
+    layers = _evaluate(
+        export_state=_healthy_export(ago=0),
+        ingest_ago=INGEST_STALE,
+        consumed_ago=INGEST_STALE,
+        published_ago=100,
+    )
+    assert layers.state is FreshnessState.FRESH
+
+
+def test_ingest_lag_past_the_threshold_is_stale():
+    layers = _evaluate(
+        export_state=_healthy_export(ago=0),
+        ingest_ago=INGEST_STALE + 1,
+        consumed_ago=INGEST_STALE + 1,
+        published_ago=100,
+    )
+    assert layers.state is FreshnessState.STALE
+    assert layers.lagging_layer == "ingestion"
+
+
+def test_publication_lag_exactly_at_its_own_threshold_is_still_fresh():
+    """Publication is judged by its own threshold, not by the ingest one."""
+    layers = _evaluate(
+        export_state=_healthy_export(ago=0),
+        ingest_ago=0,
+        consumed_ago=PUBLICATION_STALE,
+        published_ago=100,
+    )
+    assert layers.publication_lag_seconds == PUBLICATION_STALE
+    assert layers.state is FreshnessState.FRESH
+
+
+def test_publication_lag_past_its_own_threshold_is_stale():
+    layers = _evaluate(
+        export_state=_healthy_export(ago=0),
+        ingest_ago=0,
+        consumed_ago=PUBLICATION_STALE + 1,
+        published_ago=100,
+    )
+    assert layers.state is FreshnessState.STALE
+    assert layers.lagging_layer == "publication"
+
+
+def test_export_stall_is_not_masked_by_a_generous_publish_threshold():
+    """The publish threshold is the loosest of the three, so a stopped export
+    must still be named even though everything else looks within bounds."""
+    layers = _evaluate(
+        export_state=_healthy_export(ago=4000),
+        ingest_ago=4000,
+        consumed_ago=4000,
+        published_ago=100,
+    )
+    assert layers.snapshot_age_seconds == 100.0  # well inside the interval
+    assert layers.state is FreshnessState.STALE
+    assert layers.lagging_layer == "shadow_export"
+
+
+def test_export_healthy_but_publish_stalled_names_publication_not_the_export():
+    """The case the layers exist for: the upstream is fine, so blaming it
+    would send an operator to the wrong service."""
+    layers = _evaluate(
+        export_state=_healthy_export(ago=10),
+        ingest_ago=10,
+        consumed_ago=9000,
+        published_ago=9000,
+    )
+    assert layers.export_data_lag_seconds == 10.0
+    assert layers.ingestion_lag_seconds == 0.0
+    assert layers.state is FreshnessState.STALE
+    assert layers.lagging_layer == "publication"
