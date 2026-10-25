@@ -3,6 +3,7 @@
     weatherquant-shadow init      # create/migrate the database, load the models
     weatherquant-shadow run       # run the loop until SIGTERM
     weatherquant-shadow report    # metrics from the shadow database
+    weatherquant-shadow alignment # audit time alignment + LIVE/REPLAY isolation
     weatherquant-shadow export-verify  # reconcile the decision export (engine stopped)
     weatherquant-shadow status    # one-line health summary for a script
 
@@ -196,6 +197,55 @@ def _report_from_database(shadow: ShadowSettings, args: argparse.Namespace, *, f
     return 0
 
 
+def cmd_alignment(settings: Settings, shadow: ShadowSettings, args: argparse.Namespace) -> int:
+    """Audit time alignment and LIVE/REPLAY isolation (WQN-25).
+
+    Reads the database directly, so it only works while the engine is stopped.
+    Exit 0 means every invariant held; exit 1 lists the first divergences.
+    Exposure groups (same weather day across markets, a market whose date
+    moved) are traceability output, not failures - real market data always
+    has some, and calling it broken would bury the checks that matter.
+    """
+    if not shadow.shadow_db_path.exists():
+        print(f"no shadow database at {shadow.shadow_db_path}", file=sys.stderr)
+        return 2
+    try:
+        with ShadowDatabase(shadow.shadow_db_path) as db:
+            from weatherquant.shadow.alignment import audit_alignment
+
+            report = audit_alignment(db.con)
+    except Exception as exc:
+        print(
+            f"cannot audit alignment: {exc}\n"
+            "The shadow engine holds an exclusive lease on the database while it "
+            "runs; stop it first.",
+            file=sys.stderr,
+        )
+        return 3
+    payload = report.as_dict()
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    else:
+        print(f"checked        {payload['checked_decisions']} model-carrying decision(s), "
+              f"{payload['checked_predictions']} distinct prediction(s)")
+        for mode, counts in sorted(payload["per_mode"].items()):
+            print(
+                f"mode {mode:8}  {counts['decisions']:6} decision(s), "
+                f"{counts['accepts']} accept(s), {counts['distinct_markets']} market(s)"
+            )
+        if payload["partial_local_day_decisions"]:
+            print(f"partial days   {payload['partial_local_day_decisions']} decision(s) "
+                  "fed by a forecast missing local-day hours (counted, not refused)")
+        print(f"exposure       {len(payload['exposure_groups'])} correlated group(s) "
+              f"listed, {len(payload['forecast_sharing_markets'])} shared forecast run(s)")
+        for violation in payload["violations"]:
+            where = f" [{violation['decision_id']}]" if violation.get("decision_id") else ""
+            print(f"VIOLATION      {violation['kind']}{where}: {violation['detail']}")
+        print()
+        print("consistent" if payload["consistent"] else "INCONSISTENT")
+    return 0 if payload["consistent"] else 1
+
+
 def cmd_export_verify(settings: Settings, shadow: ShadowSettings, args: argparse.Namespace) -> int:
     """Reconcile the published decision export against the database.
 
@@ -283,6 +333,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p = sub.add_parser(
+        "alignment",
+        help="audit forecast/decision time alignment and LIVE/REPLAY isolation (engine stopped)",
+    )
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser(
         "export-verify",
         help="reconcile the decision export against the database (engine must be stopped)",
     )
@@ -312,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
         "init": cmd_init,
         "run": cmd_run,
         "report": cmd_report,
+        "alignment": cmd_alignment,
         "export-verify": cmd_export_verify,
         "status": cmd_status,
     }
