@@ -120,6 +120,17 @@ class PaperSettings(BaseSettings):
         description="Main loop period.",
     )
 
+    # --- consumption gates -----------------------------------------------------
+    max_signal_age_seconds: float = Field(
+        default=600.0,
+        gt=0.0,
+        description="A LIVE ACCEPT older than this at consumption time is "
+        "refused (STALE_SIGNAL) rather than filled. The shadow exports at "
+        "most every shadow_export_seconds (300s default), so the floor is "
+        "the export cadence itself; 600s tolerates one full missed export "
+        "without treating a lagging channel as a tradeable signal.",
+    )
+
     @field_validator("enabled", mode="before")
     @classmethod
     def _strict_bool(cls, v: object) -> bool:

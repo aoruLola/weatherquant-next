@@ -19,6 +19,7 @@ trade.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from typing import Any
@@ -26,7 +27,13 @@ from typing import Any
 from weatherquant.paper.events import SignalEvent
 from weatherquant.storage.paper import PaperDatabase
 
-__all__ = ["ACCOUNT_ID", "PaperStore"]
+__all__ = ["ACCOUNT_ID", "PaperStore", "quality_event_id"]
+
+
+def quality_event_id(*, kind: str, path: str, line_no: int | None, detail: str) -> str:
+    """Deterministic id for a quality event: replaying a batch inserts nothing."""
+    basis = "|".join([kind, path, str(line_no if line_no is not None else ""), detail])
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
 
 #: The virtual account's singleton id. One engine, one account; anything
 #: more is a portfolio, which is a different project.
@@ -169,6 +176,47 @@ class PaperStore:
         rows = self.db.execute(
             "SELECT refusal_reason, COUNT(*) FROM paper_signals "
             "WHERE refusal_reason IS NOT NULL GROUP BY refusal_reason ORDER BY refusal_reason"
+        ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    # -- quality events -----------------------------------------------------
+
+    def record_quality_event(
+        self,
+        *,
+        kind: str,
+        severity: str,
+        detail: str,
+        ts_utc: datetime,
+        path: str | None = None,
+        line_no: int | None = None,
+    ) -> bool:
+        """Insert one quality event. Returns False if it was already recorded.
+
+        The id is a deterministic hash of the content, so replaying a batch
+        after a crash re-inserts nothing - the same natural-key rule as the
+        signals.
+        """
+        cursor = self.db.execute(
+            "INSERT INTO paper_quality_events (event_id, ts_utc, kind, severity, detail, source, path, line_no) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (event_id) DO NOTHING "
+            "RETURNING event_id",
+            [
+                quality_event_id(kind=kind, path=path or "", line_no=line_no, detail=detail),
+                ts_utc,
+                kind,
+                severity,
+                detail,
+                "paper-consumer",
+                path,
+                line_no,
+            ],
+        )
+        return cursor.fetchone() is not None
+
+    def quality_counts(self) -> dict[str, int]:
+        rows = self.db.execute(
+            "SELECT kind, COUNT(*) FROM paper_quality_events GROUP BY kind ORDER BY kind"
         ).fetchall()
         return {str(row[0]): int(row[1]) for row in rows}
 

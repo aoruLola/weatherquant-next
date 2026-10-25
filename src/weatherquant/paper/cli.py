@@ -1,14 +1,15 @@
-"""The paper engine's command line: init and status.
+"""The paper engine's command line: init, consume and status.
 
-Deliberately small. ``init`` opens the account; ``status`` reads it back.
-The consume loop arrives with WQN-40 and grows this file rather than
-sprouting a second one.
+Deliberately small. ``init`` opens the account; ``consume`` reads one
+bounded batch of published decision events; ``status`` reads the counters
+back. The daemon loop and its heartbeat belong to the deployment ticket and
+will grow this file rather than sprouting a second one.
 
-Both commands enforce the enablement gate for anything that *writes*: a
-paper engine that initialises an account because someone typed a command is
-an enablement decision nobody made. Reading status of a disabled engine is
-harmless and stays available, because "what is on disk here?" must be
-answerable without first approving anything.
+The commands that *write* enforce the enablement gate: a paper engine that
+initialises an account or consumes signals because someone typed a command
+is an enablement decision nobody made. ``status`` stays available for a
+disabled engine, because "what is on disk here?" must be answerable without
+first approving anything.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from datetime import UTC, datetime
 
 from weatherquant.data.lock import LockError, SingleInstanceLock
 from weatherquant.paper.config import PaperSettings
+from weatherquant.paper.consumer import SignalConsumer
 from weatherquant.paper.store import ACCOUNT_ID, PaperStore
 from weatherquant.storage.paper import PaperDatabase
 
@@ -39,6 +41,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_init(settings)
         if args.command == "status":
             return _cmd_status(settings)
+        if args.command == "consume":
+            return _cmd_consume(settings, batch_lines=args.batch_lines)
     except ValueError as exc:
         # The enablement flag's parse error lands here: say it plainly and
         # exit non-zero rather than pretending the flag was absent.
@@ -53,6 +57,16 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="open the virtual account (requires WQ_PAPER_ENABLED=true)")
     sub.add_parser("status", help="print the account and the engine's counters")
+    consume = sub.add_parser(
+        "consume",
+        help="read one bounded batch of published decision events (requires enablement)",
+    )
+    consume.add_argument(
+        "--batch-lines",
+        type=int,
+        default=5000,
+        help="max published lines to read in this pass (default 5000)",
+    )
     return parser
 
 
@@ -65,8 +79,11 @@ def _require_enabled(settings: PaperSettings) -> None:
         )
 
 
-def _cmd_init(settings: PaperSettings) -> int:
-    _require_enabled(settings)
+def _open_under_lock(settings: PaperSettings, purpose: str):
+    """Acquire the single-instance lease and open the database.
+
+    Returns ``(db, lock)``; the caller closes both, lock last.
+    """
     lock_path = settings.db_path.parent / ".paper.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = SingleInstanceLock(
@@ -75,30 +92,74 @@ def _cmd_init(settings: PaperSettings) -> int:
         hostname=socket.gethostname(),
         stale_after_seconds=max(60.0, settings.tick_seconds * 4),
     )
+    lock.acquire()
     try:
-        lock.acquire()
+        db = PaperDatabase(settings.db_path)
+        db.open()
+    except Exception:
+        lock.release()
+        raise
+    return db, lock
+
+
+def _cmd_init(settings: PaperSettings) -> int:
+    _require_enabled(settings)
+    try:
+        db, lock = _open_under_lock(settings, "paper-init")
     except LockError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 4
     try:
-        with PaperDatabase(settings.db_path) as db:
-            store = PaperStore(db)
-            created = store.ensure_account(
-                initial_capital_usdc=settings.initial_capital_usdc,
-                now=datetime.now(tz=UTC),
-            )
-            run_id = db.start_run(
-                "paper-init",
-                {
-                    "initial_capital_usdc": settings.initial_capital_usdc,
-                    "events_dir": str(settings.events_dir),
-                },
-            )
-            db.finish_run(run_id, status="stopped", stats={"account_created": created})
+        store = PaperStore(db)
+        created = store.ensure_account(
+            initial_capital_usdc=settings.initial_capital_usdc,
+            now=datetime.now(tz=UTC),
+        )
+        run_id = db.start_run(
+            "paper-init",
+            {
+                "initial_capital_usdc": settings.initial_capital_usdc,
+                "events_dir": str(settings.events_dir),
+            },
+        )
+        db.finish_run(run_id, status="stopped", stats={"account_created": created})
     finally:
+        db.close()
         lock.release()
     state = "opened" if created else "already open"
     print(f"account {ACCOUNT_ID}: {state} with {settings.initial_capital_usdc} USDC")
+    return 0
+
+
+def _cmd_consume(settings: PaperSettings, *, batch_lines: int) -> int:
+    _require_enabled(settings)
+    try:
+        db, lock = _open_under_lock(settings, "paper-consume")
+    except LockError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 4
+    try:
+        store = PaperStore(db)
+        if store.account() is None:
+            print(
+                f"error: account {ACCOUNT_ID} does not exist; run "
+                "`weatherquant-paper init` first - signals are accepted into an account",
+                file=sys.stderr,
+            )
+            return 3
+        consumer = SignalConsumer(
+            store,
+            events_dir=settings.events_dir,
+            max_signal_age_seconds=settings.max_signal_age_seconds,
+            batch_lines=batch_lines,
+        )
+        result = consumer.consume_once()
+        run_id = db.start_run("paper-consume", {"batch_lines": batch_lines})
+        db.finish_run(run_id, status="stopped", stats=result.as_dict())
+    finally:
+        db.close()
+        lock.release()
+    print(json.dumps(result.as_dict(), sort_keys=True, indent=2, default=str))
     return 0
 
 
@@ -112,10 +173,10 @@ def _cmd_status(settings: PaperSettings) -> int:
     if db_path.exists():
         with PaperDatabase(db_path) as db:
             store = PaperStore(db)
-            account = store.account()
-            payload["account"] = account
+            payload["account"] = store.account()
             payload["signals"] = store.signal_counts()
             payload["refusals"] = store.refusal_counts()
+            payload["quality_events"] = store.quality_counts()
     print(json.dumps(payload, sort_keys=True, default=str, indent=2))
     return 0
 
