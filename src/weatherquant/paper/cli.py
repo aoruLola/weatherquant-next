@@ -23,6 +23,7 @@ import uuid
 from datetime import UTC, datetime
 
 from weatherquant.data.lock import LockError, SingleInstanceLock
+from weatherquant.paper.api import ENDPOINTS
 from weatherquant.paper.books import ArchiveBookSource
 from weatherquant.paper.config import PaperSettings
 from weatherquant.paper.consumer import SignalConsumer
@@ -31,6 +32,7 @@ from weatherquant.paper.ledger import Ledger
 from weatherquant.paper.risk import RiskGate, load_risk_rules
 from weatherquant.paper.settlements import SettlementParseError, read_settlement_feed
 from weatherquant.paper.store import ACCOUNT_ID, PaperStore
+from weatherquant.paper.web import make_server, serve_forever
 from weatherquant.storage.paper import PaperDatabase
 
 log = logging.getLogger("weatherquant.paper")
@@ -52,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_fill(settings)
         if args.command == "settle":
             return _cmd_settle(settings, feed=args.feed)
+        if args.command == "serve":
+            return _cmd_serve(settings)
     except ValueError as exc:
         # The enablement flag's parse error lands here: say it plainly and
         # exit non-zero rather than pretending the flag was absent.
@@ -85,6 +89,10 @@ def _parser() -> argparse.ArgumentParser:
         help="apply a published settlement feed: payouts, releases, corrections",
     )
     settle.add_argument("feed", help="path to the published settlement feed (JSONL)")
+    sub.add_parser(
+        "serve",
+        help="serve the read-only API (GET /api/v1/paper/*) from this process",
+    )
     return parser
 
 
@@ -262,6 +270,44 @@ def _cmd_settle(settings: PaperSettings, *, feed: str) -> int:
         db.close()
         lock.release()
     print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+    return 0
+
+
+def _cmd_serve(settings: PaperSettings) -> int:
+    """Serve the read-only API from the engine's own process.
+
+    The connection this command holds is the one the handlers read through;
+    DuckDB's single-writer lease means a second process cannot open the
+    file anyway, so serving from here is not just convenient - it is the
+    only way a live reader can exist at all.
+    """
+    _require_enabled(settings)
+    try:
+        db, lock = _open_under_lock(settings, "paper-serve")
+    except LockError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 4
+    try:
+        server = make_server(db.con, host=settings.api_host, port=settings.api_port)
+        run_id = db.start_run(
+            "paper-serve",
+            {"api_host": settings.api_host, "api_port": settings.api_port},
+        )
+        db.finish_run(run_id, status="running", stats={"note": "run row closed on shutdown"})
+    except OSError as exc:
+        print(f"error: cannot bind {settings.api_host}:{settings.api_port}: {exc}", file=sys.stderr)
+        db.close()
+        lock.release()
+        return 5
+    print(
+        f"paper read-only API on http://{settings.api_host}:{settings.api_port}"
+        f"/api/v1/paper/{{{','.join(ENDPOINTS)}}} (GET only)"
+    )
+    try:
+        serve_forever(server)
+    finally:
+        db.close()
+        lock.release()
     return 0
 
 

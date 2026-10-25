@@ -164,7 +164,7 @@ class TestNotExecutable:
     def test_no_frame_received_after_the_decision_is_used(self, env):
         """The re-pricing guarantee: evidence cannot be reconstructed from a
         book the future wrote. Only at-or-before frames resolve."""
-        store, raw_dir, _db = env
+        _store, raw_dir, _db = env
         late = book_payload(bids=[(0.70, 500.0)], asks=[(0.75, 500.0)])
         archive = raw_dir / "ws" / "2026-10-26.jsonl"
         with archive.open("a", encoding="utf-8") as handle:
