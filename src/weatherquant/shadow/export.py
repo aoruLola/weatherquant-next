@@ -126,14 +126,19 @@ _ID_INDEX = EXPORT_COLUMNS.index("d.decision_id")
 #: any v2 batch runs against it.
 _STATE_VERSION = 2
 
-#: How many published parts the one-time transition scans per tick. A part
-#: holds at most ``batch_rows`` lines, so this bounds the per-tick work the
-#: same way the batch itself is bounded.
+#: How many published parts the one-time transition scans per tick, as a
+#: ceiling on top of the wall-clock budget. A part holds at most
+#: ``batch_rows`` lines, so this bounds the per-tick work the same way the
+#: batch itself is bounded.
 _TRANSITION_PARTS_PER_TICK = 8
 
-#: The temp table the transition accumulates published ids in. It lives with
-#: the connection: a restart loses it and the scan restarts from part 1,
-#: which is idempotent and paid for at most once per process lifetime.
+#: The table the transition accumulates published ids in. It is a *real*
+#: table, not a temp one: the scan must survive an engine restart without
+#: rescanning from part 1 - at production scale the rescan alone cost more
+#: per restart than the scan itself - and the ids are only needed until the
+#: transition completes, at which point the table is dropped. It is runtime
+#: state owned by the exporter, like the export directory's state.json, and
+#: deliberately not part of the migration schema.
 _TRANSITION_IDS_TABLE = "_export_transition_ids"
 
 
@@ -308,6 +313,78 @@ class DecisionExporter:
     def _transition_pending(self, state: dict[str, Any]) -> bool:
         return int(state.get("version") or 1) < _STATE_VERSION
 
+    def _repair_rollback_tail(self, state: dict[str, Any]) -> list[str]:
+        """Pin the rows a rolled-back image exported, so they export once.
+
+        The supported rollback path is "run the old image, then upgrade
+        again". The old image writes rows with ``export_seq IS NULL`` and
+        publishes them in v1-format parts - no sequence on the line -
+        appended *after* the v2 parts this exporter already wrote. Left
+        alone, the v2 exporter would later repair those NULLs to fresh,
+        above-cursor values and export every one of them a second time; the
+        acceptance drill measured exactly that (15 duplicated lines, and a
+        downstream consumer that refuses the mixed format forever).
+
+        The repair pins each such row's sequence to the cursor: a value at
+        or below the cursor means "already exported", which is precisely
+        what the v1 part on disk says about it. The pin is deliberately the
+        cursor value itself rather than a fresh distinct number - nothing
+        ever queries the interior of the exported prefix, and inventing
+        free values below the floor would suggest an ordering that never
+        existed. Idempotent (only NULL rows are touched), bounded per part,
+        and recorded in the state so the repair is auditable after the fact.
+        """
+        parts = sorted(self.parts_dir.glob("part-*.jsonl"))
+        if not parts:
+            return []
+        v2_indices = [_index_of(p) for p in parts if _end_seq_of(p) is not None]
+        if not v2_indices:
+            # A pure v1 history: the one-time transition owns it.
+            return []
+        tail = [p for p in parts if _index_of(p) > max(v2_indices)]
+        if not tail:
+            return []
+        cursor = state.get("cursor_seq")
+        if cursor is None:
+            # v2 parts exist but the state lost its cursor: the transition
+            # will recover it from the parts, and the repair runs next tick.
+            return []
+        cursor = int(cursor)
+        pinned = 0
+        for path in tail:
+            row = self.con.execute(
+                "SELECT COUNT(*) FROM shadow_decisions d WHERE d.export_seq IS NULL "
+                "AND d.decision_id IN (SELECT decision_id FROM read_json_auto(?, "
+                "columns={'decision_id': 'VARCHAR'}))",
+                [str(path)],
+            ).fetchone()
+            if int(row[0]):
+                self.con.execute(
+                    "UPDATE shadow_decisions SET export_seq = ? "
+                    "WHERE export_seq IS NULL AND decision_id IN ("
+                    "SELECT decision_id FROM read_json_auto(?, "
+                    "columns={'decision_id': 'VARCHAR'}))",
+                    [cursor, str(path)],
+                )
+                pinned += int(row[0])
+        if not pinned:
+            # The tail is already pinned (a previous tick repaired it); the
+            # parts stay on disk forever, so re-reporting every tick would
+            # turn a one-time event into noise. The state marker written by
+            # the first repair is the durable record.
+            return []
+        state["last_rollback_repair"] = {
+            "parts": len(tail),
+            "rows_pinned": pinned,
+            "cursor_seq": cursor,
+            "at_utc": datetime.now(tz=UTC).isoformat(),
+        }
+        self._save(state)
+        return [
+            f"rollback repair: pinned {pinned} row(s) from {len(tail)} v1 "
+            f"part(s) written by a rolled-back image at cursor_seq={cursor}"
+        ]
+
     def _transition_step(self, state: dict[str, Any]) -> ExportResult | None:
         """Continue the one-time move from the business-time cursor to ``export_seq``.
 
@@ -323,12 +400,20 @@ class DecisionExporter:
         the v1 watermark: the watermark only says what range was *claimed*,
         and the defect being fixed is precisely that the claim skipped rows.
 
-        Bounded per tick - a handful of parts scanned, or one bounded
-        re-sequencing chunk - and resumable. The scanned ids live in a temp
-        table tied to this connection; a restart loses the table and the
-        scan restarts from part 1, which costs a rescan but never a wrong
-        floor. Every step is idempotent, so a crash mid-transition leaves
-        nothing half-applied that a rerun would mishandle.
+        Bounded per tick by the wall clock first and the part ceiling second:
+        the deadline is checked before every part and before the
+        re-sequencing pass, so a tick of this side channel can never block
+        the decision loop the way the first implementation did (240s+ per
+        tick against a 700k-row history, 18 minutes end to end). Part ids
+        are loaded set-based with ``read_json`` rather than row-by-row
+        executemany, which is where those 240s went.
+
+        The ids accumulate in a *real* table, so a restart resumes from the
+        recorded part instead of rescanning; the one unreachable case - the
+        table dropped by hand while progress claims a scan - resets to part
+        1 rather than trusting a floor over vanished ids. Every step is
+        idempotent, so a crash mid-transition leaves nothing half-applied
+        that a rerun would mishandle.
 
         Returns ``None`` only for the empty-directory case: there is nothing
         to scan and nothing to floor, so the transition completes inline and
@@ -337,7 +422,7 @@ class DecisionExporter:
         started = time.monotonic()
         result = ExportResult()
         self.con.execute(
-            f"CREATE TEMP TABLE IF NOT EXISTS {_TRANSITION_IDS_TABLE} "
+            f"CREATE TABLE IF NOT EXISTS {_TRANSITION_IDS_TABLE} "
             "(decision_id VARCHAR PRIMARY KEY)"
         )
         scanned = int(self.con.execute(
@@ -348,8 +433,9 @@ class DecisionExporter:
         phase = progress.get("phase") or "scan_parts"
         next_scan = int(progress.get("next_part") or 1)
         if next_scan > 1 and scanned == 0:
-            # A restart with no accumulated ids: the temp table was lost, so
-            # the recorded progress describes a scan whose results are gone.
+            # Progress claims a scan whose accumulated ids are gone (the
+            # table was dropped by hand). The floor must never be derived
+            # over ids that are not there, so the scan restarts instead.
             next_scan = 1
 
         existing = sorted(self.parts_dir.glob("part-*.jsonl"))
@@ -373,24 +459,32 @@ class DecisionExporter:
             self.con.execute(f"DROP TABLE IF EXISTS {_TRANSITION_IDS_TABLE}")
             return None
 
+        did_scan_work = False
+        over_budget_after_scan = False
         if phase == "scan_parts":
-            todo = existing[next_scan - 1 : next_scan - 1 + _TRANSITION_PARTS_PER_TICK]
-            for path in todo:
-                ids: list[list[str]] = []
-                with path.open(encoding="utf-8") as handle:
-                    for line in handle:
-                        if not line.strip():
-                            continue
-                        with contextlib.suppress(ValueError):
-                            row = json.loads(line)
-                            if row.get("decision_id"):
-                                ids.append([str(row["decision_id"])])
-                if ids:
-                    self.con.executemany(
-                        f"INSERT OR IGNORE INTO {_TRANSITION_IDS_TABLE} VALUES (?)",
-                        ids,
+            remaining = existing[next_scan - 1 :]
+            for batch_start in range(0, len(remaining), _TRANSITION_PARTS_PER_TICK):
+                batch = remaining[batch_start : batch_start + _TRANSITION_PARTS_PER_TICK]
+                # At least one batch per tick, then the deadline governs: a
+                # transition that makes no progress every call would look
+                # exactly like a stall, which is the failure this budget
+                # exists to prevent. One statement loads the whole batch -
+                # read_json takes a list of paths - because a statement per
+                # part is a transaction per part, and on the acceptance
+                # hardware those commits dominated the tick.
+                if did_scan_work and time.monotonic() - started >= self.max_seconds:
+                    result.notes.append(
+                        f"transition: stopped the scan at the {self.max_seconds:g}s budget"
                     )
-                next_scan += 1
+                    break
+                self.con.execute(
+                    f"INSERT OR IGNORE INTO {_TRANSITION_IDS_TABLE} "
+                    "SELECT DISTINCT decision_id FROM read_json_auto(?, "
+                    "columns={'decision_id': 'VARCHAR'}) WHERE decision_id IS NOT NULL",
+                    [[str(path) for path in batch]],
+                )
+                next_scan += len(batch)
+                did_scan_work = True
             state["transition"] = {"phase": "scan_parts", "next_part": next_scan}
             self._save(state)
             if next_scan <= len(existing):
@@ -402,6 +496,9 @@ class DecisionExporter:
                 return result
             state["transition"] = {"phase": "finalize"}
             self._save(state)
+            over_budget_after_scan = (
+                did_scan_work and time.monotonic() - started >= self.max_seconds
+            )
 
         # -- finalize: floor, re-sequence the skipped rows, switch to v2 ----
         floor_row = self.con.execute(
@@ -426,39 +523,46 @@ class DecisionExporter:
             )
 
         reassigned = 0
-        while True:
-            # Bounded chunks, re-fetched each pass: a re-sequenced row moves
-            # above the floor and stops matching, so the loop empties rather
-            # than repeats, and a crash mid-way leaves rows that are simply
-            # still pending. Idempotent, and never one unbounded fetchall.
-            chunk = self.con.execute(
-                "SELECT d.decision_id FROM shadow_decisions d "
-                f"WHERE d.export_seq IS NOT NULL AND d.export_seq <= ? AND NOT EXISTS ("
-                f"SELECT 1 FROM {_TRANSITION_IDS_TABLE} e "
-                "WHERE e.decision_id = d.decision_id) "
-                "ORDER BY d.export_seq, d.decision_id LIMIT ?",
-                [floor, self.batch_rows],
-            ).fetchall()
-            if not chunk:
-                break
-            self.con.executemany(
-                "UPDATE shadow_decisions SET export_seq = "
-                "nextval('seq_shadow_decision_export') WHERE decision_id = ?",
-                [[row[0]] for row in chunk],
+        if over_budget_after_scan:
+            # The scan used this tick's budget: defer the finalize pass to a
+            # tick of its own rather than overrun. Entry with phase already
+            # 'finalize' does the work immediately - the pass is one bounded
+            # statement now, and deferring it forever on a small budget was
+            # the first version's stall (a fresh tick must make progress).
+            state["transition"] = {
+                "phase": "finalize",
+                "floor_seq": None,
+                "rows_resequenced": 0,
+            }
+            self._save(state)
+            result.notes.append(
+                "transition: re-sequencing deferred to the next tick by the "
+                f"{self.max_seconds:g}s budget"
             )
-            reassigned += len(chunk)
-            if time.monotonic() - started >= self.max_seconds:
-                state["transition"] = {
-                    "phase": "finalize",
-                    "floor_seq": floor,
-                    "rows_resequenced": reassigned,
-                }
-                self._save(state)
-                result.notes.append(
-                    f"transition: re-sequenced {reassigned} skipped row(s) so far"
-                )
-                result.duration_seconds = time.monotonic() - started
-                return result
+            result.duration_seconds = time.monotonic() - started
+            return result
+        # One set-based pass, not a per-row loop: the selection and the
+        # UPDATE are each a single statement, so a large skipped set costs
+        # one query instead of one executemany per chunk. A re-sequenced row
+        # moves above the floor and stops matching, which is what makes a
+        # rerun after a crash exact rather than approximate.
+        missed_row = self.con.execute(
+            "SELECT COUNT(*) FROM shadow_decisions d "
+            "WHERE d.export_seq IS NOT NULL AND d.export_seq <= ? AND NOT EXISTS ("
+            f"SELECT 1 FROM {_TRANSITION_IDS_TABLE} e "
+            "WHERE e.decision_id = d.decision_id)",
+            [floor],
+        ).fetchone()
+        reassigned = int(missed_row[0])
+        if reassigned:
+            self.con.execute(
+                "UPDATE shadow_decisions SET export_seq = "
+                "nextval('seq_shadow_decision_export') "
+                "WHERE export_seq IS NOT NULL AND export_seq <= ? AND NOT EXISTS ("
+                f"SELECT 1 FROM {_TRANSITION_IDS_TABLE} e "
+                "WHERE e.decision_id = shadow_decisions.decision_id)",
+                [floor],
+            )
 
         exported_ids = int(self.con.execute(
             f"SELECT COUNT(*) FROM {_TRANSITION_IDS_TABLE}"
@@ -511,6 +615,8 @@ class DecisionExporter:
         result = ExportResult()
         try:
             state = self._load()
+            repair_notes = self._repair_rollback_tail(state)
+            result.notes.extend(repair_notes)
             if self._transition_pending(state):
                 # A tick that moves the transition does only that. Running a
                 # normal batch in the same call would swallow the transition
@@ -521,6 +627,7 @@ class DecisionExporter:
                 # its transition is free, so the tick goes straight on.
                 step = self._transition_step(state)
                 if step is not None:
+                    step.notes = repair_notes + step.notes
                     return step
                 result.transition_done = True
 
@@ -701,6 +808,7 @@ class DecisionExporter:
             "rows_on_disk": None,
             "max_seq_on_disk": None,
             "seq_monotone": None,
+            "legacy_lines": 0,
             "first_divergence": None,
             "consistent": False,
         }
@@ -732,6 +840,7 @@ class DecisionExporter:
         max_seq: int | None = None
         monotone = True
         divergence: str | None = None
+        legacy_ids: list[str] = []
         for path in parts:
             with path.open(encoding="utf-8") as handle:
                 for line in handle:
@@ -739,24 +848,21 @@ class DecisionExporter:
                         continue
                     rows_on_disk += 1
                     try:
-                        seq = json.loads(line).get("export_seq")
+                        row = json.loads(line)
                     except ValueError:
                         monotone = False
                         divergence = f"{path.name}: a line is not valid JSON"
                         break
+                    seq = row.get("export_seq")
                     if seq is None:
-                        # Legacy lines predate the column and may only appear
-                        # before any sequenced line: after the transition the
-                        # parts are strictly write-ordered, so a seq-less line
-                        # after a sequenced one is a mixed-up export.
-                        if max_seq is not None:
-                            monotone = False
-                            divergence = (
-                                f"{path.name}: a line without export_seq follows "
-                                f"sequence {max_seq}; legacy and v2 parts are "
-                                "interleaved"
-                            )
-                            break
+                        # Legacy lines predate the column. Leading ones are
+                        # the pre-transition history; trailing ones were
+                        # written by a rolled-back image and their rows are
+                        # pinned under the cursor (see _repair_rollback_tail).
+                        # Either way they are legal *if* their ids sit in the
+                        # exported prefix - verified against the source below,
+                        # which is the honest check; position alone was not.
+                        legacy_ids.append(str(row.get("decision_id") or ""))
                         continue
                     seq = int(seq)
                     if max_seq is not None and seq <= max_seq:
@@ -772,11 +878,19 @@ class DecisionExporter:
         report["rows_on_disk"] = rows_on_disk
         report["max_seq_on_disk"] = max_seq
         report["seq_monotone"] = monotone
+        report["legacy_lines"] = len(legacy_ids)
 
         if divergence:
             report["first_divergence"] = divergence
         elif not monotone:
             report["first_divergence"] = "parts are not monotone in export_seq"
+        elif legacy_ids and not self._legacy_ids_within_prefix(legacy_ids, int(cursor_seq or 0)):
+            report["first_divergence"] = (
+                "a part written in the legacy format carries decision id(s) the "
+                "source does not hold inside the exported prefix (export_seq "
+                "missing or above the cursor); those rows are neither counted "
+                "nor exportable as-is"
+            )
         elif rows_on_disk != int(state.get("rows_exported") or 0):
             report["first_divergence"] = (
                 f"state claims {state.get('rows_exported')} row(s) but the parts "
@@ -802,6 +916,29 @@ class DecisionExporter:
             )
         report["consistent"] = report["first_divergence"] is None
         return report
+
+    def _legacy_ids_within_prefix(self, ids: list[str], cursor: int) -> bool:
+        """Do the legacy-format lines all describe already-exported rows?
+
+        Chunked rather than one giant IN-list; an unbounded one would make
+        the reconciliation of a long rollback window itself the thing that
+        stalls the shell.
+        """
+        unique = {i for i in ids if i}
+        if len(unique) != len(ids):
+            return False  # a legacy line without an id describes nothing
+        for start in range(0, len(unique), 1000):
+            chunk = sorted(unique)[start : start + 1000]
+            placeholders = ", ".join(["?"] * len(chunk))
+            rows = self.con.execute(
+                "SELECT COUNT(*) FROM shadow_decisions "
+                f"WHERE decision_id IN ({placeholders}) AND "
+                "(export_seq IS NULL OR export_seq > ?)",
+                [*chunk, cursor],
+            ).fetchone()
+            if int(rows[0]):
+                return False
+        return True
 
 
 def _cursor_strings(stamp: Any, decision: Any) -> tuple[str, str]:

@@ -426,10 +426,12 @@ def test_the_transition_exports_rows_the_v1_cursor_skipped(db, tmp_path):
 
 
 def test_the_transition_is_bounded_and_resumable_across_restarts(tmp_path):
-    """Many parts, a small per-tick scan budget, a restart mid-scan.
+    """A mid-transition restart resumes from the recorded progress.
 
-    The scan is bounded per tick; a restart loses the temp table and the scan
-    restarts from part 1, which must still end at the correct floor.
+    The scan's id table is a *real* table, so a restart picks up at the
+    recorded phase instead of rescanning from part 1 - at production scale
+    the rescan cost more per restart than the scan itself. A tiny budget
+    splits the work across ticks so the restart lands between them.
     """
     database = ShadowDatabase(tmp_path / "shadow.duckdb")
     database.open()
@@ -442,38 +444,140 @@ def test_the_transition_is_bounded_and_resumable_across_restarts(tmp_path):
             _insert(database, i=i, when=NOW + timedelta(seconds=i)) for i in range(40)
         ]
         _backfill_like_migration_0005(database)
-        _write_v1_export(database, tmp_path, exported)
+        _write_v1_export(database, tmp_path, exported)  # 10 parts of 4 rows
 
-        ex = _exporter(database, tmp_path, batch_rows=4)
+        ex = _exporter(database, tmp_path, batch_rows=4, max_seconds=0.001)
         first = ex.run_batch()
-        assert first.transition_done is False, "one tick scanned everything"
-        assert any(n.startswith("transition") for n in first.notes)
+        assert first.transition_done is False, "one tick did everything"
+        assert any("stopped the scan" in note for note in first.notes), first.notes
         state = json.loads(ex.state_path.read_text(encoding="utf-8"))
         assert state["transition"]["phase"] == "scan_parts"
-        assert state["transition"]["next_part"] > 1
+        # One batch (eight parts) scanned, the deadline stopped the second.
+        assert state["transition"]["next_part"] == 9
+        ids_before = database.con.execute(
+            "SELECT COUNT(*) FROM _export_transition_ids"
+        ).fetchone()[0]
+        assert int(ids_before) == 32, "the scan table did not survive within the run"
     finally:
         database.close()
 
-    # A restart: new connection, temp table gone, progress describing a scan
-    # whose accumulated ids are lost. The scan must restart from part 1
-    # rather than trust the stale progress.
+    # A restart: the id table is a real table, so the scan resumes from part
+    # 9 instead of redoing part 1, and the transition finishes from there.
     database = ShadowDatabase(tmp_path / "shadow.duckdb")
     database.open()
     try:
+        ids_after_restart = database.con.execute(
+            "SELECT COUNT(*) FROM _export_transition_ids"
+        ).fetchone()[0]
+        assert int(ids_after_restart) == 32, "the scan progress did not survive the restart"
+
         ex = DecisionExporter(database.con, tmp_path / "export", batch_rows=4)
         result = ex.run_batch()
-        assert not result.transition_done
-        fresh = json.loads(ex.state_path.read_text(encoding="utf-8"))
-        assert fresh["transition"]["next_part"] == 1 + 8
-        while not ex.run_batch().transition_done:
-            pass
+        assert result.transition_done is True, "the resumed transition did not finish"
+        state = json.loads(ex.state_path.read_text(encoding="utf-8"))
+        assert state["transition"]["phase"] == "done"
+        assert state["transition"]["rows_resequenced"] == 1
         _run_to_caught_up(ex)
         ids = _ids(tmp_path / "export")
         assert missed in ids
         assert len(ids) == len(set(ids)) == 41
         assert ex.reconcile()["consistent"] is True
+        # The one-time table is dropped once the transition completes.
+        leftover = database.con.execute(
+            "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = '_export_transition_ids'"
+        ).fetchone()[0]
+        assert int(leftover) == 0
     finally:
         database.close()
+
+
+def test_the_transition_scan_respects_the_wall_clock_budget(db, tmp_path, monkeypatch):
+    """A transition tick yields at its deadline, batch by batch.
+
+    The first acceptance failure measured 240s+ ticks: the scan neither
+    batch-loaded ids nor checked the clock. The deadline is consulted
+    between batches (one statement per batch of parts), always after at
+    least one batch, so a tick always makes progress and never runs long.
+    The clock is driven explicitly (the repo's own pattern) so the test
+    cannot pass against code that ignores the budget.
+    """
+    import itertools
+
+    from weatherquant.shadow import export as export_module
+
+    exported = [_insert(db, i=i, when=NOW + timedelta(seconds=i)) for i in range(40)]
+    _backfill_like_migration_0005(db)
+    _write_v1_export(db, tmp_path, exported)  # 40 rows / 4 per part = 10 parts
+
+    clock = itertools.count(0.0, 1.0)  # every reading advances a full second
+    monkeypatch.setattr(export_module.time, "monotonic", lambda: next(clock))
+
+    ex = _exporter(db, tmp_path, batch_rows=4, max_seconds=0.5)
+
+    first = ex.run_batch()
+    assert not first.transition_done
+    assert any("stopped the scan at the" in note for note in first.notes), first.notes
+    state = json.loads(ex.state_path.read_text(encoding="utf-8"))
+    assert state["transition"]["phase"] == "scan_parts"
+    # One batch of eight parts, then the deadline stopped the second batch.
+    assert state["transition"]["next_part"] == 9
+
+    second = ex.run_batch()
+    assert not second.transition_done
+    state = json.loads(ex.state_path.read_text(encoding="utf-8"))
+    # The scan finished this tick (two parts left = one batch); the finalize
+    # pass defers to a tick of its own because the scan used the budget.
+    assert state["transition"]["phase"] == "finalize"
+    assert any("deferred" in note for note in second.notes), second.notes
+
+    third = ex.run_batch()
+    assert third.transition_done
+    _run_to_caught_up(ex)
+    assert len(set(_ids(tmp_path / "export"))) == 40
+    assert ex.reconcile()["consistent"] is True
+
+
+def test_a_large_transition_completes_quickly_with_bulk_id_loading(db, tmp_path):
+    """The wall-clock smoke behind the 18-minute acceptance failure.
+
+    Per-row executemany into a keyed table cost ~33s per 20k rows; the scan
+    now loads each part with one read_json statement. 48 parts x 150 rows is
+    small next to production, but the old path would already spend seconds
+    here and the bound keeps the regression measurable.
+    """
+    import time as _time
+
+    rows = 48 * 150
+    for start in range(0, rows, 5000):
+        db.con.execute(
+            "INSERT INTO shadow_decisions ("
+            "decision_id, run_id, cycle_id, market_id, station, direction, state, "
+            "decision_time_utc, model_probability, net_edge, mode, mode_reason, "
+            "created_at_utc) "
+            "SELECT "
+            f"  'id-' || LPAD(CAST(i + {start} AS VARCHAR), 6, '0'), 'run-1', "
+            f"  'cycle-' || LPAD(CAST(i + {start} AS VARCHAR), 6, '0'), "
+            f"  'm-' || (i % 7), 'KLGA', 'buy_yes', 'ACCEPT', "
+            f"  TIMESTAMPTZ '2026-10-14 00:00:00+00' + INTERVAL (i + {start}) SECOND, "
+            "  0.6, 0.05, 'LIVE', 'configured', "
+            f"  TIMESTAMPTZ '2026-10-14 00:00:00+00' + INTERVAL (i + {start}) SECOND "
+            f"FROM range({min(5000, rows - start)}) t(i)"
+        )
+    _backfill_like_migration_0005(db)
+    _write_v1_export(
+        db,
+        tmp_path,
+        [f"id-{i:06d}" for i in range(rows)],
+    )
+
+    ex = _exporter(db, tmp_path, batch_rows=150)
+    started = _time.monotonic()
+    while not ex.run_batch().transition_done:
+        pass
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 5.0, f"the transition scan took {elapsed:.1f}s for 48 parts"
+    assert ex.reconcile()["consistent"] is True
 
 
 def test_a_fresh_directory_needs_no_transition_scan(db, tmp_path):
@@ -579,3 +683,137 @@ def test_legacy_parts_then_sequenced_parts_still_ingest(db, tmp_path):
     assert state is not None
     assert state.late_rows_seen == 1  # the replay row, below the legacy cursor
     assert state.last_export_seq == 5000
+
+
+# --- the rollback drill: new -> old -> new (PR #37 fail 3) ---------------------
+
+
+def _simulate_old_image_window(db, tmp_path: Path, rows: list[tuple[int, datetime, str]]) -> None:
+    """What a rolled-back image does to a v2 export directory.
+
+    It writes rows with ``export_seq IS NULL``, publishes them in a v1 part
+    (no sequence on the line, appended after the v2 parts), and rewrites
+    state.json exactly as the old code did: the keys it knows move, the v2
+    keys it does not know are preserved untouched.
+    """
+    export_dir = tmp_path / "export"
+    state = json.loads((export_dir / "state.json").read_text(encoding="utf-8"))
+    index = int(state["next_part"])
+    watermark = tuple(state["watermark"]) if state.get("watermark") else None
+    lines = []
+    for i, when, market in rows:
+        decision_id = _insert(db, i=i, when=when, market=market)  # NULL export_seq
+        lines.append(
+            json.dumps(
+                {
+                    "decision_id": decision_id,
+                    "decision_time_utc": when.isoformat(),
+                    "market_id": market,
+                    "state": "NO_TRADE",
+                    "mode": "LIVE",
+                }
+            )
+        )
+        cursor = (when.isoformat(), decision_id)
+        if watermark is None or cursor > watermark:
+            watermark = cursor
+    (export_dir / "parts" / f"part-{index:09d}.jsonl").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+    # The old image's _save: only the keys it knows, the v2 keys ride along.
+    state.update(
+        {
+            "next_part": index + 1,
+            "rows_exported": int(state["rows_exported"]) + len(rows),
+            "watermark": list(watermark) if watermark else None,
+            "last_run_at_utc": NOW.isoformat(),
+        }
+    )
+    (export_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+
+def test_a_rollback_window_does_not_duplicate_rows(db, tmp_path):
+    """new -> old -> new: the acceptance drill that produced 15 duplicates.
+
+    The old image exports its rows in a v1 part appended after the v2 parts.
+    Without the repair, the v2 exporter would sequence those NULLs above the
+    cursor and export every one of them a second time - and both reconcile
+    and the streaming consumer would refuse the mixed format forever.
+    """
+    for i in range(6):
+        _insert(db, i=i, when=NOW + timedelta(minutes=i))
+    ex = _exporter(db, tmp_path)
+    assert ex.run_batch().rows_exported == 6  # v2 parts, every line sequenced
+
+    rollback_rows = [
+        (60 + i, NOW + timedelta(minutes=100 + i), f"m-rb-{i % 3}") for i in range(15)
+    ]
+    _simulate_old_image_window(db, tmp_path, rollback_rows)
+
+    result = ex.run_batch()
+    assert result.rows_exported == 0, "the rollback window was re-exported"
+    assert any(note.startswith("rollback repair") for note in result.notes), result.notes
+
+    ids = _ids(tmp_path / "export")
+    assert len(ids) == 21, f"expected 6 + 15 lines, got {len(ids)}"
+    assert len(set(ids)) == 21, "a decision from the rollback window was duplicated"
+
+    state = json.loads(ex.state_path.read_text(encoding="utf-8"))
+    cursor = int(state["cursor_seq"])
+    assert state["last_rollback_repair"]["rows_pinned"] == 15
+    pinned = db.con.execute(
+        "SELECT COUNT(*) FROM shadow_decisions WHERE export_seq = ?", [cursor]
+    ).fetchone()[0]
+    assert int(pinned) == 16  # the 15 pinned rows plus the row that IS the cursor
+
+    report = ex.reconcile()
+    assert report["consistent"], report
+    assert report["legacy_lines"] == 15
+
+    # A second pass is silent and idempotent: the tail stays, the repair
+    # does not re-report or re-pin.
+    again = ex.run_batch()
+    assert not any(note.startswith("rollback repair") for note in again.notes)
+
+    # A row written during the rollback but never exported by it (written
+    # after its last tick) still reaches the export exactly once.
+    _insert(db, i=90, when=NOW + timedelta(minutes=200))
+    third = ex.run_batch()
+    assert third.rows_exported == 1
+    ids = _ids(tmp_path / "export")
+    assert len(ids) == len(set(ids)) == 22
+    assert ex.reconcile()["consistent"] is True
+
+
+def test_the_streaming_consumer_accepts_a_trailing_rollback_part(db, tmp_path):
+    """The mixed format reaches the research side and folds without refusal.
+
+    Before the fix, ingest refused the trailing legacy part outright
+    ("Legacy rows may only precede it"); now the legacy region is judged on
+    its own business order and the sequence check binds the v2 rows.
+    """
+    for i in range(5):
+        _insert(db, i=i, when=NOW + timedelta(minutes=i))
+    ex = _exporter(db, tmp_path)
+    assert ex.run_batch().rows_exported == 5
+
+    _simulate_old_image_window(
+        db,
+        tmp_path,
+        [(70 + i, NOW + timedelta(minutes=50 + i), f"m-rb2-{i}") for i in range(4)],
+    )
+    assert any(
+        note.startswith("rollback repair") for note in ex.run_batch().notes
+    )
+    _run_to_caught_up(ex)
+
+    from weatherquant.performance.state import PerformanceStateStore
+    from weatherquant.performance.streaming import ingest_export
+
+    with PerformanceStateStore(tmp_path / "state.duckdb") as store:
+        result = ingest_export(store, tmp_path / "export")
+        state = store.load_state()
+
+    assert result.rows_consumed == 9
+    assert state is not None
+    assert state.last_export_seq is not None  # the v2 rows still bind it

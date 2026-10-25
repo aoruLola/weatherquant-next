@@ -39,14 +39,18 @@ REPLAY 重读历史归档时，写入时刻是现在、业务时刻是过去。�
 **交错**，不存在一个纯量下限能同时"排除已导出行、包含被跳过行"。所以过渡做三件事
 （`DecisionExporter._transition_step`，每 tick 有界、可恢复、幂等）：
 
-1. **扫描已发布分片**（每 tick 最多 8 个），把已导出的 `decision_id` 收进临时表——
-   权威是分片里**实际有什么**，不是 v1 水位**声称覆盖了什么**（本缺陷恰恰是声称跳过了行）。
+1. **扫描已发布分片**，把已导出的 `decision_id` 收进**持久表** `_export_transition_ids`
+   ——权威是分片里**实际有什么**，不是 v1 水位**声称覆盖了什么**（本缺陷恰恰是声称跳过了行）。
+   扫描按批读入（`read_json_auto` 接受路径列表，一条语句一批分片）——逐行
+   `executemany` 进带主键的表在验收机上约 33 秒/2 万行，是首轮 18.4 分钟的主要来源；
+   持久表让重启**续扫**而非从 part-1 重扫。批间检查 `max_seconds`，每 tick 至少一批。
 2. **定下限**：`floor = max(export_seq) over 已导出行`。
-3. **重排序被跳过的行**：`export_seq ≤ floor 且未导出` 的行改取序列新值（必然 > floor），
-   成为普通待导出行。分片一个字节都不改写；v1 水位字段保留（作为可观测的业务最远时刻）。
+3. **重排序被跳过的行**：`export_seq ≤ floor 且未导出` 的行经**单条集合式 UPDATE** 改取
+   序列新值（必然 > floor），成为普通待导出行。扫描耗尽预算时 finalize 顺延到独立 tick
+   （fresh tick 必做工作，不会死循环）。分片一个字节都不改写；v1 水位字段保留。
 
-过渡有自己的阶段状态（`state.json` 的 `transition` 字段），引擎崩溃重启后临时表丢失则
-从第 1 个分片重扫（幂等，只多花一次扫描）；序列头意外低于下限时先探测推进，杜绝自旋。
+过渡有自己的阶段状态（`state.json` 的 `transition` 字段）；序列头意外低于下限时先探测
+推进，杜绝自旋。
 
 ### 状态文件（v2）
 
@@ -73,40 +77,59 @@ REPLAY 重读历史归档时，写入时刻是现在、业务时刻是过去。�
 - 状态库迁移 `0003_ingest_export_seq.sql`：`performance_ingest` 增 `last_export_seq`（可空）
   与 `late_rows_seen`（默认 0），纯增量。
 
-## 5. 回滚方案
+## 5. 回滚方案（已按验收演练更正）
 
-- **引擎回滚到旧镜像**：安全。`export_seq` 对旧代码只是多出来的可空列（旧 INSERT 不写它，
-  得 NULL）；v2 的 `_assign_missing_seq` 在升级回来后有界修复这些 NULL 行。
-  旧镜像只读 `watermark` 字段（v2 保留且语义兼容），不会重导已导出行。
-- **数据库回滚**：不需要。迁移是纯增量（序列 + 可空列 + 索引），前向迁移器只加不改；
-  回滚数据库反而会丢掉回填成果。
-- **研究侧（performance 状态库）**：v2 分片可能含业务回退行，**旧版消费代码会拒绝这些分片**
-  （拒绝推进、可观测、不损坏状态库）——回滚研究侧应同时保持导出目录不再增长，或按
+支持路径是「新 → 旧 → 新」：旧镜像在 v2 导出目录上继续用业务游标导出，把
+NULL-seq 行写进**追加在 v2 分片之后的 v1 格式分片**（旧代码会原样保留它不认识的
+`version`/`cursor_seq` 键）。新镜像重新接管时：
+
+- **`_repair_rollback_tail`**（每个导出 tick 先行）：检测"末尾无 `export_seq` 的分片"，
+  把其中 id 对应的 NULL-seq 行**钉在 cursor_seq**（≤ 游标 = 已导出前缀），它们不会再被
+  `_assign_missing_seq` 分配新序列而二次导出。幂等（只碰 NULL 行），一次性记录在
+  `state.json` 的 `last_rollback_repair`，runner 记 `decision_export_rollback_repair`
+  质量事件。
+- 旧镜像窗口里**写了但没来得及导出**的行（NULL 且不在任何分片里）由 `_assign_missing_seq`
+  正常补序列并首次导出——旧镜像自身的迟到行缺陷也会在重新升级后被补发。
+- `reconcile()` 对无 seq 的行改为**按源库核验**：id 必须存在于已导出前缀（seq ≤ 游标），
+  位置本身不再是判据；对流式消费同理（旧格式行只在自己的连续区域内要求业务时间有序，
+  seq 行之间仍严格递增）。
+
+**双镜像演练证据**（old-seed 250 行 → new-upgrade → old-rollback 写 25 行并导出 →
+new-again）：source=316，exported=316，missing=0，**duplicates=0**，reconcile
+consistent=True，performance 流式消费 316 行 OK（修复前：duplicates=15、
+reconcile INCONSISTENT、流式永久拒绝）。
+
+- **引擎回滚到旧镜像**：安全。`export_seq` 对旧代码只是可空列；v2 state 的未知键被旧
+  代码保留；重新升级后由上面的修复步骤收敛，无重复、无丢失。
+- **数据库回滚**：不需要。迁移 0005/0006 纯增量（0005 列+回填+序列推进；0006 索引单独
+  事务——同一事务内 UPDATE 后建索引在非空表上会报 "Cannot create index with outstanding
+  updates"，这是拆分的原因）。
+- **研究侧（performance 状态库）**：回滚窗口的 v1 分片现在可被消费（见上）；若分片在
+  旧镜像运行期间已被旧版消费代码读过并留下分片 sha 记录，按
   `docs/performance-decouple-runbook.md` 重建状态库。
 
 ## 6. 验收证据（本机）
 
-`tests/test_shadow_export_seq.py`（16 例，全过）逐条覆盖工单验收项：
+**单元/隔离测试**：`tests/test_shadow_export_seq.py`（20 例）与
+`tests/test_shadow_export_seq_migration.py`（3 例，含旧 schema + 非空表 → 新版 open 的
+真实迁移路径、250k 行下首取 `nextval == max+1`、迁移对拆分的静态守卫）全过；
+全套 `uv run pytest -q` 1087 passed, 6 skipped；ruff 通过。
 
-| 验收项 | 测试 |
+**双镜像演练**（旧=main@3757619，新=本分支；脚本与输出见 PR #37「本机验收证据」评论）：
+
+| 验收项 | 结果 |
 |---|---|
-| 迟到 REPLAY/LIVE 混合 | `test_a_row_written_late_with_an_earlier_business_time_is_exported`、`test_a_replay_run_backfilling_history_is_exported_in_full` |
-| 重复写入 | `test_rewriting_a_decision_does_not_re_export_it` |
-| 崩溃恢复 | `test_a_lost_state_file_recovers_the_sequence_cursor_from_the_parts`、`test_recovery_after_a_crash_between_parts_publishes_the_rest_exactly_once`、`test_the_transition_is_bounded_and_resumable_across_restarts` |
-| 连续分片 + 对账不漏不重 | `test_parts_are_consecutive_and_reconcile_is_clean_over_many_ticks`、`test_reconcile_reports_a_duplicated_line`、`test_reconcile_reports_rows_missing_from_the_parts` |
-| v1 导出兼容迁移 | `test_the_transition_exports_rows_the_v1_cursor_skipped`（v1 跳过的行被补发、v1 行零重发） |
-| NULL 修复（回滚后再升级） | `test_rows_written_without_a_sequence_are_repaired_in_write_order` |
-| 下游消费 | `test_the_streaming_fold_accepts_late_rows_and_counts_them`、`test_legacy_parts_then_sequenced_parts_still_ingest`、`test_the_streaming_fold_refuses_a_repeated_sequence` |
-
-全套 `uv run pytest -q`：1080 passed, 6 skipped（main 上本就失败的
-`test_peak_memory_does_not_grow_with_the_history` 在本机通过；另一处因迁移清单变化的守卫断言已随 0003 更新）。
+| 旧 schema + 非空表 → 新版 open（原 ①） | OK：0005/0006 两个事务分别应用，不再 "Cannot create index with outstanding updates" |
+| v1 导出跳过的 30 行迟到 REPLAY | 过渡补发 30 行，v1 行零重发（source=250 exported=250 missing=0 dup=0） |
+| 新→旧→新回滚（原 ③） | duplicates=0（修复前 15）；reconcile consistent=True（修复前 INCONSISTENT）；流式消费 316 行 OK（修复前永久拒绝）；旧镜像窗口漏掉的 10 行迟到 REPLAY 亦被补发 |
+| kill -9 崩溃注入 ×3 轮 + 最终对账 | source=541 exported=541 missing=0 duplicates=0；无遗留 .tmp；reconcile consistent=True |
+| 70 万行级过渡 tick 时长（原 ②） | 修复前：单 tick 240–267s、总 18.4min（逐行 executemany ≈33s/2 万行 + 无预算检查 + 重启重扫）。修复后（本机以旧镜像真实产物验证：6×2 万行分片、生产参数 batch=20000/max_seconds=5）：迁移+回填 open 7.6s，**过渡单 tick 0.74s**，补发 12,057 行一批 0.51s；每批分片一条 `read_json` 语句、批间查预算、id 表持久化免重扫 |
 
 运维命令：`weatherquant-shadow export-verify [--json]`（引擎须停止）输出对账报告，
 exit code 0/1 对应一致/不一致。
 
 ## 7. 需 NAS 人工验收的部分
 
-- 生产 `shadow.duckdb` 上执行迁移 0005（约 70 万行回填）与一次性过渡扫描（约 35 个分片、
-  数个 tick）的实际耗时观察；
+- 生产 `shadow.duckdb` 上执行迁移 0005/0006（约 70 万行回填）与一次性过渡的实际耗时观察；
 - 过渡完成的质量事件（`decision_export_transition_done`）与 `export-verify` 在真实数据上的输出；
-- 旧镜像→新镜像→旧镜像→新镜像 的回滚演练（本机已用故障注入等价模拟，见上表）。
+- 旧镜像→新镜像→旧镜像→新镜像 的回滚演练（本机已用双镜像 + kill -9 注入等价复现，见上表）。

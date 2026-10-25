@@ -470,6 +470,13 @@ def ingest_export(
         rows_in_part = 0
         previous_cursor = state.last_end_cursor_parsed
         previous_seq = state.last_export_seq
+        # Business order binds legacy rows to their own contiguous region. The
+        # store's cursor tells us what the last consumed row was: if a
+        # sequence was seen, that row was sequenced and no legacy region is
+        # open across the boundary; otherwise the previous part ended inside
+        # (or as) a legacy region and the order check must carry across it,
+        # exactly as it did before the sequence existed.
+        previous_legacy_cursor = None if previous_seq is not None else previous_cursor
 
         with store.transaction():
             for raw in _iter_rows(part.path):
@@ -491,30 +498,37 @@ def ingest_export(
                             "part, and both would be counted twice."
                         )
                     previous_seq = export_seq
-                elif previous_seq is not None:
-                    raise PerformanceStateError(
-                        f"part {part.index} has a row without export_seq at "
-                        f"{rows_in_part}, after rows that carried one. Legacy "
-                        "rows predate the sequence and may only precede it."
-                    )
-                if (
-                    previous_cursor is not None
-                    and cursor < previous_cursor
-                    and export_seq is None
-                ):
-                    # Only legacy rows are held to business-time order: they
-                    # were exported under the business cursor, so a regression
-                    # could only be a rewrite. Sequenced rows may legitimately
-                    # arrive late - a REPLAY decision whose business instant
-                    # sits behind what was already consumed - and the sequence
-                    # check above is what catches a true duplicate instead.
-                    raise PerformanceStateError(
-                        f"part {part.index} is not in cursor order at row {rows_in_part} "
-                        f"({cursor[0].isoformat()} after {previous_cursor[0].isoformat()}). "
-                        "The fold assumes the export is non-decreasing in "
-                        "(decision_time_utc, decision_id); refusing rather than folding "
-                        "an out-of-order part."
-                    )
+                    # A sequenced row closes any open legacy region: the
+                    # business-order invariant binds legacy rows to their own
+                    # region, and a later legacy region (a rollback window)
+                    # may legitimately sit at any business time relative to
+                    # an earlier one.
+                    previous_legacy_cursor = None
+                else:
+                    # A row without export_seq is legacy format, wherever it
+                    # sits: leading parts predate the sequence, and trailing
+                    # ones were written by a rolled-back image (the shadow
+                    # exporter pins those rows under its cursor before they
+                    # could be duplicated; its reconcile proves it against
+                    # the source, which this side cannot reach). Business
+                    # order is required among legacy rows themselves - they
+                    # were exported under the business cursor, so a
+                    # regression there could only be a rewrite - but not
+                    # against a sequenced neighbour, whose business time may
+                    # legitimately sit anywhere.
+                    if (
+                        previous_legacy_cursor is not None
+                        and cursor < previous_legacy_cursor
+                    ):
+                        raise PerformanceStateError(
+                            f"part {part.index} is not in cursor order at row "
+                            f"{rows_in_part} ({cursor[0].isoformat()} after "
+                            f"{previous_legacy_cursor[0].isoformat()}) among its "
+                            "legacy-format rows. Those rows were exported under the "
+                            "business cursor; refusing rather than folding an "
+                            "out-of-order part."
+                        )
+                    previous_legacy_cursor = cursor
                 if previous_cursor is not None and cursor == previous_cursor:
                     raise PerformanceStateError(
                         f"part {part.index} repeats the cursor "

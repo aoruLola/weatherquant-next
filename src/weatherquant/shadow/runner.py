@@ -670,7 +670,7 @@ class ShadowRunner:
                     run_id=self.run_id or "",
                 )
             elif not result.caught_up and not result.rows_exported and not any(
-                note.startswith(("export failed", "transition"))
+                note.startswith(("export failed", "transition", "rollback repair"))
                 for note in result.notes
             ):
                 # Nothing written and not caught up is a stalled export, and it
@@ -691,6 +691,24 @@ class ShadowRunner:
                     ],
                     run_id=self.run_id or "",
                 )
+            for note in result.notes:
+                # The rollback repair is a rare, one-time, auditable event:
+                # rows exported by a rolled-back image got pinned under the
+                # cursor so they cannot be exported twice. Without a record,
+                # "why do these rows sit at cursor_seq?" has no answer.
+                if note.startswith("rollback repair"):
+                    log.warning("%s", note)
+                    self.store.record_quality(
+                        [
+                            QualityEvent(
+                                kind="decision_export_rollback_repair",
+                                severity="warning",
+                                detail=note,
+                                ts_utc=now,
+                            )
+                        ],
+                        run_id=self.run_id or "",
+                    )
             if any(note.startswith("export failed") for note in result.notes):
                 self.store.record_quality(
                     [
