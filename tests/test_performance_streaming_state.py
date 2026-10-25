@@ -743,9 +743,10 @@ def test_an_existing_state_database_keeps_working(tmp_path) -> None:
 
     versions = [spec.version for spec in available_migrations(PERFORMANCE_MIGRATIONS_DIR)]
     assert versions == sorted(versions, key=int), versions
-    assert versions == ["0001", "0002"], (
-        "the retraction guard needed no migration; a new one here would mean "
-        "an existing state database has to be upgraded before it can be read"
+    assert versions == ["0001", "0002", "0003"], (
+        "0003 adds the ingest columns for the write-sequence cursor (WQN-20); "
+        "any other new one here means an existing state database has to be "
+        "upgraded before it can be read, which is a decision to make openly"
     )
 
     # Reopen: migrations are idempotent and nothing is lost.

@@ -185,7 +185,13 @@ class OpenEpisode:
     fee_rate: float | None = None
 
     def observe(self, row: _DecisionRow) -> None:
-        self.last_seen = row.decided_at_utc
+        # A late row (business instant behind the episode's furthest instant)
+        # is counted but never rewinds `last_seen`: the gap clock runs from
+        # the furthest activity, and rewinding it would inflate the next gap
+        # and close the episode early. For in-order rows the guard is always
+        # true and behaviour is unchanged.
+        if row.decided_at_utc > self.last_seen:
+            self.last_seen = row.decided_at_utc
         self.count += 1
         if row.net_edge_usd is not None:
             number = float(row.net_edge_usd)
@@ -452,11 +458,13 @@ class FolderState:
 
     ``prev_instant`` is the whole of the global activity index. It is the
     largest decision instant strictly below ``last_instant``, and it is enough
-    because the fold consumes instants in non-decreasing order: when a row at
-    instant ``t`` arrives, every instant below ``t`` has already been seen and
-    no instant above ``t`` can fall inside an interval ending at ``t``. So
-    ``activity_between(a, b)`` is exactly ``prev_instant > a`` at that moment -
-    no index of the whole history, and no per-episode bookkeeping.
+    because the fold consumes instants in arrival order and the index only
+    moves forward: when a row at instant ``t`` arrives, every instant the
+    stream has already delivered below ``t`` has been seen. Late rows (since
+    the export moved to the write sequence) do not move the index at all, so
+    one cannot corrupt the answer for the rows that follow it. With that
+    guard, ``activity_between(a, b)`` is exactly ``prev_instant > a`` at that
+    moment - no index of the whole history, and no per-episode bookkeeping.
     """
 
     row_seq: int = 0
@@ -541,7 +549,15 @@ class EpisodeFolder:
         instant = row.decided_at_utc
         # The activity index only advances on rows that carry a market: the
         # original builder built its instant list from the rows it kept.
-        if instant != self.state.last_instant:
+        # It also only advances FORWARD. Since the export moved to the write
+        # sequence (WQN-20) a part can carry late REPLAY rows whose business
+        # instant sits below what was already folded; letting one of those
+        # set `last_instant` would make the index answer "was anything
+        # decided between a and b" wrongly for the next gap, and the answer
+        # would stay wrong for a row or two after the stream recovered. For
+        # in-order rows `>` behaves exactly like the previous `!=` guard,
+        # so nothing changes for any stream that never regresses.
+        if self.state.last_instant is None or instant > self.state.last_instant:
             self.state.prev_instant = self.state.last_instant
             self.state.last_instant = instant
         seq = self.state.row_seq
@@ -549,6 +565,18 @@ class EpisodeFolder:
 
         key = row.key
         current = self.open_by_key.get(key)
+        if current is not None and instant < current.last_seen:
+            # A late row against an episode that has already folded past its
+            # instant. It cannot close anything - its gap is negative and its
+            # "state change" happened before activity the episode has already
+            # recorded - so an ACCEPT is folded in where it lands and a
+            # non-ACCEPT is a no-op for the episode body. The row still
+            # counts toward decisions/accepts; it is never silently dropped
+            # from the stream's own accounting.
+            if row.state == self.accepted_state and row.net_edge_usd is not None:
+                current.observe(row)
+            return
+
         if current is not None:
             gap = (instant - current.last_seen).total_seconds()
             if gap > self.gap_window_seconds:

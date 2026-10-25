@@ -178,6 +178,8 @@ class IngestState:
     accepts_without_edge_market: int = 0
     first_decision_utc: datetime | None = None
     last_decision_utc: datetime | None = None
+    last_export_seq: int | None = None
+    late_rows_seen: int = 0
 
     @property
     def last_end_cursor(self) -> tuple[str, str] | None:
@@ -215,6 +217,11 @@ class IngestState:
             "accepts_without_edge_market": self.accepts_without_edge_market,
             "first_decision_utc": _iso(self.first_decision_utc),
             "last_decision_utc": _iso(self.last_decision_utc),
+            # The write-sequence position of the fold. Absent (not zero) while
+            # only legacy parts - those that predate export_seq - have been
+            # consumed; zero would claim the first sequence position.
+            "last_export_seq": self.last_export_seq,
+            "late_rows_seen": self.late_rows_seen,
         }
 
 
@@ -468,7 +475,8 @@ class PerformanceStateStore:
             "last_end_cursor_id, rows_consumed, row_seq, last_instant, prev_instant, "
             "decisions_seen, decisions_with_market, accepts_seen, not_accept, "
             "accepts_without_edge, accepts_without_edge_market, first_decision_utc, "
-            "last_decision_utc FROM performance_ingest WHERE id = 1"
+            "last_decision_utc, last_export_seq, late_rows_seen "
+            "FROM performance_ingest WHERE id = 1"
         )
         if row is None:
             return None
@@ -492,6 +500,8 @@ class PerformanceStateStore:
             accepts_without_edge_market=int(row[16]),
             first_decision_utc=row[17],
             last_decision_utc=row[18],
+            last_export_seq=None if row[19] is None else int(row[19]),
+            late_rows_seen=int(row[20] or 0),
         )
 
     def initialize_state(self, state: IngestState) -> None:
@@ -505,11 +515,11 @@ class PerformanceStateStore:
             "last_end_cursor_id, rows_consumed, row_seq, last_instant, prev_instant, "
             "decisions_seen, decisions_with_market, accepts_seen, not_accept, "
             "accepts_without_edge, accepts_without_edge_market, first_decision_utc, "
-            "last_decision_utc, updated_at_utc"
+            "last_decision_utc, last_export_seq, late_rows_seen, updated_at_utc"
         )
         self.con.execute(
             f"INSERT OR REPLACE INTO performance_ingest ({columns}) VALUES "
-            "(1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 state.algorithm_version,
                 state.input_source,
@@ -530,6 +540,8 @@ class PerformanceStateStore:
                 state.accepts_without_edge_market,
                 state.first_decision_utc,
                 state.last_decision_utc,
+                state.last_export_seq,
+                state.late_rows_seen,
                 datetime.now(tz=UTC),
             ],
         )

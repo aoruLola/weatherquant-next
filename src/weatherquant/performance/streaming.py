@@ -269,6 +269,25 @@ def _row_cursor(row: Mapping[str, Any]) -> tuple[datetime, str]:
     return (_timestamp(stamp), str(row.get("decision_id") or ""))
 
 
+def _export_seq_of(row: Mapping[str, Any]) -> int | None:
+    """The row's position in the export's write sequence, when it has one.
+
+    ``None`` for legacy rows, which predate the sequence: a different fact
+    from any integer, because the checks that lean on the sequence may only
+    start once a sequenced row has been seen.
+    """
+    raw = row.get("export_seq")
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise PerformanceStateError(
+            f"a decision carries export_seq={raw!r}, which is not a sequence "
+            "value; refusing rather than guessing what position it holds"
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # ingest
 # ---------------------------------------------------------------------------
@@ -450,12 +469,45 @@ def ingest_export(
         base_index = state.rows_consumed
         rows_in_part = 0
         previous_cursor = state.last_end_cursor_parsed
+        previous_seq = state.last_export_seq
 
         with store.transaction():
             for raw in _iter_rows(part.path):
                 seq = base_index + rows_in_part
                 cursor = _row_cursor(raw)
-                if previous_cursor is not None and cursor < previous_cursor:
+                export_seq = _export_seq_of(raw)
+                if export_seq is not None:
+                    # The write sequence is the order the parts are actually
+                    # written in (WQN-20). It is unique per decision and
+                    # claimed once at insert, so a repeat or a regression can
+                    # only mean a duplicated line or a reordered part - either
+                    # would count a decision twice.
+                    if previous_seq is not None and export_seq <= previous_seq:
+                        raise PerformanceStateError(
+                            f"part {part.index} repeats or regresses export_seq "
+                            f"{export_seq} after {previous_seq} at row {rows_in_part}. "
+                            "The sequence is the identity of a write; a repeat is a "
+                            "duplicated decision and a regression is a reordered "
+                            "part, and both would be counted twice."
+                        )
+                    previous_seq = export_seq
+                elif previous_seq is not None:
+                    raise PerformanceStateError(
+                        f"part {part.index} has a row without export_seq at "
+                        f"{rows_in_part}, after rows that carried one. Legacy "
+                        "rows predate the sequence and may only precede it."
+                    )
+                if (
+                    previous_cursor is not None
+                    and cursor < previous_cursor
+                    and export_seq is None
+                ):
+                    # Only legacy rows are held to business-time order: they
+                    # were exported under the business cursor, so a regression
+                    # could only be a rewrite. Sequenced rows may legitimately
+                    # arrive late - a REPLAY decision whose business instant
+                    # sits behind what was already consumed - and the sequence
+                    # check above is what catches a true duplicate instead.
                     raise PerformanceStateError(
                         f"part {part.index} is not in cursor order at row {rows_in_part} "
                         f"({cursor[0].isoformat()} after {previous_cursor[0].isoformat()}). "
@@ -471,6 +523,8 @@ def ingest_export(
                         "duplicated export line or a missing decision_id; either way it "
                         "would be counted twice."
                     )
+                if export_seq is not None and previous_cursor is not None and cursor < previous_cursor:
+                    state.late_rows_seen += 1
                 previous_cursor = cursor
 
                 row = row_from_mapping(raw)
@@ -549,6 +603,7 @@ def ingest_export(
             state.last_part_index = part.index
             state.last_end_cursor_time = part.end_cursor_time
             state.last_end_cursor_id = part.end_cursor_id
+            state.last_export_seq = previous_seq
             state.rows_consumed = base_index + rows_in_part
             state.row_seq = folder.state.row_seq
             state.last_instant = folder.state.last_instant

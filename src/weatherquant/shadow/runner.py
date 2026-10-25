@@ -638,8 +638,40 @@ class ShadowRunner:
                     result.parts_written,
                     result.watermark,
                 )
-            elif not result.caught_up and not any(
-                note.startswith("export failed") for note in result.notes
+                if result.late_rows:
+                    # Late delivery is the whole point of the sequence cursor:
+                    # rows whose business time sits behind the watermark used
+                    # to be unreachable forever. Surfaced per batch so a REPLAY
+                    # run shows up as delivery, not as statistics noise.
+                    log.info(
+                        "export included %d late row(s) (business time behind "
+                        "the watermark)",
+                        result.late_rows,
+                    )
+            if result.transition_done:
+                transition = exporter.state().get("transition") or {}
+                self.store.record_quality(
+                    [
+                        QualityEvent(
+                            kind="decision_export_transition_done",
+                            severity="info",
+                            detail=(
+                                "export cursor moved from business time to the "
+                                f"write sequence: floor_seq="
+                                f"{transition.get('floor_seq')}, "
+                                f"{transition.get('rows_resequenced')} skipped "
+                                "row(s) re-sequenced above it, "
+                                f"{transition.get('exported_ids')} exported id(s) "
+                                "reconciled from the published parts"
+                            ),
+                            ts_utc=now,
+                        )
+                    ],
+                    run_id=self.run_id or "",
+                )
+            elif not result.caught_up and not result.rows_exported and not any(
+                note.startswith(("export failed", "transition"))
+                for note in result.notes
             ):
                 # Nothing written and not caught up is a stalled export, and it
                 # is silent by construction: no exception, no watermark move, no

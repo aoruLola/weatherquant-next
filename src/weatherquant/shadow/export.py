@@ -5,14 +5,18 @@ shadow engine is the only process allowed to open its own database, so the
 export has to be written here - by the holder of the lease, on its own
 schedule, without ever letting a slow backfill stall a decision cycle.
 
-Three properties are load-bearing.
+Four properties are load-bearing.
 
-**The cursor is `(decision_time_utc, decision_id)`, never a timestamp.**
-Timestamps repeat: two decisions in one cycle share an instant, and a
-cursor that only stores the instant re-reads or skips one of them.
-`decision_id` is a deterministic hash and therefore unique, so pairing it
-with the timestamp gives a strict total order. It is *not* itself ordered,
-which is why it is the tiebreaker and not the key.
+**The positioning cursor is ``export_seq``, a monotonic write sequence.**
+Business time is revisable by the data: a REPLAY run re-reads yesterday's
+archive and writes decisions whose business instant is in the past, *after*
+the export's cursor has already moved past that instant. Positioned on
+``(decision_time_utc, decision_id)`` such a row is unreachable forever - it
+exists in the database and no batch can ever select it. ``export_seq`` is
+claimed once at insert (migration 0005 backfills the history), never moves
+on re-write, and every row written now - however old its business time -
+lands strictly above the cursor. Within one instant ``decision_id`` still
+breaks ties, so rows sharing a timestamp are all exported exactly once.
 
 **The parts are the watermark.** Each part records the cursor range it
 covers. State is a cache for fast startup, not the authority: if the
@@ -21,8 +25,17 @@ re-derives the watermark from the last part instead of re-exporting a
 range and duplicating rows. A watermark that advances before the data is
 durable is the one failure that silently corrupts a backfill.
 
+**A v1 export directory is continued, not discarded.** Old parts carry no
+``export_seq`` and were selected in business-time order, so their rows may
+interleave - in sequence space - with rows the v1 cursor silently skipped.
+The one-time transition scans the published parts for the ids they actually
+contain, floors the new cursor at the highest sequence among them, and
+re-sequences the skipped rows above that floor. No part is rewritten, the
+production cursor is never cleared, and the work is bounded per tick. See
+:meth:`DecisionExporter._transition_step`.
+
 **Nothing here is all-or-nothing across the whole history.** One bounded
-batch per call, in size and in wall clock, so an initial backfill of a
+batch per call, in rows and in wall clock, so an initial backfill of a
 large table finishes over many cycles rather than blocking one.
 """
 
@@ -51,6 +64,9 @@ __all__ = [
 #: capital need - plus the market's own fee schedule, which the pricing
 #: module refuses to assume is zero. Joined in rather than left to the
 #: reader, because by the time the reader has it the catalog may have moved.
+#: ``export_seq`` rides along as the row's position in the write sequence:
+#: the research side uses it to validate part order and to tell a late row
+#: (business time below what was already consumed) from a reordered one.
 EXPORT_COLUMNS = (
     "d.decision_id",
     "d.run_id",
@@ -97,7 +113,28 @@ EXPORT_COLUMNS = (
     "d.mode_reason",
     "c.fee_rate",
     "c.fee_exponent",
+    "d.export_seq",
 )
+
+#: Column offsets used to read a fetched row without naming it twice.
+_SEQ_INDEX = EXPORT_COLUMNS.index("d.export_seq")
+_TIME_INDEX = EXPORT_COLUMNS.index("d.decision_time_utc")
+_ID_INDEX = EXPORT_COLUMNS.index("d.decision_id")
+
+#: The state schema this module writes. State without it was written by the
+#: v1 business-time cursor and must go through the one-time transition before
+#: any v2 batch runs against it.
+_STATE_VERSION = 2
+
+#: How many published parts the one-time transition scans per tick. A part
+#: holds at most ``batch_rows`` lines, so this bounds the per-tick work the
+#: same way the batch itself is bounded.
+_TRANSITION_PARTS_PER_TICK = 8
+
+#: The temp table the transition accumulates published ids in. It lives with
+#: the connection: a restart loses it and the scan restarts from part 1,
+#: which is idempotent and paid for at most once per process lifetime.
+_TRANSITION_IDS_TABLE = "_export_transition_ids"
 
 
 def _iso(value: Any) -> Any:
@@ -119,6 +156,9 @@ class ExportResult:
     caught_up: bool = False
     state_file: str | None = None
     notes: list[str] = field(default_factory=list)
+    cursor_seq: int | None = None
+    late_rows: int = 0
+    transition_done: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -127,6 +167,9 @@ class ExportResult:
             "watermark": list(self.watermark) if self.watermark else None,
             "duration_seconds": self.duration_seconds,
             "caught_up": self.caught_up,
+            "cursor_seq": self.cursor_seq,
+            "late_rows": self.late_rows,
+            "transition_done": self.transition_done,
             "notes": list(self.notes),
         }
 
@@ -190,6 +233,7 @@ class DecisionExporter:
             "next_part": 1,
             "rows_exported": 0,
             "watermark": None,
+            "cursor_seq": None,
             "last_run_at_utc": None,
         }
         on_disk: dict[str, Any] | None = None
@@ -209,38 +253,46 @@ class DecisionExporter:
             end = _end_cursor_of(last)
             if end is not None:
                 stored = tuple(state["watermark"]) if state.get("watermark") else None
-                if stored is None or _ahead(end, stored):
+                # The business watermark is the *furthest* instant the export
+                # reached, so a late row in a newer part must not drag it
+                # backwards; `max` rather than "the newest part wins".
+                if stored is None or end > stored:
                     state["watermark"] = list(end)
-                # Everything below `accounted` is already inside rows_exported.
-                #
-                # A state that names parts but counts no rows is not one this
-                # can trust - the two are written together - so it is treated as
-                # absent and the count is rebuilt.
-                accounted = (
-                    int(state.get("next_part") or 1) if state.get("rows_exported") else 1
-                )
-                state["next_part"] = max(accounted, _index_of(last) + 1)
-                # Only the parts the state does not already cover are counted.
-                #
-                # Counting them all means reading every part, and this call
-                # happens inside the tick's wall-clock budget - so the count grew
-                # with the export until it outran the budget, and every tick broke
-                # out before writing anything. The export stalled at 700,000 rows
-                # with no error, no watermark move and no quality event, because
-                # a tick that writes nothing is indistinguishable from a tick
-                # that is caught up.
-                #
-                # The unaccounted tail is normally empty, and after a crash
-                # between publishing a part and saving state it is that one part,
-                # so recovery stays exact without a full recount. A state lost
-                # entirely counts everything - once: the next write records the
-                # total again, and that tick still exports, because the budget is
-                # not consulted until a part has been written.
-                tail = [path for path in existing if _index_of(path) >= accounted]
-                if tail:
-                    state["rows_exported"] = int(
-                        state.get("rows_exported") or 0
-                    ) + _count_rows(tail)
+            end_seq = _end_seq_of(last)
+            if end_seq is not None:
+                stored_seq = state.get("cursor_seq")
+                if stored_seq is None or int(end_seq) > int(stored_seq):
+                    state["cursor_seq"] = int(end_seq)
+            # Everything below `accounted` is already inside rows_exported.
+            #
+            # A state that names parts but counts no rows is not one this
+            # can trust - the two are written together - so it is treated as
+            # absent and the count is rebuilt.
+            accounted = (
+                int(state.get("next_part") or 1) if state.get("rows_exported") else 1
+            )
+            state["next_part"] = max(accounted, _index_of(last) + 1)
+            # Only the parts the state does not already cover are counted.
+            #
+            # Counting them all means reading every part, and this call
+            # happens inside the tick's wall-clock budget - so the count grew
+            # with the export until it outran the budget, and every tick broke
+            # out before writing anything. The export stalled at 700,000 rows
+            # with no error, no watermark move and no quality event, because
+            # a tick that writes nothing is indistinguishable from a tick
+            # that is caught up.
+            #
+            # The unaccounted tail is normally empty, and after a crash
+            # between publishing a part and saving state it is that one part,
+            # so recovery stays exact without a full recount. A state lost
+            # entirely counts everything - once: the next write records the
+            # total again, and that tick still exports, because the budget is
+            # not consulted until a part has been written.
+            tail = [path for path in existing if _index_of(path) >= accounted]
+            if tail:
+                state["rows_exported"] = int(
+                    state.get("rows_exported") or 0
+                ) + _count_rows(tail)
         if on_disk != state:
             self._save(state)
         return state
@@ -250,6 +302,201 @@ class DecisionExporter:
 
     def state(self) -> dict[str, Any]:
         return self._load()
+
+    # -- the one-time v1 -> v2 transition -----------------------------------
+
+    def _transition_pending(self, state: dict[str, Any]) -> bool:
+        return int(state.get("version") or 1) < _STATE_VERSION
+
+    def _transition_step(self, state: dict[str, Any]) -> ExportResult | None:
+        """Continue the one-time move from the business-time cursor to ``export_seq``.
+
+        A v1 export selected rows in business-time order, so the rows it
+        skipped - the late REPLAY rows this whole change exists for - sit
+        *interleaved* with exported rows in sequence space. No single
+        sequence floor can both exclude the exported rows and include the
+        skipped ones, so the skipped rows are moved above the floor instead:
+        re-sequenced to fresh, highest values that position them as ordinary
+        pending rows. The published parts are never rewritten.
+
+        The floor is derived from what the parts actually contain, not from
+        the v1 watermark: the watermark only says what range was *claimed*,
+        and the defect being fixed is precisely that the claim skipped rows.
+
+        Bounded per tick - a handful of parts scanned, or one bounded
+        re-sequencing chunk - and resumable. The scanned ids live in a temp
+        table tied to this connection; a restart loses the table and the
+        scan restarts from part 1, which costs a rescan but never a wrong
+        floor. Every step is idempotent, so a crash mid-transition leaves
+        nothing half-applied that a rerun would mishandle.
+
+        Returns ``None`` only for the empty-directory case: there is nothing
+        to scan and nothing to floor, so the transition completes inline and
+        the caller's tick may go straight on to exporting.
+        """
+        started = time.monotonic()
+        result = ExportResult()
+        self.con.execute(
+            f"CREATE TEMP TABLE IF NOT EXISTS {_TRANSITION_IDS_TABLE} "
+            "(decision_id VARCHAR PRIMARY KEY)"
+        )
+        scanned = int(self.con.execute(
+            f"SELECT COUNT(*) FROM {_TRANSITION_IDS_TABLE}"
+        ).fetchone()[0])
+
+        progress = state.get("transition") or {}
+        phase = progress.get("phase") or "scan_parts"
+        next_scan = int(progress.get("next_part") or 1)
+        if next_scan > 1 and scanned == 0:
+            # A restart with no accumulated ids: the temp table was lost, so
+            # the recorded progress describes a scan whose results are gone.
+            next_scan = 1
+
+        existing = sorted(self.parts_dir.glob("part-*.jsonl"))
+
+        if phase == "scan_parts" and not existing:
+            # Nothing was ever published: there is nothing exported to floor
+            # the cursor at and nothing to reconcile. Start the v2 export
+            # from the beginning of the sequence, and let this tick carry on
+            # into the first batch - the transition cost nothing, so holding
+            # the tick back would only add a pointless empty call.
+            state["version"] = _STATE_VERSION
+            state["cursor_seq"] = 0
+            state["transition"] = {
+                "phase": "done",
+                "exported_ids": 0,
+                "floor_seq": 0,
+                "rows_resequenced": 0,
+                "completed_at_utc": datetime.now(tz=UTC).isoformat(),
+            }
+            self._save(state)
+            self.con.execute(f"DROP TABLE IF EXISTS {_TRANSITION_IDS_TABLE}")
+            return None
+
+        if phase == "scan_parts":
+            todo = existing[next_scan - 1 : next_scan - 1 + _TRANSITION_PARTS_PER_TICK]
+            for path in todo:
+                ids: list[list[str]] = []
+                with path.open(encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        with contextlib.suppress(ValueError):
+                            row = json.loads(line)
+                            if row.get("decision_id"):
+                                ids.append([str(row["decision_id"])])
+                if ids:
+                    self.con.executemany(
+                        f"INSERT OR IGNORE INTO {_TRANSITION_IDS_TABLE} VALUES (?)",
+                        ids,
+                    )
+                next_scan += 1
+            state["transition"] = {"phase": "scan_parts", "next_part": next_scan}
+            self._save(state)
+            if next_scan <= len(existing):
+                result.notes.append(
+                    f"transition: scanned {min(next_scan - 1, len(existing))}"
+                    f"/{len(existing)} part(s)"
+                )
+                result.duration_seconds = time.monotonic() - started
+                return result
+            state["transition"] = {"phase": "finalize"}
+            self._save(state)
+
+        # -- finalize: floor, re-sequence the skipped rows, switch to v2 ----
+        floor_row = self.con.execute(
+            "SELECT COALESCE(MAX(d.export_seq), 0) FROM shadow_decisions d "
+            f"JOIN {_TRANSITION_IDS_TABLE} e ON e.decision_id = d.decision_id"
+        ).fetchone()
+        floor = int(floor_row[0])
+
+        # The re-sequencing loop assumes nextval lands above the floor; if the
+        # sequence head somehow sits below it (a recreated sequence, a skipped
+        # migration step), every reassigned row would still match the
+        # selection and the loop would spin. One probe value tells us where
+        # the head is; if it is too low, the difference is consumed so the
+        # next nextval is floor + 1. The probe itself becomes a harmless gap.
+        probe = int(self.con.execute(
+            "SELECT nextval('seq_shadow_decision_export')"
+        ).fetchone()[0])
+        if probe <= floor:
+            self.con.execute(
+                "SELECT nextval('seq_shadow_decision_export') FROM range(?)",
+                [floor - probe],
+            )
+
+        reassigned = 0
+        while True:
+            # Bounded chunks, re-fetched each pass: a re-sequenced row moves
+            # above the floor and stops matching, so the loop empties rather
+            # than repeats, and a crash mid-way leaves rows that are simply
+            # still pending. Idempotent, and never one unbounded fetchall.
+            chunk = self.con.execute(
+                "SELECT d.decision_id FROM shadow_decisions d "
+                f"WHERE d.export_seq IS NOT NULL AND d.export_seq <= ? AND NOT EXISTS ("
+                f"SELECT 1 FROM {_TRANSITION_IDS_TABLE} e "
+                "WHERE e.decision_id = d.decision_id) "
+                "ORDER BY d.export_seq, d.decision_id LIMIT ?",
+                [floor, self.batch_rows],
+            ).fetchall()
+            if not chunk:
+                break
+            self.con.executemany(
+                "UPDATE shadow_decisions SET export_seq = "
+                "nextval('seq_shadow_decision_export') WHERE decision_id = ?",
+                [[row[0]] for row in chunk],
+            )
+            reassigned += len(chunk)
+            if time.monotonic() - started >= self.max_seconds:
+                state["transition"] = {
+                    "phase": "finalize",
+                    "floor_seq": floor,
+                    "rows_resequenced": reassigned,
+                }
+                self._save(state)
+                result.notes.append(
+                    f"transition: re-sequenced {reassigned} skipped row(s) so far"
+                )
+                result.duration_seconds = time.monotonic() - started
+                return result
+
+        exported_ids = int(self.con.execute(
+            f"SELECT COUNT(*) FROM {_TRANSITION_IDS_TABLE}"
+        ).fetchone()[0])
+
+        watermark = state.get("watermark")
+        state["version"] = _STATE_VERSION
+        state["cursor_seq"] = floor
+        if watermark is None:
+            # A lost state file has no business watermark left; the furthest
+            # exported instant is recoverable from the table the same way the
+            # parts themselves would tell it.
+            furthest = self.con.execute(
+                "SELECT d.decision_time_utc, d.decision_id FROM shadow_decisions d "
+                f"JOIN {_TRANSITION_IDS_TABLE} e ON e.decision_id = d.decision_id "
+                "ORDER BY d.decision_time_utc DESC, d.decision_id DESC LIMIT 1"
+            ).fetchone()
+            if furthest is not None:
+                watermark = list(_cursor_strings(furthest[0], furthest[1]))
+                state["watermark"] = watermark
+        state["transition"] = {
+            "phase": "done",
+            "parts_scanned": len(existing),
+            "exported_ids": exported_ids,
+            "floor_seq": floor,
+            "rows_resequenced": reassigned,
+            "completed_at_utc": datetime.now(tz=UTC).isoformat(),
+        }
+        self._save(state)
+        self.con.execute(f"DROP TABLE IF EXISTS {_TRANSITION_IDS_TABLE}")
+        result.transition_done = True
+        result.cursor_seq = floor
+        result.notes.append(
+            f"transition complete: floor_seq={floor}, "
+            f"{reassigned} skipped row(s) re-sequenced above it"
+        )
+        result.duration_seconds = time.monotonic() - started
+        return result
 
     # -- export ------------------------------------------------------------
 
@@ -264,12 +511,30 @@ class DecisionExporter:
         result = ExportResult()
         try:
             state = self._load()
-            watermark = tuple(state["watermark"]) if state.get("watermark") else None
+            if self._transition_pending(state):
+                # A tick that moves the transition does only that. Running a
+                # normal batch in the same call would swallow the transition
+                # result, and the caller could no longer tell "the one-time
+                # work finished" from "an ordinary batch ran" - the runner
+                # records the completion as a quality event, which only this
+                # return can carry. The empty-directory case returns None:
+                # its transition is free, so the tick goes straight on.
+                step = self._transition_step(state)
+                if step is not None:
+                    return step
+                result.transition_done = True
+
+            cursor_seq = state.get("cursor_seq")
+            cursor_seq = int(cursor_seq) if cursor_seq is not None else 0
+            previous_watermark = (
+                tuple(state["watermark"]) if state.get("watermark") else None
+            )
             rows_before = int(state.get("rows_exported") or 0)
             index = int(state.get("next_part") or 1)
 
             parts_written = 0
             rows_written = 0
+            late_rows = 0
             while True:
                 if self.max_parts_per_run is not None and parts_written >= self.max_parts_per_run:
                     result.notes.append(
@@ -288,14 +553,16 @@ class DecisionExporter:
                     )
                     break
 
-                rows = self._fetch_batch(watermark, self.batch_rows)
+                self._assign_missing_seq()
+                rows = self._fetch_batch(cursor_seq, self.batch_rows)
                 if not rows:
                     result.caught_up = True
                     break
 
                 _write_part(self._part_path(index), rows)
-                watermark = self._cursor_of(rows[-1])
+                cursor_seq = int(rows[-1][_SEQ_INDEX])
                 rows_written += len(rows)
+                late_rows += _count_late_rows(rows, previous_watermark)
                 parts_written += 1
                 index += 1
 
@@ -303,11 +570,19 @@ class DecisionExporter:
                 # its state update is recovered on the next run by re-reading
                 # the part's last line; a state update without its part would
                 # be data loss that nothing could detect.
+                stored = tuple(state["watermark"]) if state.get("watermark") else None
+                for row in rows:
+                    business = _cursor_strings(row[_TIME_INDEX], row[_ID_INDEX])
+                    if stored is None or business > stored:
+                        stored = business
+                if stored is not None:
+                    state["watermark"] = list(stored)
                 state.update(
                     {
+                        "version": _STATE_VERSION,
                         "next_part": index,
                         "rows_exported": rows_before + rows_written,
-                        "watermark": list(watermark),
+                        "cursor_seq": cursor_seq,
                         "last_run_at_utc": datetime.now(tz=UTC).isoformat(),
                     }
                 )
@@ -315,7 +590,11 @@ class DecisionExporter:
 
             result.rows_exported = rows_written
             result.parts_written = parts_written
-            result.watermark = watermark  # type: ignore[assignment]
+            result.late_rows = late_rows
+            result.cursor_seq = cursor_seq
+            result.watermark = (
+                tuple(state["watermark"]) if state.get("watermark") else None
+            )
             if result.caught_up and rows_written == 0:
                 result.notes.append("already at the watermark; nothing new to export")
         except Exception as exc:  # a side channel must not raise
@@ -325,31 +604,54 @@ class DecisionExporter:
         result.duration_seconds = time.monotonic() - started
         return result
 
-    def _fetch_batch(self, watermark: tuple[str, str] | None, limit: int) -> list[Any]:
-        """One strictly ordered page of decisions.
+    def _assign_missing_seq(self) -> None:
+        """Give sequence values to rows written without one, in write order.
 
-        ``decision_id`` is a hash, so it has no order of its own; it is used
-        only to break ties on ``decision_time_utc``. That is what makes the
-        cursor total: two decisions recorded in one cycle share an instant,
-        and a cursor holding only the instant would re-read or drop one.
+        Rows can lack ``export_seq`` only when they were written by an image
+        that predates migration 0005 - typically an operator rolled the
+        engine back and forward again. The repair is bounded by the batch
+        size, ordered by ``created_at_utc`` so it follows write order, and
+        idempotent: an interrupted repair simply leaves NULLs for the next
+        batch to continue.
+        """
+        try:
+            missing = self.con.execute(
+                "SELECT decision_id FROM shadow_decisions WHERE export_seq IS NULL "
+                "ORDER BY created_at_utc, decision_id LIMIT ?",
+                [self.batch_rows],
+            ).fetchall()
+        except Exception:
+            # A database without the column at all (pre-0005, exporter run
+            # against it by mistake) must not take the engine down; the fetch
+            # below will fail the same way and be reported as a failed batch.
+            return
+        if not missing:
+            return
+        self.con.executemany(
+            "UPDATE shadow_decisions SET export_seq = "
+            "nextval('seq_shadow_decision_export') WHERE decision_id = ?",
+            [[row[0]] for row in missing],
+        )
+
+    def _fetch_batch(self, cursor_seq: int, limit: int) -> list[Any]:
+        """One strictly ordered page of decisions, positioned by write sequence.
+
+        ``export_seq`` is unique and claimed at insert, so ordering by it
+        alone is a strict total order: a row re-written after export keeps
+        its sequence and is never fetched again, and a row written late -
+        however far its business time lies in the past - carries a fresh,
+        high sequence and is always reachable above the cursor.
         """
         columns = ", ".join(EXPORT_COLUMNS)
         join = " LEFT JOIN market_catalog c ON c.market_id = d.market_id "
-        if watermark is None:
-            sql = f"SELECT {columns} FROM shadow_decisions d{join}"                 "ORDER BY d.decision_time_utc, d.decision_id LIMIT ?"
-            params: list[Any] = [limit]
-        else:
-            sql = f"SELECT {columns} FROM shadow_decisions d{join}"                 "WHERE d.decision_time_utc > ? "                 "   OR (d.decision_time_utc = ? AND d.decision_id > ?) "                 "ORDER BY d.decision_time_utc, d.decision_id LIMIT ?"
-            params = [watermark[0], watermark[0], watermark[1], limit]
-        return self.con.execute(sql, params).fetchall()
+        sql = (
+            f"SELECT {columns} FROM shadow_decisions d{join}"
+            "WHERE d.export_seq > ? "
+            "ORDER BY d.export_seq, d.decision_id LIMIT ?"
+        )
+        return self.con.execute(sql, [cursor_seq, limit]).fetchall()
 
-    @staticmethod
-    def _cursor_of(row: Any) -> tuple[str, str]:
-        stamp, decision = row[21], row[0]
-        if isinstance(stamp, datetime):
-            stamp = stamp.astimezone(UTC).isoformat()
-        return (str(stamp), str(decision))
-
+    # -- reconciliation ------------------------------------------------------
 
     def verify(self) -> dict[str, Any]:
         """Recount what is on disk and compare it with what state claims.
@@ -367,7 +669,162 @@ class DecisionExporter:
             "rows_in_state": claimed,
             "consistent": counted == claimed,
             "watermark": state.get("watermark"),
+            "cursor_seq": state.get("cursor_seq"),
+            "state_version": state.get("version"),
         }
+
+    def reconcile(self) -> dict[str, Any]:
+        """Prove the export against the source table: nothing lost, nothing twice.
+
+        The v2 invariant makes this cheap and exact: the exported set is the
+        prefix ``{rows with export_seq <= cursor_seq}``. If that holds, then
+
+        * no loss  - every source row at or below the cursor is in the parts
+          (the counts agree), and every row above it is simply pending;
+        * no duplication - the sequences strictly increase across the whole
+          concatenation of parts, and the source row count at or below the
+          cursor equals the row count on disk.
+
+        A duplicate line would repeat a sequence; a hole in the parts would
+        make the on-disk count smaller than the source count. Both are
+        reported as the first divergence rather than as a bare boolean, so
+        an operator can act on the answer.
+        """
+        state = self._load()
+        cursor_seq = state.get("cursor_seq")
+        report: dict[str, Any] = {
+            "state_version": state.get("version"),
+            "cursor_seq": cursor_seq,
+            "rows_in_state": int(state.get("rows_exported") or 0),
+            "source_rows_unsequenced": None,
+            "source_rows_at_or_below_cursor": None,
+            "rows_on_disk": None,
+            "max_seq_on_disk": None,
+            "seq_monotone": None,
+            "first_divergence": None,
+            "consistent": False,
+        }
+        if int(state.get("version") or 1) < _STATE_VERSION:
+            report["first_divergence"] = (
+                "state is still at v1 (business-time cursor); the one-time "
+                "transition has not completed"
+            )
+            return report
+
+        try:
+            unsequenced = self.con.execute(
+                "SELECT COUNT(*) FROM shadow_decisions WHERE export_seq IS NULL"
+            ).fetchone()[0]
+            at_or_below = self.con.execute(
+                "SELECT COUNT(*) FROM shadow_decisions WHERE export_seq <= ?",
+                [int(cursor_seq or 0)],
+            ).fetchone()[0]
+        except Exception as exc:
+            report["first_divergence"] = (
+                f"cannot read the source table: {type(exc).__name__}: {exc}"
+            )
+            return report
+        report["source_rows_unsequenced"] = int(unsequenced)
+        report["source_rows_at_or_below_cursor"] = int(at_or_below)
+
+        parts = sorted(self.parts_dir.glob("part-*.jsonl")) if self.parts_dir.exists() else []
+        rows_on_disk = 0
+        max_seq: int | None = None
+        monotone = True
+        divergence: str | None = None
+        for path in parts:
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    rows_on_disk += 1
+                    try:
+                        seq = json.loads(line).get("export_seq")
+                    except ValueError:
+                        monotone = False
+                        divergence = f"{path.name}: a line is not valid JSON"
+                        break
+                    if seq is None:
+                        # Legacy lines predate the column and may only appear
+                        # before any sequenced line: after the transition the
+                        # parts are strictly write-ordered, so a seq-less line
+                        # after a sequenced one is a mixed-up export.
+                        if max_seq is not None:
+                            monotone = False
+                            divergence = (
+                                f"{path.name}: a line without export_seq follows "
+                                f"sequence {max_seq}; legacy and v2 parts are "
+                                "interleaved"
+                            )
+                            break
+                        continue
+                    seq = int(seq)
+                    if max_seq is not None and seq <= max_seq:
+                        monotone = False
+                        divergence = (
+                            f"{path.name}: export_seq {seq} follows {max_seq}; "
+                            "the parts are not strictly increasing in write order"
+                        )
+                        break
+                    max_seq = seq
+                if divergence:
+                    break
+        report["rows_on_disk"] = rows_on_disk
+        report["max_seq_on_disk"] = max_seq
+        report["seq_monotone"] = monotone
+
+        if divergence:
+            report["first_divergence"] = divergence
+        elif not monotone:
+            report["first_divergence"] = "parts are not monotone in export_seq"
+        elif rows_on_disk != int(state.get("rows_exported") or 0):
+            report["first_divergence"] = (
+                f"state claims {state.get('rows_exported')} row(s) but the parts "
+                f"hold {rows_on_disk}"
+            )
+        elif max_seq is None and int(at_or_below) not in (0, rows_on_disk):
+            # All-legacy parts: the prefix invariant cannot be checked against
+            # the sequence, so the only honest claim is the row-count match.
+            report["first_divergence"] = (
+                f"the source holds {at_or_below} row(s) at or below cursor_seq "
+                f"{cursor_seq} but the parts hold {rows_on_disk}"
+            )
+        elif max_seq is not None and int(at_or_below) != rows_on_disk:
+            report["first_divergence"] = (
+                f"the source holds {at_or_below} row(s) at or below cursor_seq "
+                f"{cursor_seq} but the parts hold {rows_on_disk}; rows were lost "
+                "or duplicated between the database and the export"
+            )
+        elif max_seq is not None and int(cursor_seq or 0) != max_seq:
+            report["first_divergence"] = (
+                f"state cursor_seq is {cursor_seq} but the newest part ends at "
+                f"{max_seq}"
+            )
+        report["consistent"] = report["first_divergence"] is None
+        return report
+
+
+def _cursor_strings(stamp: Any, decision: Any) -> tuple[str, str]:
+    if isinstance(stamp, datetime):
+        stamp = stamp.astimezone(UTC).isoformat()
+    return (str(stamp), str(decision))
+
+
+def _count_late_rows(rows: list[Any], watermark: tuple[str, str] | None) -> int:
+    """Rows whose business cursor sits at or below the pre-batch watermark.
+
+    The count makes late REPLAY delivery observable without reading
+    anything twice: after the batch, the operator (and the tests) can see
+    how many rows arrived out of business order, rather than inferring it
+    from a watermark that no longer moves monotonically.
+    """
+    if watermark is None:
+        return 0
+    return sum(
+        1
+        for row in rows
+        if _cursor_strings(row[_TIME_INDEX], row[_ID_INDEX]) <= watermark
+    )
 
 
 def _index_of(path: Path) -> int:
@@ -392,18 +849,40 @@ def _read_last_line(path: Path) -> str | None:
     return lines[-1] if lines else None
 
 
-def _end_cursor_of(path: Path) -> tuple[str, str] | None:
+def _last_row_of(path: Path) -> dict[str, Any] | None:
     line = _read_last_line(path)
     if not line:
         return None
-    try:
-        row = json.loads(line)
-    except ValueError:
+    with contextlib.suppress(ValueError):
+        return json.loads(line)
+    return None
+
+
+def _end_cursor_of(path: Path) -> tuple[str, str] | None:
+    row = _last_row_of(path)
+    if not row:
         return None
     ts, did = row.get("decision_time_utc"), row.get("decision_id")
     if not ts or not did:
         return None
     return (str(ts), str(did))
+
+
+def _end_seq_of(path: Path) -> int | None:
+    """The write-sequence position a part ended at, for v2 recovery.
+
+    ``None`` for v1 parts (they predate the column) and for anything
+    unreadable; the caller decides what that means.
+    """
+    row = _last_row_of(path)
+    if not row:
+        return None
+    seq = row.get("export_seq")
+    if seq is None:
+        return None
+    with contextlib.suppress(TypeError, ValueError):
+        return int(seq)
+    return None
 
 
 def _ahead(candidate: tuple[str, str], stored: tuple[str, str]) -> bool:
@@ -485,6 +964,11 @@ def read_export_with_watermark(
     while the snapshots silently omit everything part 3 held. No count in
     `coverage` would reveal which range disappeared, so this is the one case
     where refusing is the only honest answer.
+
+    The returned watermark is the business cursor of the newest part's last
+    line. Since v2 parts are ordered by write sequence, a part holding late
+    rows can end at an earlier business instant than its predecessor; the
+    watermark still describes exactly where this enumeration stopped.
     """
     root = Path(directory) / "parts"
     if not root.exists():

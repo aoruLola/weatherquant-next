@@ -577,7 +577,10 @@ data/research/performance-state.duckdb        # 可用 WQ_PERFORMANCE_STATE_DB_P
 规则（均为硬约束，违反即拒绝运行）：
 
 1. 分片序号必须 `1..N` **连续**；缺一个就**不读后面的**（游标是高水位，越过缺口即谎报覆盖）。
-2. 分片内容必须按 `(decision_time_utc, decision_id)` **非降**；违反即拒绝（这也是 REPLAY 迟到写入的可观测化）。
+2. 分片内容按**写入序列 `export_seq` 严格递增**（WQN-20 起；携带序列的行在全串联上重复或回退即拒绝）。
+   携带序列的行允许业务时间回退——那是迟到 REPLAY 行的**合法送达**，计入 `late_rows_seen`；
+   仅无序列的旧格式行仍要求 `(decision_time_utc, decision_id)` 非降（违反即拒绝，这是旧格式下
+   REPLAY 迟到写入的可观测化）。详见 `docs/late-decision-export.md`。
 3. 已消费分片的 `sha256`/行数变化 → 拒绝，要求重建（发布后的分片不可变）。
 4. **行、Episode 状态、计数器、分片记录、游标在同一个事务内提交**；崩溃回滚全部，重跑不会重复计数。
 
