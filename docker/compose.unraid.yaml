@@ -54,8 +54,10 @@ services:
 # Backups are performed *by the collector itself* (see
 # docs/unraid-collector-deployment.md §9): the database file is locked for the
 # writer's whole life, so an external process cannot take a consistent copy of
-# it. The collector flushes, checkpoints, replays into a second database inside
-# one transaction, then re-opens the result read-only and compares row counts
-# before publishing it under backups/.
+# it. Since WQN-1 the copy runs on a background thread with its own connection
+# to the same in-process DuckDB instance: collection, heartbeats and the
+# health probe keep running while a multi-gigabyte backup crawls over FUSE.
+# A copy that exceeds --backup-timeout-seconds (default 1800) is abandoned and
+# the half-written .incomplete- file is discarded, never published.
 #
 # Moving that copy off the NAS is a separate schedule - see §9.3 in the guide.
