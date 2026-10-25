@@ -814,6 +814,14 @@ class CollectorWorker:
     def _run_integrity(self) -> None:
         if self._writer is None:
             return
+        if self._backup_job is not None:
+            # Defer, don't skip: the next cycle (tick_seconds away) runs it
+            # once the copy has published or failed. The check's queries are
+            # catalog-pinned now and would not block on the backup, but a
+            # 30-minute NAS copy meets the 300s cadence many times over, and
+            # keeping the two apart costs the loop nothing.
+            log.debug("integrity check deferred: a backup job is in flight")
+            return
         try:
             report = self._writer.integrity_check()
             if not report.ok:

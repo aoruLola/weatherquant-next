@@ -887,18 +887,27 @@ class CollectorWriter:
 
     # -- integrity ---------------------------------------------------------
 
+    # information_schema.tables lists tables of *every* attached catalog, not
+    # just ours. During an off-thread backup the backup database is attached
+    # to this very instance (instance-wide, see BackupJob), so a listing
+    # without a catalog filter counts the backup's tables too - and each of
+    # those counts waits on the backup's I/O while its copy transaction is
+    # still open. Pinning the listing to the connection's own database is
+    # what keeps integrity checks off the backup's critical path (WQN-1
+    # acceptance: overlapping integrity + backup stalled the loop ~20s on a
+    # slow disk, and the reads even blocked the backup's DETACH).
+    _MAIN_CATALOG_TABLES = (
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = 'main' AND table_catalog = current_database() "
+        "ORDER BY table_name"
+    )
+
     def integrity_check(self) -> IntegrityReport:
         """Structural checks that must hold for collected data to be usable."""
         problems: list[str] = []
         counts: dict[str, int] = {}
 
-        tables = [
-            r[0]
-            for r in self.con.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = 'main' ORDER BY table_name"
-            ).fetchall()
-        ]
+        tables = [r[0] for r in self.con.execute(self._MAIN_CATALOG_TABLES).fetchall()]
         for name in tables:
             counts[name] = int(self.con.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0])
 
@@ -1192,11 +1201,16 @@ class CollectorWriter:
         # the coupling the job exists to prevent.
         if con is None:
             con = self.con
+        # Catalog-pinned for the same reason as integrity_check's listing: a
+        # previous abandoned job may still hold its backup attached to this
+        # instance, and enumerating *its* tables here would replay them into
+        # the new backup as if they were ours.
         return [
             r[0]
             for r in con.execute(
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = 'main' AND table_name != 'schema_migrations' "
+                "WHERE table_schema = 'main' AND table_catalog = current_database() "
+                "AND table_name != 'schema_migrations' "
                 "AND table_type = 'BASE TABLE' ORDER BY table_name"
             ).fetchall()
         ]

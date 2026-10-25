@@ -193,6 +193,102 @@ def test_an_off_thread_backup_is_verified_and_restorable(writer: CollectorWriter
     w2.close()
 
 
+# ---------------------------------------------------------------------------
+# WQN-1 acceptance regression: integrity checks must stay off the backup's
+# critical path (the acceptance harness stalled the loop ~20s and failed the
+# backup when the two overlapped on a slow disk).
+# ---------------------------------------------------------------------------
+
+
+def test_integrity_checks_and_table_listings_ignore_an_attached_backup_catalog(
+    writer: CollectorWriter, tmp_path: Path
+) -> None:
+    """An in-flight (or abandoned) backup is ATTACHed to this very instance.
+
+    The backup's tables must be invisible to the collector's own integrity
+    check and table listings: counting them means waiting on the backup's
+    I/O, and reading them is what kept the catalog pinned so the backup's
+    verification could not re-open its file ("Unique file handle conflict").
+    """
+    writer.stage_book(_book(best_bid=0.45))
+    writer.flush(force=True)
+
+    # Reproduce the in-flight state: a second connection to the same
+    # instance ATTACHes a decoy catalog with same-named tables.
+    decoy = tmp_path / "decoy.duckdb"
+    holder = duckdb.connect(str(writer.db_path))
+    holder.execute(f"ATTACH '{decoy}' AS wq_backup_decoy")
+    holder.execute("CREATE TABLE wq_backup_decoy.order_books AS SELECT 99 AS x")
+
+    try:
+        tables = writer._user_tables()
+        assert "order_books" in tables
+        # The decoy's same-named table must not appear (it would be copied
+        # into the next backup as if it were ours).
+        report = writer.integrity_check()
+        assert report.ok, report.problems
+        assert report.row_counts["order_books"] == 2, report.row_counts["order_books"]
+        assert "schema_migrations" not in tables
+    finally:
+        holder.execute("DETACH wq_backup_decoy")
+        holder.close()
+
+
+def test_integrity_is_deferred_while_a_backup_is_in_flight(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The loop checks integrity every tick, but not while a copy is open."""
+    import time as _time
+
+    calls: list[float] = []
+    real_check = CollectorWriter.integrity_check
+
+    def spy(self: CollectorWriter) -> Any:
+        calls.append(_time.monotonic())
+        return real_check(self)
+
+    monkeypatch.setattr(CollectorWriter, "integrity_check", spy)
+
+    backup_started = threading.Event()
+    started_at_mono: list[float] = []
+    release = threading.Event()
+    real_start = CollectorWriter.start_backup
+
+    def stalled_start(self: CollectorWriter, dest_dir: Any, **kwargs: Any) -> Any:
+        started_at_mono.append(_time.monotonic())
+        backup_started.set()
+        return real_start(self, dest_dir, **kwargs, before_copy=lambda: release.wait(30))
+
+    monkeypatch.setattr(CollectorWriter, "start_backup", stalled_start)
+
+    worker = _start_worker(settings, monkeypatch, run_label="integrity-defer")
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        result["code"] = worker.run()
+
+    thread = threading.Thread(target=run, name="test-worker")
+    thread.start()
+    try:
+        assert backup_started.wait(10.0)
+        # Every cycle would run the check (integrity_seconds=0.0); with the
+        # copy stalled, none may touch the database. (A call *before* the
+        # backup started is fine: integrity runs earlier in the same cycle.)
+        time.sleep(0.5)
+        during = [c for c in calls if c > started_at_mono[0]]
+        assert during == [], f"integrity ran {len(during)} time(s) during the copy"
+        release.set()
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not _events(settings.db_path, "backup"):
+            time.sleep(0.05)
+        assert _events(settings.db_path, "backup"), "the stalled backup never verified"
+        assert calls, "integrity must resume once the backup is no longer in flight"
+    finally:
+        worker.shutdown.set("test complete")
+        thread.join(60.0)
+    assert result.get("code") == ExitCode.OK
+
+
 def test_collection_writes_commit_while_a_backup_is_in_flight(
     writer: CollectorWriter, tmp_path: Path
 ) -> None:
