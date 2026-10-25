@@ -176,7 +176,7 @@ class Ledger:
     def ledger_entries(self, *, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.db.execute(
             "SELECT ts_utc, kind, amount_usdc, balance_after_usdc, ref_type, ref_id, detail_json "
-            "FROM paper_ledger ORDER BY ts_utc, entry_id LIMIT ?",
+            "FROM paper_ledger ORDER BY seq LIMIT ?",
             [int(limit)],
         ).fetchall()
         return [
@@ -532,12 +532,20 @@ class Ledger:
         ref_id: str,
         detail: dict[str, Any],
     ) -> None:
+        # The sequence is the engine's actual order of movements: a batch
+        # settles many fills in one instant, so they share one ts_utc, and a
+        # content hash cannot reconstruct the order the money moved in -
+        # only this counter can. Ordering the ledger by (ts, entry_id) once
+        # shuffled such a batch and broke the running-balance audit chain.
+        # (A wasted sequence on a conflicting insert is a gap, not a problem.)
+        seq = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM paper_ledger").fetchone()[0]
         self.db.execute(
-            "INSERT INTO paper_ledger (entry_id, ts_utc, kind, currency, amount_usdc, "
+            "INSERT INTO paper_ledger (entry_id, seq, ts_utc, kind, currency, amount_usdc, "
             "balance_after_usdc, ref_type, ref_id, detail_json) "
-            "VALUES (?, ?, ?, 'USDC', ?, ?, ?, ?, ?) ON CONFLICT (entry_id) DO NOTHING",
+            "VALUES (?, ?, ?, ?, 'USDC', ?, ?, ?, ?, ?) ON CONFLICT (entry_id) DO NOTHING",
             [
                 ledger_entry_id(kind=kind, ref_id=ref_id),
+                int(seq),
                 ts_utc,
                 kind,
                 amount,
