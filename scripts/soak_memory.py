@@ -282,8 +282,18 @@ def _synthetic_prices(batch_index: int, rows: int, run_id: str, base: datetime) 
     ]
 
 
-def run_backup_cycle(db_path: Path, data_dir: Path, batches: int, rows: int) -> tuple[PhaseReport, dict]:
-    """Feed rows at production flush cadence, then run the daily backup."""
+def run_backup_cycle(
+    db_path: Path, data_dir: Path, batches: int, rows: int, *, flush_rows: int = 500
+) -> tuple[PhaseReport, dict]:
+    """Feed rows at production flush cadence, then run the daily backup.
+
+    ``flush_rows`` is the writer's batch threshold. 500 matches production;
+    raising it (fewer, larger commits) trades cadence fidelity for wall
+    clock when the operator only cares about the backup's memory high-water
+    mark. Progress prints every 25 batches - this phase is bounded by
+    ``--backup-batches``, not by ``--minutes``, and the acceptance found a
+    ~11-minute silent stretch here indistinguishable from a hang.
+    """
     from weatherquant.data.writer import CollectorWriter
 
     report = PhaseReport(name="backup-cycle")
@@ -308,7 +318,7 @@ def run_backup_cycle(db_path: Path, data_dir: Path, batches: int, rows: int) -> 
     writer = CollectorWriter(
         db_path,
         run_id=run_id,
-        flush_rows=500,  # production cadence
+        flush_rows=flush_rows,
         flush_seconds=5.0,
         checkpoint_seconds=300.0,
     )
@@ -319,6 +329,10 @@ def run_backup_cycle(db_path: Path, data_dir: Path, batches: int, rows: int) -> 
         image_tag="soak",
         hostname=os.uname().nodename,
         pid=os.getpid(),
+    )
+    print(
+        f"  backup-cycle: {batches} batches x {rows} rows "
+        f"(flush every {flush_rows}); time-bounded by work, not by --minutes"
     )
     backup_summary: dict = {}
     try:
@@ -344,6 +358,12 @@ def run_backup_cycle(db_path: Path, data_dir: Path, batches: int, rows: int) -> 
                     prices=int(writer.stats["prices_inserted"]),
                 )
             )
+            if batch % 25 == 24 or batch == batches - 1:
+                print(
+                    f"  batch {batch + 1}/{batches}: rss {rss:.0f} MiB, "
+                    f"books {writer.stats['books_inserted']}, "
+                    f"elapsed {time.monotonic() - started:.0f}s"
+                )
 
         rss_before, _ = read_rss_mb(os.getpid())
         backup_started = time.monotonic()
@@ -455,7 +475,16 @@ def _report(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--minutes", type=float, default=30.0)
+    parser.add_argument(
+        "--minutes",
+        type=float,
+        default=30.0,
+        help=(
+            "duration of the COLLECTION phase only. The backup-cycle phase "
+            "that follows is bounded by --backup-batches (work, not time) "
+            "and reports its own progress"
+        ),
+    )
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--interval", type=float, default=5.0, help="sample interval, seconds")
     parser.add_argument("--max-rss-mb", type=float, default=3072.0)
@@ -463,6 +492,9 @@ def main() -> int:
     parser.add_argument("--max-psi-full", type=float, default=2.0)
     parser.add_argument("--backup-batches", type=int, default=400,
                         help="synthetic batches fed before the backup (batch = 500 rows)")
+    parser.add_argument("--flush-rows", type=int, default=500,
+                        help="writer flush threshold for the backup-cycle phase; "
+                             "500 is production cadence, raise it for fewer commits")
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
 
@@ -472,13 +504,20 @@ def main() -> int:
     data_dir.mkdir(parents=True)
 
     print(f"memory soak: {args.minutes:.0f} min collection over {data_dir}")
+    print(
+        f"  phases: collection ~{args.minutes:.0f} min (time-bounded), then "
+        f"backup-cycle {args.backup_batches} batches (work-bounded, ~"
+        f"{args.backup_batches * 500 // 1000}k rows) - total runtime exceeds --minutes"
+    )
     collection = run_collection(data_dir, args.minutes, args.interval)
 
     db_path = data_dir / "weatherquant.duckdb"
     if not db_path.exists():
         print("collector produced no database; nothing to run the backup against", file=sys.stderr)
         return 2
-    backup, backup_summary = run_backup_cycle(db_path, data_dir, args.backup_batches, 500)
+    backup, backup_summary = run_backup_cycle(
+        db_path, data_dir, args.backup_batches, 500, flush_rows=args.flush_rows
+    )
 
     gates = {
         "max_rss_mb": args.max_rss_mb,
