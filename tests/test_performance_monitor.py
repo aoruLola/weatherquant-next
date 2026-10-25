@@ -196,3 +196,71 @@ def test_an_unreachable_dashboard_is_a_failure_not_a_crash(tmp_path: Path) -> No
         max_response_mb=32.0,
     )
     assert report["failures"], "unreachable must be reported"
+
+
+# --- acceptance round two: the false-green on non-200 answers -----------------
+
+
+def test_a_rate_limited_endpoint_fails_the_monitor(tmp_path: Path) -> None:
+    """30x 429 with fast, small answers used to read as PASSED: the latency
+    and size gates never saw a problem. A non-200 is now its own failure."""
+    monitor = _load_monitor()
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": "rate limited"})
+
+    report = monitor.probe_dashboard(
+        "http://dashboard.test",
+        token=None,
+        probes=3,
+        max_p95_ms=1000.0,
+        max_response_mb=32.0,
+        transport=httpx.MockTransport(handler),
+    )
+    assert report["failures"], "429 must fail, not pass"
+    assert any("429" in failure for failure in report["failures"])
+
+
+def test_a_422_on_the_clamp_probe_fails_rather_than_passing(tmp_path: Path) -> None:
+    """A truncated detail shard answers the clamp probe with 422 and zero
+    items - which the old check read as 'clamped to 0 items' and passed."""
+    monitor = _load_monitor()
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "limit=1000000" in str(request.url):
+            return httpx.Response(422, json={"error": "malformed detail part"})
+        return httpx.Response(200, json={"data": {"items": [{"i": n} for n in range(50)]}})
+
+    report = monitor.probe_dashboard(
+        "http://dashboard.test",
+        token=None,
+        probes=1,
+        max_p95_ms=1000.0,
+        max_response_mb=32.0,
+        transport=httpx.MockTransport(handler),
+    )
+    assert any("clamp" in failure and "422" in failure for failure in report["failures"]), (
+        report["failures"]
+    )
+
+
+def test_core_probes_fail_on_5xx(tmp_path: Path) -> None:
+    monitor = _load_monitor()
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    report = monitor.probe_dashboard(
+        "http://dashboard.test",
+        token=None,
+        probes=2,
+        max_p95_ms=1000.0,
+        max_response_mb=32.0,
+        transport=httpx.MockTransport(handler),
+    )
+    # The /summary reachability check itself answers 500, which is its own
+    # failure before the endpoint loop runs.
+    assert report["failures"], "an unhealthy source must fail"

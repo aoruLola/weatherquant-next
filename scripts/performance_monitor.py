@@ -216,6 +216,17 @@ def probe_dashboard(
                     "p95_ms": round(p95, 1),
                 }
                 report["probes"].append(entry)
+                # A non-200 is a failure in its own right, before any latency
+                # or size gate: a 429 (rate limited) or 422 (malformed shard)
+                # arrives fast and small, so the latency gates would pass it
+                # and the monitor would go green on a broken endpoint - the
+                # false-green the local acceptance measured (30x 429, PASSED).
+                if status != 200:
+                    report["failures"].append(
+                        f"{name} answered {status}; a degraded endpoint is a "
+                        "failed gate regardless of how fast it answers"
+                    )
+                    continue
                 if p95 > max_p95_ms:
                     report["failures"].append(
                         f"{name} p95 {p95:.0f}ms above the gate {max_p95_ms}ms"
@@ -233,8 +244,17 @@ def probe_dashboard(
             body = clamped.json()
             data = body.get("data", {})
             items = len(data.get("items") or data.get("episodes") or [])
-        report["limit_clamp"] = {"requested": 1000000, "served_items": items}
-        if clamped.status_code == 200 and items > 200:
+        report["limit_clamp"] = {
+            "requested": 1000000,
+            "status": clamped.status_code,
+            "served_items": items,
+        }
+        if clamped.status_code != 200:
+            report["failures"].append(
+                f"limit clamp probe answered {clamped.status_code}; the clamp "
+                "can only be verified against a 200"
+            )
+        elif items > 200:
             report["failures"].append(
                 f"limit=1000000 served {items} items: the server-side clamp is gone"
             )
