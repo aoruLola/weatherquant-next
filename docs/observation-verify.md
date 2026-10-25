@@ -99,3 +99,42 @@ persist_verification_results(con, [result])
 **需 NAS/人工的部分（未做）**：对真实 NOAA/WU 原始观测与真实已结算事件
 跑批量核验（本机模块测试全部使用合成读数与真实解析器输出的规则条款）；
 观测来源的接入（`klga_observations` 的采集路径）不在本工单范围。
+
+---
+
+## 7. 当前 METAR / T 规则族（本机验收修复，2026-10-26）
+
+验收发现：**2026-10 起上线的 KLGA 规则族完全不受支持**——旧解析器给不出
+precision（判 `unusable_rules`），强行补 precision 后 °C 读数被直接与 °F
+档位比较（假 MISMATCH）。已按规则原文（真实事件全文存
+`tests/fixtures/rules/klga_metar_2026.txt`）支持：
+
+| 规则条款 | 解析/实现 |
+|---|---|
+| "highest temperature reported in the hourly temperature remark of any routine (METAR) observation" | 家族判定 `statistic_family='metar_t_group'` |
+| "in tenths of a degree Celsius as reported" | `observation_unit='degC'`、`precision_deg=0.1` |
+| "Each market states its range in whole degrees Fahrenheit" | `unit='degF'`（档位单位） |
+| "rounded to the nearest whole degree, with a value ending in exactly half rounded up" | `rounding='half_up_f'`；`_round_half_up = floor(x+0.5)`（规则自带例子 18.3°C→65、17.8°C→64、19°C→66、−22.5°C→−8 全部有测试） |
+| "A report whose line begins with SPECI ... does not count" | `observation_filter='routine_excluding_speci'`；SPECI 行被**计数排除**（`n_excluded_special`），更暖也不合格 |
+| "resolve to the lowest bracket"（新措辞） | 新正则直接锚定该短语 → `no_data_resolution` |
+| "The resolution source ... published here: https://aviationweather.gov/api/data/metar?..." | `primary_source_name='METAR'` + 源 URL 逐字保留 |
+| 观测单位换算 | 最大值先取（观测单位），再 ×9/5+32 换算到档位单位，再按 half-up 取整——**°C 永不与 °F 档位直接比较**；无定义换算 → `unusable_rules` 而不是猜 |
+
+验收修复同批：
+
+- `parser_version` 落库不再为 NULL：`ParsedRules` 自带版本字段；规则 dict 带
+  哈希而无版本字段时回退 `settlement-rules-1`（该 dict 只能出自解析器）。
+- `persist_verification_results` 改为逐行写入：一行失败（如 NOT NULL）不再
+  回滚整批，返回 `(written, failed)`；station 缺失的 UNUSABLE 行用哨兵
+  `"unknown"` 落库——坏行本身也是证据。
+- **接入主流程**：新 CLI `weatherquant-research verify-market`——
+  `--collector-copy`（规则+档位，副本只读）+ `--settlements`（赔付 1.0=赢家）
+  + `--observations-db/--observations-file` → 双向核验 → `--persist` 落研究库
+  → `--out` 产出 verified 对（供 `backfill-settlements --verified`）。
+  与 WQN-32 队列闭环：`resolved_unverified` → verify-market → verified → WIN/LOSS。
+- 2026-10-24 案例（验收手算 16.7°C → 62.06°F → 62 → 62-63°F 与平台一致）
+  现为端到端测试：CLI 全流程 MATCH 且产出 verified 对。
+
+仍需 NAS/人工：观测侧 T 组解析的采集路径（把 METAR 报文拆成 temp_c+report_type
+行存入 `klga_observations`）是 collector 侧依赖，verify-market 消费其产物；
+生产事件的批量核验待观测数据接入后进行。

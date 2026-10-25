@@ -13,6 +13,10 @@ import json
 from datetime import UTC, date, datetime, timedelta
 
 from weatherquant.markets.settlement_rules import parse_rules_text
+
+NOW_ISO = datetime(2026, 10, 26, 12, 0, tzinfo=UTC).isoformat()
+
+
 from weatherquant.truth.observation_verify import (
     AMBIGUOUS_WINNER,
     INCOMPLETE_OBSERVATION,
@@ -283,7 +287,7 @@ def test_provenance_travels_with_the_verdict() -> None:
     assert set(sources) == {"noaa-timeseries", "wu-daily"}
     assert sources["wu-daily"]["n_readings"] == 1
     assert result.rules_sha256
-    assert result.verifier_version == "observation-verify-1"
+    assert result.verifier_version == "observation-verify-2"
     assert result.aggregation_rule.startswith("max of hourly readings")
 
 
@@ -351,10 +355,10 @@ def test_verification_rows_persist_with_full_provenance(tmp_path) -> None:
         target_date=day,
         event_id=EVENT,
     )
-    count = persist_verification_results(
+    written, failed = persist_verification_results(
         con, [result], verified_at_utc=dt(2026, 10, 26, 12, 0, tzinfo=UTC)
     )
-    assert count == 1
+    assert (written, failed) == (1, [])
 
     row = con.execute(
         "SELECT verdict, detail, expected_hours, distinct_hours, observed_max_f, "
@@ -371,3 +375,255 @@ def test_verification_rows_persist_with_full_provenance(tmp_path) -> None:
     assert row[6] == MARKET_VERIFY_VERSION
     sources = json.loads(row[7])
     assert sources and sources[0]["source"] == "noaa-timeseries"
+
+
+# --- the current METAR / T-group rules family (real rules text) ---------------
+
+
+def _current_rules(**overrides) -> dict:
+    """Rules parsed from the REAL 2026-10 rules text (KLGA, METAR family)."""
+    from pathlib import Path
+
+    from weatherquant.markets.settlement_rules import parse_rules_text
+
+    fixture = Path(__file__).parent / "fixtures" / "rules" / "klga_metar_2026.txt"
+    parsed = parse_rules_text(fixture.read_text(encoding="utf-8"), event_id=EVENT)
+    base = {
+        "station": parsed.station,
+        "unit": parsed.unit,
+        "precision_deg": parsed.precision_deg,
+        "rounding": parsed.rounding,
+        "observation_unit": parsed.observation_unit,
+        "observation_filter": parsed.observation_filter,
+        "no_data_resolution": parsed.no_data_resolution,
+        "rules_sha256": parsed.rules_sha256,
+        "parser_version": parsed.parser_version,
+    }
+    base.update(overrides)
+    return base
+
+
+def _metar(day: date, hour_utc: int, temp_c: float, *, special: bool = False) -> dict:
+    when = datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(hours=hour_utc)
+    return {
+        "obs_time_utc": when,
+        "temp_c": temp_c,
+        "source": "aviationweather-metar",
+        "report_type": "SPECI" if special else "METAR",
+    }
+
+
+def test_the_current_rules_family_parses_every_term_the_verifier_needs() -> None:
+    from weatherquant.markets.settlement_rules import RULES_PARSER_VERSION
+
+    rules = _current_rules()
+    assert rules["station"] == "KLGA"
+    assert rules["unit"] == "degF", "brackets are quoted in whole degrees Fahrenheit"
+    assert rules["observation_unit"] == "degC", "the station reports tenths of a degree Celsius"
+    assert rules["precision_deg"] == 0.1
+    assert rules["rounding"] == "half_up_f"
+    assert rules["observation_filter"] == "routine_excluding_speci"
+    assert rules["no_data_resolution"] == "the lowest bracket"
+    assert rules["parser_version"] == RULES_PARSER_VERSION
+
+
+def test_the_2026_10_24_case_resolves_to_62_63F() -> None:
+    """The acceptance's hand calc, end to end: max 16.7C -> 62.06F -> 62 ->
+    62-63F, matching what the venue paid. Under the old verifier this event
+    was unusable_rules (no precision parsed) and, with precision forced,
+    a false mismatch (16.7C compared against a Fahrenheit bracket)."""
+    day = date(2026, 10, 24)
+    # A full local day (24h) of routine METARs in tenths of a degree Celsius.
+    observations = [_metar(day, h, 12.0 + (h % 5) * 0.4) for h in range(4, 28)]
+    observations.append(_metar(day, 21, 16.7))  # the day's peak (62.06F -> 62)
+
+    result = verify_market_rules(
+        rules=_current_rules(),
+        markets=_markets(61, 62, "61-62F", market_id="m-win"),
+        outcomes=[_outcome("m-win")],
+        observations=observations,
+        target_date=day,
+        event_id=EVENT,
+    )
+
+    assert result.observed_max_whole_f == 62, result.detail
+    assert result.verdict == MATCH
+    assert result.observation_picks_venue_winner is True
+    assert result.venue_bracket_contains_observation is True
+
+
+def test_speci_reports_never_win_even_when_warmer() -> None:
+    """The rules exclude special reports by line type - a warmer SPECI is
+    counted (not silently dropped) and still not the qualifying value."""
+    day = date(2026, 10, 24)
+    observations = [_metar(day, h, 12.0) for h in range(4, 28)]
+    observations.append(_metar(day, 21, 16.7))          # routine peak -> 62F
+    observations.append(_metar(day, 22, 19.9, special=True))  # SPECI, warmer
+
+    result = verify_market_rules(
+        rules=_current_rules(),
+        markets=_markets(61, 62, "61-62F", market_id="m-win"),
+        outcomes=[_outcome("m-win")],
+        observations=observations,
+        target_date=day,
+        event_id=EVENT,
+    )
+
+    assert result.n_excluded_special == 1
+    assert result.observed_max_whole_f == 62
+    assert result.verdict == MATCH
+
+
+def test_the_rules_own_rounding_examples_hold() -> None:
+    """18.3C -> 65F, 17.8C -> 64F, 19C -> 66F, -22.5C -> -8F: the exact-half
+    rounds UP, which Python's banker's round() gets wrong on both ends."""
+    from weatherquant.truth.observation_verify import _round_half_up
+
+    assert round(18.3 * 9 / 5 + 32, 2) == 64.94
+    assert _round_half_up(18.3 * 9 / 5 + 32) == 65
+    assert _round_half_up(17.8 * 9 / 5 + 32) == 64
+    assert _round_half_up(19.0 * 9 / 5 + 32) == 66
+    assert _round_half_up(-22.5 * 9 / 5 + 32) == -8  # exactly -8.5 rounds up to -8
+
+
+def test_a_degC_reading_is_never_compared_against_a_degF_bracket() -> None:
+    """The acceptance's forced-precision scenario: with the units wired, the
+    same observations that produced a false mismatch now match."""
+    day = date(2026, 10, 24)
+    observations = [_metar(day, h, 12.0) for h in range(4, 28)]
+    observations.append(_metar(day, 21, 16.7))
+
+    result = verify_market_rules(
+        rules=_current_rules(),
+        markets=_markets(61, 62, "61-62F", market_id="m-win"),
+        outcomes=[_outcome("m-win")],
+        observations=observations,
+        target_date=day,
+        event_id=EVENT,
+    )
+    assert result.verdict == MATCH
+    # observed_max_f carries the converted-but-unrounded value; the bracket
+    # comparison uses the whole-degree rounding the rules declare.
+    assert result.observed_max_f is not None and abs(result.observed_max_f - 62.06) < 0.01
+    assert result.observed_max_whole_f == 62
+
+
+def test_a_rules_row_without_station_still_persists_and_spares_the_batch(tmp_path) -> None:
+    """One UNUSABLE row with no station must not roll back its batch - and
+    the row itself lands under the documented sentinel."""
+
+    from weatherquant.storage.research import initialize_research
+    from weatherquant.truth.observation_verify import persist_verification_results
+
+    db = tmp_path / "research.duckdb"
+    con, _applied = initialize_research(db)
+
+    broken = verify_market_rules(
+        rules={"station": None, "unit": "degF", "precision_deg": 1.0, "rules_sha256": "x"},
+        markets=_markets(59, 61, "59-61F", market_id="m-win"),
+        outcomes=[_outcome("m-win")],
+        observations=[_obs(date(2026, 10, 13), 12, 60.0)],
+        target_date=date(2026, 10, 13),
+        event_id="e-broken",
+    )
+    good = verify_market_rules(
+        rules=_rules(),
+        markets=_markets(59, 61, "59-61F", market_id="m-win"),
+        outcomes=[_outcome("m-win")],
+        observations=[_obs(date(2026, 10, 14), h, 60.0) for h in range(4, 28)],
+        target_date=date(2026, 10, 14),
+        event_id=EVENT,
+    )
+    written, failed = persist_verification_results(con, [broken, good])
+    con.close()
+
+    assert written == 2, f"the good row must survive the broken one: {failed}"
+    assert failed == []
+
+
+# --- CLI wiring: verify-market over a collector copy, end to end ---------------
+
+
+def test_verify_market_cli_matches_and_emits_verified_pairs(tmp_path) -> None:
+    """The wired flow: collector copy (real rules text + brackets) +
+    settlement index + readings -> MATCH -> verified pairs for
+    backfill-settlements --verified, and a persisted row that carries
+    parser_version."""
+
+    import duckdb
+
+    from weatherquant.cli import main
+
+    collector = tmp_path / "collector.duckdb"
+    con, _ = _init_collector_like(collector)
+    con.execute(
+        "INSERT INTO events (event_id, slug, title, target_date, fetched_at_utc, raw) "
+        "VALUES ('e-1024', 'slug-1024', 't', '2026-10-24', now(), '{}')"
+    )
+    con.execute(
+        "INSERT INTO markets (market_id, event_id, condition_id, question, "
+        "bracket_label, bracket_kind, bracket_low, bracket_high, token_yes, token_no, "
+        "target_date, station, tick_size, min_order_size_shares, active, closed, "
+        "accepting_orders, rules_text, fetched_at_utc, raw) VALUES "
+        "('700001', 'e-1024', '0xabc', 'q', '61-62°F', 'range', 61.0, 62.0, 'yes', 'no', "
+        "'2026-10-24', 'KLGA', 0.01, 5, true, false, true, ?, now(), '{}')",
+        [_rules_text()],
+    )
+    con.close()
+
+    settlements = tmp_path / "settlements.json"
+    settlements.write_text(json.dumps([
+        {"market_id": "700001", "target_date": "2026-10-24",
+         "settlement_status": "RESOLVED", "resolved_outcome": 1.0,
+         "verification_status": "UNVERIFIED", "fetched_at_utc": NOW_ISO},
+    ]), encoding="utf-8")
+
+    day = date(2026, 10, 24)
+    readings = []
+    for hour in range(4, 28):
+        when = datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(hours=hour)
+        readings.append({"obs_time_utc": when.isoformat(), "temp_c": 12.0,
+                         "report_type": "METAR", "source": "aviationweather-metar"})
+    peak = datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(hours=21)
+    readings.append({"obs_time_utc": peak.isoformat(), "temp_c": 16.7,
+                     "report_type": "METAR", "source": "aviationweather-metar"})
+    obs_file = tmp_path / "observations.json"
+    obs_file.write_text(json.dumps(readings), encoding="utf-8")
+
+    out = tmp_path / "verified.json"
+    research = tmp_path / "research.duckdb"
+    code = main([
+        "verify-market",
+        "--collector-copy", str(collector),
+        "--date", "2026-10-24",
+        "--settlements", str(settlements),
+        "--observations-file", str(obs_file),
+        "--persist", str(research),
+        "--out", str(out),
+    ])
+    assert code == 0
+
+    pairs = json.loads(out.read_text(encoding="utf-8"))
+    assert pairs == [{"market_id": "700001", "target_date": "2026-10-24"}]
+
+    row = duckdb.connect(str(research), read_only=True).execute(
+        "SELECT verdict, parser_version, n_excluded_special, observed_max_whole_f "
+        "FROM market_rule_verification"
+    ).fetchall()
+    verdict, parser_version, _special, whole = row[0]
+    assert verdict == "match"
+    assert parser_version == "settlement-rules-1", "the rules version must land"
+    assert whole == 62
+
+
+def _init_collector_like(path):
+    from weatherquant.storage import initialize
+
+    return initialize(path)
+
+
+def _rules_text() -> str:
+    from pathlib import Path
+
+    fixture = Path(__file__).parent / "fixtures" / "rules" / "klga_metar_2026.txt"
+    return fixture.read_text(encoding="utf-8")

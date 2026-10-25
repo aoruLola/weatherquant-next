@@ -41,6 +41,7 @@ Verdicts:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -61,7 +62,11 @@ __all__ = [
 
 #: Bumped when the comparison rules change; every persisted row carries it,
 #: so a verdict can always be re-run under the version that produced it.
-MARKET_VERIFY_VERSION = "observation-verify-1"
+MARKET_VERIFY_VERSION = "observation-verify-2"
+
+#: The parser version to record when a rules dict carries a hash but no
+#: parser_version field - i.e. it was built before the parser stamped itself.
+RULES_PARSER_FALLBACK = "settlement-rules-1"
 
 MATCH = "match"
 MISMATCH = "mismatch"
@@ -102,6 +107,7 @@ class MarketVerifyResult:
     n_readings: int
     n_out_of_day: int
     n_malformed: int
+    n_excluded_special: int = 0
 
     # The two directions, separately. Both true is `match`; any other
     # combination is a mismatch, and the pair says which way it broke.
@@ -157,6 +163,15 @@ def _require(
     return value
 
 
+def _round_half_up(value: float) -> int:
+    """Round to the nearest whole degree, exactly-half UP - the rounding the
+    METAR family's rules spell out ("18.3°C is 64.94°F and counts as 65°F;
+    -22.5°C is exactly -8.5°F and counts as -8°F"). Python's ``round`` is
+    banker's rounding and gets both of those wrong; floor(x + 0.5) matches
+    the rules for positives and negatives alike."""
+    return math.floor(value + 0.5)
+
+
 def verify_market_rules(
     *,
     rules: Mapping[str, Any],
@@ -169,14 +184,30 @@ def verify_market_rules(
     """Run the two-way verification for one event on one target date.
 
     ``rules`` is a parsed rules row (station, unit, precision_deg, rounding,
-    no_data_resolution, rules_sha256, parser_version) - the market's own
+    no_data_resolution, rules_sha256, parser_version, and - for the METAR
+    family - observation_unit and observation_filter) - the market's own
     terms, never a convention this module prefers. ``markets`` are the
     event's brackets; ``outcomes`` say what the venue paid; ``observations``
     are station readings for any range of time (out-of-day points are
     counted and excluded, so a caller may pass a whole archive).
+
+    Units are the rules' business: ``observation_unit`` says which column a
+    reading arrives in (degF for the NOAA/WU families, degC for the METAR
+    family); ``unit`` says what the brackets are quoted in. When the two
+    differ the maximum is converted (°F = °C x 9/5 + 32) and rounded per the
+    rules' rounding clause - comparing a °C reading against a °F bracket is
+    exactly the silent convention swap this module exists to refuse.
     """
     start, end = local_day_bounds_utc(target_date)
     expected = expected_local_hours(target_date)
+    # parser_version: recorded from the rules when the caller supplies it;
+    # rules that carry a hash came from the parser, which since
+    # settlement-rules-1 stamps its own version - an absent field on a
+    # hashed row means an older dict shape, and the version that parsed it
+    # is the one to record. A row with neither is not from the parser at all.
+    parser_version = rules.get("parser_version") or (
+        RULES_PARSER_FALLBACK if rules.get("rules_sha256") else None
+    )
     common = {
         "event_id": event_id,
         "target_date": target_date,
@@ -185,7 +216,7 @@ def verify_market_rules(
         "local_day_end_utc": end.isoformat(),
         "expected_hours": expected,
         "rules_sha256": rules.get("rules_sha256"),
-        "parser_version": rules.get("parser_version"),
+        "parser_version": parser_version,
         "unit": rules.get("unit"),
         "precision_deg": rules.get("precision_deg"),
     }
@@ -212,12 +243,19 @@ def verify_market_rules(
         )
 
     # --- observations inside the market's local day -------------------------
-    # The unit the RULES name decides which column is read. A degC market
-    # reads temp_c; nothing is silently converted into another convention.
-    temp_key = "temp_f" if str(unit).lower() == "degf" else "temp_c"
+    # Which column a reading arrives in is the OBSERVATION unit from the
+    # rules (degC for the METAR family, degF for the legacy ones) - not a
+    # guess from the bracket unit.
+    observation_unit = str(rules.get("observation_unit") or unit)
+    temp_key = "temp_f" if observation_unit.lower() == "degf" else "temp_c"
+    # The METAR family's SPECI clause: a special observation never counts.
+    # Rows carry the report type verbatim; only an explicit rules filter
+    # turns it into an exclusion, so legacy families are untouched.
+    exclude_special = str(rules.get("observation_filter") or "") == "routine_excluding_speci"
     del station  # validated above; common already carries it
     in_day: list[tuple[datetime, float]] = []
     out_of_day = malformed = 0
+    excluded_special = 0
     sources: dict[str, dict[str, Any]] = {}
     for item in observations:
         when_raw = item.get("obs_time_utc")
@@ -246,6 +284,11 @@ def verify_market_rules(
             malformed += 1
             continue
         source = str(item.get("source") or "unknown")
+        if exclude_special and str(item.get("report_type") or "").upper().startswith("SPECI"):
+            # The rules exclude special reports by line type, whether or not
+            # they carry a higher reading; they are counted, not dropped.
+            excluded_special += 1
+            continue
         stats = sources.setdefault(source, {"n": 0, "first": when, "last": when})
         stats["n"] += 1
         stats["first"] = min(stats["first"], when)
@@ -272,6 +315,7 @@ def verify_market_rules(
             n_readings=len(in_day),
             n_out_of_day=out_of_day,
             n_malformed=malformed,
+            n_excluded_special=excluded_special,
             observation_sources=provenance,
             verdict=verdict,
             detail=detail,
@@ -309,10 +353,22 @@ def verify_market_rules(
         )
 
     observed = max(value for _, value in in_day)
-    # The station measures whole degrees, so the comparison value is the
-    # reading rounded to the nearest integer - the rounding the parsed rules
-    # declare, applied to the observed maximum and no other number.
-    observed_whole = round(observed)
+    # The comparison value, per the rules: the maximum in the OBSERVATION
+    # unit, converted to the bracket unit when they differ (°F = °C x 9/5 +
+    # 32), then rounded exactly-half UP. Max-then-convert is what the METAR
+    # family's text describes; the conversion is monotonic, so the two
+    # orders agree, but the text is followed literally. A °C reading is
+    # never compared against a °F bracket unconverted.
+    if observation_unit.lower() != str(unit).lower():
+        if observation_unit.lower() == "degc" and str(unit).lower() == "degf":
+            observed = observed * 9.0 / 5.0 + 32.0
+        else:
+            return result(
+                UNUSABLE_RULES,
+                f"no conversion defined from {observation_unit} to {unit}; "
+                "refusing to compare across units",
+            )
+    observed_whole = _round_half_up(observed)
 
     # --- observation → bracket ---------------------------------------------
     computed = [
@@ -429,9 +485,9 @@ _VERIFICATION_COLUMNS = (
     "event_id, target_date, station, verdict, detail, observed_max_f, "
     "observed_max_whole_f, observation_picks_venue_winner, "
     "venue_bracket_contains_observation, local_day_start_utc, local_day_end_utc, "
-    "expected_hours, distinct_hours, n_readings, aggregation_rule, unit, "
-    "precision_deg, rules_sha256, parser_version, verifier_version, "
-    "observation_sources_json, verified_at_utc"
+    "expected_hours, distinct_hours, n_readings, n_excluded_special, "
+    "aggregation_rule, unit, precision_deg, rules_sha256, parser_version, "
+    "verifier_version, observation_sources_json, verified_at_utc"
 )
 
 
@@ -442,7 +498,10 @@ def to_row(result: MarketVerifyResult, *, verified_at_utc: datetime) -> tuple:
     return (
         result.event_id,
         result.target_date,
-        result.station,
+        # A verdict whose rules could not name a station is still evidence;
+        # the sentinel keeps the column's NOT NULL honest without losing the
+        # row (local acceptance: one such row used to roll back the batch).
+        result.station or "unknown",
         result.verdict,
         result.detail,
         result.observed_max_f,
@@ -454,6 +513,7 @@ def to_row(result: MarketVerifyResult, *, verified_at_utc: datetime) -> tuple:
         result.expected_hours,
         result.distinct_hours,
         result.n_readings,
+        result.n_excluded_special,
         result.aggregation_rule,
         result.unit,
         result.precision_deg,
@@ -470,17 +530,32 @@ def persist_verification_results(
     results: Iterable[MarketVerifyResult],
     *,
     verified_at_utc: datetime | None = None,
-) -> int:
-    """Insert verification rows. INSERT OR REPLACE on the versioned key: a
-    re-run under the SAME verifier version replaces its own row (it re-derived
-    it from the same inputs); a NEW verifier version writes a new row, so no
-    verdict's provenance is ever overwritten."""
+) -> tuple[int, list[str]]:
+    """Insert verification rows one by one, and keep going past a failure.
+
+    ``executemany`` is atomic: one bad row (a constraint the row shape did
+    not expect) rolled back the whole batch, losing verdicts that were fine.
+    Each row stands on its own here; the failed ones come back as
+    descriptions so the caller can report exactly what did not land.
+
+    INSERT OR REPLACE on the versioned key: a re-run under the SAME verifier
+    version replaces its own row (it re-derived it from the same inputs); a
+    NEW verifier version writes a new row, so no verdict's provenance is
+    ever overwritten. Returns ``(written, failed_descriptions)``.
+    """
     verified_at = verified_at_utc or datetime.now(tz=UTC)
-    rows = [to_row(result, verified_at_utc=verified_at) for result in results]
     placeholders = ", ".join("?" for _ in range(len(_VERIFICATION_COLUMNS.split(","))))
-    con.executemany(
+    statement = (
         f"INSERT OR REPLACE INTO market_rule_verification ({_VERIFICATION_COLUMNS}) "
-        f"VALUES ({placeholders})",
-        rows,
+        f"VALUES ({placeholders})"
     )
-    return len(rows)
+    written = 0
+    failed: list[str] = []
+    for result in results:
+        row = to_row(result, verified_at_utc=verified_at)
+        try:
+            con.execute(statement, row)
+            written += 1
+        except Exception as exc:
+            failed.append(f"{result.event_id}/{result.target_date}: {exc}")
+    return written, failed

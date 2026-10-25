@@ -23,6 +23,7 @@ CREATE TABLE market_rule_verification (
     expected_hours          INTEGER NOT NULL,
     distinct_hours          INTEGER NOT NULL,
     n_readings              INTEGER NOT NULL,
+    n_excluded_special      INTEGER NOT NULL DEFAULT 0,
     aggregation_rule        VARCHAR NOT NULL,
     unit                    VARCHAR,
     precision_deg           DOUBLE,
