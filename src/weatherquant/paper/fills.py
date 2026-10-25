@@ -193,10 +193,6 @@ class FillEngine:
                 for row in pending:
                     result.attempted += 1
                     outcome = self._fill_one_isolated(row, now)
-            with self.store.db.transaction():
-                for row in pending:
-                    result.attempted += 1
-                    outcome = self._fill_one(row, now)
                     if outcome.filled and outcome.fill is not None:
                         settled, refusal = self._settle(outcome.fill, now)
                         if settled:

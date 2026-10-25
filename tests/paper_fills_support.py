@@ -8,9 +8,8 @@ in the ledger).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 import inspect
+from datetime import UTC, datetime
 
 from paper_book_helpers import T_DECISION, TOKEN
 from weatherquant.execution.pricing import taker_fee_usd
