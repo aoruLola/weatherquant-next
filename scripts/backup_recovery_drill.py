@@ -382,8 +382,20 @@ def stage_restore(report: DrillReport, work: Path, source: Path) -> tuple[Path, 
         copy_s = time.monotonic() - started
 
         verify_started = time.monotonic()
-        source_point = _recovery_point(source)
-        restored_point = _recovery_point(dest)
+        # A corrupt or truncated source makes the recovery-point read itself
+        # raise (checksum/IO). That failure belongs to THIS stage with its
+        # evidence attached - not to a catch-all "drill" stage that tells the
+        # operator the drill failed without saying where (local acceptance,
+        # 2026-10-26: a 50%-offset corruption reported restore=pass).
+        try:
+            source_point = _recovery_point(source)
+            restored_point = _recovery_point(dest)
+        except Exception as exc:
+            stage.status = "fail"
+            stage.detail = (
+                f"the recovery point could not be read: {type(exc).__name__}: {exc}"
+            )
+            raise
         failures = _recovery_points_agree(source_point, restored_point)
         if failures:
             stage.status = "fail"
@@ -863,9 +875,20 @@ def main() -> int:
         stage_slow_io(report, work, source)
         stage_incomplete_files(report, work, restored)
     except Exception as exc:
-        stage = report.stage("drill")
-        stage.status = "fail"
-        stage.detail = str(exc)
+        # Attribute the failure to the stage that already recorded it, when
+        # one did - a second catch-all "drill" stage would make the report
+        # say "failed somewhere" next to a stage that says exactly where.
+        existing = report.stage("drill") if not any(
+            s.status == "fail" for s in report.stages
+        ) else None
+        if existing is not None:
+            existing.status = "fail"
+            existing.detail = str(exc)
+        else:
+            failed_stage = next(s for s in report.stages if s.status == "fail")
+            failed_stage.detail = (
+                f"{failed_stage.detail}; unhandled: {type(exc).__name__}: {exc}"
+            ) if "unhandled" not in failed_stage.detail else failed_stage.detail
 
     failures = [s for s in report.stages if s.status == "fail"]
     report.verdict = "FAILED" if failures else "PASSED"

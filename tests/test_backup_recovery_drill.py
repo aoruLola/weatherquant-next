@@ -180,3 +180,41 @@ def test_recovery_point_detects_a_content_change(tmp_path: Path) -> None:
     assert point_a["tables"]["price_history"]["rows"] != point_b["tables"]["price_history"]["rows"]
     failures = drill._recovery_points_agree(point_a, point_b)
     assert failures, "a content change must not pass the recovery-point comparison"
+
+
+def test_a_corrupt_source_fails_the_restore_stage_itself(tmp_path: Path) -> None:
+    """The acceptance's fault injection, asserted at the ledger level: an
+    unreadable source must fail the restore stage with its evidence - not
+    surface as a pass on restore plus a vague 'drill' stage."""
+    # A real database synthesized outside any drill work dir (the drill
+    # clears its work dir at start), then a 4096-byte block overwritten at
+    # the halfway point of the file - the exact shape the acceptance
+    # injected.
+    drill = _load_drill()
+    source = tmp_path / "plain.duckdb"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    drill.synthesize_source(source)
+
+    outside = tmp_path / "corrupt.duckdb"
+    data = source.read_bytes()
+    # Truncate rather than overwrite a mid-file block: on a small synthesized
+    # database the halfway point can land in a free block, which the drill
+    # correctly PASSES (no live data hurt - the acceptance saw the same).
+    # A cut file is unreadable no matter the block layout.
+    outside.write_bytes(data[: int(len(data) * 0.6)])
+
+    corrupt_ledger = tmp_path / "corrupt-ledger" / "drills.jsonl"
+    code, output, _ = _run_drill(
+        tmp_path / "work-corrupt",
+        "--source", str(outside), "--source-is-copy",
+        "--ledger", str(corrupt_ledger), "--keep",
+    )
+    assert code == 1, output
+
+    entry = _ledger_entry(tmp_path / "work-corrupt", corrupt_ledger)
+    by_name = {stage["name"]: stage for stage in entry["stages"]}
+    assert by_name["restore"]["status"] == "fail", by_name["restore"]
+    assert by_name["restore"]["detail"], "the failure evidence must be on the stage"
+    assert "drill" not in by_name, (
+        f"no catch-all stage expected: stages were {sorted(by_name)}"
+    )
