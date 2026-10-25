@@ -842,11 +842,12 @@ class Ledger:
         ref_id: str,
         detail: dict[str, Any],
     ) -> None:
-        # The sequence is the engine's actual order of movements: several
-        # entries share an instant when one batch settles several fills, and
-        # a hash or a timestamp cannot reconstruct that order - only this
-        # counter can. (A wasted sequence on a conflicting insert is a gap,
-        # not a problem.)
+        # The sequence is the engine's actual order of movements: a batch
+        # settles many fills in one instant, so they share one ts_utc, and a
+        # content hash cannot reconstruct the order the money moved in -
+        # only this counter can. Ordering the ledger by (ts, entry_id) once
+        # shuffled such a batch and broke the running-balance audit chain.
+        # (A wasted sequence on a conflicting insert is a gap, not a problem.)
         seq = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM paper_ledger").fetchone()[0]
         self.db.execute(
             "INSERT INTO paper_ledger (entry_id, seq, ts_utc, kind, currency, amount_usdc, "

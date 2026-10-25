@@ -232,27 +232,46 @@ class RiskGate:
         available = (self.ledger.balances() or {}).get("available_usdc") or 0.0
         headroom = self.market_cap_usdc - self.market_exposure_usdc(event.market_id)
         cap_usdc = min(self.budget_usdc, headroom, available)
+        # A cap too small for even the venue's minimum order is a refusal -
+        # and the reason names the constraint that actually binds, not the
+        # generic budget: cash is INSUFFICIENT_FUNDS, market headroom is
+        # RISK_EXPOSURE_EXCEEDED, only a budget smaller than the venue's own
+        # minimum is a rule-file problem (RISK_BUDGET_EXCEEDED).
+        min_order_cost = self.min_order_shares * cost_per_share
+        if available < min_order_cost - _EPS:
+            return 0.0, GateVerdict.refuse(
+                RefusalReason.INSUFFICIENT_FUNDS,
+                f"only {available:.4f} USDC available; even the venue's minimum "
+                f"order of {self.min_order_shares:g} share(s) costs {min_order_cost:.4f} "
+                f"at the best ask {price:.4f} (rules {self.rules.version})",
+            )
+        if headroom < min_order_cost - _EPS:
+            return 0.0, GateVerdict.refuse(
+                RefusalReason.RISK_EXPOSURE_EXCEEDED,
+                f"{event.market_id} has {headroom:.4f} USDC of exposure headroom left "
+                f"(cap {self.market_cap_usdc:.2f}, occupied "
+                f"{self.market_exposure_usdc(event.market_id):.4f}); even the venue's "
+                f"minimum order of {self.min_order_shares:g} share(s) costs "
+                f"{min_order_cost:.4f} at the best ask {price:.4f} "
+                f"(rules {self.rules.version})",
+            )
         if cap_usdc <= _EPS:
             return 0.0, GateVerdict.refuse(
-                RefusalReason.RISK_BUDGET_EXCEEDED if headroom <= _EPS else RefusalReason.INSUFFICIENT_FUNDS,
-                (
-                    f"no budget for {event.market_id}: market exposure "
-                    f"{self.market_exposure_usdc(event.market_id):.4f} USDC against a "
-                    f"{self.market_cap_usdc:.2f} USDC cap (rules {self.rules.version})"
-                    if headroom <= _EPS
-                    else f"only {available:.4f} USDC available, no budget left "
-                    f"(rules {self.rules.version})"
-                ),
+                RefusalReason.RISK_BUDGET_EXCEEDED,
+                f"no budget left for {event.market_id} "
+                f"(rules {self.rules.version})",
             )
         affordable = cap_usdc / cost_per_share
         shares = min(event.proposed_shares, affordable)
         if shares < self.min_order_shares:
+            # Cash and market headroom were already shown to afford a minimum
+            # order, so the per-opportunity budget itself is the binding cap.
             return 0.0, GateVerdict.refuse(
                 RefusalReason.RISK_BUDGET_EXCEEDED,
-                f"the budget sizes this opportunity to {shares:.2f} shares, below the "
-                f"venue's minimum order of {self.min_order_shares:g} shares; a "
-                "sub-minimum fill is one the venue could never have accepted "
-                f"(rules {self.rules.version})",
+                f"the per-opportunity budget ({self.budget_usdc:.2f} USDC) sizes this "
+                f"opportunity to {shares:.2f} shares, below the venue's minimum order "
+                f"of {self.min_order_shares:g} shares - a sub-minimum fill is one the "
+                f"venue could never have accepted (rules {self.rules.version})",
             )
         return shares, GateVerdict()
 

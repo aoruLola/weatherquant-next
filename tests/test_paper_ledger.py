@@ -7,6 +7,8 @@ valuation that says MARK_UNAVAILABLE instead of inventing a number.
 
 from __future__ import annotations
 
+import itertools
+import pathlib
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -166,6 +168,58 @@ class TestSellSide:
                 make_fill(decision_id="s1", shares=150.0, fill_cost=78.0, fees_usd=0.39, price=0.52, side="sell"),
                 now=NOW + timedelta(minutes=2),
             )
+
+
+class TestManyEntriesOneInstant:
+    def test_verify_orders_a_single_instant_batch_correctly(self):
+        """99 settles sharing one ts_utc must audit in movement order.
+
+        Regression for the acceptance run's kill -9 drill: a full batch
+        settles at one `now`, so every entry carries the same timestamp and
+        ordering by (ts, entry_id) - entry_id being a content hash - read
+        the balances back scrambled (70.00, 90.00, 60.00, ...) and failed
+        the running-balance check. The ledger's `seq` is the movement order.
+        """
+        from paper_fills_support import make_fill
+        from weatherquant.paper.ledger import Ledger
+        from weatherquant.paper.store import PaperStore
+        from weatherquant.storage.paper import PaperDatabase
+
+        with PaperDatabase(self.tmp_dir() / "paper.duckdb") as db:
+            store = PaperStore(db)
+            store.ensure_account(initial_capital_usdc=100.0, now=NOW)
+            ledger = Ledger(store)
+            ledger.open_account(initial_capital_usdc=100.0, now=NOW)
+            with db.transaction():
+                for i in range(99):
+                    ledger.apply_buy(
+                        make_fill(
+                            decision_id=f"{i:032d}",
+                            market_id=f"mkt-{i}",
+                            token_id=f"tok-{i}",
+                            shares=1.0,
+                            price=0.30,
+                            fill_cost=0.30,
+                            fees_usd=0.0034,
+                        ),
+                        now=NOW,  # one instant: exactly the batch shape the drill produced
+                    )
+            report = ledger.verify()
+            assert report["running_balance_consistent"] is True, report
+            assert report["consistent"] is True, report
+            entries = ledger.ledger_entries(limit=200)
+            assert entries[0]["kind"] == "OPEN"
+            balances = [e["balance_after_usdc"] for e in entries]
+            # Each buy spends 0.3034: the chain descends in movement order.
+            assert balances == sorted(balances, reverse=True)
+            for previous, entry in itertools.pairwise(balances):
+                assert entry == pytest.approx(previous - 0.3034, abs=1e-6)
+
+    @staticmethod
+    def tmp_dir():
+        import tempfile
+
+        return pathlib.Path(tempfile.mkdtemp())
 
 
 class TestConservation:
