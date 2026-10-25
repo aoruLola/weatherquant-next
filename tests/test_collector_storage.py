@@ -113,6 +113,30 @@ def test_a_foreign_database_is_refused_not_initialised_over(tmp_path: Path) -> N
     probe.close()
 
 
+def test_open_survives_a_same_process_read_write_handle(tmp_path: Path) -> None:
+    """The foreign-database probe must not fight an existing connection.
+
+    A read-only probe used to crash here ("different configuration than
+    existing connections") the moment any same-process read-write handle to
+    the database existed - the backup job's connection, or a supervisor
+    polling the file. The guard only reads, so it uses the same
+    configuration as the writer instead.
+    """
+    path = tmp_path / "wq.duckdb"
+    first = CollectorWriter(path, run_id="r1")
+    first.open()
+    first.close()
+
+    holder = duckdb.connect(str(path))  # read-write, like the backup job's
+    try:
+        second = CollectorWriter(path, run_id="r2")
+        applied = second.open()  # must not raise, and must not re-migrate
+        assert applied == []
+        second.close()
+    finally:
+        holder.close()
+
+
 def test_close_flushes_and_records_the_exit(tmp_path: Path) -> None:
     path = tmp_path / "wq.duckdb"
     w = CollectorWriter(path, run_id="r1")

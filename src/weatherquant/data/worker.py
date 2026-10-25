@@ -280,6 +280,19 @@ class CollectorWorker:
                 checkpoint_seconds=300.0,
             )
             self._writer.open()
+            # Before this run registers itself: anything still 'running' was
+            # abandoned by a process that died without closing (SIGKILL, OOM,
+            # watchdog exit - the container can stay Up through all of them).
+            # Failing those rows now is what makes "which runs ended
+            # abnormally" answerable by query (WQN-5).
+            abandoned = self._writer.mark_abandoned_runs_failed()
+            if abandoned:
+                self._event(
+                    "warning",
+                    "restart",
+                    f"marked {len(abandoned)} abandoned run(s) as failed",
+                    {"run_ids": abandoned[:20]},
+                )
             self._writer.start_run(
                 app_version=__version__,
                 git_sha=self.git_sha,
@@ -832,7 +845,12 @@ class CollectorWorker:
                     self._event("error", "backup_failed", report.error or "unknown")
                 self._last_backup_day = today
             except Exception as exc:
+                # The exception path is the one the acceptance cares about:
+                # a backups mount that vanished or filled up must leave an
+                # audit trail, not just a log line on a rotating container.
                 log.warning("backup failed: %s", exc)
+                self._event("error", "backup_failed", f"{type(exc).__name__}: {exc}")
+                self._last_backup_day = today
 
     def _drain_stream(self, archive: RawArchive | None) -> None:
         # Sampled *before* the writer guard: queue depth is a property of the
