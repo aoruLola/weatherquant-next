@@ -372,6 +372,13 @@ class CollectorWorker:
             self._loop(http, discovery, stream, publisher, archive)
             status = HealthStatus.STOPPED
             reason = self.shutdown.reason or "shutdown requested"
+            # Drain safety net (WQN-4): frames the producer queued during the
+            # last tick are data too. A graceful exit may not drop them; a
+            # crash path never gets here, which is what the gap record and
+            # the raw archive's tail discipline are for. Bounded, so a full
+            # queue cannot hold SIGTERM hostage (the frames beyond the budget
+            # are the next run's upstream refresh).
+            self._final_drain(archive)
         except Exception as exc:
             log.exception("collector fatal error")
             self._fatal = f"{type(exc).__name__}: {exc}"
@@ -1089,6 +1096,32 @@ class CollectorWorker:
                 break
             drained += 1
             self._handle_stream_frame(frame, archive)
+
+    # A graceful exit drains the backlog, but only a bounded one: SIGTERM must
+    # stay bounded even when the producer outpaced the loop for a whole sweep.
+    FINAL_DRAIN_MAX_FRAMES = 5000
+    FINAL_DRAIN_MAX_SECONDS = 5.0
+
+    def _final_drain(self, archive: RawArchive | None) -> None:
+        if self._writer is None or archive is None:
+            return
+        deadline = time.monotonic() + self.FINAL_DRAIN_MAX_SECONDS
+        total = 0
+        while total < self.FINAL_DRAIN_MAX_FRAMES and time.monotonic() < deadline:
+            before = self._ws_queue.qsize()
+            self._drain_stream(archive)
+            total += before - self._ws_queue.qsize()
+            if self._ws_queue.empty():
+                break
+        if total:
+            log.info("final drain: %d queued frame(s) processed before exit", total)
+            try:
+                self._writer.flush(force=True)
+            except Exception:
+                log.exception("could not flush the final drain's rows")
+            leftover = self._ws_queue.qsize()
+            if leftover:
+                log.warning("final drain budget reached; %d frame(s) not processed", leftover)
 
     def _handle_stream_frame(self, frame: Any, archive: RawArchive) -> None:
         received_at, payload = frame
