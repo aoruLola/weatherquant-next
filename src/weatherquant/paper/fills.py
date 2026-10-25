@@ -89,6 +89,13 @@ class PaperFill:
     levels_consumed: int
     complete: bool
     consumed_levels: list[dict[str, float]]
+    #: WQN-24: the FULL two-sided book the decision faced - both sides'
+    #: levels, best first - plus the identity of the archive line it came
+    #: from. A fill row is auditable (and re-priceable) against the whole
+    #: picture, not just the side this direction happened to walk.
+    book_bids_json: str
+    book_asks_json: str
+    book_source_event_id: str
     decision_time_utc: datetime
     filled_at_utc: datetime
     fee_rate: float
@@ -279,7 +286,7 @@ class FillEngine:
             outcome.detail = "the market did not report a fee schedule; refusing to assume zero"
             return outcome
         if not event.token_id:
-            outcome.reason = RefusalReason.NO_BOOK_EVIDENCE.value
+            outcome.reason = RefusalReason.NOT_EXECUTABLE.value
             outcome.detail = "signal names no token; its book cannot be resolved"
             return outcome
 
@@ -321,7 +328,7 @@ class FillEngine:
                 # A crossed or one-sided book is evidence failure, not a
                 # thin market - the decision's own gates should have caught
                 # it, so it is recorded as such here.
-                outcome.reason = RefusalReason.NO_BOOK_EVIDENCE.value
+                outcome.reason = RefusalReason.NOT_EXECUTABLE.value
             outcome.detail = f"{exc.code}: {exc.detail}"
             return outcome
         except FeeStructureUnknown as exc:
@@ -370,6 +377,9 @@ class FillEngine:
             levels_consumed=plan.levels_consumed,
             complete=plan.complete,
             consumed_levels=_consumed_levels(evidence.book, side, plan),
+            book_bids_json=evidence.bids_json(),
+            book_asks_json=evidence.asks_json(),
+            book_source_event_id=evidence.source_event_id,
             decision_time_utc=event.decision_time_utc,
             filled_at_utc=now,
             fee_rate=event.fee_rate,
@@ -392,9 +402,10 @@ class FillEngine:
         """Evidence gates, in causal order. ``None`` means the book may be used."""
         if evidence is None:
             return (
-                RefusalReason.NO_BOOK_EVIDENCE.value,
+                RefusalReason.NOT_EXECUTABLE.value,
                 f"no archived L2 frame for token {event.token_id} at or before "
-                f"{event.decision_time_utc.isoformat()}; nothing honest to fill against",
+                f"{event.decision_time_utc.isoformat()}; no executable evidence, "
+                "so no trade is recorded",
             )
         if event.book_id and evidence.book_id != event.book_id:
             return (
@@ -411,7 +422,7 @@ class FillEngine:
             )
         if evidence.venue_ts_utc > event.decision_time_utc:
             return (
-                RefusalReason.NO_BOOK_EVIDENCE.value,
+                RefusalReason.NOT_EXECUTABLE.value,
                 f"the resolved book's venue timestamp {evidence.venue_ts_utc.isoformat()} "
                 "is after the decision instant; it is not evidence for this trade",
             )

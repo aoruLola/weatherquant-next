@@ -40,6 +40,20 @@ now a regression test.
 own parser, so the resolved book's ``book_id`` is the same content hash the
 shadow recorded on the decision. When the two disagree, the evidence does
 not describe the trade, and the fill is refused rather than approximated.
+
+**The whole book is the evidence.** Both sides' levels travel with the
+resolution - not just the side a particular direction would walk - so a
+fill row can later be audited (or re-priced) against the complete two-sided
+picture the decision actually faced, keyed to the archive line it came from
+(``source_event_id``). WQN-24: the backtest and the paper account both need
+token, both-side levels, sizes, timestamps, a source event identity and the
+fee schedule, reconstructed from no frame received after the decision.
+
+**The scan is on a clock.** ``timeout_seconds`` bounds the whole resolution:
+the paper engine runs beside other work and a book lookup must never become
+an unbounded hunt through the archive. When the clock expires the resolver
+returns whatever it has established - possibly ``None``, which the fill
+layer records as NOT_EXECUTABLE - rather than blocking.
 """
 
 from __future__ import annotations
@@ -52,6 +66,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from weatherquant.data.books import parse_book_payload
+from weatherquant.data.writer import canonical_levels_json
 from weatherquant.markets.models import OrderBook
 
 __all__ = ["ArchiveBookSource", "BookEvidence"]
@@ -75,10 +90,27 @@ class BookEvidence:
     venue_ts_utc: datetime | None
     collector_received_at_utc: datetime
     quality: str
+    #: Identity of the exact archive line this evidence came from - the
+    #: sha256 of the raw JSONL line, the same digest the collector's own
+    #: envelopes carry. Two fills naming the same event id priced against
+    #: the same bytes.
+    source_event_id: str = ""
 
     @property
     def defects(self) -> list[str]:
         return self.book.defects()
+
+    def bids_json(self) -> str:
+        """The FULL bid side, best first - not the levels a fill consumed."""
+        return canonical_levels_json(
+            [(lv.price_usd_per_share, lv.size_shares) for lv in self.book.bids]
+        )
+
+    def asks_json(self) -> str:
+        """The FULL ask side, best first - not the levels a fill consumed."""
+        return canonical_levels_json(
+            [(lv.price_usd_per_share, lv.size_shares) for lv in self.book.asks]
+        )
 
 
 class ArchiveBookSource:
@@ -90,14 +122,18 @@ class ArchiveBookSource:
         *,
         tail_bytes: int = 4 * 1024 * 1024,
         lookback_seconds: float = 3600.0,
+        timeout_seconds: float = 2.0,
     ) -> None:
         if tail_bytes <= 0:
             raise ValueError(f"tail_bytes must be > 0, got {tail_bytes!r}")
         if lookback_seconds <= 0:
             raise ValueError(f"lookback_seconds must be > 0, got {lookback_seconds!r}")
+        if timeout_seconds <= 0:
+            raise ValueError(f"timeout_seconds must be > 0, got {timeout_seconds!r}")
         self.raw_dir = Path(raw_dir)
         self.tail_bytes = int(tail_bytes)
         self.lookback = timedelta(seconds=lookback_seconds)
+        self.timeout_seconds = float(timeout_seconds)
 
     def resolve(
         self,
@@ -111,7 +147,10 @@ class ArchiveBookSource:
         """
         if not token_id:
             return None
+        import time
+
         floor = decision_time - self.lookback
+        deadline = time.monotonic() + self.timeout_seconds
         newest: BookEvidence | None = None
         newest_received: datetime | None = None
         for day in (decision_time.date(), (decision_time - timedelta(days=1)).date()):
@@ -119,6 +158,17 @@ class ArchiveBookSource:
                 path = self.raw_dir / source / f"{day.isoformat()}.jsonl"
                 if not path.is_file():
                     continue
+                # Checked per file, not per frame: the whole resolution is
+                # bounded, and a lookup that cannot finish in its budget
+                # returns what it has rather than hanging the caller.
+                if time.monotonic() > deadline:
+                    log.warning(
+                        "book resolution for %s hit its %.1fs timeout; returning "
+                        "the newest frame found so far",
+                        token_id,
+                        self.timeout_seconds,
+                    )
+                    return newest
                 for evidence, received in self._frames_in_file(
                     path, source, token_id, floor, decision_time
                 ):
@@ -140,7 +190,7 @@ class ArchiveBookSource:
         parsed yields nothing and the scan moves on. One corrupted or exotic
         frame must never cost the caller its whole fill pass.
         """
-        for envelope, payload in _iter_tail(path, self.tail_bytes):
+        for envelope, payload, line_sha in _iter_tail(path, self.tail_bytes):
             received = envelope.get("received_at_utc")
             if not isinstance(received, str):
                 continue
@@ -163,6 +213,7 @@ class ArchiveBookSource:
                     token_id=token_id,
                     source=source,
                     received_at=stamp,
+                    source_event_id=line_sha,
                 )
             except (ValueError, TypeError, KeyError, IndexError):
                 # An unusable payload for our token: skip it, the previous
@@ -173,11 +224,17 @@ class ArchiveBookSource:
 
 
 def _iter_tail(path: Path, tail_bytes: int):
-    """Yield ``(envelope, payload)`` from the last ``tail_bytes`` of a JSONL file.
+    """Yield ``(envelope, payload, line_sha256)`` from the last ``tail_bytes``
+    of a JSONL file.
 
     The scan starts at a line boundary, so a frame split by the window edge
-    is skipped whole rather than half-parsed.
+    is skipped whole rather than half-parsed. The digest is over the line's
+    exact bytes - the same envelope identity the collector's own tooling
+    uses, and what makes a fill's evidence pointable at "this frame, these
+    bytes".
     """
+    import hashlib
+
     size = path.stat().st_size
     start = max(size - tail_bytes, 0)
     with path.open("rb") as handle:
@@ -193,7 +250,9 @@ def _iter_tail(path: Path, tail_bytes: int):
             except json.JSONDecodeError:
                 continue
             if isinstance(envelope, dict):
-                yield envelope, envelope.get("payload")
+                yield envelope, envelope.get("payload"), hashlib.sha256(
+                    text.encode("utf-8")
+                ).hexdigest()
 
 
 def _extract_book_element(payload: object, token_id: str) -> dict | None:
@@ -229,6 +288,7 @@ def _build_evidence(
     token_id: str,
     source: str,
     received_at: datetime,
+    source_event_id: str = "",
 ) -> BookEvidence:
     """Parse one frame with the collector's own parser.
 
@@ -261,4 +321,5 @@ def _build_evidence(
         venue_ts_utc=snapshot.venue_ts,
         collector_received_at_utc=received_at,
         quality=snapshot.quality,
+        source_event_id=source_event_id,
     )

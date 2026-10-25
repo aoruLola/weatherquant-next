@@ -123,7 +123,7 @@ class TestRefusalVocabulary:
         # criteria; renaming them silently would orphan every recorded row.
         assert RefusalReason.NOT_LIVE.value == "NOT_LIVE"
         assert RefusalReason.DUPLICATE_SIGNAL.value == "DUPLICATE_SIGNAL"
-        assert RefusalReason.NO_BOOK_EVIDENCE.value == "NO_BOOK_EVIDENCE"
+        assert RefusalReason.NOT_EXECUTABLE.value == "NOT_EXECUTABLE"
         assert RefusalReason.NO_INVENTORY.value == "NO_INVENTORY"
 
     def test_decoded_at_offset_is_preserved(self):

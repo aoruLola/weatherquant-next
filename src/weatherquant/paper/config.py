@@ -169,6 +169,15 @@ class PaperSettings(BaseSettings):
         "outside the window is honestly not found rather than guessed at.",
     )
 
+    book_resolve_timeout_seconds: float = Field(
+        default=2.0,
+        gt=0.0,
+        description="Wall-clock budget for one point-in-time book resolution "
+        "(WQN-24). A lookup that cannot finish in its budget returns what it "
+        "has established - the fill is then NOT_EXECUTABLE - and never "
+        "blocks the engine's loop on the archive.",
+    )
+
     # --- risk gates -------------------------------------------------------------
     risk_rules_path: Path = Field(
         default=Path("configs/paper-risk.json"),

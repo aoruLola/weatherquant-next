@@ -9,6 +9,7 @@ in the ledger).
 from __future__ import annotations
 
 import inspect
+import json
 from datetime import UTC, datetime
 
 from paper_book_helpers import T_DECISION, TOKEN
@@ -66,6 +67,13 @@ def make_fill(
         levels_consumed=1,
         complete=True,
         consumed_levels=[{"price_usd_per_share": price, "size_shares_taken": shares}],
+        book_bids_json=json.dumps(
+            [{"price_usd_per_share": best if side == "sell" else 0.52, "size_shares": 500.0}]
+        ),
+        book_asks_json=json.dumps(
+            [{"price_usd_per_share": price if side == "buy" else 0.60, "size_shares": 100.0}]
+        ),
+        book_source_event_id="sha-" + decision_id,
         decision_time_utc=T_DECISION,
         filled_at_utc=NOW,
         fee_rate=fee_rate,

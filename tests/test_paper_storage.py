@@ -58,7 +58,7 @@ class TestMigrations:
         path = tmp_path / "paper.duckdb"
         with PaperDatabase(path) as first:
             applied = dict(first.applied_migrations())
-            assert set(applied) == {"0001", "0002", "0003", "0004", "0005", "0006"}
+            assert set(applied) == {"0001", "0002", "0003", "0004", "0005", "0006", "0007"}
         with PaperDatabase(path) as again:
             assert again.applied_migrations() == applied
 

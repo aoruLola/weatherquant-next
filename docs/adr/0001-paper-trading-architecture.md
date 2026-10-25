@@ -121,6 +121,24 @@ fill 行 + 信号状态迁移,同一事务;任何一层拒绝(无资金/无库�
 4. 幂等:`UNIQUE(market_id, revision)` 自然键 + `(applied revision)`
    判断,重放整个 feed 是 no-op;更旧 revision 视为被取代。
 
+### D9. 盘口证据:成交行携带完整双向快照,不可执行即 NOT_EXECUTABLE(WQN-24)
+
+paper 与可执行回测需要**信号当时**的 token、双向 bid/ask 层级、数量、
+时间戳、来源事件标识与费用规则——绝不能用未来盘口重构:
+
+1. `BookEvidence` 携带完整 OrderBook(双侧)与 `source_event_id`
+   (归档行的 sha256,与 collector 信封同一标识);`paper_fills` 行
+   存 `book_bids_json / book_asks_json / book_source_event_id`
+   (migration 0007),按 `decision_id` 主键天然关联;存的是
+   collector 规范层级形式,可哈希回 `book_id`(测试断言)。
+2. 盘口证据无法建立(缺失、解析超时)→ 拒绝原因 `NOT_EXECUTABLE`,
+   不记录任何成交;BOOK_STALE / BOOK_EVIDENCE_MISMATCH 保留专名
+   (证据存在但不合格)。旧拼写 NO_BOOK_EVIDENCE 仅为已记录行保留。
+3. `ArchiveBookSource` 增加 `timeout_seconds`(默认 2s,文件粒度
+   检查):超时返回已建立的部分——绝不挂起调用方;resolver 是
+   paper 进程的本地文件扫描,shadow 主循环不受其影响(跨进程、
+   只读、有界)。
+
 ## 后果
 
 * 正面:四个引擎生命周期(collector/shadow/research/paper)互不可写;
