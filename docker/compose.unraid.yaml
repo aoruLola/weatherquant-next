@@ -14,6 +14,11 @@
 #      reach the process and be allowed to flush, checkpoint and release the
 #      lock before the container is killed. Docker's default 10s is tight
 #      against a 5s flush plus a 300s checkpoint on a busy filesystem.
+#   4. `restart: unless-stopped` is the recovery half of WQN-2: the loop
+#      watchdog (default 120s) exits the process when the main loop goes
+#      silent - a heartbeat the probe can *see* - and this policy turns that
+#      exit into an automatic restart. Docker does not restart an
+#      unhealthy-but-running container on its own; see docs/... §8.2.
 
 x-common: &common
   # Published by .github/workflows/release.yml. `stable` tracks the newest tag
