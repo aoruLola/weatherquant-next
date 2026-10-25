@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import inspect
+
 from paper_book_helpers import T_DECISION, TOKEN
 from weatherquant.execution.pricing import taker_fee_usd
 from weatherquant.paper.fills import PaperFill
@@ -84,3 +86,38 @@ def make_risk(store, *, capital: float = 100.0, version: str = "test-unrestricte
         ),
         initial_capital_usdc=capital,
     )
+
+
+def open_ledger_if_needed(store, *, capital: float = 100.0, now) -> None:
+    """Open the account's books when this branch's FillEngine settles through them."""
+    from weatherquant.paper.fills import FillEngine
+
+    params = inspect.signature(FillEngine.__init__).parameters
+    if "ledger" in params or "risk" in params:
+        from weatherquant.paper.ledger import Ledger
+
+        Ledger(store).open_account(initial_capital_usdc=capital, now=now)
+
+
+def build_engine(store, raw_dir, *, clock, **overrides):
+    """Construct this branch's FillEngine, adapting to its signature.
+
+    The robustness regressions run on every branch of the stack; the fill
+    engine gained `ledger` (WQN-42) and `risk` (WQN-43) along the way, so
+    the arguments are supplied exactly when the constructor asks for them.
+    """
+    from weatherquant.paper.fills import FillEngine
+
+    params = inspect.signature(FillEngine.__init__).parameters
+    kwargs = dict(
+        store=store,
+        book_source=raw_dir,
+        buffer_fraction=0.005,
+        clock=clock,
+    )
+    if "ledger" in params and overrides.get("ledger") is not None:
+        kwargs["ledger"] = overrides["ledger"]
+    if "risk" in params:
+        kwargs["risk"] = make_risk(store, capital=overrides.get("capital", 100.0))
+    return FillEngine(**kwargs)
+
