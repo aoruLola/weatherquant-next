@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from weatherquant.paper.settlements import settlement_id
 from weatherquant.paper.store import ACCOUNT_ID, PaperStore
 
 __all__ = [
@@ -480,6 +481,22 @@ class Ledger:
                 )
                 pos["shares"] -= float(detail["shares"])
                 pos["basis"] -= float(detail["cost_released_usdc"])
+            elif entry["kind"] == "SETTLE_PAYOUT":
+                # A payout releases every position it names and books the
+                # realised P&L the sale-side entries never carried.
+                available += entry["amount_usdc"]
+                occupied -= float(detail["cost_released_usdc"])
+                realised += float(detail["realized_pnl_usdc"])
+                for pos_detail in detail.get("positions", []):
+                    key = (detail["market_id"], pos_detail["token_id"])
+                    pos = positions.setdefault(key, {"shares": 0.0, "basis": 0.0})
+                    pos["shares"] -= float(pos_detail["shares"])
+                    pos["basis"] -= float(pos_detail["cost_released_usdc"])
+            elif entry["kind"] == "CORRECTION":
+                # A compensation moves cash and realised P&L by the same
+                # delta; positions are untouched (they closed at payout).
+                available += entry["amount_usdc"]
+                realised += entry["amount_usdc"]
         rebuilt = {
             "available_usdc": available,
             "occupied_usdc": occupied,
@@ -519,6 +536,299 @@ class Ledger:
                 "SELECT 1 FROM paper_ledger WHERE entry_id = ?", [entry_id]
             ).fetchone()
             is not None
+        )
+
+    # -- settlements ---------------------------------------------------------
+
+    def apply_settlement(self, event, *, now: datetime) -> dict[str, Any]:
+        """Apply one published settlement record. Idempotent by natural key.
+
+        Returns an outcome dict: ``action`` is one of
+
+        * ``APPLIED``          - a payout (or correction) moved the ledger;
+        * ``NOOP``             - already applied, superseded, or a redundant
+                                 confirmation; nothing moved, ever;
+        * ``RECORDED``         - stored for audit, nothing to apply (not a
+                                 payout, or no open position);
+        * ``REVIEW_REQUIRED``  - a correction or dispute that must not be
+                                 settled automatically; balances untouched.
+
+        Must run inside a transaction together with whatever it moves.
+        """
+        market_id = event.market_id
+        inserted = self._insert_settlement_row(event, now=now)
+        if not inserted:
+            return {
+                "action": "NOOP",
+                "market_id": market_id,
+                "revision": event.revision,
+                "detail": "already recorded; the natural key absorbed the redelivery",
+            }
+
+        if not event.is_payout:
+            # A dispute that reopens an already-settled market breaks the
+            # applied payout's finality: the final answer is unknown, and
+            # keeping OR reversing the payout would both fabricate realised
+            # profit. A human decides; the balances stay untouched.
+            applied = self._applied_settlement(market_id)
+            if applied is not None and event.status == "DISPUTED":
+                self._flag_review(
+                    event,
+                    reason=(
+                        f"market re-disputed after a payout was applied at revision "
+                        f"{applied['revision']}; whether that payout stands is a "
+                        "human decision"
+                    ),
+                )
+                return {
+                    "action": "REVIEW_REQUIRED",
+                    "market_id": market_id,
+                    "revision": event.revision,
+                    "detail": "dispute after settlement; flagged for manual review",
+                }
+            return {
+                "action": "RECORDED",
+                "market_id": market_id,
+                "revision": event.revision,
+                "detail": f"status {event.status}; unsettled positions never book realised P&L",
+            }
+
+        applied = self._applied_settlement(market_id)
+        if applied is not None and event.revision <= applied["revision"]:
+            return {
+                "action": "NOOP",
+                "market_id": market_id,
+                "revision": event.revision,
+                "detail": f"superseded by applied revision {applied['revision']}",
+            }
+
+        payout = float(event.yes_payout)  # guaranteed by is_payout
+        if applied is None:
+            return self._apply_first_payout(event, payout=payout, now=now)
+        if payout == applied["yes_payout"]:
+            self._mark_settlement_applied(event, now=now)
+            return {
+                "action": "NOOP",
+                "market_id": market_id,
+                "revision": event.revision,
+                "detail": f"confirms the payout {payout} already applied at revision "
+                f"{applied['revision']}; no entry written",
+            }
+        return self._apply_correction(event, payout=payout, applied=applied, now=now)
+
+    def _apply_first_payout(self, event, *, payout: float, now: datetime) -> dict[str, Any]:
+        """Release occupied capital and book realised P&L on settlement.
+
+        A payout on shares bought at cost basis C pays ``payout * shares``:
+        available rises by that, occupied falls by C, and realised P&L
+        finally exists - it did not exist the whole time the position was
+        merely open.
+        """
+        positions = [
+            p for p in self.positions() if p.market_id == event.market_id
+        ]
+        if not positions:
+            return {
+                "action": "RECORDED",
+                "market_id": event.market_id,
+                "revision": event.revision,
+                "detail": "RESOLVED but the account holds no open position in this market",
+            }
+        balances = self.balances() or {}
+        total_proceeds = 0.0
+        total_released = 0.0
+        total_realised = 0.0
+        details = []
+        for position in positions:
+            proceeds = payout * position.shares
+            released = position.cost_basis_usdc
+            realised = proceeds - released
+            total_proceeds += proceeds
+            total_released += released
+            total_realised += realised
+            self.db.execute(
+                "UPDATE paper_positions SET shares = 0.0, cost_basis_usdc = 0.0, updated_at_utc = ? "
+                "WHERE market_id = ? AND token_id = ?",
+                [now, position.market_id, position.token_id],
+            )
+            details.append(
+                {
+                    "token_id": position.token_id,
+                    "shares": position.shares,
+                    "avg_cost_usd_per_share": position.avg_cost_usd_per_share,
+                    "cost_released_usdc": released,
+                    "proceeds_usdc": proceeds,
+                    "realized_pnl_usdc": realised,
+                }
+            )
+        available = balances.get("available_usdc", 0.0) + total_proceeds
+        occupied = max(balances.get("occupied_usdc", 0.0) - total_released, 0.0)
+        realised_total = balances.get("realized_pnl_usdc", 0.0) + total_realised
+        self.db.execute(
+            "UPDATE paper_balances SET available_usdc = ?, occupied_usdc = ?, "
+            "realized_pnl_usdc = ?, updated_at_utc = ? WHERE account_id = ?",
+            [available, occupied, realised_total, now, ACCOUNT_ID],
+        )
+        ref_id = f"{event.market_id}#{event.revision}"
+        self._insert_entry(
+            kind="SETTLE_PAYOUT",
+            ts_utc=now,
+            amount=total_proceeds,
+            balance_after=available,
+            ref_type="settlement",
+            ref_id=ref_id,
+            detail={
+                "market_id": event.market_id,
+                "revision": event.revision,
+                "yes_payout": payout,
+                "positions": details,
+                "cost_released_usdc": total_released,
+                "realized_pnl_usdc": total_realised,
+            },
+        )
+        self._mark_settlement_applied(event, now=now)
+        return {
+            "action": "APPLIED",
+            "market_id": event.market_id,
+            "revision": event.revision,
+            "detail": f"payout {payout} on {len(details)} position(s); released "
+            f"{total_released:.4f} USDC, realised {total_realised:.4f} USDC",
+        }
+
+    def _apply_correction(self, event, *, payout: float, applied: dict[str, Any], now: datetime) -> dict[str, Any]:
+        """A changed payout: compensate, never edit.
+
+        The delta is ``(new - old) * settled_shares``. When it claws back
+        more cash than the account holds, the correction is flagged for a
+        human - an automatic clawback into a negative balance would trade an
+        audit problem for an insolvency.
+        """
+        balances = self.balances() or {}
+        delta = (payout - applied["yes_payout"]) * applied["settled_shares"]
+        available = balances.get("available_usdc", 0.0)
+        if delta < 0 and available + delta < -_EPS:
+            self._flag_review(
+                event,
+                reason=(
+                    f"correction would claw back {-delta:.4f} USDC but only "
+                    f"{available:.4f} is available; the money has moved on and the "
+                    "fix is not automatic"
+                ),
+            )
+            return {
+                "action": "REVIEW_REQUIRED",
+                "market_id": event.market_id,
+                "revision": event.revision,
+                "detail": "correction would drive cash negative; flagged for manual review",
+            }
+        new_available = available + delta
+        realised = balances.get("realized_pnl_usdc", 0.0) + delta
+        self.db.execute(
+            "UPDATE paper_balances SET available_usdc = ?, realized_pnl_usdc = ?, "
+            "updated_at_utc = ? WHERE account_id = ?",
+            [new_available, realised, now, ACCOUNT_ID],
+        )
+        ref_id = f"{event.market_id}#{event.revision}"
+        self._insert_entry(
+            kind="CORRECTION",
+            ts_utc=now,
+            amount=delta,
+            balance_after=new_available,
+            ref_type="settlement",
+            ref_id=ref_id,
+            detail={
+                "market_id": event.market_id,
+                "revision": event.revision,
+                "old_payout": applied["yes_payout"],
+                "old_revision": applied["revision"],
+                "new_payout": payout,
+                "settled_shares": applied["settled_shares"],
+                "delta_usdc": delta,
+            },
+        )
+        self._mark_settlement_applied(event, now=now)
+        return {
+            "action": "APPLIED",
+            "market_id": event.market_id,
+            "revision": event.revision,
+            "detail": f"correction {applied['yes_payout']} -> {payout} on "
+            f"{applied['settled_shares']} shares; compensated {delta:+.4f} USDC",
+        }
+
+    def review_required(self) -> list[dict[str, Any]]:
+        """Settlement rows a human must look at, newest first."""
+        rows = self.db.execute(
+            "SELECT market_id, revision, status, review_reason, settled_at_utc "
+            "FROM paper_settlements WHERE review_required ORDER BY settled_at_utc DESC"
+        ).fetchall()
+        return [
+            {
+                "market_id": str(r[0]),
+                "revision": int(r[1]),
+                "status": str(r[2]),
+                "review_reason": r[3],
+                "settled_at_utc": r[4],
+            }
+            for r in rows
+        ]
+
+    def _insert_settlement_row(self, event, *, now: datetime) -> bool:
+        cursor = self.db.execute(
+            "INSERT INTO paper_settlements (settlement_id, market_id, revision, status, "
+            "yes_payout, settled_at_utc, evidence_json) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (market_id, revision) DO NOTHING RETURNING settlement_id",
+            [
+                settlement_id(market_id=event.market_id, revision=event.revision),
+                event.market_id,
+                event.revision,
+                event.status,
+                event.yes_payout,
+                event.settled_at_utc,
+                event.evidence_json(),
+            ],
+        )
+        return cursor.fetchone() is not None
+
+    def _applied_settlement(self, market_id: str) -> dict[str, Any] | None:
+        """The newest APPLIED payout for a market, with the shares it paid on.
+
+        The settled share count lives on the SETTLE_PAYOUT entry - the ledger
+        is the authority for what actually happened, and a correction needs
+        exactly those shares, not whatever the position holds now.
+        """
+        row = self.db.execute(
+            "SELECT revision, yes_payout FROM paper_settlements "
+            "WHERE market_id = ? AND applied ORDER BY revision DESC LIMIT 1",
+            [market_id],
+        ).fetchone()
+        if row is None:
+            return None
+        entry = self.db.execute(
+            "SELECT detail_json FROM paper_ledger WHERE ref_type = 'settlement' AND ref_id = ?",
+            [f"{market_id}#{row[0]}"],
+        ).fetchone()
+        shares = 0.0
+        if entry is not None:
+            detail = json.loads(str(entry[0]))
+            shares = sum(float(p["shares"]) for p in detail.get("positions", []))
+        return {
+            "revision": int(row[0]),
+            "yes_payout": float(row[1]),
+            "settled_shares": shares,
+        }
+
+    def _mark_settlement_applied(self, event, *, now: datetime) -> None:
+        self.db.execute(
+            "UPDATE paper_settlements SET applied = TRUE, applied_at_utc = ? "
+            "WHERE settlement_id = ?",
+            [now, settlement_id(market_id=event.market_id, revision=event.revision)],
+        )
+
+    def _flag_review(self, event, *, reason: str) -> None:
+        self.db.execute(
+            "UPDATE paper_settlements SET review_required = TRUE, review_reason = ? "
+            "WHERE settlement_id = ?",
+            [reason, settlement_id(market_id=event.market_id, revision=event.revision)],
         )
 
     def _insert_entry(
