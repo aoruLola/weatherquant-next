@@ -54,7 +54,11 @@ from weatherquant.data.heartbeat import (
 from weatherquant.data.http import ResilientHttp
 from weatherquant.data.lock import LockError, SingleInstanceLock
 from weatherquant.data.ratelimit import RateLimitRegistry
-from weatherquant.data.writer import CollectorWriter
+from weatherquant.data.writer import (
+    DEFAULT_BACKUP_TIMEOUT_SECONDS,
+    BackupJob,
+    CollectorWriter,
+)
 
 log = logging.getLogger(__name__)
 
@@ -105,6 +109,8 @@ class CollectorWorker:
         integrity_seconds: float = 300.0,
         parquet_daily: bool = True,
         backup_daily: bool = True,
+        backup_timeout_seconds: float = DEFAULT_BACKUP_TIMEOUT_SECONDS,
+        backup_retry_seconds: float = 3600.0,
         stream_enabled: bool = True,
         once: bool = False,
     ) -> None:
@@ -120,6 +126,8 @@ class CollectorWorker:
         self.integrity_seconds = integrity_seconds
         self.parquet_daily = parquet_daily
         self.backup_daily = backup_daily
+        self.backup_timeout_seconds = backup_timeout_seconds
+        self.backup_retry_seconds = backup_retry_seconds
         self.stream_enabled = stream_enabled
         self.once = once
 
@@ -140,6 +148,15 @@ class CollectorWorker:
         self._last_integrity_mono = -1e18
         self._last_parquet_day: date | None = None
         self._last_backup_day: date | None = None
+        # Daily backup bookkeeping. The job runs off-thread (see
+        # CollectorWriter.start_backup); the loop only ever *polls* it here,
+        # so a backup stuck on FUSE can no longer stall collection.
+        self._backup_job: BackupJob | None = None
+        self._backup_attempts_day: date | None = None
+        self._backup_attempts_today = 0
+        self._last_backup_attempt_mono = -1e18
+        self._last_backup_ok: str | None = None
+        self._last_backup_error: str | None = None
 
         self._last_rest_mid: dict[str, tuple[datetime, float]] = {}
         self._last_mismatch_note = datetime.min.replace(tzinfo=UTC)
@@ -368,6 +385,28 @@ class CollectorWorker:
                     status = HealthStatus.FATAL
                 finally:
                     self._archive_records = archive.records_written
+            if self._backup_job is not None:
+                # The copy runs on its own connection, so it survives the
+                # archive close above. SIGTERM arriving mid-backup is exactly
+                # when a verified copy is worth a bounded wait - but never
+                # hold the container hostage to it: beyond this window the
+                # daemon thread is killed and the next run's backup sweeps
+                # the .incomplete- file.
+                job = self._backup_job
+                if not job.done:
+                    job.join(30.0)
+                report = job.poll()
+                if report is not None:
+                    # Recorded before the writer closes, so the run's exit
+                    # includes the backup outcome it was still holding.
+                    if report.ok:
+                        self._event(
+                            "info", "backup", f"verified backup {report.destination.name} (shutdown)"
+                        )
+                    else:
+                        self._event(
+                            "error", "backup_failed", report.error or "unknown (shutdown)"
+                        )
             if self._writer is not None:
                 # Close this run's own gap before the writer goes away. A run
                 # that opened a gap at start must close it at exit whatever the
@@ -815,24 +854,107 @@ class CollectorWorker:
             except Exception as exc:
                 log.warning("parquet export failed: %s", exc)
         if self.backup_daily and self._last_backup_day != today:
-            try:
-                report = self._writer.backup(self.settings.db_path.parent / "backups")
-                if report.ok:
-                    log.info(
-                        "backup verified: %s (%d bytes, %d tables)",
-                        report.destination.name,
-                        report.bytes_written,
-                        len(report.row_counts),
+            self._advance_daily_backup(today)
+
+    # A clean backup failure (bad destination, verification mismatch, ENOSPC)
+    # is worth retrying later the same day; a *timeout* is not, because the
+    # copy is still holding its private connection open and a second one an
+    # hour later would only double the I/O the first is stuck on.
+    BACKUP_MAX_ATTEMPTS_PER_DAY = 4
+
+    def _advance_daily_backup(self, today: date) -> None:
+        """Drive the daily backup job: poll, enforce the timeout, retry.
+
+        Called from the loop every tick, this method never blocks on the
+        copy itself - that is the isolation WQN-1 asked for. Everything it
+        does while a job is in flight is a few attribute reads and, at most
+        once, recording an event.
+        """
+        if self._writer is None:
+            return
+        if self._backup_attempts_day != today:
+            self._backup_attempts_day = today
+            self._backup_attempts_today = 0
+
+        job = self._backup_job
+        if job is not None:
+            report = job.poll()
+            if report is None:
+                if job.expired() and job.abandon(
+                    f"no finished backup after {job.elapsed_seconds():.0f}s "
+                    f"(limit {self.backup_timeout_seconds:.0f}s)"
+                ):
+                    message = (
+                        f"backup {job.final.name} abandoned after "
+                        f"{job.elapsed_seconds():.0f}s; the copy continues "
+                        "on its own thread and will discard its file"
                     )
-                    self._event(
-                        "info", "backup", f"verified backup {report.destination.name}"
-                    )
-                else:
-                    log.error("backup failed: %s", report.error)
-                    self._event("error", "backup_failed", report.error or "unknown")
+                    log.error("%s", message)
+                    self._event("error", "backup_timeout", message)
+                    self._last_backup_error = "backup_timeout"
+                    self._backup_attempts_today += 1
+                    self._last_backup_attempt_mono = time.monotonic()
+                    # No same-day retry after a timeout: the stuck copy is
+                    # still holding its private connection, and a second
+                    # one would only double the I/O it is stuck on.
+                    self._last_backup_day = today
+                    # Detached, not forgotten: the thread discards its own
+                    # file when (if) it completes. Keeping the handle would
+                    # re-enter this branch every tick and storm the log.
+                    self._backup_job = None
+                # Either still running or just abandoned: nothing to start.
+                return
+
+            self._backup_job = None
+            self._backup_attempts_today += 1
+            self._last_backup_attempt_mono = time.monotonic()
+            if report.ok:
+                self._last_backup_ok = report.destination.name
+                self._last_backup_error = None
+                log.info(
+                    "backup verified: %s (%d bytes, %d tables)",
+                    report.destination.name,
+                    report.bytes_written,
+                    len(report.row_counts),
+                )
+                self._event("info", "backup", f"verified backup {report.destination.name}")
                 self._last_backup_day = today
-            except Exception as exc:
-                log.warning("backup failed: %s", exc)
+            else:
+                log.error("backup failed: %s", report.error)
+                self._event("error", "backup_failed", report.error or "unknown")
+                self._last_backup_error = (report.error or "unknown")[:200]
+                if self._backup_attempts_today >= self.BACKUP_MAX_ATTEMPTS_PER_DAY:
+                    self._last_backup_day = today
+            return
+
+        if self._last_backup_day == today:
+            return
+        if self._backup_attempts_today >= self.BACKUP_MAX_ATTEMPTS_PER_DAY:
+            return
+        if self._backup_attempts_today and (
+            time.monotonic() - self._last_backup_attempt_mono < self.backup_retry_seconds
+        ):
+            return
+        try:
+            # The flush + checkpoint inside are the only synchronous part and
+            # are bounded by the pending batch, not by the database size.
+            job = self._writer.start_backup(
+                self.settings.db_path.parent / "backups",
+                timeout_seconds=self.backup_timeout_seconds,
+            )
+        except Exception as exc:
+            log.warning("backup could not start: %s", exc)
+            self._event("error", "backup_failed", f"start: {exc}")
+            self._last_backup_error = f"start: {exc}"[:200]
+            self._backup_attempts_today += 1
+            self._last_backup_attempt_mono = time.monotonic()
+            if self._backup_attempts_today >= self.BACKUP_MAX_ATTEMPTS_PER_DAY:
+                self._last_backup_day = today
+            return
+        self._backup_job = job
+        self._backup_attempts_today += 1
+        self._last_backup_attempt_mono = time.monotonic()
+        self._event("info", "backup_started", str(job.final.name))
 
     def _drain_stream(self, archive: RawArchive | None) -> None:
         # Sampled *before* the writer guard: queue depth is a property of the
@@ -919,6 +1041,12 @@ class CollectorWorker:
                 "budget_seconds": self.POLL_BUDGET_SECONDS,
                 "exceeded": self._poll_budget_exceeded,
                 "deferred_tokens": self._poll_deferred,
+            },
+            "backup": {
+                "running": self._backup_job is not None,
+                "attempts_today": self._backup_attempts_today,
+                "last_ok": self._last_backup_ok,
+                "last_error": self._last_backup_error,
             },
             "ws_queue": {
                 "depth": depth,
@@ -1296,6 +1424,12 @@ def worker_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--discovery-seconds", type=float, default=900.0)
     parser.add_argument("--book-poll-seconds", type=float, default=5.0)
     parser.add_argument("--heartbeat-seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--backup-timeout-seconds",
+        type=float,
+        default=DEFAULT_BACKUP_TIMEOUT_SECONDS,
+        help="abandon the daily backup if it runs longer than this (default: %(default)ss)",
+    )
     parser.add_argument("--once", action="store_true", help="run one discovery+poll cycle then exit")
     args = parser.parse_args(argv)
 
@@ -1318,6 +1452,7 @@ def worker_main(argv: list[str] | None = None) -> int:
         discovery_seconds=args.discovery_seconds,
         book_poll_seconds=args.book_poll_seconds,
         heartbeat_seconds=args.heartbeat_seconds,
+        backup_timeout_seconds=args.backup_timeout_seconds,
         once=args.once,
     )
     return worker.run()
