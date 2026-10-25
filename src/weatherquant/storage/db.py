@@ -91,6 +91,17 @@ def _apply_budget(
     con.execute(f"SET threads={_threads(threads if threads is not None else DEFAULT_THREADS)}")
     directory = (temp_directory if temp_directory is not None else DEFAULT_TEMP_DIRECTORY).strip()
     if directory:
+        # The spill target must exist before the engine needs it. DuckDB would
+        # surface a missing directory only when a query actually overflows -
+        # hours into a run, mid-transaction. Creating it here means a mistyped
+        # path or an unwritable volume fails at startup, where an operator is
+        # looking, instead of at the worst possible moment.
+        try:
+            Path(directory).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(
+                f"temp_directory {directory!r} cannot be created: {exc}"
+            ) from exc
         con.execute(f"SET temp_directory='{directory.replace(chr(39), chr(39) * 2)}'")
 
 
