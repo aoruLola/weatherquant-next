@@ -111,18 +111,20 @@ def test_successful_partition_is_not_replayed_after_next_partition_fails(tmp_pat
     archive = RawArchive(root, run_id="review-test", flush_records=1000)
     archive.append(_record())
     archive.append(_record(1))
-    real_fsync = os.fsync
-    calls = 0
+    real_write = os.write
 
-    def fail_second(fd):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
+    # The fault is aimed at the second partition's data write rather than "the
+    # second fsync call": since the integrity trail landed, a flush also fsyncs
+    # sidecars and the recovery log, so call order no longer identifies the
+    # data files. Targeting the payload keeps the scenario the same - the
+    # first partition is durable when the second one fails.
+    def fail_second_partition(fd, data):
+        if b'"day":1' in data:
             raise OSError("second UTC partition failed")
-        return real_fsync(fd)
+        return real_write(fd, data)
 
     with monkeypatch.context() as patch:
-        patch.setattr(os, "fsync", fail_second)
+        patch.setattr(os, "write", fail_second_partition)
         with pytest.raises(OSError, match="second UTC"):
             archive.flush()
     assert archive.records_written == 1

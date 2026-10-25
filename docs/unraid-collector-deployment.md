@@ -415,6 +415,31 @@ docker start weatherquant-collector
 `[待NAS验证]` 做一次恢复演练：停容器 → 换备份 → 启容器 → `SELECT COUNT(*)`
 确认数据回到备份时点，且 `collection_gaps` 里多了一条 `start_after_restart`。
 
+### 9.5 raw 归档的校验和与恢复日志(WQN-21)
+
+`raw/` 是只追加的证据链,旁边有两个伴生文件描述"写者声称已经落盘了什么":
+
+- `<日期>.jsonl.sha256` — **逐行链式摘要** sidecar:`sha256(上一摘要 ‖ 行字节)`
+  逐行折叠,与 flush 批次无关,因此可以只凭文件字节复算。同时记录已覆盖的
+  字节数与行数;超出覆盖范围的字节是"已写入但未入链"(崩溃窗口),和
+  "内容被改过"是两种不同的报告。
+- `recovery.jsonl` — **恢复日志**:发现撕裂尾行、sidecar 与文件不符需要重建、
+  从上次运行延续 `archive_seq`,每件事都留一行,绝不静默通过。
+
+`archive_seq` 在单个文件内跨重启严格递增(重启会先读该文件最后一条持久
+行的序号再继续),重放不会铸造死掉的运行已经用过的序号。
+
+在 NAS 上验收(只读操作,随时可跑):
+
+```bash
+docker run --rm -v /mnt/user/appdata/weatherquant-next:/data:ro \
+  ghcr.io/<owner>/<repo>:stable \
+  python -m weatherquant.data.verify_raw_archive /data/raw
+```
+
+退出码 0 = 所有分区链验证通过;1 = 有分区报告问题(逐条列出);2 = 目录不可读。
+建议接入 User Scripts 每日跑一次,与 §9.3 的异地复制放在一起。
+
 ---
 
 ## 10. 回滚到上一个 SHA 版本
