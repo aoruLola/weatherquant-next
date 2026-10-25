@@ -303,6 +303,19 @@ class CollectorWorker:
                 checkpoint_seconds=300.0,
             )
             self._writer.open()
+            # Before this run registers itself: anything still 'running' was
+            # abandoned by a process that died without closing (SIGKILL, OOM,
+            # watchdog exit - the container can stay Up through all of them).
+            # Failing those rows now is what makes "which runs ended
+            # abnormally" answerable by query (WQN-5).
+            abandoned = self._writer.mark_abandoned_runs_failed()
+            if abandoned:
+                self._event(
+                    "warning",
+                    "restart",
+                    f"marked {len(abandoned)} abandoned run(s) as failed",
+                    {"run_ids": abandoned[:20]},
+                )
             self._writer.start_run(
                 app_version=__version__,
                 git_sha=self.git_sha,
@@ -1039,8 +1052,12 @@ class CollectorWorker:
                 timeout_seconds=self.backup_timeout_seconds,
             )
         except Exception as exc:
+            # The exception path is the one the acceptance cares about:
+            # a backups mount that vanished or filled up must leave an
+            # audit trail, not just a log line on a rotating container.
+            # (WQN-5; subsumed into the job-based flow of WQN-1.)
             log.warning("backup could not start: %s", exc)
-            self._event("error", "backup_failed", f"start: {exc}")
+            self._event("error", "backup_failed", f"start: {type(exc).__name__}: {exc}")
             self._last_backup_error = f"start: {exc}"[:200]
             self._backup_attempts_today += 1
             self._last_backup_attempt_mono = time.monotonic()

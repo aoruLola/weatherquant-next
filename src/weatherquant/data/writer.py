@@ -537,7 +537,13 @@ class CollectorWriter:
     def _guard_foreign_database(self, existed_before: bool) -> None:
         if not existed_before:
             return
-        probe = connect(self.db_path, read_only=True)
+        # Same configuration as the writer's own connection, deliberately not
+        # read_only: DuckDB refuses a second, differently-configured handle
+        # to one file within a process, so a read-only probe crashes whenever
+        # a same-process read-write connection already exists (the backup
+        # job's, or a test's). The probe only ever reads; and the file
+        # already exists, so this cannot create anything.
+        probe = connect(self.db_path)
         try:
             has_ledger = bool(
                 probe.execute(
@@ -657,6 +663,33 @@ class CollectorWriter:
         if rows:
             log.info("closed %d gap(s) left open by a previous run", len(rows))
         return len(rows)
+
+    def mark_abandoned_runs_failed(self) -> list[str]:
+        """Fail every run still marked ``running`` - none of them is us.
+
+        A run's row is closed by :meth:`close`. Anything still ``running`` was
+        abandoned by a process that died without closing: SIGKILL, a
+        container OOM, or a watchdog exit (the container can stay Up through
+        all of those, which is exactly when a supervisor needs the database
+        to say what the process could not). Auditing "which runs ended
+        abnormally" must be a query, not an archaeology project - so the next
+        start marks them, with a reason and a timestamp.
+
+        Call this *before* :meth:`start_run` (or it would fail this run too).
+        """
+        reason = "run did not exit cleanly (crash, kill, or watchdog exit)"
+        rows = self.con.execute(
+            "UPDATE collector_runs SET status = 'failed', stop_reason = ?, "
+            "stopped_at_utc = ? WHERE status = 'running' RETURNING run_id",
+            [reason, datetime.now(tz=UTC)],
+        ).fetchall()
+        if rows:
+            log.warning(
+                "marked %d abandoned run(s) as failed: %s",
+                len(rows),
+                ", ".join(str(r[0])[:12] for r in rows),
+            )
+        return [str(r[0]) for r in rows]
 
     def log_event(
         self, level: str, kind: str, message: str, details: dict | None = None
