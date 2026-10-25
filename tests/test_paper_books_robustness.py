@@ -79,10 +79,13 @@ class TestWsArrayFrames:
         refusal - never a crashed pass with the signal stranded ACCEPTED."""
         from datetime import datetime as _dt
 
+        from paper_fills_support import make_risk
+        from paper_fills_support_import import real_book_id_for_seed
         from paper_helpers import export_row
         from weatherquant.data.books import parse_book_payload
         from weatherquant.paper.events import parse_signal_event
         from weatherquant.paper.fills import FillEngine
+        from weatherquant.paper.ledger import Ledger
         from weatherquant.paper.store import PaperStore
         from weatherquant.storage.paper import PaperDatabase
 
@@ -102,19 +105,16 @@ class TestWsArrayFrames:
                 )
             ],
         )
-        snapshot = parse_book_payload(
-            two_level_book(), token_id=TOKEN, market_id="", fetched_at_utc=T_DECISION,
-            run_id="", source="ws",
-        )
         with PaperDatabase(tmp_path / "paper.duckdb") as db:
             store = PaperStore(db)
             store.ensure_account(initial_capital_usdc=100.0, now=NOW)
+            Ledger(store).open_account(initial_capital_usdc=100.0, now=NOW)
             event = parse_signal_event(
                 export_row(
                     decision_id="a" * 32,
                     token_id=TOKEN,
                     proposed_shares=100.0,
-                    book_id=snapshot.content_hash,
+                    book_id=real_book_id_for_seed(),
                 )
             )
             store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
@@ -123,6 +123,7 @@ class TestWsArrayFrames:
                 book_source=ArchiveBookSource(raw_dir),
                 buffer_fraction=0.005,
                 clock=lambda: NOW,
+                risk=make_risk(store),
             )
             result = engine.fill_pending()
             assert result.notes == [], result.notes
@@ -133,10 +134,12 @@ class TestWsArrayFrames:
         """One poisoned signal is a recorded refusal; its neighbours still fill."""
         from datetime import datetime as _dt
 
+        from paper_fills_support import make_risk
+        from paper_fills_support_import import real_book_id_for_seed
         from paper_helpers import export_row
-        from weatherquant.data.books import parse_book_payload
         from weatherquant.paper.events import parse_signal_event
         from weatherquant.paper.fills import FillEngine
+        from weatherquant.paper.ledger import Ledger
         from weatherquant.paper.store import PaperStore
         from weatherquant.storage.paper import PaperDatabase
 
@@ -146,20 +149,17 @@ class TestWsArrayFrames:
             raw_dir, source="ws", day="2026-10-26",
             lines=[ws_line(two_level_book(), received=T_DECISION - timedelta(seconds=20))],
         )
-        snapshot = parse_book_payload(
-            two_level_book(), token_id=TOKEN, market_id="", fetched_at_utc=T_DECISION,
-            run_id="", source="ws",
-        )
         with PaperDatabase(tmp_path / "paper.duckdb") as db:
             store = PaperStore(db)
             store.ensure_account(initial_capital_usdc=100.0, now=NOW)
+            Ledger(store).open_account(initial_capital_usdc=100.0, now=NOW)
             for decision_id, token in (("b" * 32, "tok-poison"), ("c" * 32, TOKEN)):
                 event = parse_signal_event(
                     export_row(
                         decision_id=decision_id,
                         token_id=token,
                         proposed_shares=100.0,
-                        book_id=snapshot.content_hash if token == TOKEN else None,
+                        book_id=real_book_id_for_seed(),
                     )
                 )
                 store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
@@ -169,6 +169,7 @@ class TestWsArrayFrames:
                 book_source=ArchiveBookSource(raw_dir),
                 buffer_fraction=0.005,
                 clock=lambda: NOW,
+                risk=make_risk(store),
             )
             # The poison: this token's resolution blows up mid-pricing.
             original_resolve = engine.books.resolve
