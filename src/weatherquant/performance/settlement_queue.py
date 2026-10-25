@@ -61,7 +61,7 @@ __all__ = [
 #: Bumped when the bucket rules change. The queue is an intermediate artefact,
 #: but a report whose semantics changed between runs is not comparable to the
 #: one before it unless it says so.
-QUEUE_VERSION = "settlement-queue-1"
+QUEUE_VERSION = "settlement-queue-2"
 
 #: ``state`` values that count as "this market produced an ACCEPT". Only the
 #: literal matters: the decision export's other states (REJECT, NO_TRADE, …)
@@ -69,6 +69,32 @@ QUEUE_VERSION = "settlement-queue-1"
 #: built from every decided market would ask the platform about markets the
 #: system never had an opinion on.
 ACCEPT_STATES = frozenset({"ACCEPT"})
+
+def _normalise_target(value: object) -> str | None:
+    """Normalise a target date onto its civil day.
+
+    A settlement index may carry ``"2026-10-13"`` while a decision export
+    carries ``"2026-10-13T00:00:00"``: the same day under two shapes, which
+    the pair key must not split into two buckets. Anything that is not
+    datetime-shaped passes through untouched - including None.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if len(text) > 10 and text[10] in (" ", "T"):
+        return text[:10]
+    return text or None
+
+
+def _fetched_at_of(record: Mapping[str, Any]) -> datetime:
+    """The record's fetch time, for newest-wins dedup; unparseable -> min."""
+    raw = record.get("fetched_at_utc")
+    if raw is None:
+        return datetime.min.replace(tzinfo=UTC)
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=UTC)
 
 ACCEPT = "ACCEPT"
 BUCKET_MISSING = "missing"
@@ -113,7 +139,7 @@ def build_settlement_queue(
     """
     now = now or datetime.now(tz=UTC)
 
-    pairs, skipped_no_market = _accept_pairs(decisions)
+    pairs, accept_stats = _accept_pairs(decisions)
     if not pairs:
         raise SettlementQueueError(
             "no ACCEPT decisions in the input: the queue's whole point is the "
@@ -124,10 +150,16 @@ def build_settlement_queue(
     by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for record in settlements:
         market_id = str(record.get("market_id") or "")
-        target = record.get("target_date")
+        target = _normalise_target(record.get("target_date"))
         if not market_id:
             continue
-        by_key[(market_id, str(target) if target is not None else None)] = record
+        key = (market_id, target)
+        existing = by_key.get(key)
+        # The same pair can be backfilled twice (a re-run, a revision). The
+        # record with the newest fetch time is the answer; file order says
+        # nothing about which one that is.
+        if existing is None or _fetched_at_of(record) >= _fetched_at_of(existing):
+            by_key[key] = record
 
     catalog_by_id: dict[str, Mapping[str, Any]] = {}
     for row in catalog:
@@ -172,21 +204,34 @@ def build_settlement_queue(
         queue.append(entry)
 
     eligible = sum(1 for entry in queue if entry["win_loss_eligible"])
+    # The coverage check, honestly: recompute the expected pair set from the
+    # ACCEPT decisions through a *different* code path than the accumulation
+    # loop that built the queue, and compare the sets. `len(queue) ==
+    # len(pairs)` was a tautology - both sides of it came from the same
+    # structure, so it could never catch a pair the queue lost. This version
+    # catches duplicates, lost pairs and normalisation drift.
+    expected_pairs = {
+        (str(row.get("market_id")), _normalise_target(row.get("target_date")))
+        for row in decisions
+        if row.get("market_id")
+        and str(row.get("state") or "").upper() in ACCEPT_STATES
+    }
+    queued_pairs = {(entry["market_id"], entry["target_date"]) for entry in queue}
     return {
         "queue_version": QUEUE_VERSION,
         "generated_at_utc": now.isoformat(),
         "coverage": {
             "accept_markets": len(queue),
-            "decisions_without_market_id": skipped_no_market,
+            "accept_rows": accept_stats["rows"],
+            # An ACCEPT row without a market id is a hole in the coverage
+            # claim - it can never be queued. REJECT/NO_TRADE rows without an
+            # id are irrelevant here and are not counted: this number exists
+            # so an export that loses ids on the rows that matter is visible.
+            "accept_rows_without_market_id": accept_stats["missing_id"],
             "buckets": buckets,
             "catalog_matched": catalog_matched,
             "catalog_unmatched": len(queue) - catalog_matched,
-            # The invariant, computed rather than asserted: every distinct
-            # (market_id, target_date) with an ACCEPT is in the queue exactly
-            # once. len(queue) is that count by construction; stating it in
-            # the same vocabulary the acceptance uses keeps the report
-            # checkable against the ticket.
-            "all_accept_markets_in_queue": len(queue) == len(pairs),
+            "all_accept_markets_in_queue": queued_pairs == expected_pairs,
             "win_loss_eligible_markets": eligible,
             "win_loss_gating": "official resolved + observation-verified only",
         },
@@ -196,25 +241,28 @@ def build_settlement_queue(
 
 def _accept_pairs(
     decisions: Sequence[Mapping[str, Any]],
-) -> tuple[dict[tuple[str, str], dict], int]:
+) -> tuple[dict[tuple[str, str], dict], dict[str, int]]:
     """Distinct ``(market_id, target_date)`` pairs with at least one ACCEPT.
 
-    Rows without a market id cannot be queued by definition, but they are
-    counted rather than swallowed: an export that loses its ids should
-    degrade the report, not disappear into silence.
+    Rows without a market id cannot be queued by definition. ACCEPT rows in
+    that state are counted (`missing_id`) - they are holes in the coverage
+    claim - while non-ACCEPT rows without an id are irrelevant to this queue
+    and are not counted at all. The state comparison is case-insensitive: a
+    feed that starts saying "accept" must degrade loudly, not vanish.
     """
     pairs: dict[tuple[str, str], dict] = {}
-    skipped = 0
+    stats = {"rows": 0, "missing_id": 0}
     for row in decisions:
-        market_id = row.get("market_id")
-        if not market_id:
-            skipped += 1
-            continue
-        state = str(row.get("state") or "")
+        state = str(row.get("state") or "").upper()
         if state not in ACCEPT_STATES:
             continue
-        target = row.get("target_date")
-        key = (str(market_id), str(target) if target is not None else None)
+        stats["rows"] += 1
+        market_id = row.get("market_id")
+        if not market_id:
+            stats["missing_id"] += 1
+            continue
+        target = _normalise_target(row.get("target_date"))
+        key = (str(market_id), target)
         entry = pairs.get(key)
         if entry is None:
             pairs[key] = {
@@ -226,7 +274,7 @@ def _accept_pairs(
             }
         else:
             entry["accept_observations"] += 1
-    return pairs, skipped
+    return pairs, stats
 
 
 def _bucket_of(

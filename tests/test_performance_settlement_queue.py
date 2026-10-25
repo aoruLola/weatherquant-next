@@ -47,7 +47,7 @@ def _decision(market: str, target: str, *, state: str = "ACCEPT", seq: int = 0) 
     }
 
 
-def _settlement(market: str, target: str, *, status: str, outcome=None, verification="UNVERIFIED") -> dict:
+def _settlement(market: str, target: str, *, status: str, outcome=None, verification="UNVERIFIED", fetched_at=None) -> dict:
     return {
         "market_id": market,
         "target_date": target,
@@ -55,7 +55,7 @@ def _settlement(market: str, target: str, *, status: str, outcome=None, verifica
         "resolved_outcome": outcome,
         "verification_status": verification,
         "resolution_source": "clob:/v2/resolutions",
-        "fetched_at_utc": NOW.isoformat(),
+        "fetched_at_utc": fetched_at or NOW.isoformat(),
     }
 
 
@@ -87,12 +87,78 @@ def test_every_accept_market_is_in_the_queue_exactly_once() -> None:
     assert entry["bucket"] == "missing" and entry["action"] == "backfill"
 
 
-def test_a_market_without_a_market_id_is_counted_not_swallowed() -> None:
-    decisions = [_decision("m-1", "2026-10-13"), {"state": "ACCEPT", "decision_id": "x"}]
+def test_accept_rows_without_a_market_id_are_counted_rejects_are_not() -> None:
+    """The hole that matters is an ACCEPT the queue can never hold.
+
+    A REJECT row without an id says nothing about coverage; counting it made
+    the number meaningless (an export with a few id-less REJECTs read as
+    "lost decisions" even though nothing queueable was lost).
+    """
+    decisions = [
+        _decision("m-1", "2026-10-13"),
+        {"state": "ACCEPT", "decision_id": "x"},
+        {"state": "ACCEPT", "decision_id": "y"},
+        {"state": "REJECT", "decision_id": "z"},
+        {"decision_id": "no-state"},
+    ]
     queue = build_settlement_queue(decisions, now=NOW)
 
-    assert queue["coverage"]["decisions_without_market_id"] == 1
+    assert queue["coverage"]["accept_rows"] == 3
+    assert queue["coverage"]["accept_rows_without_market_id"] == 2
     assert queue["coverage"]["accept_markets"] == 1
+
+
+def test_the_coverage_flag_is_a_real_comparison_not_a_tautology() -> None:
+    """`len(queue) == len(pairs)` compared a structure with itself.
+
+    The check now recomputes the expected pair set through a different code
+    path (a set comprehension over the ACCEPT decisions) and compares sets -
+    which a keying bug that collapses two days onto one pair can fail.
+    """
+    decisions = [_decision("m-1", "2026-10-13"), _decision("m-1", "2026-10-14")]
+    queue = build_settlement_queue(decisions, now=NOW)
+    assert queue["coverage"]["all_accept_markets_in_queue"] is True
+
+    # Simulate the drift: one entry loses its date. The recomputed
+    # expectation no longer matches the queue set.
+    drifted = {(e["market_id"], "2026-10-13") for e in queue["queue"]}
+    expected = {
+        (str(d["market_id"]), d["target_date"])
+        for d in decisions
+        if d.get("market_id") and str(d["state"]).upper() in {"ACCEPT"}
+    }
+    assert drifted != expected
+
+
+def test_lowercase_accept_is_counted_and_datetime_targets_are_normalised() -> None:
+    """A feed saying "accept" degrades loudly; the same day under two shapes
+    ("2026-10-13" vs "2026-10-13T00:00:00") is one pair, not two."""
+    decisions = [
+        _decision("m-1", "2026-10-13"),
+        {"decision_id": "d2", "decision_time_utc": "2026-10-13T01:00:00+00:00",
+         "market_id": "m-2", "target_date": "2026-10-13T00:00:00",
+         "model_name": "calibrated", "direction": "buy_yes", "mode": "LIVE",
+         "state": "accept", "net_edge": 0.05, "station": "KLGA",
+         "bracket_label": "81F"},
+    ]
+    settlements = [
+        _settlement("m-1", "2026-10-13", status="RESOLVED", outcome=1.0,
+                    verification="VERIFIED"),
+        # Same pair, datetime-shaped: must bucket as one, newest fetch wins.
+        _settlement("m-2", "2026-10-13T00:00:00", status="PENDING",
+                    fetched_at="2026-10-20T00:00:00+00:00"),
+        _settlement("m-2", "2026-10-13", status="RESOLVED", outcome=0.0,
+                    verification="UNVERIFIED",
+                    fetched_at="2026-10-21T00:00:00+00:00"),
+    ]
+    queue = build_settlement_queue(decisions, settlements=settlements, now=NOW)
+
+    assert queue["coverage"]["accept_markets"] == 2
+    assert queue["coverage"]["all_accept_markets_in_queue"] is True
+    by_id = {e["market_id"]: e for e in queue["queue"]}
+    assert by_id["m-2"]["bucket"] == "resolved_unverified", (
+        "the newer fetch (RESOLVED) must win over the older PENDING"
+    )
 
 
 def test_an_input_with_no_accepts_at_all_is_refused() -> None:
