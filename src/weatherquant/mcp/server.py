@@ -25,6 +25,25 @@ from weatherquant.mcp.security import RequestGuard, audit_event, current_caller
 
 __all__ = ["Gateway", "build_server", "market_path"]
 
+
+def _register(server: Any, *, name: str, title: str, description: str):
+    """Register a tool under the audit/error wrapper.
+
+    The wrapper is the only place transport errors become the explicit
+    no-answer payloads the contract promises - a timeout answered with a
+    JSON-RPC traceback is not a degraded answer, it is a broken one. Tools
+    are registered through this decorator so the mapping the unit tests
+    exercise is the mapping that runs; defining ``_wrap`` and never
+    applying it (which is how this shipped) passes every unit test and
+    fails every real client.
+    """
+
+    def decorate(fn):
+        server.tool(name=name, title=title, description=description)(_wrap(fn, name))
+        return fn
+
+    return decorate
+
 #: Tools that answer about *now*. The distinction matters because a client
 #: that asks "what is happening" and gets a week-old settlement will
 #: describe it in the present tense.
@@ -175,7 +194,7 @@ def build_server(gateway: Gateway) -> Any:
         ),
     )
 
-    @server.tool(
+    @_register(server,
         name="get_overview",
         title="运行总览",
         description=(
@@ -187,7 +206,7 @@ def build_server(gateway: Gateway) -> Any:
     def get_overview() -> dict[str, Any]:
         return gateway.call("get_overview", "/api/v1/overview")
 
-    @server.tool(
+    @_register(server,
         name="get_system_health",
         title="系统健康",
         description=(
@@ -206,7 +225,7 @@ def build_server(gateway: Gateway) -> Any:
         }
         return overview
 
-    @server.tool(
+    @_register(server,
         name="list_markets",
         title="查询当前市场",
         description=(
@@ -226,7 +245,7 @@ def build_server(gateway: Gateway) -> Any:
             params["date"] = target_date
         return gateway.call_raw("list_markets", "/api/v1/markets", params=params)
 
-    @server.tool(
+    @_register(server,
         name="get_market_detail",
         title="市场详情",
         description=(
@@ -237,7 +256,7 @@ def build_server(gateway: Gateway) -> Any:
     def get_market_detail(market_id: str) -> dict[str, Any]:
         return gateway.call_raw("get_market_detail", market_path(market_id))
 
-    @server.tool(
+    @_register(server,
         name="get_forecasts",
         title="读取天气预测",
         description=(
@@ -249,7 +268,7 @@ def build_server(gateway: Gateway) -> Any:
     def get_forecasts() -> dict[str, Any]:
         return gateway.call_raw("get_forecasts", "/api/v1/forecasts")
 
-    @server.tool(
+    @_register(server,
         name="list_decisions",
         title="查询 Shadow 决策",
         description=(
@@ -275,7 +294,7 @@ def build_server(gateway: Gateway) -> Any:
             params["model"] = model
         return gateway.call_raw("list_decisions", "/api/v1/decisions", params=params)
 
-    @server.tool(
+    @_register(server,
         name="get_shadow_report",
         title="Shadow 累计报表",
         description=(
@@ -287,7 +306,7 @@ def build_server(gateway: Gateway) -> Any:
     def get_shadow_report() -> dict[str, Any]:
         return gateway.call_raw("get_shadow_report", "/api/v1/shadow/report")
 
-    @server.tool(
+    @_register(server,
         name="get_edge_summary",
         title="理论 Edge 汇总",
         description=(
@@ -301,7 +320,7 @@ def build_server(gateway: Gateway) -> Any:
     def get_edge_summary() -> dict[str, Any]:
         return gateway.call_raw("get_edge_summary", "/api/v1/performance/edge")
 
-    @server.tool(
+    @_register(server,
         name="get_opportunities",
         title="独立机会列表",
         description=(
@@ -347,7 +366,7 @@ def build_server(gateway: Gateway) -> Any:
             params=params,
         )
 
-    @server.tool(
+    @_register(server,
         name="get_win_rate",
         title="实际胜率",
         description=(
@@ -362,7 +381,7 @@ def build_server(gateway: Gateway) -> Any:
     def get_win_rate() -> dict[str, Any]:
         return gateway.call_raw("get_win_rate", "/api/v1/performance/win-rate")
 
-    @server.tool(
+    @_register(server,
         name="get_settlements",
         title="官方结算",
         description=(
@@ -379,7 +398,7 @@ def build_server(gateway: Gateway) -> Any:
             params={"limit": max(1, min(limit, 200)), "cursor": max(0, cursor)},
         )
 
-    @server.tool(
+    @_register(server,
         name="compare_models",
         title="模型比较",
         description=(
@@ -392,7 +411,7 @@ def build_server(gateway: Gateway) -> Any:
     def compare_models() -> dict[str, Any]:
         return gateway.call_raw("compare_models", "/api/v1/performance/models")
 
-    @server.tool(
+    @_register(server,
         name="simulate_reference_capital",
         title="参考本金模拟",
         description=(
@@ -432,8 +451,16 @@ def build_server(gateway: Gateway) -> Any:
 
 
 def _wrap(fn, name: str):
-    """Run a tool with audit, mapping transport errors to readable ones."""
+    """Run a tool with audit, mapping transport errors to readable ones.
 
+    ``functools.wraps`` is load-bearing, not cosmetic: the SDK builds its
+    argument-validation model from the registered function's signature, and
+    a bare ``(*args, **kwargs)`` wrapper validates as "args and kwargs
+    required" - every call rejected before reaching the tool.
+    """
+    from functools import wraps
+
+    @wraps(fn)
     def wrapper(*args, **kwargs):
         import time
 
