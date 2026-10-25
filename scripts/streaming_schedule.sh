@@ -37,6 +37,13 @@
 #   WQ_SETTLEMENTS_JSON    settlement index for publish scoring  (optional)
 #   WQ_SCHEDULE_LOG        JSONL log (default <state db dir>/schedule.jsonl)
 #   WQ_MEMORY_LIMIT        DuckDB budget for the state store     (default 1GB)
+#   WQ_RUN_TIMEOUT_SECONDS wall-clock cap per invocation (default 900 = 15
+#                          min). A hung run is killed (TERM, then KILL) and
+#                          logged as timeout - without it, one stuck ingest
+#                          holds the lock and every later tick reads
+#                          skipped-locked forever.
+#   WQ_LOCK_WAIT_SECONDS   how long a second arrival waits for the lock
+#                          (default 0 = skip immediately)
 #
 # The log line is the acceptance record: role, exit, duration, peak RSS (when
 # /usr/bin/time exists), the watermark this run reached and - on skip - that
@@ -96,19 +103,31 @@ EXIT=0
 RSS_KB=""
 OUTPUT=""
 
-json_escape() { "$PY" -c "import json,sys; print(json.dumps(sys.argv[1]))" "$1"; }
+# The JSON helpers must NOT depend on $PY: the acceptance's timeout test
+# hung exactly there, because a hung/fake PY kept the watermark fallback
+# running after timeout had already killed the CLI run. These helpers need
+# any python3 - stdlib only - and never the run's own interpreter.
+JSON_PY="$(command -v python3 || command -v python || true)"
+
+json_escape() { "$JSON_PY" -c "import json,sys; print(json.dumps(sys.argv[1]))" "$1"; }
 
 log_line() {
-  # One JSON line per invocation - the acceptance record. Appended with
-  # fsync so a NAS power cut cannot reorder it away.
+  # One JSON line per invocation - the acceptance record. Appended, then the
+  # file's data is synced so a NAS power cut cannot reorder it away (local
+  # acceptance caught the comment promising fsync without the deed).
   printf '%s\n' "$1" >>"$LOG"
+  sync -d "$LOG" 2>/dev/null || true
 }
 
-# One lock for both roles; -n skips instead of queueing. A skip is a normal
-# event under cron (an ingest can still be running when the publish fires),
-# and the log line is what makes it observable.
+# One lock for both roles. Two fixes from local acceptance:
+#  - the crontab now staggers the publish minute (see the Runbook), and this
+#    script additionally supports `flock -w` (WQ_LOCK_WAIT_SECONDS, default
+#    0 = the old immediate skip) so an operator who prefers waiting over
+#    skipping can bound the wait instead of losing the tick;
+#  - a skip is still a logged normal event, never silent.
 exec 9>"$LOCK" || { echo "cannot open lock file $LOCK" >&2; exit 2; }
-if ! flock -n 9; then
+LOCK_WAIT="${WQ_LOCK_WAIT_SECONDS:-0}"
+if ! flock -w "$LOCK_WAIT" 9; then
   log_line "{\"ts\":\"$STARTED\",\"role\":\"$ROLE\",\"status\":\"skipped-locked\",\"exit\":0,\"duration_s\":0,\"rss_kb\":null,\"watermark\":null}"
   exit 0
 fi
@@ -121,16 +140,26 @@ if [[ "$ROLE" == "publish" && ! -f "$WQ_STATE_DB" ]]; then
   exit 0
 fi
 
+RUN_TIMEOUT="${WQ_RUN_TIMEOUT_SECONDS:-900}"
+RUN_CMD=(timeout --signal=TERM --kill-after=60 "$RUN_TIMEOUT")
 if [[ -n "$TIME_BIN" ]]; then
-  OUTPUT="$($TIME_BIN "$PY" -m weatherquant.cli "${ARGS[@]}" 2>&1)"
+  OUTPUT="$("${RUN_CMD[@]}" $TIME_BIN "$PY" -m weatherquant.cli "${ARGS[@]}" 2>&1)"
   EXIT=$?
   # GNU time prints "Maximum resident set size (kbytes): N" in its report.
   RSS_KB="$(printf '%s\n' "$OUTPUT" | sed -n 's/.*Maximum resident set size (kbytes): //p' | tail -1)"
 else
-  OUTPUT="$("$PY" -m weatherquant.cli "${ARGS[@]}" 2>&1)"
+  OUTPUT="$("${RUN_CMD[@]}" "$PY" -m weatherquant.cli "${ARGS[@]}" 2>&1)"
   EXIT=$?
 fi
-[[ $EXIT -ne 0 ]] && STATUS="failed"
+if [[ $EXIT -eq 124 || $EXIT -eq 137 ]]; then
+  # timeout's own codes: the run was killed for exceeding the wall clock.
+  # Recorded as its own status - a hung run is not the same fact as a failed
+  # one, and "every later tick reads skipped-locked forever" is the failure
+  # mode this cap exists to break.
+  STATUS="timeout"
+elif [[ $EXIT -ne 0 ]]; then
+  STATUS="failed"
+fi
 
 DURATION="$(($(date +%s) - T0))"
 
@@ -139,7 +168,7 @@ DURATION="$(($(date +%s) - T0))"
 # invented.
 WATERMARK="$(printf '%s\n' "$OUTPUT" | sed -n 's/^watermark: //p' | tail -1)"
 if [[ -z "$WATERMARK" && -f "$WQ_EXPORT_DIR/state.json" ]]; then
-  WATERMARK="$("$PY" -c "
+  WATERMARK="$("$JSON_PY" -c "
 import json
 try:
     state = json.load(open('$WQ_EXPORT_DIR/state.json'))

@@ -38,7 +38,12 @@
   WQ_STATE_DB=/mnt/user/appdata/weatherquant-performance-state/performance-state.duckdb \
   WQ_SETTLEMENTS_JSON=/mnt/user/appdata/weatherquant-settlements/settlements.json \
   PY=/mnt/user/appdata/wq-venv/bin/python /mnt/user/appdata/wq/scripts/streaming_schedule.sh >> /var/log/wq-schedule.log 2>&1
-*/20 * * * *  WQ_SCHEDULE_ROLE=publish <同上环境变量> /mnt/user/appdata/wq/scripts/streaming_schedule.sh >> /var/log/wq-schedule.log 2>&1
+# publish 错开分钟（2-59/20 而不是 */20）：*/5 与 */20 在 :00/:20/:40 同时
+# 触发时两角色抢同一把 flock，本机验收实测 75% 的 publish 被 skipped-locked。
+# 错峰后同一分钟内不再有第二个角色；调度器另支持 WQ_LOCK_WAIT_SECONDS（flock
+# -w 有界等待）与 WQ_RUN_TIMEOUT_SECONDS（默认 900s，挂死的运行被杀并记
+# timeout——否则一次挂起会让后续每一拍都 skipped-locked）。
+2-59/20 * * * *  WQ_SCHEDULE_ROLE=publish <同上环境变量> /mnt/user/appdata/wq/scripts/streaming_schedule.sh >> /var/log/wq-schedule.log 2>&1
 ```
 
 每次调用向 `<state db 目录>/schedule.jsonl` 追加一行 JSON：

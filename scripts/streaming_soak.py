@@ -48,6 +48,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -222,6 +223,21 @@ class CronStandIn:
                 self.crash_at = datetime.now(tz=UTC)
                 self.log.append(f"SOAK: SIGKILLed the running ingest at "
                                 f"{time.monotonic() - self.started:.0f}s")
+                # The scheduler cannot log its own death; without this line
+                # the schedule log shows a silent gap where the killed run
+                # was (local acceptance minor finding). The status name
+                # says who wrote it.
+                schedule_log = Path(self._env["WQ_SCHEDULE_LOG"])
+                with open(schedule_log, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({
+                        "ts": self.crash_at.isoformat(),
+                        "role": "ingest",
+                        "status": "killed-by-soak",
+                        "exit": 137,
+                        "duration_s": round(time.monotonic() - self.started, 1),
+                        "rss_kb": None,
+                        "watermark": None,
+                    }) + "\n")
             except (ProcessLookupError, PermissionError):
                 pass
 
@@ -301,6 +317,49 @@ def read_schedule_log(path: Path) -> list[ScheduleEntry]:
     return entries
 
 
+def publish_interval_observations(
+    entries: list[ScheduleEntry],
+) -> tuple[list[float], str | None]:
+    """Actual intervals between consecutive *successful* publish starts.
+
+    Returns (intervals in seconds, warning). The acceptance requires the
+    observed publish cadence to stay within 1.5x the configured one - a
+    schedule whose publishes slip (lock starvation, slow runs) is failing
+    its contract even when each individual run says ok.
+    """
+    started_publishes = [
+        _parse_ts(e.ts)
+        for e in entries
+        if e.role == "publish" and e.status == "ok"
+    ]
+    started_publishes = [t for t in started_publishes if t is not None]
+    if len(started_publishes) < 2:
+        return [], "fewer than two successful publish runs: cadence unmeasurable"
+    intervals = [
+        (later - earlier).total_seconds()
+        for earlier, later in pairwise(started_publishes)
+    ]
+    return intervals, None
+
+
+def rss_gate_failure(peak_rss_kb: int | None, *, allow_missing: bool) -> str | None:
+    """The resource-budget gate, as a failure message or None.
+
+    An unmeasurable RSS failed the acceptance silently once (the report said
+    'n/a' and moved on); here it is either an explicit failure or an
+    explicitly granted opt-out, never silence.
+    """
+    if peak_rss_kb is None:
+        if allow_missing:
+            return None
+        return (
+            "peak RSS unmeasurable: the scheduler found no /usr/bin/time. "
+            "Install GNU time (apt install time) or pass --allow-missing-rss "
+            "to accept a run without resource evidence"
+        )
+    return None
+
+
 def watermark_value(entry: ScheduleEntry) -> str | None:
     """The watermark's time component, parsed from the CLI's list rendering."""
     if not entry.watermark:
@@ -341,6 +400,10 @@ def main() -> int:
     parser.add_argument("--crash-after-seconds", type=float, default=240.0)
     parser.add_argument("--max-rss-kb", type=int, default=1500000,
                         help="per-invocation peak RSS gate (default 1.5 GB)")
+    parser.add_argument("--allow-missing-rss", action="store_true",
+                        help="accept a run whose RSS could not be measured "
+                             "(no GNU time); without it an unmeasurable RSS "
+                             "fails the soak")
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
 
@@ -452,6 +515,27 @@ def main() -> int:
         failures_list.append(
             f"peak RSS {peak_rss} kB above the gate {args.max_rss_kb}"
         )
+    rss_failure = rss_gate_failure(peak_rss, allow_missing=args.allow_missing_rss)
+    if rss_failure:
+        failures_list.append(rss_failure)
+    elif peak_rss is None:
+        soak_log.append("SOAK: RSS unmeasurable (no GNU time); gated off by --allow-missing-rss")
+    intervals, cadence_warning = publish_interval_observations(entries)
+    if cadence_warning:
+        failures_list.append(f"publish cadence: {cadence_warning}")
+    else:
+        worst = max(intervals)
+        limit = args.publish_seconds * 1.5
+        print(
+            f"  publish cadence        worst gap {worst:.0f}s "
+            f"(gate {limit:.0f}s = cadence x1.5)"
+        )
+        if worst > limit:
+            failures_list.append(
+                f"publish interval {worst:.0f}s exceeds {limit:.0f}s "
+                f"(cadence {args.publish_seconds:.0f}s x 1.5): the schedule "
+                "is starving its own publishes"
+            )
     if not current_generation_complete(work / "performance"):
         failures_list.append("the published tree has no complete current generation")
 

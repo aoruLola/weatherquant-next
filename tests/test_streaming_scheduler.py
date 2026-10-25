@@ -158,3 +158,69 @@ def test_a_missing_role_argument_is_refused() -> None:
     )
     assert result.returncode == 2
     assert "ingest|publish" in result.stderr
+
+
+# --- acceptance round two: timeout, cadence gate, RSS gate ---------------------
+
+
+def test_a_hung_run_is_killed_and_logged_as_timeout(tmp_path: Path) -> None:
+    """A run that ignores its wall clock must die by it - otherwise one hung
+    ingest holds the lock and every later tick reads skipped-locked forever
+    (local acceptance). The fake PY ignores its arguments and sleeps."""
+    work = tmp_path / "hang"
+    work.mkdir()
+    _make_export(work, parts=1, rows=8)
+    fake_py = work / "fakepy"
+    fake_py.write_text("#!/bin/bash\nexec sleep 999\n", encoding="utf-8")
+    fake_py.chmod(0o755)
+
+    env = _env(work)
+    env["PY"] = str(fake_py)
+    env["WQ_RUN_TIMEOUT_SECONDS"] = "3"
+
+    result = _schedule(env, "ingest", timeout=60)
+    # A timed-out run is a failure: the scheduler must exit non-zero so CI
+    # and cron mail see it, while the log records it as its own status.
+    assert result.returncode in (124, 137)
+    entries = _log_entries(work)
+    assert entries[-1]["status"] == "timeout", entries[-1]
+    assert entries[-1]["exit"] in (124, 137)
+
+
+def test_publish_cadence_gate_uses_successful_runs(tmp_path: Path) -> None:
+    """The observed publish cadence must stay within 1.5x the schedule - the
+    acceptance measured 75% skipped publishes under a same-minute crontab."""
+    soak = _load_soak_module()
+
+    def entry(ts: str, status: str = "ok") -> soak.ScheduleEntry:
+        return soak.ScheduleEntry(ts=ts, role="publish", status=status,
+                                  exit=0, duration_s=1, rss_kb=None, watermark=None)
+
+    # 120s cadence, runs 100s and 400s apart: the second gap breaches 1.5x.
+    entries = [
+        entry("2026-10-26T10:00:00+00:00"),
+        entry("2026-10-26T10:01:40+00:00"),
+        entry("2026-10-26T10:08:20+00:00"),
+    ]
+    intervals, warning = soak.publish_interval_observations(entries)
+    assert warning is None
+    assert max(intervals) == 400.0
+
+    # A skipped publish is not a successful run and does not count.
+    entries.append(entry("2026-10-26T10:09:00+00:00", status="skipped-locked"))
+    intervals, _ = soak.publish_interval_observations(entries)
+    assert max(intervals) == 400.0
+
+    # Fewer than two successes: cadence unmeasurable, reported as a warning.
+    intervals, warning = soak.publish_interval_observations([entry("2026-10-26T10:00:00+00:00")])
+    assert intervals == [] and warning
+
+
+def test_an_unmeasurable_rss_fails_unless_explicitly_allowed() -> None:
+    soak = _load_soak_module()
+
+    failure = soak.rss_gate_failure(None, allow_missing=False)
+    assert failure and "apt install time" in failure
+
+    assert soak.rss_gate_failure(None, allow_missing=True) is None
+    assert soak.rss_gate_failure(123456, allow_missing=False) is None
