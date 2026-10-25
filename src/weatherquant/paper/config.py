@@ -130,6 +130,44 @@ class PaperSettings(BaseSettings):
         "the export cadence itself; 600s tolerates one full missed export "
         "without treating a lagging channel as a tradeable signal.",
     )
+    max_book_age_seconds: float = Field(
+        default=90.0,
+        gt=0.0,
+        description="A resolved point-in-time book older than this at the "
+        "decision instant is refused (BOOK_STALE). Matches the shadow's "
+        "max_snapshot_age_ms gate (v2: two measured collector sweeps), so "
+        "the paper engine never fills a book the decision layer would have "
+        "refused.",
+    )
+
+    # --- fill gates -------------------------------------------------------------
+    require_complete_fill: bool = Field(
+        default=True,
+        description="A partial fill is not a smaller trade, it is a different "
+        "trade: the unfilled remainder would have to be repriced against a "
+        "book we just drove through. Refusing keeps every fill interpretable.",
+    )
+    execution_buffer_fraction: float = Field(
+        default=0.005,
+        ge=0.0,
+        description="Execution buffer as a fraction of fill notional (0.5%), "
+        "matching the collector's execution_buffer_fraction so both engines "
+        "cost the same trade the same way.",
+    )
+    fill_batch: int = Field(
+        default=100,
+        ge=1,
+        description="Max signals priced per fill pass. One transaction per "
+        "batch; bounded like every other loop in this engine.",
+    )
+    archive_tail_bytes: int = Field(
+        default=4 * 1024 * 1024,
+        gt=0,
+        description="How deep into each archived day file the point-in-time "
+        "book resolver may read, from the end. LIVE decisions are "
+        "contemporary, so the matching frame is near the tail; a frame "
+        "outside the window is honestly not found rather than guessed at.",
+    )
 
     @field_validator("enabled", mode="before")
     @classmethod

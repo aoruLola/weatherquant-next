@@ -23,8 +23,10 @@ import uuid
 from datetime import UTC, datetime
 
 from weatherquant.data.lock import LockError, SingleInstanceLock
+from weatherquant.paper.books import ArchiveBookSource
 from weatherquant.paper.config import PaperSettings
 from weatherquant.paper.consumer import SignalConsumer
+from weatherquant.paper.fills import FillEngine
 from weatherquant.paper.store import ACCOUNT_ID, PaperStore
 from weatherquant.storage.paper import PaperDatabase
 
@@ -43,6 +45,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_status(settings)
         if args.command == "consume":
             return _cmd_consume(settings, batch_lines=args.batch_lines)
+        if args.command == "fill":
+            return _cmd_fill(settings)
     except ValueError as exc:
         # The enablement flag's parse error lands here: say it plainly and
         # exit non-zero rather than pretending the flag was absent.
@@ -66,6 +70,10 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=5000,
         help="max published lines to read in this pass (default 5000)",
+    )
+    sub.add_parser(
+        "fill",
+        help="price accepted signals against their point-in-time books (requires enablement)",
     )
     return parser
 
@@ -155,6 +163,39 @@ def _cmd_consume(settings: PaperSettings, *, batch_lines: int) -> int:
         )
         result = consumer.consume_once()
         run_id = db.start_run("paper-consume", {"batch_lines": batch_lines})
+        db.finish_run(run_id, status="stopped", stats=result.as_dict())
+    finally:
+        db.close()
+        lock.release()
+    print(json.dumps(result.as_dict(), sort_keys=True, indent=2, default=str))
+    return 0
+
+
+def _cmd_fill(settings: PaperSettings) -> int:
+    _require_enabled(settings)
+    try:
+        db, lock = _open_under_lock(settings, "paper-fill")
+    except LockError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 4
+    try:
+        store = PaperStore(db)
+        if store.account() is None:
+            print(
+                f"error: account {ACCOUNT_ID} does not exist; run "
+                "`weatherquant-paper init` first",
+                file=sys.stderr,
+            )
+            return 3
+        engine = FillEngine(
+            store,
+            book_source=ArchiveBookSource(settings.raw_dir, tail_bytes=settings.archive_tail_bytes),
+            buffer_fraction=settings.execution_buffer_fraction,
+            require_complete_fill=settings.require_complete_fill,
+            max_book_age_seconds=settings.max_book_age_seconds,
+        )
+        result = engine.fill_pending()
+        run_id = db.start_run("paper-fill", {})
         db.finish_run(run_id, status="stopped", stats=result.as_dict())
     finally:
         db.close()
