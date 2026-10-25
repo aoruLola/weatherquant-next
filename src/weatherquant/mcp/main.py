@@ -111,14 +111,22 @@ def _split(raw: str | None) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
-def _allowed_hosts(host: str, port: int) -> list[str]:
+def _allowed_hosts(host: str, port: int, extra: str | None = None) -> list[str]:
     """Host header values a client may legitimately send.
 
     A bound address of ``0.0.0.0`` is never a Host header - a client
-    connects to a real name or address. All three forms are accepted so a
-    health probe and a browser agree about who we are.
+    connects to a real name or address. The bind-derived forms are joined so
+    a health probe and a browser agree about who we are.
+
+    ``WQ_MCP_ALLOWED_HOSTS`` (comma separated) names *additional* values -
+    the service name a reverse proxy or another container uses to reach this
+    gateway, or the LAN address a browser is pointed at. Without reading it
+    the variable documented everywhere (module docstring, compose, the
+    deployment guide) was dead text: every such request died with ``421
+    Invalid Host header`` before authentication could even see it.
     """
-    return sorted({f"{host}:{port}", f"localhost:{port}", f"127.0.0.1:{port}"})
+    configured = _split(extra if extra is not None else os.environ.get("WQ_MCP_ALLOWED_HOSTS"))
+    return sorted({f"{host}:{port}", f"localhost:{port}", f"127.0.0.1:{port}", *configured})
 
 
 def main(argv: list[str] | None = None) -> int:

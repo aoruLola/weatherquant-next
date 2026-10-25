@@ -28,6 +28,7 @@ import pytest
 
 from weatherquant.mcp.client import DashboardClient
 from weatherquant.mcp.http_app import build_http_app
+from weatherquant.mcp.main import _allowed_hosts
 from weatherquant.mcp.security import RequestGuard
 from weatherquant.mcp.server import Gateway, build_server
 
@@ -89,7 +90,7 @@ class _Upstream:
 
 
 @contextlib.contextmanager
-def _running_server(*, client_timeout: float = 20.0):
+def _running_server(*, client_timeout: float = 20.0, extra_hosts: list[str] | None = None):
     """A real MCP server bound to a real port, with a counting upstream."""
     upstream = _Upstream()
     client = DashboardClient(
@@ -115,10 +116,12 @@ def _running_server(*, client_timeout: float = 20.0):
     server = build_server(Gateway(client, guard))
 
     port = _free_port()
+    # The allowlist is built the way main() builds it: bind-derived forms plus
+    # any operator-configured extra hosts.
     app = build_http_app(
         server,
         guard=guard,
-        allowed_hosts=[f"127.0.0.1:{port}", f"localhost:{port}"],
+        allowed_hosts=_allowed_hosts("127.0.0.1", port, extra=",".join(extra_hosts or [])),
         allowed_origins=[ALLOWED_ORIGIN],
     )
 
@@ -567,6 +570,43 @@ def test_an_upstream_5xx_is_an_explicit_no_answer(server_env) -> None:
     content = _json.loads(payload["result"]["content"][0]["text"])
     assert content["data"] is None
     assert any("could not answer" in w for w in content["warnings"]), content["warnings"]
+
+
+def test_the_env_configured_service_name_is_an_accepted_host(monkeypatch) -> None:
+    """WQ_MCP_ALLOWED_HOSTS must reach the real transport.
+
+    Local acceptance caught the gap: the variable was documented in the module
+    docstring, the compose file and the deployment guide, but `_allowed_hosts`
+    never read it - so a request addressed by the service name died with 421
+    before authentication, on exactly the deployment the compose file
+    describes. Here the allowlist is built the way `main()` builds it and a
+    request carrying that Host gets past the SDK's rebinding check.
+    """
+    from weatherquant.mcp.main import _allowed_hosts
+
+    monkeypatch.setenv("WQ_MCP_ALLOWED_HOSTS", "weatherquant-mcp:8788")
+    merged = _allowed_hosts("127.0.0.1", 8788)
+    assert "weatherquant-mcp:8788" in merged
+    assert "127.0.0.1:8788" in merged and "localhost:8788" in merged
+
+    # Over the real socket: the configured name passes, an unlisted one dies.
+    with _running_server(extra_hosts=["weatherquant-mcp:8788"]) as env:
+        port = env["port"]
+        named = httpx.post(
+            f"http://127.0.0.1:{port}/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            headers={**_headers(TOKEN), "Host": "weatherquant-mcp:8788"},
+            timeout=20.0,
+        )
+        assert named.status_code != 421, named.text
+
+        foreign = httpx.post(
+            f"http://127.0.0.1:{port}/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            headers={**_headers(TOKEN), "Host": "attacker.rebinding.test"},
+            timeout=20.0,
+        )
+        assert foreign.status_code == 421, foreign.text
 
 
 def test_a_non_loopback_bind_without_a_token_never_starts_serving(monkeypatch) -> None:
