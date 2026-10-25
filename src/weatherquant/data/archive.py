@@ -43,11 +43,17 @@ durable-wrote:
   flush batch - batch boundaries exist only in memory and would not survive
   a restart). It records the byte and line counts the digest covers; bytes
   beyond that count are written but not yet checksummed.
-* ``recovery.jsonl`` - one line per *recovery event*: a torn final line found
-  on restart, a sidecar that no longer matches the file and had to be
-  rebuilt, or an ``archive_seq`` baseline picked up from a previous run.
-  These are the events an operator needs when reconstructing what happened;
-  none of them may silently pass.
+* ``recovery.jsonl`` - one line per *recovery event*: a torn final line
+  quarantined on restart, a sidecar that no longer matches the file and had
+  to be rebuilt, or an ``archive_seq`` baseline picked up from a previous
+  run. These are the events an operator needs when reconstructing what
+  happened; none of them may silently pass.
+* ``quarantine/<source>/`` - the torn fragments themselves. A crash mid-write
+  leaves a final line without its newline; the next run moves those bytes
+  here (fsynced before the data file is truncated, with their sha256 in the
+  recovery log) and continues appending. A restart therefore never wedges on
+  a torn tail, and the evidence of what the dead process was writing is
+  kept, not buried and not dropped.
 
 ``archive_seq`` is monotonic *within a file*, including across process
 restarts: a restarted archive reads the last durable line of each partition
@@ -79,6 +85,43 @@ EMPTY_CHAIN = hashlib.sha256(b"").hexdigest()
 # existing partition file. 64 KiB covers a day's tail at any realistic line
 # length; the read happens once per partition per process.
 _TAIL_READ_BYTES = 65536
+
+
+def _read_full(fd: int, count: int) -> bytes:
+    """Read exactly ``count`` bytes from the descriptor's current position.
+
+    ``os.read`` may return short; callers here need whole spans (a torn
+    fragment, a tail window) or nothing.
+    """
+    chunks: list[bytes] = []
+    remaining = count
+    while remaining > 0:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _write_full(fd: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(fd, data[offset:])
+        if written <= 0:
+            raise OSError("write made no progress")
+        offset += written
+
+
+def _fsync_dir(path: Path) -> None:
+    """Flush a directory entry so a completed rename survives a crash."""
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    fd = os.open(path, os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +234,58 @@ class RawArchive:
 
     def _partition_path(self, key: tuple[str, date]) -> Path:
         return self.root / key[0] / f"{key[1].isoformat()}.jsonl"
+
+    def _quarantine_torn_tail_locked(self, path: Path, fd: int) -> int:
+        """Move a previous crash's torn final line aside; return surviving bytes.
+
+        The fragment is *evidence* of what the dead process was writing, so
+        it is moved, never dropped: the quarantine copy is written and fsynced
+        first, and only then is the data file truncated. A crash between the
+        two leaves the same torn tail for the next start to quarantine again -
+        the fragment cannot be lost, only quarantined twice. A quarantine
+        write that fails (full disk) aborts the flush with the file untouched,
+        which is the retryable failure the rest of this module already
+        handles.
+
+        Returns the post-truncation size, which the caller uses as its
+        rollback boundary in place of the pre-quarantine file size.
+        """
+        file_size = os.fstat(fd).st_size
+        # Everything before the last newline is complete lines that must
+        # survive untouched; everything after it is the fragment. The scan
+        # steps backwards window by window because the fragment can be
+        # longer than any single tail read.
+        newline_at = _scan_last_newline(fd, file_size)
+        keep_bytes = 0 if newline_at < 0 else newline_at + 1
+        os.lseek(fd, keep_bytes, os.SEEK_SET)
+        torn = _read_full(fd, file_size - keep_bytes)
+
+        digest = hashlib.sha256(torn).hexdigest()
+        quarantine_dir = self.root / "quarantine" / path.parent.name
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        quarantine_path = (
+            quarantine_dir
+            / f"{path.name}.{datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%S%fZ')}.torn"
+        )
+        qfd = os.open(quarantine_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            _write_full(qfd, torn)
+            os.fsync(qfd)
+        finally:
+            os.close(qfd)
+        _fsync_dir(quarantine_dir)
+
+        os.ftruncate(fd, keep_bytes)
+        os.fsync(fd)
+        self._log_recovery(
+            "torn_tail_quarantined",
+            path=str(path),
+            kept_bytes=keep_bytes,
+            quarantined_bytes=len(torn),
+            quarantined_sha256=digest,
+            quarantine_path=str(quarantine_path),
+        )
+        return keep_bytes
 
     def _continue_seq_from_file_locked(self, key: tuple[str, date]) -> None:
         """Pick up the sequence baseline a previous run left in this partition."""
@@ -319,16 +414,13 @@ class RawArchive:
                 else:
                     last_byte = b"\n"
                 if original_size and last_byte != b"\n":
-                    # A torn last line from a previous process must not be
-                    # buried in the JSONL stream. Preserve it for inspection;
-                    # refuse until repaired rather than silently discard it.
-                    self._log_recovery(
-                        "unterminated_line_detected",
-                        path=str(path),
-                        file_bytes=original_size,
-                        detail="appending would bury a torn final line; repair required",
-                    )
-                    raise RuntimeError(f"archive has an unterminated line: {path}")
+                    # A torn last line from a previous crash must not be
+                    # buried in the JSONL stream - and it must not wedge the
+                    # collector either. Move the fragment aside, durably,
+                    # and continue: the previous behaviour (refuse until an
+                    # operator trims the file) turned every kill -9 mid-write
+                    # into an archive that could never flush again.
+                    original_size = self._quarantine_torn_tail_locked(path, fd)
                 try:
                     offset = 0
                     while offset < len(payload):
@@ -494,6 +586,26 @@ def _scan_file_trail(path: Path) -> tuple[str, int, int]:
     return chain, covered, lines
 
 
+def _scan_last_newline(fd: int, file_size: int) -> int:
+    """Offset of the last ``b"\\n"`` in the file, or -1 - in window steps.
+
+    A torn fragment has no internal newline and can be arbitrarily long (a
+    whole multi-line batch dying between two bytes), so a single fixed-size
+    tail read can land entirely inside it. Stepping backwards window by
+    window keeps the boundary correct at any fragment length.
+    """
+    pos = file_size
+    while pos > 0:
+        step = min(pos, _TAIL_READ_BYTES)
+        pos -= step
+        os.lseek(fd, pos, os.SEEK_SET)
+        chunk = _read_full(fd, step)
+        idx = chunk.rfind(b"\n")
+        if idx >= 0:
+            return pos + idx
+    return -1
+
+
 def _last_seq_in_file(path: Path) -> int:
     """The archive_seq of the last *complete* line, or 0 when unreadable.
 
@@ -502,18 +614,25 @@ def _last_seq_in_file(path: Path) -> int:
     baseline the surviving lines do provide.
     """
     try:
-        size = path.stat().st_size
+        file_size = path.stat().st_size
     except OSError:
         return 0
-    if not size:
+    if not file_size:
         return 0
-    with path.open("rb") as fh:
-        fh.seek(max(0, size - _TAIL_READ_BYTES))
-        chunk = fh.read()
-    if chunk and not chunk.endswith(b"\n"):
-        # Discard the unterminated tail fragment.
-        cut = chunk.rfind(b"\n")
-        chunk = chunk[: cut + 1] if cut >= 0 else b""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        newline_at = _scan_last_newline(fd, file_size)
+        if newline_at < 0:
+            return 0
+        # The last complete line lies between the previous newline and this
+        # one; read back at most one window to capture it whole.
+        window_start = max(0, newline_at - _TAIL_READ_BYTES)
+        os.lseek(fd, window_start, os.SEEK_SET)
+        chunk = _read_full(fd, newline_at - window_start)
+    except OSError:
+        return 0
+    finally:
+        os.close(fd)
     complete = [ln for ln in chunk.split(b"\n") if ln.strip()]
     if not complete:
         return 0

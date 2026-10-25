@@ -197,7 +197,13 @@ def test_a_sidecar_left_behind_is_resumed_not_rebuilt(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_a_torn_tail_is_refused_and_logged_then_repaired_without_loss(tmp_path):
+def test_a_torn_tail_is_quarantined_automatically_and_appending_continues(tmp_path):
+    """WQN-21 acceptance regression: a kill -9 mid-batch must not wedge the
+    collector until an operator trims the file. The fragment is quarantined
+    (fsynced before the truncate, sha256 recorded), the surviving complete
+    lines are untouched, and the archive keeps appending - to the same file."""
+    import hashlib
+
     root = tmp_path / "raw"
     first = RawArchive(root, run_id="run-a", flush_records=1000)
     first.append(_record(run_id="run-a"))
@@ -205,29 +211,67 @@ def test_a_torn_tail_is_refused_and_logged_then_repaired_without_loss(tmp_path):
     first.close()
 
     path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    durable = path.read_bytes()
     torn = b'{"crash":"half a line"'
     with path.open("ab") as fh:
         fh.write(torn)
-    before = path.read_bytes()
 
     restarted = RawArchive(root, run_id="run-b", flush_records=1000)
     restarted.append(_record(1, run_id="run-b"))
-    with pytest.raises(RuntimeError, match="unterminated"):
-        restarted.flush()
-    assert path.read_bytes() == before, "refusal must not touch historical bytes"
-    events = [e["event"] for e in _recovery_events(root)]
-    assert "unterminated_line_detected" in events
-
-    # Operator repair: trim to the last newline, then the archive continues -
-    # rebuilding the checksum trail over the surviving bytes, and saying so.
-    path.write_bytes(before[: before.rfind(b"\n") + 1])
-    assert restarted.flush() == 1
-    events = [e["event"] for e in _recovery_events(root)]
-    assert "checksum_rebuilt" in events
-    lines = _lines(root)
-    assert [r["payload"]["n"] for r in lines] == [0, 1]
-    assert _all_ok(root)
+    assert restarted.flush() == 1, "a torn tail must not require manual repair"
     restarted.close()
+
+    # Historical bytes byte-for-byte intact; fragment gone from the data file,
+    # intact under quarantine/, with its checksum in the recovery log.
+    data = path.read_bytes()
+    assert data.startswith(durable)
+    assert data.endswith(b"\n") and torn not in data
+    quarantined_files = list((root / "quarantine" / "rest").glob("*.torn"))
+    assert len(quarantined_files) == 1
+    assert quarantined_files[0].read_bytes() == torn
+
+    events = _recovery_events(root)
+    by_kind = [e["event"] for e in events]
+    assert "torn_tail_quarantined" in by_kind
+    record = next(e for e in events if e["event"] == "torn_tail_quarantined")
+    assert record["quarantined_sha256"] == hashlib.sha256(torn).hexdigest()
+
+    assert [r["payload"]["n"] for r in _lines(root)] == [0, 1]
+    assert _all_ok(root)
+
+
+def test_a_torn_fragment_longer_than_the_tail_window_is_still_quarantined(tmp_path):
+    """The backward scan for the last newline must step past one window: a
+    whole batch dying between two bytes leaves a fragment far bigger than the
+    64 KiB tail read, and mis-locating the boundary would truncate history."""
+    from weatherquant.data import archive as archive_module
+
+    root = tmp_path / "raw"
+    first = RawArchive(root, run_id="run-a", flush_records=1000)
+    for i in range(3):
+        first.append(_record(i, run_id="run-a"))
+    first.flush()
+    first.close()
+
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    durable = path.read_bytes()
+    huge_torn = b'{"crash":"' + b"x" * (2 * archive_module._TAIL_READ_BYTES) + b'"'
+    with path.open("ab") as fh:
+        fh.write(huge_torn)
+
+    restarted = RawArchive(root, run_id="run-b", flush_records=1000)
+    restarted.append(_record(50, run_id="run-b"))
+    assert restarted.flush() == 1
+    restarted.close()
+
+    data = path.read_bytes()
+    assert data.startswith(durable), "complete lines were truncated with the fragment"
+    assert data.endswith(b"\n")
+    quarantined = list((root / "quarantine" / "rest").glob("*.torn"))
+    assert len(quarantined) == 1
+    assert quarantined[0].stat().st_size == len(huge_torn)
+    assert [r["payload"]["n"] for r in _lines(root)] == [0, 1, 2, 50]
+    assert _all_ok(root)
 
 
 def test_corruption_inside_a_durable_line_is_provable_from_the_trail(tmp_path):

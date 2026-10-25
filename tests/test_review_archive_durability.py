@@ -154,27 +154,51 @@ def test_uncertain_rollback_blocks_duplicate_prone_retry(tmp_path, monkeypatch):
     assert len(archive._buffer) == 1
 
 
-def test_crash_torn_line_is_detected_without_erasing_historical_bytes(tmp_path):
+def test_a_crash_torn_tail_is_quarantined_and_the_archive_continues(tmp_path):
+    """A torn final line is moved aside automatically, not repaired by hand.
+
+    The earlier contract - refuse to flush until an operator trims the file -
+    turned every kill -9 mid-write into an archive that could never append
+    again (WQN-21 acceptance drill: random kills, wedged on every restart).
+    Now the fragment is quarantined (fsynced before the truncate, sha256 in
+    the recovery log) and collection continues; the historical bytes are
+    untouched either way.
+    """
+    import hashlib
+
     root = tmp_path / "raw"
     archive = RawArchive(root, run_id="review-test", flush_records=1000)
     archive.append(_record())
     assert archive.flush() == 1
     archive.close()
     path = root / "rest" / "2026-10-10.jsonl"
+    historical = path.read_bytes()
+    torn = b'{"crash":"unfinished"'
     with path.open("ab") as file:
-        file.write(b'{"crash":"unfinished"')
-    before = path.read_bytes()
+        file.write(torn)
 
     restarted = RawArchive(root, run_id="review-test", flush_records=1000)
-    restarted.append(_record())
-    with pytest.raises(RuntimeError, match="unterminated"):
-        restarted.flush()
-    assert path.read_bytes() == before
-    # Operator repair of an incomplete suffix preserves the previous valid line.
-    path.write_bytes(before[: before.rfind(b"\n") + 1])
-    assert restarted.flush() == 1
-    assert len(_read(root)) == 2
+    restarted.append(_record())  # same partition as the torn file
+    assert restarted.flush() == 1, "a torn tail must not wedge the archive"
     restarted.close()
+
+    # The complete line survived byte-for-byte; the fragment is gone from the
+    # data file and sits - intact - under quarantine/.
+    data = path.read_bytes()
+    assert data.startswith(historical)
+    assert data.endswith(b"\n") and b'"crash"' not in data
+    torn_files = list((root / "quarantine" / "rest").glob("*.torn"))
+    assert len(torn_files) == 1
+    assert torn_files[0].read_bytes() == torn
+
+    # The recovery log names what happened, with the fragment's checksum.
+    events = [json.loads(line) for line in (root / "recovery.jsonl").read_text().splitlines()]
+    quarantined = [e for e in events if e["event"] == "torn_tail_quarantined"]
+    assert len(quarantined) == 1
+    assert quarantined[0]["quarantined_sha256"] == hashlib.sha256(torn).hexdigest()
+
+    lines = _read(root)
+    assert [x["payload"]["day"] for x in lines] == [0, 0]
 
 
 def test_close_fsyncs_pending_records(tmp_path):
