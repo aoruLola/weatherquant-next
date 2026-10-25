@@ -364,9 +364,9 @@ class TestMoneyScenarios:
         result = h.fill_engine().fill_pending()
         # Ten fills exhaust the cash; the last two refuse by name.
         assert result.filled == 10
-        # The remainder cannot fund a venue-legal order (5-share minimum),
-        # so the last two refuse by name rather than printing dust fills.
-        assert result.by_reason.get("RISK_BUDGET_EXCEEDED") == 2
+        # The remainder cannot fund a venue-legal order (5-share minimum);
+        # the refusal names the constraint that actually binds: the cash.
+        assert result.by_reason.get("INSUFFICIENT_FUNDS") == 2
         b = h.ledger.balances()
         assert 0.0 <= b["available_usdc"] < 0.05  # sized to the budget, never below zero
         h.assert_conservation()
@@ -381,7 +381,8 @@ class TestMoneyScenarios:
             result = h.fill_engine().fill_pending()
             h.advance(30)
         assert result.filled == 0
-        assert result.by_reason == {"RISK_BUDGET_EXCEEDED": 1}
+        # The market's exposure headroom is what binds, and the refusal says so.
+        assert result.by_reason == {"RISK_EXPOSURE_EXCEEDED": 1}
         b = h.ledger.balances()
         # Two budget-sized fills occupy just under the 20 USDC market cap.
         assert b["occupied_usdc"] == pytest.approx(19.9956, abs=1e-3)
