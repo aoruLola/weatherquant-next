@@ -169,6 +169,15 @@ class PaperSettings(BaseSettings):
         "outside the window is honestly not found rather than guessed at.",
     )
 
+    # --- risk gates -------------------------------------------------------------
+    risk_rules_path: Path = Field(
+        default=Path("configs/paper-risk.json"),
+        description="The versioned risk-rule file (per-opportunity budget, "
+        "per-market exposure). A file, not environment variables: a cap that "
+        "can be widened on the box producing the results cannot be audited "
+        "afterwards. Missing keys are errors, never permissive defaults.",
+    )
+
     @field_validator("enabled", mode="before")
     @classmethod
     def _strict_bool(cls, v: object) -> bool:

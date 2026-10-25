@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 from paper_book_helpers import T_DECISION, TOKEN
 from weatherquant.execution.pricing import taker_fee_usd
 from weatherquant.paper.fills import PaperFill
+from weatherquant.paper.ledger import Ledger
+from weatherquant.paper.risk import RiskGate, RiskRules
 
 NOW = datetime(2026, 10, 26, 12, 5, 0, tzinfo=UTC)
 
@@ -67,4 +69,18 @@ def make_fill(
         filled_at_utc=NOW,
         fee_rate=fee_rate,
         thresholds_version="v2",
+    )
+
+
+def make_risk(store, *, capital: float = 100.0, version: str = "test-unrestricted") -> RiskGate:
+    """A gate with the caps off - for tests of pricing mechanics, not rules."""
+    return RiskGate(
+        Ledger(store),
+        RiskRules(
+            version=version,
+            basis="test: caps off",
+            max_opportunity_fraction=1.0,
+            max_market_exposure_fraction=1.0,
+        ),
+        initial_capital_usdc=capital,
     )

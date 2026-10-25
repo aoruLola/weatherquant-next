@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from paper_book_helpers import TOKEN, two_level_book, write_archive, ws_line
-from paper_fills_support import make_fill
+from paper_fills_support import make_fill, make_risk
 from weatherquant.paper.books import ArchiveBookSource
 from weatherquant.paper.fills import FillEngine
 from weatherquant.paper.ledger import (
@@ -252,6 +252,7 @@ class TestFillEngineIntegration:
                 book_source=ArchiveBookSource(raw_dir),
                 buffer_fraction=0.005,
                 clock=lambda: NOW,
+                risk=make_risk(store),
             )
             assert engine.fill_pending().filled == 1
             ledger = Ledger(store)
@@ -277,6 +278,7 @@ class TestFillEngineIntegration:
                 buffer_fraction=0.005,
                 clock=lambda: NOW,
                 ledger=ExplodingLedger(store),
+                risk=make_risk(store, capital=1e9),
             )
             result = engine.fill_pending()
             # The injected failure is contained: the signal is recorded as

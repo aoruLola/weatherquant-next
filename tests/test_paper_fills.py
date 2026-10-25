@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from paper_book_helpers import TOKEN, book_payload, two_level_book, write_archive, ws_line
+from paper_fills_support import make_risk
 from paper_helpers import export_row
 from weatherquant.execution.pricing import taker_fee_usd
 from weatherquant.paper.books import ArchiveBookSource
@@ -95,6 +96,7 @@ def make_engine(store, raw_dir, **kwargs):
         book_source=ArchiveBookSource(raw_dir),
         buffer_fraction=0.005,
         clock=lambda: NOW,
+        risk=kwargs.pop("risk", None) or make_risk(store),
         **kwargs,
     )
 

@@ -28,6 +28,7 @@ from weatherquant.paper.config import PaperSettings
 from weatherquant.paper.consumer import SignalConsumer
 from weatherquant.paper.fills import FillEngine
 from weatherquant.paper.ledger import Ledger
+from weatherquant.paper.risk import RiskGate, load_risk_rules
 from weatherquant.paper.store import ACCOUNT_ID, PaperStore
 from weatherquant.storage.paper import PaperDatabase
 
@@ -201,6 +202,11 @@ def _cmd_fill(settings: PaperSettings) -> int:
             buffer_fraction=settings.execution_buffer_fraction,
             require_complete_fill=settings.require_complete_fill,
             max_book_age_seconds=settings.max_book_age_seconds,
+            risk=RiskGate(
+                Ledger(store),
+                load_risk_rules(settings.risk_rules_path),
+                initial_capital_usdc=settings.initial_capital_usdc,
+            ),
         )
         result = engine.fill_pending()
         run_id = db.start_run("paper-fill", {})
