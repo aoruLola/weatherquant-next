@@ -124,12 +124,12 @@ class TestSizing:
         verdict = gate.before_fill(parse_signal_event(export_row(token_id=TOKEN)))
         assert verdict.allowed  # a buy passes before_fill
         _shares, sized = gate.size(parse_signal_event(export_row(token_id=TOKEN, proposed_shares=100.0)), _evidence())
-        # 19 USDC occupied against a 20 cap: under 1 USDC of headroom sizes a
-        # 1.6-share fill, below the venue's minimum order - refused, because a
-        # sub-minimum fill is one the venue could never have accepted.
+        # 19 USDC occupied against a 20 cap: under 1 USDC of headroom cannot
+        # fund the venue's minimum order, and the refusal names the market
+        # exposure cap as the constraint that binds.
         assert not sized.allowed
-        assert sized.reason == "RISK_BUDGET_EXCEEDED"
-        assert "minimum order" in sized.detail
+        assert sized.reason == "RISK_EXPOSURE_EXCEEDED"
+        assert "headroom" in sized.detail
 
     def test_market_fully_climbed_refuses(self, env):
         _store, ledger, gate, db = env
@@ -144,7 +144,7 @@ class TestSizing:
             )
         _shares, verdict = gate.size(parse_signal_event(export_row(token_id=TOKEN, proposed_shares=100.0)), _evidence())
         assert not verdict.allowed
-        assert verdict.reason == "RISK_BUDGET_EXCEEDED"
+        assert verdict.reason == "RISK_EXPOSURE_EXCEEDED"
         assert "mvp-test" in verdict.detail
 
     def test_sell_is_sized_to_what_is_held(self, env):
@@ -266,6 +266,72 @@ class TestCheckPriced:
         verdict = gate.check_priced(parse_signal_event(export_row(token_id=TOKEN, market_id="mkt-11")), big)
         assert not verdict.allowed
         assert verdict.reason == "INSUFFICIENT_FUNDS"
+
+
+class TestRefusalNamesTheBindingConstraint:
+    """Acceptance regression: caps truncating below the venue minimum used to
+    report a generic RISK_BUDGET_EXCEEDED no matter what bound them."""
+
+    def test_cash_truncation_reports_insufficient_funds(self, env):
+        _store, ledger, gate, db = env
+        # Drain the account to dust with buys in other markets.
+        for i in range(10):
+            with db.transaction():
+                ledger.apply_buy(
+                    make_fill(
+                        decision_id=f"d{i}", shares=17.0, fill_cost=9.95,
+                        fees_usd=0.047, price=0.553,
+                        market_id=f"mkt-{i}", token_id=f"tok-{i}",
+                    ),
+                    now=NOW,
+                )
+        available = ledger.balances()["available_usdc"]
+        assert available < 0.05
+        _shares, verdict = gate.size(
+            parse_signal_event(export_row(token_id=TOKEN, proposed_shares=100.0)),
+            _evidence(),
+        )
+        assert not verdict.allowed
+        assert verdict.reason == "INSUFFICIENT_FUNDS", verdict.detail
+        assert "available" in verdict.detail
+
+    def test_market_headroom_truncation_reports_exposure(self, env):
+        _store, ledger, gate, db = env
+        # 19.5 of the 20 USDC market cap already occupied: 0.5 left.
+        with db.transaction():
+            ledger.apply_buy(
+                make_fill(decision_id="big", shares=34.0, fill_cost=19.5, fees_usd=0.098, price=0.558),
+                now=NOW,
+            )
+        _shares, verdict = gate.size(
+            parse_signal_event(export_row(token_id=TOKEN, proposed_shares=100.0)),
+            _evidence(),
+        )
+        assert not verdict.allowed
+        assert verdict.reason == "RISK_EXPOSURE_EXCEEDED", verdict.detail
+        assert "headroom" in verdict.detail
+
+    def test_budget_below_a_minimum_order_names_the_budget(self, env):
+        _store, _ledger, gate, _db = env
+        # A 20 USDC account: its 10% budget (2.0) is below the venue's
+        # minimum-order cost (5 x ~0.5625 = 2.81), while cash (20) and the
+        # market cap (4.0) both afford it - the budget is what binds.
+        gate = RiskGate(
+            _ledger_or_none(env),
+            RiskRules(version="t", basis="", max_opportunity_fraction=0.10, max_market_exposure_fraction=0.20),
+            initial_capital_usdc=20.0,
+        )
+        _shares, verdict = gate.size(
+            parse_signal_event(export_row(token_id=TOKEN, proposed_shares=100.0)),
+            _evidence(),
+        )
+        assert not verdict.allowed
+        assert verdict.reason == "RISK_BUDGET_EXCEEDED", verdict.detail
+        assert "budget" in verdict.detail
+
+
+def _ledger_or_none(env):
+    return env[1]
 
 
 class TestNoNakedShorts:

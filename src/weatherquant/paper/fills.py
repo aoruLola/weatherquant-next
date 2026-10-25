@@ -192,7 +192,7 @@ class FillEngine:
             with self.store.db.transaction():
                 for row in pending:
                     result.attempted += 1
-                    outcome = self._fill_one(row, now)
+                    outcome = self._fill_one_isolated(row, now)
                     if outcome.filled and outcome.fill is not None:
                         settled, refusal = self._settle(outcome.fill, now)
                         if settled:
@@ -242,6 +242,27 @@ class FillEngine:
         return True, None
 
     # -- one signal ---------------------------------------------------------
+
+    def _fill_one_isolated(self, row: dict[str, Any], now: datetime) -> FillOutcome:
+        """Price one signal with its own failure boundary.
+
+        A bug or an exotic payload in one signal's pricing must cost that
+        signal - a recorded refusal with the exception's name on it - not
+        the whole batch. One crashing frame once stalled an entire fill pass
+        with every signal stranded ACCEPTED; this boundary is the regression
+        that cannot ship twice. Settlement keeps no such boundary: a failure
+        while *moving money* aborts the batch loudly and retries whole.
+        """
+        outcome = FillOutcome(decision_id=str(row["decision_id"]))
+        try:
+            return self._fill_one(row, now)
+        except Exception as exc:
+            outcome.reason = RefusalReason.UNPRICABLE_EVENT.value
+            outcome.detail = (
+                f"pricing failed: {type(exc).__name__}: {exc}; the signal is "
+                "recorded as refused rather than stalling the pass"
+            )
+            return outcome
 
     def _fill_one(self, row: dict[str, Any], now: datetime) -> FillOutcome:
         outcome = FillOutcome(decision_id=str(row["decision_id"]))
