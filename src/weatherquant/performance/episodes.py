@@ -185,7 +185,13 @@ class OpenEpisode:
     fee_rate: float | None = None
 
     def observe(self, row: _DecisionRow) -> None:
-        self.last_seen = row.decided_at_utc
+        # A late row (business instant behind the episode's furthest instant)
+        # is counted but never rewinds `last_seen`: the gap clock runs from
+        # the furthest activity, and rewinding it would inflate the next gap
+        # and close the episode early. For in-order rows the guard is always
+        # true and behaviour is unchanged.
+        if row.decided_at_utc > self.last_seen:
+            self.last_seen = row.decided_at_utc
         self.count += 1
         if row.net_edge_usd is not None:
             number = float(row.net_edge_usd)
@@ -364,9 +370,9 @@ def episode_from_mapping(row: Mapping[str, Any]) -> Episode:
         raise ValueError(f"episode {row.get('episode_id')!r} has no usable first_edge")
 
     return Episode(
-        episode_id=str(row.get("episode_id") or _episode_id(
-            EpisodeKey(market_id, target_date, model_name, direction, mode), first
-        )),
+        episode_id=str(
+            row.get("episode_id") or _episode_id(EpisodeKey(market_id, target_date, model_name, direction, mode), first)
+        ),
         key=EpisodeKey(market_id, target_date, model_name, direction, mode),
         first_seen_utc=first,
         last_seen_utc=last,
@@ -451,12 +457,11 @@ class FolderState:
     """Everything about the fold that has to survive between runs.
 
     ``prev_instant`` is the whole of the global activity index. It is the
-    largest decision instant strictly below ``last_instant``, and it is enough
-    because the fold consumes instants in non-decreasing order: when a row at
-    instant ``t`` arrives, every instant below ``t`` has already been seen and
-    no instant above ``t`` can fall inside an interval ending at ``t``. So
-    ``activity_between(a, b)`` is exactly ``prev_instant > a`` at that moment -
-    no index of the whole history, and no per-episode bookkeeping.
+    largest market-bearing decision instant strictly below ``last_instant``.
+    Input must be chronological. The streaming driver sorts and rebuilds from
+    immutable parts when late decisions arrive, so ``prev_instant > a`` gives
+    the activity between ``a`` and the current instant without retaining all
+    historical timestamps.
     """
 
     row_seq: int = 0
@@ -539,9 +544,11 @@ class EpisodeFolder:
             self.accepts_without_edge += 1
 
         instant = row.decided_at_utc
-        # The activity index only advances on rows that carry a market: the
-        # original builder built its instant list from the rows it kept.
-        if instant != self.state.last_instant:
+        if self.state.last_instant is not None and instant < self.state.last_instant:
+            raise ValueError("episode input must be chronological; replay late rows through the streaming driver")
+        # Rows without a market never enter the activity index. Equal instants
+        # retain the previous distinct instant for the gap test.
+        if self.state.last_instant is None or instant > self.state.last_instant:
             self.state.prev_instant = self.state.last_instant
             self.state.last_instant = instant
         seq = self.state.row_seq
@@ -646,9 +653,7 @@ def build_episodes(
 
     normalised.sort(key=lambda r: r.decided_at_utc)
 
-    folder = EpisodeFolder(
-        gap_window_seconds=gap_window_seconds, accepted_state=accepted_state
-    )
+    folder = EpisodeFolder(gap_window_seconds=gap_window_seconds, accepted_state=accepted_state)
     for row in normalised:
         folder.add(row)
 
@@ -714,9 +719,7 @@ class EpisodeSummary:
             "unique_opportunity_edge_sum": self.unique_opportunity_edge_sum,
             "observation_edge_sum": self.observation_edge_sum,
             "mean_episode_edge": (
-                self.unique_opportunity_edge_sum / self.opportunity_episodes
-                if self.opportunity_episodes
-                else None
+                self.unique_opportunity_edge_sum / self.opportunity_episodes if self.opportunity_episodes else None
             ),
             "statistical_scope": ["opportunity_episodes", "observation_all_accepts"],
             "warnings": [

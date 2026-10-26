@@ -638,8 +638,40 @@ class ShadowRunner:
                     result.parts_written,
                     result.watermark,
                 )
-            elif not result.caught_up and not any(
-                note.startswith("export failed") for note in result.notes
+                if result.late_rows:
+                    # Late delivery is the whole point of the sequence cursor:
+                    # rows whose business time sits behind the watermark used
+                    # to be unreachable forever. Surfaced per batch so a REPLAY
+                    # run shows up as delivery, not as statistics noise.
+                    log.info(
+                        "export included %d late row(s) (business time behind "
+                        "the watermark)",
+                        result.late_rows,
+                    )
+            if result.transition_done:
+                transition = exporter.state().get("transition") or {}
+                self.store.record_quality(
+                    [
+                        QualityEvent(
+                            kind="decision_export_transition_done",
+                            severity="info",
+                            detail=(
+                                "export cursor moved from business time to the "
+                                f"write sequence: floor_seq="
+                                f"{transition.get('floor_seq')}, "
+                                f"{transition.get('rows_resequenced')} skipped "
+                                "row(s) re-sequenced above it, "
+                                f"{transition.get('exported_ids')} exported id(s) "
+                                "reconciled from the published parts"
+                            ),
+                            ts_utc=now,
+                        )
+                    ],
+                    run_id=self.run_id or "",
+                )
+            elif not result.caught_up and not result.rows_exported and not any(
+                note.startswith(("export failed", "transition", "rollback repair"))
+                for note in result.notes
             ):
                 # Nothing written and not caught up is a stalled export, and it
                 # is silent by construction: no exception, no watermark move, no
@@ -659,6 +691,24 @@ class ShadowRunner:
                     ],
                     run_id=self.run_id or "",
                 )
+            for note in result.notes:
+                # The rollback repair is a rare, one-time, auditable event:
+                # rows exported by a rolled-back image got pinned under the
+                # cursor so they cannot be exported twice. Without a record,
+                # "why do these rows sit at cursor_seq?" has no answer.
+                if note.startswith("rollback repair"):
+                    log.warning("%s", note)
+                    self.store.record_quality(
+                        [
+                            QualityEvent(
+                                kind="decision_export_rollback_repair",
+                                severity="warning",
+                                detail=note,
+                                ts_utc=now,
+                            )
+                        ],
+                        run_id=self.run_id or "",
+                    )
             if any(note.startswith("export failed") for note in result.notes):
                 self.store.record_quality(
                     [

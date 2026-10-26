@@ -3,6 +3,7 @@
     weatherquant-shadow init      # create/migrate the database, load the models
     weatherquant-shadow run       # run the loop until SIGTERM
     weatherquant-shadow report    # metrics from the shadow database
+    weatherquant-shadow export-verify  # reconcile the decision export (engine stopped)
     weatherquant-shadow status    # one-line health summary for a script
 
 Every command is read-only with respect to the collector: it never opens
@@ -195,6 +196,45 @@ def _report_from_database(shadow: ShadowSettings, args: argparse.Namespace, *, f
     return 0
 
 
+def cmd_export_verify(settings: Settings, shadow: ShadowSettings, args: argparse.Namespace) -> int:
+    """Reconcile the published decision export against the database.
+
+    Opens the shadow database directly, so it only works while the engine is
+    stopped - the same lease `report --offline` lives under. The check it
+    runs is the one WQN-20 demands of the export: nothing lost (every row at
+    or below the cursor is in the parts), nothing twice (sequences strictly
+    increase across the whole concatenation, and the counts agree).
+    """
+    if not shadow.shadow_db_path.exists():
+        print(f"no shadow database at {shadow.shadow_db_path}", file=sys.stderr)
+        return 2
+    export_dir = shadow.shadow_report_path.parent / "decisions-export"
+    try:
+        with ShadowDatabase(shadow.shadow_db_path) as db:
+            from weatherquant.shadow.export import DecisionExporter
+
+            exporter = DecisionExporter(db.con, export_dir)
+            report = exporter.reconcile()
+            report.update(exporter.verify())
+            report["export_dir"] = str(export_dir)
+    except Exception as exc:
+        print(
+            f"cannot reconcile the export: {exc}\n"
+            "The shadow engine holds an exclusive lease on the database while it "
+            "runs; stop it first, or read state.json for a cache-only answer.",
+            file=sys.stderr,
+        )
+        return 3
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, sort_keys=True, default=str))
+    else:
+        for key in sorted(report):
+            print(f"{key:32} {report[key]}")
+        print()
+        print("consistent" if report.get("consistent") else "INCONSISTENT - see first_divergence")
+    return 0 if report.get("consistent") else 1
+
+
 def cmd_status(settings: Settings, shadow: ShadowSettings, args: argparse.Namespace) -> int:
     """Exit code mirrors the health probe: 0 healthy/degraded, 1 unhealthy."""
     from weatherquant.shadow.health import evaluate_shadow_health
@@ -242,6 +282,12 @@ def build_parser() -> argparse.ArgumentParser:
         "while it runs, DuckDB refuses the file to any other process.",
     )
 
+    p = sub.add_parser(
+        "export-verify",
+        help="reconcile the decision export against the database (engine must be stopped)",
+    )
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("status", help="health summary; exit code matches the probe")
     p.add_argument("--json", action="store_true")
     return parser
@@ -266,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         "init": cmd_init,
         "run": cmd_run,
         "report": cmd_report,
+        "export-verify": cmd_export_verify,
         "status": cmd_status,
     }
     return handlers[args.command](settings, shadow, args)

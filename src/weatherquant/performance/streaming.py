@@ -201,9 +201,7 @@ def scan_export_parts(directory: str | Path) -> list[ExportPart]:
         raise PerformanceStateError(f"no published decision parts under {root}")
     paths = sorted(root.glob("part-*.jsonl"))
     if not paths:
-        raise PerformanceStateError(
-            f"no published decision parts under {root}; run the shadow's export first"
-        )
+        raise PerformanceStateError(f"no published decision parts under {root}; run the shadow's export first")
     indices = [_index_of(path) for path in paths]
     if indices != list(range(1, len(indices) + 1)):
         missing = sorted(set(range(1, len(indices) + 1)) - set(indices))
@@ -218,8 +216,7 @@ def scan_export_parts(directory: str | Path) -> list[ExportPart]:
         end = _end_cursor_of(path)
         if end is None:
             raise PerformanceStateError(
-                f"part {path.name} has no readable end cursor; it is empty or "
-                "truncated and cannot be consumed"
+                f"part {path.name} has no readable end cursor; it is empty or truncated and cannot be consumed"
             )
         parts.append(
             ExportPart(
@@ -267,6 +264,25 @@ def _row_cursor(row: Mapping[str, Any]) -> tuple[datetime, str]:
     if stamp is None:
         raise PerformanceStateError("a decision in the export carries no decision_time_utc")
     return (_timestamp(stamp), str(row.get("decision_id") or ""))
+
+
+def _export_seq_of(row: Mapping[str, Any]) -> int | None:
+    """The row's position in the export's write sequence, when it has one.
+
+    ``None`` for legacy rows, which predate the sequence: a different fact
+    from any integer, because the checks that lean on the sequence may only
+    start once a sequenced row has been seen.
+    """
+    raw = row.get("export_seq")
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise PerformanceStateError(
+            f"a decision carries export_seq={raw!r}, which is not a sequence "
+            "value; refusing rather than guessing what position it holds"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -333,9 +349,7 @@ def _require_compatible(
         )
 
 
-def _verify_consumed_parts(
-    store: PerformanceStateStore, parts: Sequence[ExportPart], *, deep: bool
-) -> None:
+def _verify_consumed_parts(store: PerformanceStateStore, parts: Sequence[ExportPart], *, deep: bool) -> None:
     """Refuse to continue if a part already consumed no longer matches.
 
     Published parts are immutable, so a mismatch means something outside this
@@ -367,6 +381,60 @@ def _verify_consumed_parts(
                 f"{record.sha256[:12]}, now {rows} rows / {digest[:12]}). Published parts are "
                 "immutable; rebuild the state store if this was deliberate"
             )
+
+
+def _ensure_chronological_episodes(store: PerformanceStateStore) -> None:
+    """Re-fold immutable input parts only after a late decision or an upgrade.
+
+    The dirty marker commits with the ingest cursor. A crash before this pass
+    leaves it set, so the next ingest or publish must finish the repair before
+    exposing aggregates. DuckDB sorts on disk under the existing memory budget;
+    Python holds one fetch page and the open episodes, never the whole history.
+    """
+    if not store.fetchone("SELECT required FROM performance_episode_rebuild WHERE id = 1")[0]:
+        return
+    state = store.load_state()
+    if state is None or not state.last_part_index:
+        return
+    parts = [p for p in scan_export_parts(state.input_source) if p.index <= state.last_part_index]
+    _verify_consumed_parts(store, parts, deep=True)
+    reader = store.con.cursor()
+    closed = []
+
+    def on_close(episode, opened, seq):
+        closed.append((episode, opened, seq))
+        if len(closed) >= 5000:
+            store.upsert_closed_episodes(closed)
+            closed.clear()
+
+    folder = EpisodeFolder(
+        gap_window_seconds=state.gap_window_seconds,
+        accepted_state=state.accepted_state,
+        on_close=on_close,
+    )
+    try:
+        reader.execute(
+            "WITH source AS (SELECT json, row_number() OVER () AS arrival "
+            "FROM read_json_objects(?, format='newline_delimited')) "
+            "SELECT json FROM source ORDER BY CAST(COALESCE("
+            "json_extract_string(json, '$.decided_at_utc'), "
+            "json_extract_string(json, '$.decision_time_utc')) AS TIMESTAMPTZ), arrival",
+            [[str(p.path) for p in parts]],
+        )
+        with store.transaction():
+            store.execute("DELETE FROM performance_episodes")
+            while page := reader.fetchmany(5000):
+                for (raw,) in page:
+                    folder.add(row_from_mapping(json.loads(raw)))
+            store.upsert_closed_episodes(closed)
+            store.upsert_open_episodes(folder.open_by_key.values())
+            state.row_seq = folder.state.row_seq
+            state.last_instant = folder.state.last_instant
+            state.prev_instant = folder.state.prev_instant
+            store.write_state(state)
+            store.execute("UPDATE performance_episode_rebuild SET required = FALSE WHERE id = 1")
+    finally:
+        reader.close()
 
 
 def ingest_export(
@@ -413,6 +481,7 @@ def ingest_export(
 
     _verify_consumed_parts(store, parts, deep=deep_verify)
 
+    rebuild_required = bool(store.fetchone("SELECT required FROM performance_episode_rebuild WHERE id = 1")[0])
     closed_buffer: list[tuple[Episode, OpenEpisode, int]] = []
 
     def on_close(episode: Episode, open_ep: OpenEpisode, seq: int) -> None:
@@ -450,19 +519,63 @@ def ingest_export(
         base_index = state.rows_consumed
         rows_in_part = 0
         previous_cursor = state.last_end_cursor_parsed
+        previous_seq = state.last_export_seq
+        # Business order binds legacy rows to their own contiguous region. The
+        # store's cursor tells us what the last consumed row was: if a
+        # sequence was seen, that row was sequenced and no legacy region is
+        # open across the boundary; otherwise the previous part ended inside
+        # (or as) a legacy region and the order check must carry across it,
+        # exactly as it did before the sequence existed.
+        previous_legacy_cursor = None if previous_seq is not None else previous_cursor
 
         with store.transaction():
             for raw in _iter_rows(part.path):
                 seq = base_index + rows_in_part
                 cursor = _row_cursor(raw)
-                if previous_cursor is not None and cursor < previous_cursor:
-                    raise PerformanceStateError(
-                        f"part {part.index} is not in cursor order at row {rows_in_part} "
-                        f"({cursor[0].isoformat()} after {previous_cursor[0].isoformat()}). "
-                        "The fold assumes the export is non-decreasing in "
-                        "(decision_time_utc, decision_id); refusing rather than folding "
-                        "an out-of-order part."
-                    )
+                export_seq = _export_seq_of(raw)
+                if export_seq is not None:
+                    # The write sequence is the order the parts are actually
+                    # written in (WQN-20). It is unique per decision and
+                    # claimed once at insert, so a repeat or a regression can
+                    # only mean a duplicated line or a reordered part - either
+                    # would count a decision twice.
+                    if previous_seq is not None and export_seq <= previous_seq:
+                        raise PerformanceStateError(
+                            f"part {part.index} repeats or regresses export_seq "
+                            f"{export_seq} after {previous_seq} at row {rows_in_part}. "
+                            "The sequence is the identity of a write; a repeat is a "
+                            "duplicated decision and a regression is a reordered "
+                            "part, and both would be counted twice."
+                        )
+                    previous_seq = export_seq
+                    # A sequenced row closes any open legacy region: the
+                    # business-order invariant binds legacy rows to their own
+                    # region, and a later legacy region (a rollback window)
+                    # may legitimately sit at any business time relative to
+                    # an earlier one.
+                    previous_legacy_cursor = None
+                else:
+                    # A row without export_seq is legacy format, wherever it
+                    # sits: leading parts predate the sequence, and trailing
+                    # ones were written by a rolled-back image (the shadow
+                    # exporter pins those rows under its cursor before they
+                    # could be duplicated; its reconcile proves it against
+                    # the source, which this side cannot reach). Business
+                    # order is required among legacy rows themselves - they
+                    # were exported under the business cursor, so a
+                    # regression there could only be a rewrite - but not
+                    # against a sequenced neighbour, whose business time may
+                    # legitimately sit anywhere.
+                    if previous_legacy_cursor is not None and cursor < previous_legacy_cursor:
+                        raise PerformanceStateError(
+                            f"part {part.index} is not in cursor order at row "
+                            f"{rows_in_part} ({cursor[0].isoformat()} after "
+                            f"{previous_legacy_cursor[0].isoformat()}) among its "
+                            "legacy-format rows. Those rows were exported under the "
+                            "business cursor; refusing rather than folding an "
+                            "out-of-order part."
+                        )
+                    previous_legacy_cursor = cursor
                 if previous_cursor is not None and cursor == previous_cursor:
                     raise PerformanceStateError(
                         f"part {part.index} repeats the cursor "
@@ -471,9 +584,14 @@ def ingest_export(
                         "duplicated export line or a missing decision_id; either way it "
                         "would be counted twice."
                     )
+                if export_seq is not None and previous_cursor is not None and cursor < previous_cursor:
+                    state.late_rows_seen += 1
                 previous_cursor = cursor
 
                 row = row_from_mapping(raw)
+                if state.last_decision_utc is not None and row.decided_at_utc < state.last_decision_utc:
+                    rebuild_required = True
+                    store.execute("UPDATE performance_episode_rebuild SET required = TRUE WHERE id = 1")
                 is_accept = row.state == accepted_state
                 has_edge = is_accept and row.net_edge_usd is not None
 
@@ -513,7 +631,7 @@ def ingest_export(
                         ]
                     )
 
-                if row.market_id:
+                if row.market_id and not rebuild_required:
                     if has_edge or row.key in folder.open_by_key:
                         touched[row.key] = True
                     folder.add(row)
@@ -529,12 +647,8 @@ def ingest_export(
 
             store.insert_edge_observations(edge_rows)
             store.upsert_closed_episodes(closed_buffer)
-            store.upsert_open_episodes(
-                [folder.open_by_key[key] for key in touched if key in folder.open_by_key]
-            )
-            store.upsert_dimensions(
-                markets=markets, target_dates=target_dates, models=models
-            )
+            store.upsert_open_episodes([folder.open_by_key[key] for key in touched if key in folder.open_by_key])
+            store.upsert_dimensions(markets=markets, target_dates=target_dates, models=models)
             store.record_part(
                 PartRecord(
                     index=part.index,
@@ -549,6 +663,7 @@ def ingest_export(
             state.last_part_index = part.index
             state.last_end_cursor_time = part.end_cursor_time
             state.last_end_cursor_id = part.end_cursor_id
+            state.last_export_seq = previous_seq
             state.rows_consumed = base_index + rows_in_part
             state.row_seq = folder.state.row_seq
             state.last_instant = folder.state.last_instant
@@ -557,11 +672,11 @@ def ingest_export(
 
         rows_this_run += rows_in_part
         if progress is not None:
-            progress(
-                f"part {part.index}: {rows_in_part} rows, watermark "
-                f"{part.end_cursor_time.isoformat()}"
-            )
+            progress(f"part {part.index}: {rows_in_part} rows, watermark {part.end_cursor_time.isoformat()}")
 
+    _ensure_chronological_episodes(store)
+    state = store.load_state()
+    assert state is not None
     return IngestResult(
         parts_available=len(parts),
         parts_consumed=len(pending),
@@ -594,18 +709,10 @@ def _counts_and_extremes(
     Exact for all three, and it keeps the Python passes below to one job each.
     """
     if expression is None:
-        count, low, high = store.fetchone(
-            "SELECT count(*), min(edge), max(edge) FROM performance_edge_observations"
-        )
+        count, low, high = store.fetchone("SELECT count(*), min(edge), max(edge) FROM performance_edge_observations")
         return {_OVERALL: (int(count), low, high)} if count else {}
-    sql = (
-        f"SELECT {expression} AS g, count(*), min(edge), max(edge) "
-        "FROM performance_edge_observations GROUP BY 1"
-    )
-    return {
-        str(key): (int(count), low, high)
-        for key, count, low, high in _row_stream(store, sql)
-    }
+    sql = f"SELECT {expression} AS g, count(*), min(edge), max(edge) FROM performance_edge_observations GROUP BY 1"
+    return {str(key): (int(count), low, high) for key, count, low, high in _row_stream(store, sql)}
 
 
 def _fsums(store: PerformanceStateStore, expression: str | None) -> dict[str, float]:
@@ -670,15 +777,11 @@ def _rank_filter(count_expression: str) -> str:
     clauses: list[str] = []
     for quantile in QUANTILES:
         for bound in ("floor", "ceil"):
-            clauses.append(
-                f"rn = CAST({bound}({quantile!r} * ({count_expression} - 1)) AS BIGINT)"
-            )
+            clauses.append(f"rn = CAST({bound}({quantile!r} * ({count_expression} - 1)) AS BIGINT)")
     return " OR ".join(clauses)
 
 
-def _order_statistics(
-    store: PerformanceStateStore, expression: str | None
-) -> dict[str, tuple[int, dict[int, float]]]:
+def _order_statistics(store: PerformanceStateStore, expression: str | None) -> dict[str, tuple[int, dict[int, float]]]:
     """``rank -> value`` for the ranks the quantiles interpolate between."""
     partition = f"PARTITION BY {expression} " if expression is not None else ""
     grouped = expression is not None
@@ -758,10 +861,7 @@ def _distributions(
     sums = _fsums(store, expression)
     stdevs = _population_stdev(store, expression, counts)
     ranks = _order_statistics(store, expression)
-    out = {
-        key: distribution_from_parts(_parts_for(key, counts, sums, stdevs, ranks))
-        for key in counts
-    }
+    out = {key: distribution_from_parts(_parts_for(key, counts, sums, stdevs, ranks)) for key in counts}
     for key in ensure_keys or ():
         out.setdefault(key, distribution_from_parts(DistributionParts(count=0)))
     return dict(sorted(out.items()))
@@ -773,20 +873,14 @@ def _daily(store: PerformanceStateStore) -> list[dict[str, object]]:
         str(key): int(count)
         for key, count in _row_stream(
             store,
-            "SELECT target_date, count(*) FROM performance_edge_observations "
-            "WHERE target_date IS NOT NULL GROUP BY 1",
+            "SELECT target_date, count(*) FROM performance_edge_observations WHERE target_date IS NOT NULL GROUP BY 1",
         )
     }
-    sql = (
-        "SELECT target_date, edge FROM performance_edge_observations "
-        "WHERE target_date IS NOT NULL ORDER BY 1"
-    )
+    sql = "SELECT target_date, edge FROM performance_edge_observations WHERE target_date IS NOT NULL ORDER BY 1"
     out: list[dict[str, object]] = []
     rows = _row_stream(store, sql)
     for key, group in itertools.groupby(rows, key=lambda row: str(row[0])):
-        out.append(
-            daily_entry(str(key), counts[str(key)], math.fsum(map(itemgetter(1), group)))
-        )
+        out.append(daily_entry(str(key), counts[str(key)], math.fsum(map(itemgetter(1), group))))
     return out
 
 
@@ -888,11 +982,10 @@ def build_streaming_payloads(
     the cheap half of the trade. What is *not* traded is exactness: every pass
     runs the same functions the in-memory builder runs.
     """
+    _ensure_chronological_episodes(store)
     state = store.load_state()
     if state is None:
-        raise PerformanceStateError(
-            "the state store is empty; run an ingest before building snapshots"
-        )
+        raise PerformanceStateError("the state store is empty; run an ingest before building snapshots")
 
     answers, verified, settlement_records = _stored_settlements(store)
     freshness = settlement_freshness(settlement_records)
@@ -901,9 +994,7 @@ def build_streaming_payloads(
     # -- one pass over the episodes: the summary and all six win rates ------
     episode_summary = EpisodeSummary()
     overall_rate = WinRateAccumulator()
-    grouped_rates: dict[str, dict[str, WinRateAccumulator]] = {
-        dimension: {} for dimension in WIN_RATE_DIMENSIONS
-    }
+    grouped_rates: dict[str, dict[str, WinRateAccumulator]] = {dimension: {} for dimension in WIN_RATE_DIMENSIONS}
     episode_count = 0
     for stored in store.iter_episodes():
         episode = _render(stored)
@@ -930,10 +1021,7 @@ def build_streaming_payloads(
     episode_summary_dict = episode_summary.as_dict()
     rate = overall_rate.result()
     grouped_rate_results = {
-        dimension: {
-            key: accumulator.result()
-            for key, accumulator in sorted(buckets.items())
-        }
+        dimension: {key: accumulator.result() for key, accumulator in sorted(buckets.items())}
         for dimension, buckets in grouped_rates.items()
     }
 
@@ -941,13 +1029,8 @@ def build_streaming_payloads(
     overall_distributions = _distributions(store, None)
     # An empty edge table is a real state - a history with no priced ACCEPT -
     # and it publishes a distribution of nothing rather than raising.
-    overall_edge = overall_distributions.get(_OVERALL) or distribution_from_parts(
-        DistributionParts(count=0)
-    )
-    grouped_edges = {
-        name: _distributions(store, expression)
-        for name, expression in EDGE_GROUP_SQL.items()
-    }
+    overall_edge = overall_distributions.get(_OVERALL) or distribution_from_parts(DistributionParts(count=0))
+    grouped_edges = {name: _distributions(store, expression) for name, expression in EDGE_GROUP_SQL.items()}
     daily = _daily(store)
     bands = _band_distributions(store)
     models = sorted(store.distinct_values("performance_models_seen"))
@@ -963,12 +1046,8 @@ def build_streaming_payloads(
     build_watermark = state.last_end_cursor
     lifetime_window = {
         "episodes_all": episode_count,
-        "first_seen_utc_from": _iso(
-            store.fetchone("SELECT min(first_seen_utc) FROM performance_episodes")[0]
-        ),
-        "last_seen_utc_to": _iso(
-            store.fetchone("SELECT max(first_seen_utc) FROM performance_episodes")[0]
-        ),
+        "first_seen_utc_from": _iso(store.fetchone("SELECT min(first_seen_utc) FROM performance_episodes")[0]),
+        "last_seen_utc_to": _iso(store.fetchone("SELECT max(first_seen_utc) FROM performance_episodes")[0]),
     }
 
     scope = ["observation_all_accepts", "opportunity_episodes", "database_lifetime"]
@@ -990,9 +1069,7 @@ def build_streaming_payloads(
         "accept_observations": episode_summary_dict["accept_observations"],
         "opportunity_episodes": episode_summary_dict["opportunity_episodes"],
         "accept_opportunity_distinct_markets": episode_summary_dict["distinct_markets"],
-        "accept_opportunity_distinct_target_dates": episode_summary_dict[
-            "distinct_target_dates"
-        ],
+        "accept_opportunity_distinct_target_dates": episode_summary_dict["distinct_target_dates"],
         "distinct_markets": episode_summary_dict["distinct_markets"],
         "distinct_target_dates": episode_summary_dict["distinct_target_dates"],
         "episode_build": {
@@ -1046,9 +1123,7 @@ def build_streaming_payloads(
         "by_model": {k: v.as_dict() for k, v in grouped_rate_results["model"].items()},
         "by_direction": {k: v.as_dict() for k, v in grouped_rate_results["direction"].items()},
         "by_mode": {k: v.as_dict() for k, v in grouped_rate_results["mode"].items()},
-        "by_target_date": {
-            k: v.as_dict() for k, v in grouped_rate_results["target_date"].items()
-        },
+        "by_target_date": {k: v.as_dict() for k, v in grouped_rate_results["target_date"].items()},
         "by_edge_band": {k: v.as_dict() for k, v in grouped_rate_results["edge_band"].items()},
         "statistical_scope": rate.statistical_scope,
         "warnings": rate.warnings,
@@ -1072,8 +1147,7 @@ def build_streaming_payloads(
         "total": window["episodes"],
         "total_all": window["episodes_all"],
         "window": window,
-        "statistical_scope": ["opportunity_episodes"]
-        + ([] if window["complete"] else [f"window:{window['days']}d"]),
+        "statistical_scope": ["opportunity_episodes"] + ([] if window["complete"] else [f"window:{window['days']}d"]),
         "warnings": [*episode_summary_dict["warnings"], *detail_warnings(window)],
     }
 
@@ -1082,9 +1156,7 @@ def build_streaming_payloads(
     models_payload = {
         "models": models,
         "by_model_edge": grouped_edges["model"],
-        "by_model_win_rate": {
-            k: v.as_dict() for k, v in grouped_rate_results["model"].items()
-        },
+        "by_model_win_rate": {k: v.as_dict() for k, v in grouped_rate_results["model"].items()},
         "note": (
             "Brier, Log Loss, ECE, MAE, RMSE and Top-1 are served from the "
             "research evaluation module; see /api/v1/performance/models"
@@ -1097,35 +1169,52 @@ def build_streaming_payloads(
     sample = overall_edge["count"] or 0
     payloads = {
         "summary.json": _envelope(
-            logical_name="performance-summary", data=summary_data,
-            sample_size=sample, statistical_scope=scope,
-            warnings=summary_data["warnings"], **common,
+            logical_name="performance-summary",
+            data=summary_data,
+            sample_size=sample,
+            statistical_scope=scope,
+            warnings=summary_data["warnings"],
+            **common,
         ),
         "edge.json": _envelope(
-            logical_name="performance-edge", data=edge_payload,
-            sample_size=sample, statistical_scope=scope,
-            warnings=edge_payload["warnings"], **common,
+            logical_name="performance-edge",
+            data=edge_payload,
+            sample_size=sample,
+            statistical_scope=scope,
+            warnings=edge_payload["warnings"],
+            **common,
         ),
         "win-rate.json": _envelope(
-            logical_name="performance-win-rate", data=win_rate_payload,
-            sample_size=rate.valid_samples, statistical_scope=rate.statistical_scope,
-            warnings=rate.warnings, **common,
+            logical_name="performance-win-rate",
+            data=win_rate_payload,
+            sample_size=rate.valid_samples,
+            statistical_scope=rate.statistical_scope,
+            warnings=rate.warnings,
+            **common,
         ),
         "opportunities.json": _envelope(
-            logical_name="performance-opportunities", data=opportunities,
+            logical_name="performance-opportunities",
+            data=opportunities,
             sample_size=window["episodes"],
             statistical_scope=opportunities["statistical_scope"],
-            warnings=opportunities["warnings"], **common,
+            warnings=opportunities["warnings"],
+            **common,
         ),
         "settlements.json": _envelope(
-            logical_name="performance-settlements", data=settlements_payload,
-            sample_size=len(settlement_records), statistical_scope=["resolved_verified_only"],
-            warnings=settlements_payload["warnings"], **common,
+            logical_name="performance-settlements",
+            data=settlements_payload,
+            sample_size=len(settlement_records),
+            statistical_scope=["resolved_verified_only"],
+            warnings=settlements_payload["warnings"],
+            **common,
         ),
         "models.json": _envelope(
-            logical_name="performance-models", data=models_payload,
-            sample_size=sample, statistical_scope=["out_of_sample_chronological"],
-            warnings=models_payload["warnings"], **common,
+            logical_name="performance-models",
+            data=models_payload,
+            sample_size=sample,
+            statistical_scope=["out_of_sample_chronological"],
+            warnings=models_payload["warnings"],
+            **common,
         ),
     }
 
@@ -1170,9 +1259,7 @@ def _iso(value: datetime | None) -> str | None:
 
 
 def _open_episode_count(store: PerformanceStateStore) -> int:
-    return int(
-        store.fetchone("SELECT count(*) FROM performance_episodes WHERE is_open")[0]
-    )
+    return int(store.fetchone("SELECT count(*) FROM performance_episodes WHERE is_open")[0])
 
 
 def _walk_capital(
@@ -1324,9 +1411,7 @@ def streaming_generation_id(
                     "verification_status": record.verification_status,
                     "resolution_source": record.resolution_source,
                     "fetched_at_utc": (
-                        record.fetched_at_utc.astimezone(UTC).isoformat()
-                        if record.fetched_at_utc is not None
-                        else None
+                        record.fetched_at_utc.astimezone(UTC).isoformat() if record.fetched_at_utc is not None else None
                     ),
                 }
                 for record in settlements
@@ -1394,9 +1479,7 @@ def _export_watermark_at_build(export_path: Path) -> list[str] | None:
 INGEST_STATE_FILE = "ingest-state.json"
 
 
-def _write_ingest_state(
-    out_dir: str | Path, watermark: Any, ingest_result: Any, now: datetime
-) -> None:
+def _write_ingest_state(out_dir: str | Path, watermark: Any, ingest_result: Any, now: datetime) -> None:
     """Record where ingest has got to, separately from what was published.
 
     The published snapshot's watermark is frozen at publish time, so it cannot
@@ -1491,9 +1574,7 @@ def build_performance_streaming(
             "Nothing was read, written or retracted."
         )
 
-    with PerformanceStateStore(
-        state_db, memory_limit=memory_limit, temp_directory=temp_directory
-    ) as store:
+    with PerformanceStateStore(state_db, memory_limit=memory_limit, temp_directory=temp_directory) as store:
         if reset:
             store.reset()
             if progress is not None:
@@ -1550,9 +1631,7 @@ def build_performance_streaming(
                 }
             )
             if progress is not None:
-                progress(
-                    f"replaced the settlement set: {len(answers)} kept, {removed} retracted"
-                )
+                progress(f"replaced the settlement set: {len(answers)} kept, {removed} retracted")
         elif answers:
             provenance = _settlement_provenance_map(settlements)
             payload = {
@@ -1602,9 +1681,7 @@ def build_performance_streaming(
             manifest_extra = dict(build.manifest_extra or {})
             # Audit only - see _export_watermark_at_build. The Dashboard reads
             # the export live rather than trusting this.
-            manifest_extra.setdefault(
-                "export_watermark_at_build", _export_watermark_at_build(export_path)
-            )
+            manifest_extra.setdefault("export_watermark_at_build", _export_watermark_at_build(export_path))
             written = publish_performance(
                 build.payloads,
                 out_dir,

@@ -312,13 +312,20 @@ class ShadowStore:
             "available_depth_usd, proposed_shares, estimated_fill_shares, estimated_fill_price, "
             "estimated_fees_usd, estimated_buffer_usd, estimated_cost_usd, "
             "expected_net_profit_usd, net_edge, market_closed, forecast_age_hours, "
-            "thresholds_version, mode, mode_reason, decision_latency_ms, created_at_utc) "
-            "VALUES (" + ", ".join(["?"] * 44) + ") "
+            "thresholds_version, mode, mode_reason, decision_latency_ms, created_at_utc, "
+            "export_seq) "
+            "VALUES (" + ", ".join(["?"] * 44) + ", nextval('seq_shadow_decision_export')) "
             "ON CONFLICT (cycle_id, market_id, direction) DO UPDATE SET "
             "state = excluded.state, primary_reason = excluded.primary_reason, "
             "mode = excluded.mode, mode_reason = excluded.mode_reason, "
             "net_edge = excluded.net_edge, "
             "created_at_utc = excluded.created_at_utc"
+            # export_seq is deliberately absent from the UPDATE above: the
+            # sequence value is claimed on insert only, so re-writing a
+            # decision (the engine re-observing the same cycle+market+
+            # direction) neither changes its export position nor re-exports
+            # it. The column is nullable so pre-0005 images can still insert
+            # (NULL); the exporter repairs those rows in bounded batches.
         )
         decision_rows = [
             (
