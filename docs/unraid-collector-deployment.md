@@ -692,3 +692,8 @@ WebSocket 无限速文档；实测热门 token 约 15–20 条 `price_change` / 
 - **无下单代码**：`weatherquant.data.*` 里没有任何可以发出订单的路径。
 - **只读 API 集合**：Gamma `GET`、CLOB `GET /book`、WS `market` 频道订阅。
 - 镜像内**不含**数据库、配置密钥或本地 `.env`（`.dockerignore` 排除）。
+
+
+### 评审修复验证
+
+JSONL fsync 成功后立即确认该批数据已持久化。若 .sha256 发布失败，后续 flush/close 只重试待发布摘要，不重复追加数据。归档、摘要和尾部扫描统一使用二进制文件描述符。
