@@ -54,6 +54,7 @@ from weatherquant.data.heartbeat import (
 from weatherquant.data.http import ResilientHttp
 from weatherquant.data.lock import LockError, SingleInstanceLock
 from weatherquant.data.ratelimit import RateLimitRegistry
+from weatherquant.data.watchdog import LoopWatchdog
 from weatherquant.data.writer import (
     DEFAULT_BACKUP_TIMEOUT_SECONDS,
     BackupJob,
@@ -111,6 +112,7 @@ class CollectorWorker:
         backup_daily: bool = True,
         backup_timeout_seconds: float = DEFAULT_BACKUP_TIMEOUT_SECONDS,
         backup_retry_seconds: float = 3600.0,
+        loop_stuck_seconds: float = 120.0,
         stream_enabled: bool = True,
         once: bool = False,
     ) -> None:
@@ -128,6 +130,9 @@ class CollectorWorker:
         self.backup_daily = backup_daily
         self.backup_timeout_seconds = backup_timeout_seconds
         self.backup_retry_seconds = backup_retry_seconds
+        # 120s by default: the same number the health probe uses to call a
+        # heartbeat stale. Pass 0 to run without the watchdog (diagnostics).
+        self.loop_stuck_seconds = loop_stuck_seconds
         self.stream_enabled = stream_enabled
         self.once = once
 
@@ -138,6 +143,7 @@ class CollectorWorker:
         self._writer: CollectorWriter | None = None
         self._archive: RawArchive | None = None
         self._http: ResilientHttp | None = None
+        self._watchdog: LoopWatchdog | None = None
 
         # Heartbeat pacing uses its own monotonic clock: comparing
         # time.monotonic() against a wall-clock timestamp mixes two unrelated
@@ -347,6 +353,9 @@ class CollectorWorker:
                 detail=f"run={self.run_id} pid={os.getpid()} host={self.hostname}",
             )
 
+            self._start_watchdog()
+            self._maybe_inject_fault_block()
+
             self._loop(http, discovery, stream, publisher, archive)
             status = HealthStatus.STOPPED
             reason = self.shutdown.reason or "shutdown requested"
@@ -362,6 +371,12 @@ class CollectorWorker:
                 except Exception:
                     log.exception("could not record fatal event")
         finally:
+            # Stop the watchdog before any teardown: the steps below are
+            # deliberately allowed to take longer than a loop tick (backup
+            # join, checkpoint, archive close), and a watchdog that fired
+            # mid-clean-shutdown would convert every graceful stop into a kill.
+            if self._watchdog is not None:
+                self._watchdog.stop()
             # Each shutdown step is isolated: a stream that fails to stop must
             # not prevent the writer from flushing, checkpointing and recording
             # the run's exit. Without this, one subsystem's failure silently
@@ -449,6 +464,8 @@ class CollectorWorker:
         self._stream = stream
         cycles = 0
         while not self.shutdown.requested():
+            if self._watchdog is not None:
+                self._watchdog.tick()
             now = time.monotonic()
             cycles += 1
 
@@ -499,6 +516,72 @@ class CollectorWorker:
             self.shutdown.wait(self.tick_seconds)
 
     # -- tasks -------------------------------------------------------------
+
+    def _start_watchdog(self) -> None:
+        """Arm the loop watchdog (WQN-2): an independent thread that ends the
+        process when the loop stops ticking, so the container restart policy
+        can recover it. A heartbeat going stale tells the *probe* something is
+        wrong; the exit tells *Docker* to do something about it."""
+        if self.loop_stuck_seconds <= 0:
+            log.info("loop watchdog disabled (loop_stuck_seconds <= 0)")
+            return
+        # Sample ~4x per threshold so a stuck loop is caught within a
+        # fraction of its budget at any scale - including the compressed
+        # thresholds tests use.
+        check_interval = min(5.0, max(0.02, self.loop_stuck_seconds / 4.0))
+        self._watchdog = LoopWatchdog(
+            self, stuck_seconds=self.loop_stuck_seconds, check_interval=check_interval
+        )
+        self._watchdog.start()
+        log.info(
+            "loop watchdog armed: a silent main loop will exit the process after %.0fs",
+            self.loop_stuck_seconds,
+        )
+
+    # A deliberate, operator-placed fault: touch this file in the data
+    # directory to make the next run's loop block once, for chaos testing the
+    # watchdog + restart-policy path (WQN-2 acceptance). The file is consumed
+    # *before* blocking, so the restart that follows runs normally - the
+    # recovery arc, not a crash loop.
+    FAULT_BLOCK_MARKER = ".fault-block-main"
+
+    def _maybe_inject_fault_block(self) -> None:
+        marker = self.settings.db_path.parent / self.FAULT_BLOCK_MARKER
+        try:
+            raw = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            return
+        try:
+            seconds = float(raw) if raw else self.loop_stuck_seconds + 10.0
+        except ValueError:
+            seconds = self.loop_stuck_seconds + 10.0
+        # Consume first: if the watchdog ends the process mid-block, the
+        # restart must come up clean.
+        marker.unlink(missing_ok=True)
+        message = (
+            f"fault injection: blocking the main loop for {seconds:.0f}s "
+            "(operator chaos test; the watchdog is expected to end the process)"
+        )
+        log.warning("%s", message)
+        self._event("warning", "fault_injection", message)
+        if self._watchdog is not None:
+            # The block itself is the stuck state under test: no allowance.
+            time.sleep(seconds)
+        else:
+            log.warning("watchdog disabled; sleeping the fault block out instead")
+
+    def publish_stuck_heartbeat(self, message: str) -> None:
+        """A last heartbeat that names the stuck loop, written by the watchdog.
+
+        Best-effort on purpose: if even this write hangs, the process exit
+        must still happen - that is the one action that cannot be skipped.
+        """
+        self._status = HealthStatus.UNHEALTHY
+        self._fatal = message
+        publisher = HeartbeatWriter(
+            self.settings.db_path.parent / "health" / "heartbeat.json"
+        )
+        self._publish(publisher, None)
 
     def _run_discovery(self, discovery: GammaDiscovery, archive: RawArchive | None) -> None:
         if self._writer is None or archive is None:
@@ -850,6 +933,11 @@ class CollectorWorker:
             return
         today = datetime.now(tz=UTC).date()
         if self.parquet_daily and self._last_parquet_day != today:
+            # Bounded but unboundedly slow on a NAS: the watchdog gets a
+            # declared budget so a legitimate export cannot look like a stuck
+            # loop. An export that overruns it still trips the watchdog.
+            if self._watchdog is not None:
+                self._watchdog.allow(600.0)
             try:
                 report = self._writer.export_parquet_day(
                     today - timedelta(days=1), self.settings.raw_dir.parent / "parquet"
@@ -1438,6 +1526,13 @@ def worker_main(argv: list[str] | None = None) -> int:
         default=DEFAULT_BACKUP_TIMEOUT_SECONDS,
         help="abandon the daily backup if it runs longer than this (default: %(default)ss)",
     )
+    parser.add_argument(
+        "--loop-stuck-seconds",
+        type=float,
+        default=120.0,
+        help="exit the process if the main loop is silent this long, so the "
+        "restart policy recovers it (0 disables; default: %(default)ss)",
+    )
     parser.add_argument("--once", action="store_true", help="run one discovery+poll cycle then exit")
     args = parser.parse_args(argv)
 
@@ -1461,6 +1556,7 @@ def worker_main(argv: list[str] | None = None) -> int:
         book_poll_seconds=args.book_poll_seconds,
         heartbeat_seconds=args.heartbeat_seconds,
         backup_timeout_seconds=args.backup_timeout_seconds,
+        loop_stuck_seconds=args.loop_stuck_seconds,
         once=args.once,
     )
     return worker.run()

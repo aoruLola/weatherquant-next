@@ -280,7 +280,29 @@ for r in con.execute('''
 不是"数据有没有变化"。天气市场凌晨三点盘口不动是正常的；只要 REST 轮询仍然拿到
 200 响应，接触时钟就在走，探针就保持绿色。
 
-### 8.2 实操命令
+### 8.2 卡死的循环：探针看见,watchdog 处理(WQN-2)
+
+探针**识别**问题(120 秒未更新 → `unhealthy`),但 Docker 对"运行中但不健康"的
+容器**不会**重启 —— `restart: unless-stopped` 只在**进程退出**时动作。所以采集器
+进程内还有一条独立的 **loop watchdog 线程**(`--loop-stuck-seconds`,默认 120s,
+与探针的过期阈值同数):
+
+- 主循环每次迭代向它 `tick()`;有界但可能很慢的任务(每日 Parquet 导出)会先
+  `allow(预算)` 声明,声明超支照样触发;
+- 静默超过阈值 → watchdog 写**最后一条心跳**(status=`unhealthy`,
+  `fatal_error` 写明卡了多久)→ `os._exit(1)`。刻意不走优雅关闭:循环卡死时
+  `finally` 里的 flush/fsync 只会一起卡死。DuckDB 的 WAL 重放、下一次运行的
+  gap 关闭、raw 归档拒绝掩埋撕裂行,这三件事负责把状态收敛回来;
+- 于是链条完整:**120s 卡死 → 探针 unhealthy(识别)→ watchdog 退出 →
+  restart policy 拉起新进程(恢复)→ 自然键去重,不重复写入**。
+
+混沌验证(操作员主动触发,一次性):在数据目录放 `.fault-block-main` 文件
+(内容为阻塞秒数,缺省 130s),下一次启动的主循环会阻塞一次——文件在阻塞前
+**被消费**,所以随后的自动重启正常运行,不会死循环。验证脚本:
+`scripts/wqn2_container_recovery_test.sh`(本机构建镜像,跑识别+恢复两个场景,
+并断言重启后无重复写入)。
+
+### 8.3 实操命令
 
 ```bash
 # Docker 的视角
@@ -528,6 +550,7 @@ print('code supports  :', __import__('glob').glob('/app/.venv/lib/python3.12/sit
 | 15 | 无对外端口 | `docker port weatherquant-collector` → 空 |
 | 16 | SIGTERM 优雅退出 | `docker stop -t 60` → 日志显示 flush/checkpoint，`collector_runs.status='stopped'` |
 | 17 | 备份自校验 | `backups/` 内文件可只读打开且行数 = 主库 |
+| 18 | watchdog 自动恢复(WQN-2) | `echo 130 > /mnt/user/appdata/weatherquant-next/.fault-block-main && docker restart weatherquant-collector` → ~2 分钟后 `RestartCount` +1、容器回 `healthy`、`collector_runs` 多一行非 `stopped` 的记录、`collection_gaps` 无未关闭行 |
 | 18 | 30 分钟浸泡（含断网+重启） | 在 NAS 上跑 `python scripts/soak_test.py --minutes 30 --data /tmp/wq-soak` |
 
 ### 11.3 需要 GitHub Actions 执行的
@@ -656,6 +679,25 @@ RESULT: PASSED
 | 非交易时段不误报 | ✅ 未单列阶段；由单测 `test_a_quiet_market_stays_healthy` 覆盖 |
 | 磁盘告警 | ✅ 未在本机触发（磁盘充足）；单测覆盖 <15% / <5% 两档 |
 
+### 12.5 容器级心跳识别与自动恢复实测（WQN-2，2026-10-26）
+
+`scripts/wqn2_container_recovery_test.sh` 在本机（Debian + Docker 26.1.5）构建
+采集器镜像并用**真实的 120s 阈值**跑了两个场景，全部通过：
+
+```
+A 识别:  healthy(7s) → 主循环阻塞150s → 探针在 131s 判 unhealthy（120s 过期阈值）→ RestartCount=0（watchdog 未启用）
+B 恢复:  healthy → 阻塞130s → watchdog: "collection loop stuck for 120s (limit 120s);
+         ending the process so the container restart policy can recover it"
+         → RestartCount=1（restart: unless-stopped 自动拉起）→ 回到 healthy
+B 不重复: 优雅停止后开库断言——runs≥2、恰好 1 个 run 非 stopped（被杀的那个，
+         stop_reason 为 NULL）、collection_gaps 无未关闭行、order_books 全部
+         book_id 唯一、price_history 自然键无重复
+```
+
+配套单测 `tests/test_collector_watchdog.py`：探针 119s/121s 边界、watchdog 对
+阻塞循环触发并写出诊断心跳、健康循环不误触发、`allow()` 预算超支仍触发、
+故障标记一次性消费、被杀后重启无重复写入。
+
 ---
 
 ## 13. 限速参考（官方，按 IP / 10 秒滑动窗口）
@@ -710,3 +752,4 @@ WebSocket 无限速文档；实测热门 token 约 15–20 条 `price_change` / 
 
 备份文件的 fsync 使用可写二进制句柄，Windows 与 Linux 都可验证并发布备份。新增正常文件 fsync 回归测试。
 JSONL fsync 成功后立即确认该批数据已持久化。若 .sha256 发布失败，后续 flush/close 只重试待发布摘要，不重复追加数据。归档、摘要和尾部扫描统一使用二进制文件描述符。
+watchdog 的最后诊断心跳在独立 daemon 线程写入，最多等待 0.5 秒。即使挂载存储阻塞，进程仍退出以触发 restart 策略。
