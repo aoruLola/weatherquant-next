@@ -8,18 +8,14 @@ in the ledger).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 import inspect
+from datetime import UTC, datetime
 
 from paper_book_helpers import T_DECISION, TOKEN
 from weatherquant.execution.pricing import taker_fee_usd
 from weatherquant.paper.fills import PaperFill
-
-try:  # the risk gate exists from WQN-43 upward
-    from weatherquant.paper.risk import RiskGate, RiskRules
-except ImportError:  # pragma: no cover
-    RiskGate = RiskRules = None
+from weatherquant.paper.ledger import Ledger
+from weatherquant.paper.risk import RiskGate, RiskRules
 
 NOW = datetime(2026, 10, 26, 12, 5, 0, tzinfo=UTC)
 
@@ -123,3 +119,4 @@ def build_engine(store, raw_dir, *, clock, **overrides):
     if "risk" in params:
         kwargs["risk"] = make_risk(store, capital=overrides.get("capital", 100.0))
     return FillEngine(**kwargs)
+

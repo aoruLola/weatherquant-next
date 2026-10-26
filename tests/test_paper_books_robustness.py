@@ -82,10 +82,7 @@ class TestWsArrayFrames:
         from paper_fills_support import build_engine, open_ledger_if_needed
         from paper_fills_support_import import real_book_id_for_seed
         from paper_helpers import export_row
-        from weatherquant.data.books import parse_book_payload
         from weatherquant.paper.events import parse_signal_event
-        from weatherquant.paper.fills import FillEngine
-        from weatherquant.paper.ledger import Ledger
         from weatherquant.paper.store import PaperStore
         from weatherquant.storage.paper import PaperDatabase
 
@@ -134,8 +131,6 @@ class TestWsArrayFrames:
         from paper_fills_support_import import real_book_id_for_seed
         from paper_helpers import export_row
         from weatherquant.paper.events import parse_signal_event
-        from weatherquant.paper.fills import FillEngine
-        from weatherquant.paper.ledger import Ledger
         from weatherquant.paper.store import PaperStore
         from weatherquant.storage.paper import PaperDatabase
 

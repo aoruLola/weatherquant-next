@@ -339,6 +339,29 @@ class Ledger:
         )
         return True
 
+    # -- exposure ---------------------------------------------------------------
+
+    def market_exposure(self, market_id: str) -> float:
+        """Cost basis occupied across all open positions in one market.
+
+        This is the number the per-market exposure cap climbs: repeated
+        fills in the same market are one exposure, not many.
+        """
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(cost_basis_usdc), 0.0) FROM paper_positions "
+            "WHERE market_id = ? AND shares > ?",
+            [market_id, _EPS],
+        ).fetchone()
+        return float(row[0])
+
+    def held_shares(self, market_id: str, token_id: str) -> float:
+        """Shares of one token currently held (0 when the position is closed)."""
+        row = self.db.execute(
+            "SELECT shares FROM paper_positions WHERE market_id = ? AND token_id = ?",
+            [market_id, token_id],
+        ).fetchone()
+        return float(row[0]) if row else 0.0
+
     # -- valuation --------------------------------------------------------------
 
     def mark_valuation(self, mark_of: Callable[[str], float | None]) -> dict[str, Any]:

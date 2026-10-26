@@ -112,6 +112,7 @@ class RefusalReason(StrEnum):
     BOOK_STALE = "BOOK_STALE"                  # resolved book is older than the freshness limit
     INSUFFICIENT_CAPACITY = "INSUFFICIENT_CAPACITY"    # book cannot cover the order
     RISK_BUDGET_EXCEEDED = "RISK_BUDGET_EXCEEDED"      # a configured risk gate refused
+    RISK_EXPOSURE_EXCEEDED = "RISK_EXPOSURE_EXCEEDED"  # one market's cumulative cap
     INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS"  # frozen cash + cost exceeds available
     NO_INVENTORY = "NO_INVENTORY"              # a SELL YES with nothing to sell
     UNPRICABLE_EVENT = "UNPRICABLE_EVENT"      # fee schedule or price data unusable

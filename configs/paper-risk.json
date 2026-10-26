@@ -1,0 +1,28 @@
+{
+  "_readme": [
+    "Risk rules for the paper engine. Same discipline as the shadow's",
+    "shadow-thresholds.json: every value carries its own rationale, the file",
+    "carries a version, and nothing here is fitted to observed outcomes.",
+    "",
+    "These are MVP rules set A PRIORI from the account definition (100 USDC,",
+    "no leverage, no naked shorts). They are not claimed optimal, and tuning",
+    "them on results the rules will later be judged against is how a strategy",
+    "is invented rather than found. A change must bump `version` and be",
+    "reviewed against docs/paper-risk-rules.md."
+  ],
+  "version": "mvp-v1",
+  "set_at_utc": "2026-10-26T00:00:00+00:00",
+  "basis": "a priori: 100 USDC virtual account, no leverage, no naked shorts; per-opportunity and per-market caps sized so a full day of signals cannot exhaust the account in one trade",
+  "thresholds": {
+    "max_opportunity_fraction": {
+      "value": 0.10,
+      "unit": "fraction of initial capital per opportunity",
+      "rationale": "One opportunity may commit at most 10% of opening capital (10 USDC at 100). Sized against the account, not the market: the point is that no single signal can dominate the ledger, whatever its edge claims."
+    },
+    "max_market_exposure_fraction": {
+      "value": 0.20,
+      "unit": "fraction of initial capital per market (cumulative)",
+      "rationale": "All open positions in one market together may occupy at most 20% of opening capital (20 USDC at 100). Cumulative, not per-fill: multiple episodes in the same market accumulate toward one cap, so a market cannot be climbed by repeated small buys."
+    }
+  }
+}

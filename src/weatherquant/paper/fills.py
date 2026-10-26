@@ -51,11 +51,15 @@ from weatherquant.paper.ledger import (
     Ledger,
     LedgerError,
 )
+from weatherquant.paper.risk import RiskGate
 from weatherquant.paper.store import PaperStore
 
 __all__ = ["FillEngine", "FillOutcome", "FillResult", "PaperFill"]
 
 log = logging.getLogger("weatherquant.paper")
+
+# Money comparisons carry a tolerance; the ledger's own checks are exact.
+_EPS = 1e-9
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +145,7 @@ class FillEngine:
         clock: Any = None,
         batch_signals: int = 100,
         ledger: Ledger | None = None,
+        risk: RiskGate | None = None,
     ) -> None:
         if buffer_fraction < 0.0:
             raise ValueError("buffer_fraction must be >= 0")
@@ -154,15 +159,28 @@ class FillEngine:
         self.clock = clock or (lambda: datetime.now(tz=UTC))
         self.batch_signals = int(batch_signals)
         self.ledger = ledger if ledger is not None else Ledger(store)
+        # Deliberately not optional-with-a-permissive-default: a fill engine
+        # constructed without a gate must be told so explicitly, by a caller
+        # that passes an explicit unrestricted gate.
+        if risk is None:
+            raise ValueError(
+                "FillEngine needs a RiskGate; construct one from the versioned "
+                "rules file - a fill engine without risk rules is a missing "
+                "gate, not a permissive one"
+            )
+        self.risk = risk
 
     def fill_pending(self) -> FillResult:
         """Fill every ACCEPTED signal currently in the account, bounded.
 
-        The ledger movement, the fill row, the position and the outcome
-        transition commit together, in one transaction per batch: a signal is
-        never left ACCEPTED with a fill row beside it, nor FILLED without its
-        debit. A ledger refusal (no funds, no inventory) converts the signal
-        to a recorded refusal instead of writing half a trade.
+        Signals are priced-and-settled **in order, one at a time**, inside one
+        transaction per batch: the second signal's pricing sees the cash and
+        inventory the first signal's settlement just moved, which is what
+        makes a batch behave like the same sequence of trades would have in
+        reality. The ledger movement, the fill row, the position and the
+        outcome transition commit together; a ledger refusal (no funds, no
+        inventory) converts the signal to a recorded refusal instead of
+        writing half a trade.
         """
         result = FillResult()
         try:
@@ -171,20 +189,16 @@ class FillEngine:
                 result.caught_up = True
                 return result
             now = self.clock()
-            outcomes: list[FillOutcome] = []
-            for row in pending:
-                result.attempted += 1
-                outcomes.append(self._fill_one_isolated(row, now))
             with self.store.db.transaction():
-                for outcome in outcomes:
+                for row in pending:
+                    result.attempted += 1
+                    outcome = self._fill_one_isolated(row, now)
                     if outcome.filled and outcome.fill is not None:
                         settled, refusal = self._settle(outcome.fill, now)
                         if settled:
                             self.store.record_fill(outcome.fill)
-                            self.store.set_signal_outcome(
-                                outcome.decision_id,
-                                outcome="FILLED",
-                            )
+                            self.store.set_signal_outcome(outcome.decision_id, outcome="FILLED")
+                            result.filled += 1
                             continue
                         outcome.filled = False
                         outcome.reason, outcome.detail = refusal
@@ -194,10 +208,6 @@ class FillEngine:
                         refusal_reason=outcome.reason,
                         refusal_detail=outcome.detail,
                     )
-            for outcome in outcomes:
-                if outcome.filled:
-                    result.filled += 1
-                else:
                     result.refused += 1
                     key = outcome.reason or "UNKNOWN"
                     result.by_reason[key] = result.by_reason.get(key, 0) + 1
@@ -268,13 +278,17 @@ class FillEngine:
             outcome.reason = RefusalReason.UNPRICABLE_EVENT.value
             outcome.detail = "the market did not report a fee schedule; refusing to assume zero"
             return outcome
-        if not event.proposed_shares or event.proposed_shares <= 0.0:
-            outcome.reason = RefusalReason.UNPRICABLE_EVENT.value
-            outcome.detail = f"signal carries no order size to fill (proposed_shares={event.proposed_shares!r})"
-            return outcome
         if not event.token_id:
             outcome.reason = RefusalReason.NO_BOOK_EVIDENCE.value
             outcome.detail = "signal names no token; its book cannot be resolved"
+            return outcome
+
+        # The inventory gate needs no book: you cannot sell what you do not
+        # hold, whatever the book says. It runs before pricing, which is the
+        # earliest broken precondition.
+        verdict = self.risk.before_fill(event)
+        if not verdict.allowed:
+            outcome.reason, outcome.detail = verdict.reason, verdict.detail
             return outcome
 
         evidence = self.books.resolve(token_id=event.token_id, decision_time=event.decision_time_utc)
@@ -284,9 +298,21 @@ class FillEngine:
             return outcome
         assert evidence is not None  # narrowed by _gate_book
 
+        # Size the opportunity to the account's own rules before pricing.
+        shares, verdict = self.risk.size(event, evidence)
+        if not verdict.allowed:
+            outcome.reason, outcome.detail = verdict.reason, verdict.detail
+            return outcome
+        if shares <= _EPS:
+            outcome.reason = RefusalReason.INSUFFICIENT_FUNDS.value
+            outcome.detail = (
+                f"the risk rules sized this opportunity to {shares} shares; nothing to trade"
+            )
+            return outcome
+
         side = Side.BUY if event.direction.value == "buy_yes" else Side.SELL
         try:
-            plan = build_fill_plan(evidence.book, side=side, shares=event.proposed_shares)
+            plan = build_fill_plan(evidence.book, side=side, shares=shares)
             cost = execution_cost(plan, fee_rate=event.fee_rate, buffer_fraction=self.buffer_fraction)
         except ExecutionRefused as exc:
             if exc.code == "NO_LIQUIDITY" or exc.code == "INVALID_ORDER_SIZE":
@@ -320,8 +346,7 @@ class FillEngine:
         avg = plan.avg_price_usd_per_share
         assert avg is not None and best is not None  # guaranteed for a priced plan
         is_buy = side is Side.BUY
-        outcome.filled = True
-        outcome.fill = PaperFill(
+        fill = PaperFill(
             decision_id=event.decision_id,
             market_id=event.market_id,
             token_id=event.token_id,
@@ -350,6 +375,15 @@ class FillEngine:
             fee_rate=event.fee_rate,
             thresholds_version=event.thresholds_version,
         )
+        # The caps apply to the *actual* outflow a real walk produced - a
+        # deeper walk costs more than the best level suggested, and this is
+        # the last place an over-budget trade can be stopped.
+        verdict = self.risk.check_priced(event, fill)
+        if not verdict.allowed:
+            outcome.reason, outcome.detail = verdict.reason, verdict.detail
+            return outcome
+        outcome.filled = True
+        outcome.fill = fill
         return outcome
 
     def _gate_book(
