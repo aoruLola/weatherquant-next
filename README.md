@@ -53,7 +53,7 @@ weatherquant-next/
 │   ├── shadow/      影子交易引擎（决策观察）             [P2-0 已实现]
 │   ├── strategies/  信号逻辑                             [P1，当前为空]
 │   ├── backtest/    研究引擎                             [P1，当前为空]
-│   ├── paper/       模拟交易账本                         [P2 续，当前为空]
+│   ├── paper/       Paper 模拟账户（默认关闭,100 USDC）     [WQN-39 地基,消费循环 WQN-40+]
 │   ├── risk/        风险限制                             [P2 续，当前为空]
 │   ├── storage/     DuckDB 连接、schema、迁移            [P0 + P1-0 + P2-0]
 │   ├── execution/   共享定价 / 成本 / Edge 计算（见下）   [P0 + P2-0 卖出侧]
@@ -77,9 +77,11 @@ weatherquant-next/
 > `strategies`（信号）与 `paper`（模拟成交）调用；放进任何一方都会造成反向依赖。
 > 因此新增一个中立的 `execution` 包作为唯一的成本计算来源。
 
-> **关于空包**：`strategies/`、`backtest/`、`paper/`、`risk/` **只有 `.gitkeep`，没有任何代码**。
+> **关于空包**：`strategies/`、`backtest/`、`risk/` **只有 `.gitkeep`，没有任何代码**。
 > 按规范"不要一次性生成全部未来阶段的占位代码"，这里不放 stub——空桩比没有更糟，
-> 它会假装某个能力已经存在。`data/` 已在 P1-0 实现，不再是空包。
+> 它会假装某个能力已经存在。`data/` 已在 P1-0 实现，不再是空包；
+> `paper/` 自 WQN-39 起有了地基（配置闸门、事件契约、独立状态库），架构见
+> [`docs/adr/0001-paper-trading-architecture.md`](docs/adr/0001-paper-trading-architecture.md)。
 
 ## 安装
 
@@ -113,6 +115,7 @@ uv run ruff check .
 | [`docs/architecture.md`](docs/architecture.md) | 新系统架构设计 |
 | [`docs/legacy-data-migration.md`](docs/legacy-data-migration.md) | 旧库只读迁移方案与待核实判定规则 |
 | [`docs/roadmap.md`](docs/roadmap.md) | P1–P4 详细开发任务 |
+| [`docs/adr/0001-paper-trading-architecture.md`](docs/adr/0001-paper-trading-architecture.md) | Paper 引擎架构 ADR（WQN-39：单向解耦、默认关闭、事件契约、幂等模型） |
 
 ## P0 状态（已完成）
 
