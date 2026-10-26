@@ -153,6 +153,11 @@ paper 与可执行回测需要**信号当时**的 token、双向 bid/ask 层级�
   各 PR 中标注)。
 
 
+### 评审修复验证
+
+serve 在同一写者租约中按 tick_seconds 持续消费、成交并维护锁心跳；可通过 --settlement-feed 读取只读结算 JSONL。每个 HTTP 请求创建独立 DuckDB cursor，查询不共享结果游标。
+
+
 同一消费批次的待成交信号按决策时间排序，decision_id 只用于同一时刻的稳定排序，避免哈希顺序反转先买后卖。
 
 

@@ -480,6 +480,9 @@ class TestNoNetworkPath:
 
         import weatherquant.paper as paper_pkg
         from weatherquant.paper import (
+            api as paper_api,
+        )
+        from weatherquant.paper import (
             books as paper_books,
         )
         from weatherquant.paper import (
@@ -509,10 +512,17 @@ class TestNoNetworkPath:
         from weatherquant.paper import (
             store as paper_store,
         )
+        from weatherquant.paper import (
+            web as paper_web,
+        )
 
+        # The API module (WQN-45) is a *server* over stdlib http.server; the
+        # list still holds because it names client machinery only, and the
+        # server avoids even urllib's parse helpers to keep this check exact.
         forbidden = ("httpx", "requests", "ResilientHttp", "socket.create_connection", "urllib")
         for module in (
             paper_pkg,
+            paper_api,
             paper_books,
             paper_cli,
             paper_config,
@@ -523,6 +533,7 @@ class TestNoNetworkPath:
             paper_risk,
             paper_settlements,
             paper_store,
+            paper_web,
         ):
             source = inspect.getsource(sys.modules[module.__name__])
             for needle in forbidden:

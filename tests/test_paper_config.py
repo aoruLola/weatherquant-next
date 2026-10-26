@@ -69,7 +69,7 @@ class TestAccountSettings:
 
     def test_paths_default_inside_the_paper_directory(self):
         settings = PaperSettings(_env_file=None)
-        assert str(settings.db_path).startswith("data/paper/")
+        assert settings.db_path.as_posix().startswith("data/paper/")
         # The decision channel is the shadow's *published* export, never the
         # shadow's database file.
         assert "decisions-export" in str(settings.events_dir)

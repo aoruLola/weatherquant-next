@@ -178,6 +178,21 @@ class PaperSettings(BaseSettings):
         "blocks the engine's loop on the archive.",
     )
 
+    # --- read-only API (WQN-45) -------------------------------------------------
+    api_host: str = Field(
+        default="127.0.0.1",
+        description="Bind address for the read-only API. Localhost by "
+        "default: the surface exposes balances, positions and the ledger to "
+        "anything that can reach it, so widening the bind is an operator "
+        "decision, not a default.",
+    )
+    api_port: int = Field(
+        default=8790,
+        ge=1,
+        le=65535,
+        description="Port for the read-only API.",
+    )
+
     # --- risk gates -------------------------------------------------------------
     risk_rules_path: Path = Field(
         default=Path("configs/paper-risk.json"),
