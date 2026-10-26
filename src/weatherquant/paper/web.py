@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -61,7 +63,7 @@ class PaperAPIHandler(BaseHTTPRequestHandler):
         if not path.startswith(_API_PREFIX):
             self._send(*self._not_found(path))
             return
-        name = path[len(_API_PREFIX):].strip("/")
+        name = path[len(_API_PREFIX) :].strip("/")
         if name not in ENDPOINTS:
             self._send(*self._not_found(path))
             return
@@ -80,13 +82,19 @@ class PaperAPIHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send(400, {"status": "error", "reason": str(exc)})
                 return
+        owner = getattr(self.con, "con", self.con)
+        request_con = owner.cursor()
         try:
-            payload = builder(self.con, now=datetime.now(tz=UTC), query=query) if takes_query else builder(
-                self.con, now=datetime.now(tz=UTC)
+            payload = (
+                builder(request_con, now=datetime.now(tz=UTC), query=query)
+                if takes_query
+                else builder(request_con, now=datetime.now(tz=UTC))
             )
         except ValueError as exc:
             self._send(400, {"status": "error", "reason": str(exc)})
             return
+        finally:
+            request_con.close()
         status = 200 if payload.get("status") == "ok" else 503
         self._send(status, payload)
 
@@ -143,7 +151,14 @@ def _validate_page(query: dict[str, Any]) -> None:
             raise ValueError(f"limit must be in [1, {_MAX_LIMIT}], got {limit}")
 
 
-def make_server(con: Any, *, host: str, port: int) -> ThreadingHTTPServer:
+def make_server(
+    con: Any,
+    *,
+    host: str,
+    port: int,
+    on_tick: Callable[[], None] | None = None,
+    tick_seconds: float = 5.0,
+) -> ThreadingHTTPServer:
     """Bind the router to a host:port with the connection injected.
 
     The connection is the caller's - normally the engine process's own -
@@ -154,8 +169,17 @@ def make_server(con: Any, *, host: str, port: int) -> ThreadingHTTPServer:
     class _Wired(PaperAPIHandler):
         pass
 
+    class _EngineServer(ThreadingHTTPServer):
+        last_tick = float("-inf")
+
+        def service_actions(self) -> None:
+            now = time.monotonic()
+            if on_tick is not None and now - self.last_tick >= tick_seconds:
+                self.last_tick = now
+                on_tick()
+
     _Wired.con = con
-    return ThreadingHTTPServer((host, port), _Wired)
+    return _EngineServer((host, port), _Wired)
 
 
 def serve_forever(server: ThreadingHTTPServer) -> None:

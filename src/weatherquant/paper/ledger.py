@@ -220,14 +220,12 @@ class Ledger:
         available = balances["available_usdc"] - cash_out
         occupied = balances["occupied_usdc"] + cash_out
         self.db.execute(
-            "UPDATE paper_balances SET available_usdc = ?, occupied_usdc = ?, updated_at_utc = ? "
-            "WHERE account_id = ?",
+            "UPDATE paper_balances SET available_usdc = ?, occupied_usdc = ?, updated_at_utc = ? WHERE account_id = ?",
             [available, occupied, now, ACCOUNT_ID],
         )
 
         existing = self.db.execute(
-            "SELECT shares, cost_basis_usdc FROM paper_positions "
-            "WHERE market_id = ? AND token_id = ?",
+            "SELECT shares, cost_basis_usdc FROM paper_positions WHERE market_id = ? AND token_id = ?",
             [fill.market_id, fill.token_id],
         ).fetchone()
         if existing is None:
@@ -349,8 +347,7 @@ class Ledger:
         fills in the same market are one exposure, not many.
         """
         row = self.db.execute(
-            "SELECT COALESCE(SUM(cost_basis_usdc), 0.0) FROM paper_positions "
-            "WHERE market_id = ? AND shares > ?",
+            "SELECT COALESCE(SUM(cost_basis_usdc), 0.0) FROM paper_positions WHERE market_id = ? AND shares > ?",
             [market_id, _EPS],
         ).fetchone()
         return float(row[0])
@@ -425,15 +422,11 @@ class Ledger:
         """
         expected_balances, expected_positions = self._replay()
         stored_balances = self.balances() or {}
-        stored_positions = {
-            (p.market_id, p.token_id): p for p in self.positions()
-        }
+        stored_positions = {(p.market_id, p.token_id): p for p in self.positions()}
         # Closed positions (shares == 0) are stored but not replayed as open;
         # compare only what should be open.
         stored_open = {k: v for k, v in stored_positions.items() if v.shares > _EPS}
-        expected_open = {
-            k: v for k, v in expected_positions.items() if v.shares > _EPS
-        }
+        expected_open = {k: v for k, v in expected_positions.items() if v.shares > _EPS}
 
         balance_ok = all(
             abs(stored_balances.get(field, 0.0) - expected_balances[field]) <= 1e-6
@@ -449,9 +442,7 @@ class Ledger:
             "positions_match": positions_ok,
             "running_balance_consistent": running_ok,
             "expected_balances": expected_balances,
-            "stored_balances": {
-                k: stored_balances.get(k) for k in expected_balances
-            },
+            "stored_balances": {k: stored_balances.get(k) for k in expected_balances},
             "open_positions": len(expected_open),
         }
 
@@ -466,9 +457,7 @@ class Ledger:
                 available += entry["amount_usdc"]  # negative
                 occupied += float(detail["cost_basis_usdc"])
                 key = (detail["market_id"], detail["token_id"])
-                pos = positions.setdefault(
-                    key, {"shares": 0.0, "basis": 0.0}
-                )
+                pos = positions.setdefault(key, {"shares": 0.0, "basis": 0.0})
                 pos["shares"] += float(detail["shares"])
                 pos["basis"] += float(detail["cost_basis_usdc"])
             elif entry["kind"] == "SELL_SETTLE":
@@ -476,9 +465,7 @@ class Ledger:
                 occupied -= float(detail["cost_released_usdc"])
                 realised += float(detail["realized_pnl_usdc"])
                 key = (detail["market_id"], detail["token_id"])
-                pos = positions.setdefault(
-                    key, {"shares": 0.0, "basis": 0.0}
-                )
+                pos = positions.setdefault(key, {"shares": 0.0, "basis": 0.0})
                 pos["shares"] -= float(detail["shares"])
                 pos["basis"] -= float(detail["cost_released_usdc"])
             elif entry["kind"] == "SETTLE_PAYOUT":
@@ -531,12 +518,7 @@ class Ledger:
     # -- internals ----------------------------------------------------------------
 
     def _entry_exists(self, entry_id: str) -> bool:
-        return (
-            self.db.execute(
-                "SELECT 1 FROM paper_ledger WHERE entry_id = ?", [entry_id]
-            ).fetchone()
-            is not None
-        )
+        return self.db.execute("SELECT 1 FROM paper_ledger WHERE entry_id = ?", [entry_id]).fetchone() is not None
 
     # -- settlements ---------------------------------------------------------
 
@@ -624,9 +606,7 @@ class Ledger:
         finally exists - it did not exist the whole time the position was
         merely open.
         """
-        positions = [
-            p for p in self.positions() if p.market_id == event.market_id
-        ]
+        positions = [p for p in self.positions() if p.market_id == event.market_id]
         if not positions:
             return {
                 "action": "RECORDED",
@@ -804,8 +784,12 @@ class Ledger:
         if row is None:
             return None
         entry = self.db.execute(
-            "SELECT detail_json FROM paper_ledger WHERE ref_type = 'settlement' AND ref_id = ?",
-            [f"{market_id}#{row[0]}"],
+            "SELECT l.detail_json FROM paper_ledger l "
+            "JOIN paper_settlements s ON s.market_id = ? "
+            "AND l.ref_id = s.market_id || '#' || CAST(s.revision AS VARCHAR) "
+            "WHERE l.kind = 'SETTLE_PAYOUT' AND l.ref_type = 'settlement' "
+            "ORDER BY l.seq LIMIT 1",
+            [market_id],
         ).fetchone()
         shares = 0.0
         if entry is not None:
@@ -819,15 +803,13 @@ class Ledger:
 
     def _mark_settlement_applied(self, event, *, now: datetime) -> None:
         self.db.execute(
-            "UPDATE paper_settlements SET applied = TRUE, applied_at_utc = ? "
-            "WHERE settlement_id = ?",
+            "UPDATE paper_settlements SET applied = TRUE, applied_at_utc = ? WHERE settlement_id = ?",
             [now, settlement_id(market_id=event.market_id, revision=event.revision)],
         )
 
     def _flag_review(self, event, *, reason: str) -> None:
         self.db.execute(
-            "UPDATE paper_settlements SET review_required = TRUE, review_reason = ? "
-            "WHERE settlement_id = ?",
+            "UPDATE paper_settlements SET review_required = TRUE, review_reason = ? WHERE settlement_id = ?",
             [reason, settlement_id(market_id=event.market_id, revision=event.revision)],
         )
 

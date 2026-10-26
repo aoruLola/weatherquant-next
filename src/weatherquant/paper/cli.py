@@ -55,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "settle":
             return _cmd_settle(settings, feed=args.feed)
         if args.command == "serve":
-            return _cmd_serve(settings)
+            return _cmd_serve(settings, settlement_feed=args.settlement_feed)
     except ValueError as exc:
         # The enablement flag's parse error lands here: say it plainly and
         # exit non-zero rather than pretending the flag was absent.
@@ -89,10 +89,11 @@ def _parser() -> argparse.ArgumentParser:
         help="apply a published settlement feed: payouts, releases, corrections",
     )
     settle.add_argument("feed", help="path to the published settlement feed (JSONL)")
-    sub.add_parser(
+    serve = sub.add_parser(
         "serve",
-        help="serve the read-only API (GET /api/v1/paper/*) from this process",
+        help="consume signals, fill and serve the read-only API from one process",
     )
+    serve.add_argument("--settlement-feed", help="optional published settlement JSONL feed")
     return parser
 
 
@@ -196,6 +197,25 @@ def _cmd_consume(settings: PaperSettings, *, batch_lines: int) -> int:
     return 0
 
 
+def _fill_engine(store: PaperStore, settings: PaperSettings) -> FillEngine:
+    return FillEngine(
+        store,
+        book_source=ArchiveBookSource(
+            settings.raw_dir,
+            tail_bytes=settings.archive_tail_bytes,
+            timeout_seconds=settings.book_resolve_timeout_seconds,
+        ),
+        buffer_fraction=settings.execution_buffer_fraction,
+        require_complete_fill=settings.require_complete_fill,
+        max_book_age_seconds=settings.max_book_age_seconds,
+        risk=RiskGate(
+            Ledger(store),
+            load_risk_rules(settings.risk_rules_path),
+            initial_capital_usdc=float(store.account()["initial_capital_usdc"]),
+        ),
+    )
+
+
 def _cmd_fill(settings: PaperSettings) -> int:
     _require_enabled(settings)
     try:
@@ -207,27 +227,11 @@ def _cmd_fill(settings: PaperSettings) -> int:
         store = PaperStore(db)
         if store.account() is None:
             print(
-                f"error: account {ACCOUNT_ID} does not exist; run "
-                "`weatherquant-paper init` first",
+                f"error: account {ACCOUNT_ID} does not exist; run `weatherquant-paper init` first",
                 file=sys.stderr,
             )
             return 3
-        engine = FillEngine(
-            store,
-            book_source=ArchiveBookSource(
-                settings.raw_dir,
-                tail_bytes=settings.archive_tail_bytes,
-                timeout_seconds=settings.book_resolve_timeout_seconds,
-            ),
-            buffer_fraction=settings.execution_buffer_fraction,
-            require_complete_fill=settings.require_complete_fill,
-            max_book_age_seconds=settings.max_book_age_seconds,
-            risk=RiskGate(
-                Ledger(store),
-                load_risk_rules(settings.risk_rules_path),
-                initial_capital_usdc=settings.initial_capital_usdc,
-            ),
-        )
+        engine = _fill_engine(store, settings)
         result = engine.fill_pending()
         run_id = db.start_run("paper-fill", {})
         db.finish_run(run_id, status="stopped", stats=result.as_dict())
@@ -273,39 +277,60 @@ def _cmd_settle(settings: PaperSettings, *, feed: str) -> int:
     return 0
 
 
-def _cmd_serve(settings: PaperSettings) -> int:
-    """Serve the read-only API from the engine's own process.
-
-    The connection this command holds is the one the handlers read through;
-    DuckDB's single-writer lease means a second process cannot open the
-    file anyway, so serving from here is not just convenient - it is the
-    only way a live reader can exist at all.
-    """
+def _cmd_serve(settings: PaperSettings, *, settlement_feed: str | None = None) -> int:
+    """Run the consumer and fills under the API process's single writer lease."""
     _require_enabled(settings)
     try:
         db, lock = _open_under_lock(settings, "paper-serve")
     except LockError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 4
+    run_id = None
     try:
-        server = make_server(db.con, host=settings.api_host, port=settings.api_port)
-        run_id = db.start_run(
-            "paper-serve",
-            {"api_host": settings.api_host, "api_port": settings.api_port},
+        store = PaperStore(db)
+        if store.account() is None:
+            print("error: run weatherquant-paper init first", file=sys.stderr)
+            return 3
+        consumer = SignalConsumer(
+            store,
+            events_dir=settings.events_dir,
+            max_signal_age_seconds=settings.max_signal_age_seconds,
         )
-        db.finish_run(run_id, status="running", stats={"note": "run row closed on shutdown"})
-    except OSError as exc:
-        print(f"error: cannot bind {settings.api_host}:{settings.api_port}: {exc}", file=sys.stderr)
-        db.close()
-        lock.release()
-        return 5
-    print(
-        f"paper read-only API on http://{settings.api_host}:{settings.api_port}"
-        f"/api/v1/paper/{{{','.join(ENDPOINTS)}}} (GET only)"
-    )
-    try:
+        engine = _fill_engine(store, settings)
+        ledger = Ledger(store)
+
+        def tick() -> None:
+            consumed = consumer.consume_once()
+            filled = engine.fill_pending()
+            for note in [*consumed.notes, *filled.notes]:
+                log.warning("%s", note)
+            if settlement_feed is not None:
+                events = read_settlement_feed(settlement_feed)
+                with db.transaction():
+                    for event in events:
+                        ledger.apply_settlement(event, now=datetime.now(tz=UTC))
+            lock.heartbeat()
+
+        try:
+            server = make_server(
+                db.con,
+                host=settings.api_host,
+                port=settings.api_port,
+                on_tick=tick,
+                tick_seconds=settings.tick_seconds,
+            )
+        except OSError as exc:
+            print(f"error: cannot bind {settings.api_host}:{settings.api_port}: {exc}", file=sys.stderr)
+            return 5
+        run_id = db.start_run("paper-serve", {"api_host": settings.api_host, "api_port": settings.api_port})
+        print(
+            f"paper read-only API on http://{settings.api_host}:{settings.api_port}"
+            f"/api/v1/paper/{{{','.join(ENDPOINTS)}}} (GET only)"
+        )
         serve_forever(server)
     finally:
+        if run_id is not None:
+            db.finish_run(run_id, status="stopped", stats={})
         db.close()
         lock.release()
     return 0
