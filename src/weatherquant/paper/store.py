@@ -273,9 +273,10 @@ class PaperStore:
             "requested_shares, filled_shares, avg_price_usd_per_share, "
             "best_price_usd_per_share, slippage_usd_per_share, fill_cost_usd, fees_usd, "
             "execution_buffer_usd, total_cost_usd, net_proceeds_usd, levels_consumed, "
-            "complete, consumed_levels_json, decision_time_utc, filled_at_utc, fee_rate, "
+            "complete, consumed_levels_json, book_bids_json, book_asks_json, "
+            "book_source_event_id, decision_time_utc, filled_at_utc, fee_rate, "
             "thresholds_version) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (decision_id) DO NOTHING RETURNING decision_id",
             [
                 fill.decision_id,
@@ -301,6 +302,9 @@ class PaperStore:
                 fill.levels_consumed,
                 bool(fill.complete),
                 fill.consumed_levels_json(),
+                fill.book_bids_json,
+                fill.book_asks_json,
+                fill.book_source_event_id,
                 fill.decision_time_utc,
                 fill.filled_at_utc,
                 fill.fee_rate,
@@ -313,7 +317,8 @@ class PaperStore:
         row = self.db.execute(
             "SELECT decision_id, filled_shares, avg_price_usd_per_share, fees_usd, "
             "total_cost_usd, net_proceeds_usd, levels_consumed, complete, consumed_levels_json, "
-            "slippage_usd_per_share, best_price_usd_per_share, execution_buffer_usd "
+            "slippage_usd_per_share, best_price_usd_per_share, execution_buffer_usd, "
+            "book_bids_json, book_asks_json, book_source_event_id "
             "FROM paper_fills WHERE decision_id = ?",
             [decision_id],
         ).fetchone()
@@ -332,6 +337,9 @@ class PaperStore:
             "slippage_usd_per_share": float(row[9]),
             "best_price_usd_per_share": float(row[10]),
             "execution_buffer_usd": float(row[11]),
+            "book_bids": json.loads(str(row[12])),
+            "book_asks": json.loads(str(row[13])),
+            "book_source_event_id": row[14],
         }
 
     # -- cursor state -------------------------------------------------------

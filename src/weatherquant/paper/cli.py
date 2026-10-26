@@ -205,7 +205,11 @@ def _cmd_fill(settings: PaperSettings) -> int:
             return 3
         engine = FillEngine(
             store,
-            book_source=ArchiveBookSource(settings.raw_dir, tail_bytes=settings.archive_tail_bytes),
+            book_source=ArchiveBookSource(
+                settings.raw_dir,
+                tail_bytes=settings.archive_tail_bytes,
+                timeout_seconds=settings.book_resolve_timeout_seconds,
+            ),
             buffer_fraction=settings.execution_buffer_fraction,
             require_complete_fill=settings.require_complete_fill,
             max_book_age_seconds=settings.max_book_age_seconds,

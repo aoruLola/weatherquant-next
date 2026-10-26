@@ -200,7 +200,7 @@ class TestEvidenceGates:
         store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
         result = make_engine(store, raw_dir).fill_pending()
         assert result.refused == 1
-        assert result.by_reason == {"NO_BOOK_EVIDENCE": 1}
+        assert result.by_reason == {"NOT_EXECUTABLE": 1}
         assert store.fill_of(event.decision_id) is None
         row = store.signal(event.decision_id)
         assert row["outcome"] == "REFUSED"
@@ -255,7 +255,7 @@ class TestEvidenceGates:
         )
         store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
         result = make_engine(store, raw_dir).fill_pending()
-        assert result.by_reason == {"NO_BOOK_EVIDENCE": 1}
+        assert result.by_reason == {"NOT_EXECUTABLE": 1}
 
 
 class TestCapacityAndFees:

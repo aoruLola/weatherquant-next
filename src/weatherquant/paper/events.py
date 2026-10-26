@@ -107,7 +107,8 @@ class RefusalReason(StrEnum):
     STALE_SIGNAL = "STALE_SIGNAL"              # older than the freshness window at consumption
     MARKET_NOT_OPEN = "MARKET_NOT_OPEN"        # market lifecycle says closed at consumption
     DUPLICATE_SIGNAL = "DUPLICATE_SIGNAL"      # already consumed; recorded on the existing row
-    NO_BOOK_EVIDENCE = "NO_BOOK_EVIDENCE"      # point-in-time book could not be resolved
+    NOT_EXECUTABLE = "NOT_EXECUTABLE"          # no point-in-time book evidence: missing or timed out
+    NO_BOOK_EVIDENCE = "NO_BOOK_EVIDENCE"      # (pre-WQN-24 spelling of NOT_EXECUTABLE; kept for recorded rows)
     BOOK_EVIDENCE_MISMATCH = "BOOK_EVIDENCE_MISMATCH"  # resolved book is not the referenced one
     BOOK_STALE = "BOOK_STALE"                  # resolved book is older than the freshness limit
     INSUFFICIENT_CAPACITY = "INSUFFICIENT_CAPACITY"    # book cannot cover the order
