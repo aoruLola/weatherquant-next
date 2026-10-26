@@ -104,3 +104,8 @@ weatherquant-research settlement-queue \
   副本；
 - 生产验收（对全量导出跑队列+回填+核对闭环）需 NAS，未做——工单状态
   保持"代码完成、生产验收待做"。
+
+
+### 评审修复验证
+
+coverage 中缺失市场 ID 的 ACCEPT 行字段统一为 accept_rows_without_market_id，CLI 与队列构建器使用同一字段。正常输入命令返回 0 并输出队列。
