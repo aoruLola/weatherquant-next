@@ -100,3 +100,8 @@ ls -la /mnt/user/appdata/weatherquant-next/backups/ | grep .incomplete
 3. **`not_applicable` 不是 skip**：对 shadow 形状的库，采集器的写路径阶段
    如实记 `not_applicable` 并说明原因——一个对 shadow 库假装跑过 collector
    备份的演练，本身就是演练要消灭的那种假证据。
+
+
+### 评审修复验证
+
+默认生命周期台账位于工作目录旁的 <work-name>-recovery-drills.jsonl，成功清理及下一次演练均保留并追加它。显式 --ledger 也应位于 --work 之外。

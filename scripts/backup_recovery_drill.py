@@ -85,7 +85,7 @@ SYNTH_ROWS_PER_BATCH = 500
 @dataclass
 class Stage:
     name: str
-    status: str = "pass"           # pass | fail | skip | not_applicable
+    status: str = "pass"  # pass | fail | skip | not_applicable
     duration_ms: float = 0.0
     detail: str = ""
 
@@ -175,9 +175,7 @@ def _table_digest(con, table: str) -> tuple[int, int]:
     count = con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
     digest = 0
     if count:
-        digest = int(con.execute(
-            f'SELECT sum(hash({projection}))::HUGEINT FROM "{table}"'
-        ).fetchone()[0])
+        digest = int(con.execute(f'SELECT sum(hash({projection}))::HUGEINT FROM "{table}"').fetchone()[0])
     return int(count), int(digest)
 
 
@@ -221,9 +219,7 @@ def _recovery_point(db_path: Path) -> dict:
         # an older migration ledger than its source would open fine and still
         # not be the database that was backed up.
         try:
-            schema_version = con.execute(
-                "SELECT max(version) FROM schema_migrations"
-            ).fetchone()[0]
+            schema_version = con.execute("SELECT max(version) FROM schema_migrations").fetchone()[0]
         except Exception:
             schema_version = None
         return {
@@ -252,9 +248,7 @@ def _recovery_points_agree(source: dict, restored: dict) -> list[str]:
     for table in set(restored.get("tables", {})) - set(source.get("tables", {})):
         failures.append(f"table {table} appeared after restore")
     if source.get("watermark") != restored.get("watermark"):
-        failures.append(
-            f"watermark differs: {source.get('watermark')} != {restored.get('watermark')}"
-        )
+        failures.append(f"watermark differs: {source.get('watermark')} != {restored.get('watermark')}")
     return failures
 
 
@@ -271,9 +265,24 @@ def _synthetic_books(batch: int, rows: int, run_id: str, base: datetime) -> list
         content = f"drill-{n:016x}"
         out.append(
             (
-                content, "DRILL-M", f"DRILL-T-{i % 50:03d}",
-                '[[0.55,"500"]]', '[[0.57,"450"]]', 0.55, 0.57, 0.02,
-                500.0, 450.0, "", stamp, stamp, "rest", "venue", content, "ok", run_id,
+                content,
+                "DRILL-M",
+                f"DRILL-T-{i % 50:03d}",
+                '[[0.55,"500"]]',
+                '[[0.57,"450"]]',
+                0.55,
+                0.57,
+                0.02,
+                500.0,
+                450.0,
+                "",
+                stamp,
+                stamp,
+                "rest",
+                "venue",
+                content,
+                "ok",
+                run_id,
             )
         )
     return out
@@ -282,8 +291,7 @@ def _synthetic_books(batch: int, rows: int, run_id: str, base: datetime) -> list
 def _synthetic_prices(batch: int, rows: int, run_id: str, base: datetime) -> list[tuple]:
     stamp = base.replace(second=batch % 60, microsecond=0)
     return [
-        ("DRILL-M", f"DRILL-T-{(batch * rows + i) % 50:03d}", stamp, 0.56, "rest",
-         stamp, "venue", run_id)
+        ("DRILL-M", f"DRILL-T-{(batch * rows + i) % 50:03d}", stamp, 0.56, "rest", stamp, "venue", run_id)
         for i in range(rows)
     ]
 
@@ -292,13 +300,14 @@ def synthesize_source(db_path: Path, *, batches: int = SYNTH_BATCHES) -> dict:
     from weatherquant.data.writer import CollectorWriter
 
     run_id = f"drill-{uuid.uuid4().hex[:8]}"
-    writer = CollectorWriter(
-        db_path, run_id=run_id, flush_rows=500, flush_seconds=5.0, checkpoint_seconds=300.0
-    )
+    writer = CollectorWriter(db_path, run_id=run_id, flush_rows=500, flush_seconds=5.0, checkpoint_seconds=300.0)
     writer.open()
     writer.start_run(
-        app_version="recovery-drill", git_sha=None, image_tag="drill",
-        hostname=os.uname().nodename, pid=os.getpid(),
+        app_version="recovery-drill",
+        git_sha=None,
+        image_tag="drill",
+        hostname=os.uname().nodename,
+        pid=os.getpid(),
     )
     base = datetime.now(tz=UTC)
     try:
@@ -343,9 +352,7 @@ def child_wal_writer(db_path: Path, rows_per_batch: int) -> None:
 
     con = connect(db_path)
     con.execute("SET checkpoint_threshold='1TB'")
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS drill_wal (batch INTEGER, payload VARCHAR)"
-    )
+    con.execute("CREATE TABLE IF NOT EXISTS drill_wal (batch INTEGER, payload VARCHAR)")
     journal = db_path.parent / "drill-wal-journal.txt"
     batch = 0
     while True:
@@ -392,9 +399,7 @@ def stage_restore(report: DrillReport, work: Path, source: Path) -> tuple[Path, 
             restored_point = _recovery_point(dest)
         except Exception as exc:
             stage.status = "fail"
-            stage.detail = (
-                f"the recovery point could not be read: {type(exc).__name__}: {exc}"
-            )
+            stage.detail = f"the recovery point could not be read: {type(exc).__name__}: {exc}"
             raise
         failures = _recovery_points_agree(source_point, restored_point)
         if failures:
@@ -450,13 +455,19 @@ def stage_backup_cycle(report: DrillReport, work: Path, restored: Path) -> None:
 
         run_id = f"drill-cycle-{uuid.uuid4().hex[:8]}"
         writer = CollectorWriter(
-            db_path, run_id=run_id, flush_rows=500, flush_seconds=5.0,
+            db_path,
+            run_id=run_id,
+            flush_rows=500,
+            flush_seconds=5.0,
             checkpoint_seconds=300.0,
         )
         writer.open()
         writer.start_run(
-            app_version="recovery-drill", git_sha=None, image_tag="drill",
-            hostname=os.uname().nodename, pid=os.getpid(),
+            app_version="recovery-drill",
+            git_sha=None,
+            image_tag="drill",
+            hostname=os.uname().nodename,
+            pid=os.getpid(),
         )
         base = datetime.now(tz=UTC)
         backup_report = None
@@ -500,9 +511,7 @@ def stage_backup_cycle(report: DrillReport, work: Path, restored: Path) -> None:
         # yet, so these two are excluded from the chain comparison by name.
         excluded = {"collector_runs", "collector_events"}
         for point in (expected_point, chained_point):
-            point["tables"] = {
-                t: facts for t, facts in point["tables"].items() if t not in excluded
-            }
+            point["tables"] = {t: facts for t, facts in point["tables"].items() if t not in excluded}
         failures = _recovery_points_agree(expected_point, chained_point)
         if failures:
             stage.status = "fail"
@@ -541,8 +550,11 @@ def stage_clean_shutdown(report: DrillReport, work: Path, restored: Path) -> Non
         # Start from the restored copy so the stage runs against real data.
         child_restore(restored, db_path)
         writer = CollectorWriter(
-            db_path, run_id=f"drill-clean-{uuid.uuid4().hex[:8]}",
-            flush_rows=500, flush_seconds=5.0, checkpoint_seconds=300.0,
+            db_path,
+            run_id=f"drill-clean-{uuid.uuid4().hex[:8]}",
+            flush_rows=500,
+            flush_seconds=5.0,
+            checkpoint_seconds=300.0,
         )
         writer.open()
         base = datetime.now(tz=UTC)
@@ -605,9 +617,7 @@ def stage_wal_recovery(report: DrillReport, work: Path, restored: Path) -> None:
 
         con = connect(db_path)  # reopen replays the WAL
         try:
-            max_batch, rows = con.execute(
-                "SELECT MAX(batch), COUNT(*) FROM drill_wal"
-            ).fetchone()
+            max_batch, rows = con.execute("SELECT MAX(batch), COUNT(*) FROM drill_wal").fetchone()
             con.execute("CHECKPOINT")
         finally:
             con.close()
@@ -687,8 +697,11 @@ def stage_slow_io(report: DrillReport, work: Path, source: Path) -> None:
             shutil.rmtree(dest.parent)
         proc = subprocess.Popen(
             [
-                sys.executable, str(Path(__file__).resolve()),
-                "--child-restore", str(source), str(dest),
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--child-restore",
+                str(source),
+                str(dest),
             ],
             cwd=PROJECT_ROOT,
             stdout=subprocess.DEVNULL,
@@ -771,20 +784,14 @@ def discover_backups(backups_dir: Path) -> list[Path]:
     source."""
     if not backups_dir.is_dir():
         return []
-    return sorted(
-        p for p in backups_dir.glob("weatherquant-*.duckdb")
-        if not p.name.startswith(".incomplete")
-    )
+    return sorted(p for p in backups_dir.glob("weatherquant-*.duckdb") if not p.name.startswith(".incomplete"))
 
 
 def report_incomplete_files(backups_dir: Path) -> list[dict]:
     """What the incident class of files looks like right now, for cleanup."""
     if not backups_dir.is_dir():
         return []
-    return [
-        {"name": p.name, "bytes": p.stat().st_size}
-        for p in sorted(backups_dir.glob(".incomplete-*"))
-    ]
+    return [{"name": p.name, "bytes": p.stat().st_size} for p in sorted(backups_dir.glob(".incomplete-*"))]
 
 
 def append_ledger(ledger: Path, entry: dict) -> None:
@@ -803,14 +810,22 @@ def append_ledger(ledger: Path, entry: dict) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work", type=Path, help="scratch directory (never a production path)")
-    parser.add_argument("--source", type=Path, default=None,
-                        help="a COPY of a database to drill against; default: synthesize one")
-    parser.add_argument("--source-is-copy", action="store_true",
-                        help="confirm --source is a file copy, not a database a writer "
-                             "may have open - a byte-copy of a live DuckDB is torn, and "
-                             "the drill refuses to turn that into a 'recovery'")
-    parser.add_argument("--ledger", type=Path, default=None,
-                        help="JSONL lifecycle ledger to append to (default <work>/recovery-drills.jsonl)")
+    parser.add_argument(
+        "--source", type=Path, default=None, help="a COPY of a database to drill against; default: synthesize one"
+    )
+    parser.add_argument(
+        "--source-is-copy",
+        action="store_true",
+        help="confirm --source is a file copy, not a database a writer "
+        "may have open - a byte-copy of a live DuckDB is torn, and "
+        "the drill refuses to turn that into a 'recovery'",
+    )
+    parser.add_argument(
+        "--ledger",
+        type=Path,
+        default=None,
+        help="JSONL lifecycle ledger to append to (default sibling <work-name>-recovery-drills.jsonl)",
+    )
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--child-restore", type=Path, nargs=2, metavar=("SRC", "DEST"), help=argparse.SUPPRESS)
     parser.add_argument("--child-wal", type=Path, help=argparse.SUPPRESS)
@@ -826,10 +841,12 @@ def main() -> int:
     if args.work is None:
         parser.error("--work is required (child modes excepted)")
     work = args.work.resolve()
+    ledger = args.ledger.resolve() if args.ledger else work.parent / (work.name + "-recovery-drills.jsonl")
+    if ledger.is_relative_to(work):
+        parser.error("--ledger must be outside --work so cleanup preserves the lifecycle history")
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True)
-    ledger = (args.ledger.resolve() if args.ledger else work / "recovery-drills.jsonl")
 
     report = DrillReport(
         drill_id=f"{datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}",
@@ -878,17 +895,17 @@ def main() -> int:
         # Attribute the failure to the stage that already recorded it, when
         # one did - a second catch-all "drill" stage would make the report
         # say "failed somewhere" next to a stage that says exactly where.
-        existing = report.stage("drill") if not any(
-            s.status == "fail" for s in report.stages
-        ) else None
+        existing = report.stage("drill") if not any(s.status == "fail" for s in report.stages) else None
         if existing is not None:
             existing.status = "fail"
             existing.detail = str(exc)
         else:
             failed_stage = next(s for s in report.stages if s.status == "fail")
             failed_stage.detail = (
-                f"{failed_stage.detail}; unhandled: {type(exc).__name__}: {exc}"
-            ) if "unhandled" not in failed_stage.detail else failed_stage.detail
+                (f"{failed_stage.detail}; unhandled: {type(exc).__name__}: {exc}")
+                if "unhandled" not in failed_stage.detail
+                else failed_stage.detail
+            )
 
     failures = [s for s in report.stages if s.status == "fail"]
     report.verdict = "FAILED" if failures else "PASSED"
@@ -898,11 +915,15 @@ def main() -> int:
     print("=" * 72)
     for stage in report.stages:
         print(f"  [{stage.status:>4}] {stage.name:<18} {stage.duration_ms:9.0f} ms  {stage.detail}")
-    print(f"\n  source: {report.source.get('bytes', 0) / 1024 / 1024:.1f} MiB, "
-          f"sha256={report.source.get('sha256', '')[:16]}…")
+    print(
+        f"\n  source: {report.source.get('bytes', 0) / 1024 / 1024:.1f} MiB, "
+        f"sha256={report.source.get('sha256', '')[:16]}…"
+    )
     watermark = report.recovery_point.get("watermark", {})
-    print(f"  recovery point: {len(report.recovery_point.get('tables', {}))} tables, "
-          f"watermark {watermark.get('name')}={watermark.get('value')}")
+    print(
+        f"  recovery point: {len(report.recovery_point.get('tables', {}))} tables, "
+        f"watermark {watermark.get('name')}={watermark.get('value')}"
+    )
     print(f"  ledger: {ledger}")
 
     entry = report.as_dict()

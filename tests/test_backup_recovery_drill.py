@@ -47,13 +47,11 @@ def test_the_full_drill_passes_and_writes_a_well_formed_ledger(tmp_path: Path) -
     assert entry["source"]["synthesized"] is True
 
     by_name = {stage["name"]: stage for stage in entry["stages"]}
-    for name in ("restore", "backup_cycle", "clean_shutdown", "wal_recovery",
-                 "slow_io", "incomplete_files"):
+    for name in ("restore", "backup_cycle", "clean_shutdown", "wal_recovery", "slow_io", "incomplete_files"):
         assert name in by_name, f"stage {name} missing from the ledger"
     # slow_io needs root; the unprivileged run must record a skip, not a pass.
     assert by_name["slow_io"]["status"] == "skip"
-    for name in ("restore", "backup_cycle", "clean_shutdown", "wal_recovery",
-                 "incomplete_files"):
+    for name in ("restore", "backup_cycle", "clean_shutdown", "wal_recovery", "incomplete_files"):
         assert by_name[name]["status"] == "pass", f"{name}: {by_name[name]['detail']}"
 
     # The recovery point is a fact about the data, not a summary string.
@@ -85,11 +83,9 @@ def test_a_shadow_shaped_source_reports_a_decision_watermark(tmp_path: Path) -> 
     con.close()
 
     # The drill treats every source the same way; hand it the shadow file.
-    code, output, _ = _run_drill(
-        tmp_path / "work", "--source", str(source), "--source-is-copy", "--keep"
-    )
+    code, output, _ = _run_drill(tmp_path / "work", "--source", str(source), "--source-is-copy", "--keep")
     assert code == 0, output
-    entry = _ledger_entry(tmp_path / "work", tmp_path / "work" / "recovery-drills.jsonl")
+    entry = _ledger_entry(tmp_path / "work", tmp_path / "work-recovery-drills.jsonl")
     assert entry["recovery_point"]["watermark"] == {
         "source": "shadow_decisions.decision_time_utc",
         "value": "2026-10-20 12:00:00+00:00",
@@ -171,8 +167,18 @@ def test_recovery_point_detects_a_content_change(tmp_path: Path) -> None:
     # One price point changes content without changing table existence.
     writer = CollectorWriter(db, run_id="digest-test-2")
     writer.open()
-    writer.stage_price(("DRILL-M", "DRILL-T-000", base + timedelta(seconds=5), 0.9,
-                        "rest", base + timedelta(seconds=5), "venue", "digest-test-2"))
+    writer.stage_price(
+        (
+            "DRILL-M",
+            "DRILL-T-000",
+            base + timedelta(seconds=5),
+            0.9,
+            "rest",
+            base + timedelta(seconds=5),
+            "venue",
+            "digest-test-2",
+        )
+    )
     writer.flush(force=True)
     writer.close(status="stopped", reason="digest test 2")
     point_b = drill._recovery_point(db)
@@ -206,8 +212,12 @@ def test_a_corrupt_source_fails_the_restore_stage_itself(tmp_path: Path) -> None
     corrupt_ledger = tmp_path / "corrupt-ledger" / "drills.jsonl"
     code, output, _ = _run_drill(
         tmp_path / "work-corrupt",
-        "--source", str(outside), "--source-is-copy",
-        "--ledger", str(corrupt_ledger), "--keep",
+        "--source",
+        str(outside),
+        "--source-is-copy",
+        "--ledger",
+        str(corrupt_ledger),
+        "--keep",
     )
     assert code == 1, output
 
@@ -215,6 +225,30 @@ def test_a_corrupt_source_fails_the_restore_stage_itself(tmp_path: Path) -> None
     by_name = {stage["name"]: stage for stage in entry["stages"]}
     assert by_name["restore"]["status"] == "fail", by_name["restore"]
     assert by_name["restore"]["detail"], "the failure evidence must be on the stage"
-    assert "drill" not in by_name, (
-        f"no catch-all stage expected: stages were {sorted(by_name)}"
-    )
+    assert "drill" not in by_name, f"no catch-all stage expected: stages were {sorted(by_name)}"
+
+
+def test_default_lifecycle_ledger_survives_successful_cleanup_and_repeated_runs(tmp_path, monkeypatch):
+    drill = _load_drill()
+    work = tmp_path / "work"
+    ledger = tmp_path / "work-recovery-drills.jsonl"
+
+    def synthesize(path):
+        path.write_bytes(b"fixture")
+        return {}
+
+    monkeypatch.setattr(drill, "synthesize_source", synthesize)
+    monkeypatch.setattr(drill, "stage_restore", lambda report, work, source: (source, {}, {}))
+    for name in (
+        "stage_backup_cycle",
+        "stage_clean_shutdown",
+        "stage_wal_recovery",
+        "stage_slow_io",
+        "stage_incomplete_files",
+    ):
+        monkeypatch.setattr(drill, name, lambda *args: None)
+    monkeypatch.setattr(sys, "argv", ["drill", "--work", str(work)])
+    for _ in range(2):
+        assert drill.main() == 0
+        assert not work.exists()
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 2
