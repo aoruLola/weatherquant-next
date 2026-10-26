@@ -115,7 +115,8 @@ uv run ruff check .
 | [`docs/architecture.md`](docs/architecture.md) | 新系统架构设计 |
 | [`docs/legacy-data-migration.md`](docs/legacy-data-migration.md) | 旧库只读迁移方案与待核实判定规则 |
 | [`docs/roadmap.md`](docs/roadmap.md) | P1–P4 详细开发任务 |
-| [`docs/adr/0001-paper-trading-architecture.md`](docs/adr/0001-paper-trading-architecture.md) | Paper 引擎架构 ADR（WQN-39：单向解耦、默认关闭、事件契约、幂等模型） |
+| [`docs/adr/0001-paper-trading-architecture.md`](docs/adr/0001-paper-trading-architecture.md) | Paper 引擎架构 ADR（WQN-39/42/44：单向解耦、默认关闭、事件契约、记账与结算模型） |
+| [`docs/paper-risk-rules.md`](docs/paper-risk-rules.md) | Paper 风控规则（WQN-43：单机会 10%、单市场 20%、不杠杆不裸空，先验设定） |
 
 ## P0 状态（已完成）
 
