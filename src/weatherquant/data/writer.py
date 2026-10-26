@@ -680,9 +680,7 @@ class CollectorWriter:
             )
         return [str(r[0]) for r in rows]
 
-    def log_event(
-        self, level: str, kind: str, message: str, details: dict | None = None
-    ) -> None:
+    def log_event(self, level: str, kind: str, message: str, details: dict | None = None) -> None:
         event_id = next_event_id(self.run_id)
         self._batch.collector_events.append(
             (

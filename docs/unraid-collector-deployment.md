@@ -781,3 +781,4 @@ WebSocket 无限速文档；实测热门 token 约 15–20 条 `price_change` / 
 备份文件的 fsync 使用可写二进制句柄，Windows 与 Linux 都可验证并发布备份。新增正常文件 fsync 回归测试。
 JSONL fsync 成功后立即确认该批数据已持久化。若 .sha256 发布失败，后续 flush/close 只重试待发布摘要，不重复追加数据。归档、摘要和尾部扫描统一使用二进制文件描述符。
 watchdog 的最后诊断心跳在独立 daemon 线程写入，最多等待 0.5 秒。即使挂载存储阻塞，进程仍退出以触发 restart 策略。
+整合修复保留三项回归：摘要发布失败只重试元数据；归档与备份采用 Windows 可用的二进制/可写句柄；watchdog 不等待故障文件系统恢复才退出。
