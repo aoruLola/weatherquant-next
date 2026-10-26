@@ -450,6 +450,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True, help="where to write the queue (JSON)")
 
     p = sub.add_parser(
+        "verify-market",
+        help=(
+            "verify station observations against a market's own settlement "
+            "terms, two-way, and emit the verified (market, date) pairs"
+        ),
+    )
+    p.add_argument(
+        "--collector-copy",
+        required=True,
+        help="a COPY of the collector database: rules text and bracket bounds",
+    )
+    p.add_argument("--date", required=True, help="the observation date (YYYY-MM-DD)")
+    p.add_argument("--event-id", help="narrow to one event on that date")
+    p.add_argument(
+        "--settlements",
+        help="settlement index from backfill-settlements: payout 1.0 marks the winner",
+    )
+    obs_src = p.add_mutually_exclusive_group()
+    obs_src.add_argument(
+        "--observations-db",
+        help="research DB whose klga_observations table supplies the readings",
+    )
+    obs_src.add_argument(
+        "--observations-file",
+        help="JSON list of readings: {obs_time_utc, temp_f/temp_c, report_type, source}",
+    )
+    p.add_argument("--persist", help="research DB to write market_rule_verification rows into")
+    p.add_argument("--out", help="write the verified (market_id, target_date) pairs here")
+
+    p = sub.add_parser(
         "build-performance",
         help="build the six performance snapshots from a decisions export",
     )
@@ -677,6 +707,168 @@ def cmd_settlement_queue(settings: Settings, args: argparse.Namespace) -> int:
     print(f"  catalog: {coverage['catalog_matched']} matched, {coverage['catalog_unmatched']} unmatched")
     print(f"  WIN/LOSS eligible: {coverage['win_loss_eligible_markets']} ({coverage['win_loss_gating']})")
     print(f"wrote {len(queue['queue'])} entr(ies) to {out}")
+    return 0
+
+
+def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
+    """Run the two-way observation verification for one date, offline.
+
+    Inputs are the three recorded facts the comparison runs on: the rules
+    text and brackets from a collector COPY (never the live file), the venue's
+    payout from a settlement index, and the station readings from a research
+    DB or a JSON file. The verified pairs it writes are what
+    ``backfill-settlements --verified`` consumes - the last step that turns
+    ``resolved_unverified`` into ``verified`` in the settlement queue.
+    """
+    import json as _json
+    from datetime import date as _date
+
+    import duckdb
+
+    from weatherquant.markets.settlement_rules import parse_rules_text
+    from weatherquant.truth.observation_verify import (
+        persist_verification_results,
+        verify_market_rules,
+    )
+    from weatherquant.weather.daily_max import local_day_bounds_utc
+
+    day = _date.fromisoformat(args.date)
+    con = duckdb.connect(str(Path(args.collector_copy)), read_only=True)
+    con.execute("SET TimeZone='UTC'")
+    try:
+        params: list = [day]
+        event_filter = ""
+        if args.event_id:
+            event_filter = " AND event_id = ?"
+            params.append(args.event_id)
+        rows = con.execute(
+            "SELECT market_id, event_id, bracket_label, bracket_low, bracket_high, "
+            "bracket_low_inclusive, bracket_high_inclusive, rules_text "
+            f"FROM markets WHERE target_date = ?{event_filter} ORDER BY market_id",
+            params,
+        ).fetchall()
+    finally:
+        con.close()
+    if not rows:
+        print(f"no markets for {args.date} in {args.collector_copy}", file=sys.stderr)
+        return 2
+
+    markets = [
+        {
+            "market_id": r[0],
+            "event_id": r[1],
+            "bracket_label": r[2],
+            "bracket_low": r[3],
+            "bracket_high": r[4],
+            "bracket_low_inclusive": r[5],
+            "bracket_high_inclusive": r[6],
+        }
+        for r in rows
+    ]
+    parsed = parse_rules_text(rows[0][7], event_id=str(rows[0][1]))
+    rules = {
+        "station": parsed.station,
+        "unit": parsed.unit,
+        "precision_deg": parsed.precision_deg,
+        "rounding": parsed.rounding,
+        "observation_unit": parsed.observation_unit,
+        "observation_filter": parsed.observation_filter,
+        "no_data_resolution": parsed.no_data_resolution,
+        "rules_sha256": parsed.rules_sha256,
+        "parser_version": parsed.parser_version,
+    }
+
+    outcomes: list[dict] = []
+    if args.settlements:
+        with Path(args.settlements).open(encoding="utf-8") as handle:
+            index = _json.load(handle)
+        wanted = {str(m["market_id"]) for m in markets}
+        for record in index:
+            if str(record.get("market_id")) in wanted and record.get("resolved_outcome") is not None:
+                payout = float(record["resolved_outcome"])
+                outcomes.append(
+                    {
+                        "market_id": str(record["market_id"]),
+                        "is_winner": payout == 1.0,
+                        "yes_price": payout,
+                    }
+                )
+    else:
+        print(
+            "no --settlements given: the venue side will be empty and the verdict will be no_outcome",
+            file=sys.stderr,
+        )
+
+    observations: list[dict] = []
+    if args.observations_file:
+        with Path(args.observations_file).open(encoding="utf-8") as handle:
+            observations = _json.load(handle)
+    elif args.observations_db:
+        odb = duckdb.connect(str(Path(args.observations_db)), read_only=True)
+        odb.execute("SET TimeZone='UTC'")
+        try:
+            start, end = local_day_bounds_utc(day)
+            observations = [
+                {
+                    "obs_time_utc": r[0],
+                    "temp_f": r[1],
+                    "temp_c": r[2],
+                    "report_type": r[3],
+                    "source": r[4],
+                }
+                for r in odb.execute(
+                    "SELECT obs_time_utc, temp_f, temp_c, report_type, source "
+                    "FROM klga_observations WHERE obs_time_utc >= ? AND obs_time_utc < ?",
+                    [start, end],
+                ).fetchall()
+            ]
+        finally:
+            odb.close()
+    else:
+        print(
+            "no --observations-db/--observations-file: zero readings, and the "
+            "verdict will follow the rules' no-data clause",
+            file=sys.stderr,
+        )
+
+    result = verify_market_rules(
+        rules=rules,
+        markets=markets,
+        outcomes=outcomes,
+        observations=observations,
+        target_date=day,
+        event_id=str(rows[0][1]),
+    )
+    print(f"event {result.event_id} on {args.date}: {result.verdict}")
+    print(f"  {result.detail}")
+    print(
+        f"  observed max {result.observed_max_f} ({result.observed_max_whole_f}F), "
+        f"{result.distinct_hours}/{result.expected_hours} hours, "
+        f"{result.n_readings} readings, {result.n_excluded_special} SPECI excluded"
+    )
+
+    if args.persist:
+        from weatherquant.storage.research import initialize_research
+
+        pdb, _applied = initialize_research(Path(args.persist))
+        try:
+            written, failed = persist_verification_results(pdb, [result])
+        finally:
+            pdb.close()
+        print(f"  persisted {written} row(s) to {args.persist}" + (f"; FAILED: {failed}" if failed else ""))
+
+    if args.out:
+        # The queue's contract: only a two-way MATCH marks the pair verified.
+        pairs = []
+        if result.verdict == "match":
+            checked = {o["market_id"] for o in outcomes if o["yes_price"] in (0.0, 1.0)}
+            pairs = [
+                {"market_id": str(m["market_id"]), "target_date": args.date}
+                for m in markets
+                if str(m["market_id"]) in checked
+            ]
+        _atomic_write_json(Path(args.out), pairs)
+        print(f"  verified pairs: {len(pairs)} -> {args.out}")
     return 0
 
 
@@ -952,6 +1144,7 @@ def main(argv: list[str] | None = None) -> int:
         "report": cmd_report,
         "backfill-settlements": cmd_backfill_settlements,
         "settlement-queue": cmd_settlement_queue,
+        "verify-market": cmd_verify_market,
         "build-performance": cmd_build_performance,
     }
     return handlers[args.command](settings, args)
