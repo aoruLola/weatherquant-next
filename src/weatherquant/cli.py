@@ -118,9 +118,20 @@ def cmd_rules(settings: Settings, args: argparse.Namespace) -> int:
         rows = db.con.execute(sql, params).fetchall()
 
     columns = [
-        "event_id", "target_date", "station", "source", "fallback", "unit",
-        "precision", "rounding", "timezone", "tz_hint", "field", "no_data",
-        "status", "notes",
+        "event_id",
+        "target_date",
+        "station",
+        "source",
+        "fallback",
+        "unit",
+        "precision",
+        "rounding",
+        "timezone",
+        "tz_hint",
+        "field",
+        "no_data",
+        "status",
+        "notes",
     ]
     if args.json:
         print(json.dumps([dict(zip(columns, r, strict=True)) for r in rows], default=str, indent=2))
@@ -133,9 +144,9 @@ def cmd_rules(settings: Settings, args: argparse.Namespace) -> int:
             f"{d['status']}"
         )
         detail = {
-            k: v for k, v in d.items()
-            if k in ("fallback", "rounding", "timezone", "tz_hint", "field", "no_data", "notes")
-            and v
+            k: v
+            for k, v in d.items()
+            if k in ("fallback", "rounding", "timezone", "tz_hint", "field", "no_data", "notes") and v
         }
         if detail and args.verbose:
             print(f"{'':>10}  {detail}")
@@ -198,7 +209,9 @@ def cmd_fit_models(settings: Settings, args: argparse.Namespace) -> int:
 
     for artifact in artifacts:
         print(f"{artifact.model_name}@{artifact.model_version}")
-        print(f"  cutoff      {artifact.training_cutoff_utc.date()}  pairs={artifact.n_pairs}  dates={artifact.n_dates}")
+        print(
+            f"  cutoff      {artifact.training_cutoff_utc.date()}  pairs={artifact.n_pairs}  dates={artifact.n_dates}"
+        )
         print(f"  bias        {artifact.bias_f:+.4f} F")
         print(f"  sigma       {artifact.sigma_by_lead}")
         print(f"  source hash {artifact.source_data_hash[:16]}…")
@@ -225,19 +238,14 @@ def cmd_report(settings: Settings, args: argparse.Namespace) -> int:
             report["rules"] = {
                 "total": counts["settlement_rules"],
                 "by_status": dict(
-                    db.con.execute(
-                        "SELECT parse_status, COUNT(*) FROM settlement_rules GROUP BY 1"
-                    ).fetchall()
+                    db.con.execute("SELECT parse_status, COUNT(*) FROM settlement_rules GROUP BY 1").fetchall()
                 ),
                 "by_primary_source": dict(
-                    db.con.execute(
-                        "SELECT primary_source_name, COUNT(*) FROM settlement_rules GROUP BY 1"
-                    ).fetchall()
+                    db.con.execute("SELECT primary_source_name, COUNT(*) FROM settlement_rules GROUP BY 1").fetchall()
                 ),
                 "by_station": dict(
                     db.con.execute(
-                        "SELECT COALESCE(station, 'UNIDENTIFIED'), COUNT(*) "
-                        "FROM settlement_rules GROUP BY 1"
+                        "SELECT COALESCE(station, 'UNIDENTIFIED'), COUNT(*) FROM settlement_rules GROUP BY 1"
                     ).fetchall()
                 ),
             }
@@ -245,8 +253,7 @@ def cmd_report(settings: Settings, args: argparse.Namespace) -> int:
         if counts.get("settlement_crosscheck"):
             by_rule = {}
             for rule, verdict, n in db.con.execute(
-                "SELECT aggregation_rule, verdict, COUNT(*) FROM settlement_crosscheck "
-                "GROUP BY 1, 2 ORDER BY 1, 3 DESC"
+                "SELECT aggregation_rule, verdict, COUNT(*) FROM settlement_crosscheck GROUP BY 1, 2 ORDER BY 1, 3 DESC"
             ).fetchall():
                 by_rule.setdefault(rule, {})[verdict] = n
             report["crosscheck"] = by_rule
@@ -279,30 +286,16 @@ def cmd_report(settings: Settings, args: argparse.Namespace) -> int:
         if counts.get("forecast_runs"):
             report["forecasts"] = {
                 "runs": counts["forecast_runs"],
-                "by_model": dict(
-                    db.con.execute(
-                        "SELECT model, COUNT(*) FROM forecast_runs GROUP BY 1"
-                    ).fetchall()
-                ),
-                "by_status": dict(
-                    db.con.execute(
-                        "SELECT status, COUNT(*) FROM forecast_runs GROUP BY 1"
-                    ).fetchall()
-                ),
+                "by_model": dict(db.con.execute("SELECT model, COUNT(*) FROM forecast_runs GROUP BY 1").fetchall()),
+                "by_status": dict(db.con.execute("SELECT status, COUNT(*) FROM forecast_runs GROUP BY 1").fetchall()),
                 "by_publishable_basis": dict(
-                    db.con.execute(
-                        "SELECT publishable_basis, COUNT(*) FROM forecast_runs GROUP BY 1"
-                    ).fetchall()
+                    db.con.execute("SELECT publishable_basis, COUNT(*) FROM forecast_runs GROUP BY 1").fetchall()
                 ),
             }
         if counts.get("point_in_time"):
             report["point_in_time"] = {
-                "eligible": db.con.execute(
-                    "SELECT COUNT(*) FROM point_in_time WHERE eligible"
-                ).fetchone()[0],
-                "ineligible": db.con.execute(
-                    "SELECT COUNT(*) FROM point_in_time WHERE NOT eligible"
-                ).fetchone()[0],
+                "eligible": db.con.execute("SELECT COUNT(*) FROM point_in_time WHERE eligible").fetchone()[0],
+                "ineligible": db.con.execute("SELECT COUNT(*) FROM point_in_time WHERE NOT eligible").fetchone()[0],
             }
 
     if args.json:
@@ -392,7 +385,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cutoff", required=True, help="last target date the fit may see (YYYY-MM-DD)")
     p.add_argument("--version", help="artifact version (default: cut-<cutoff>)")
     p.add_argument("--out", help="models directory (default: <project>/models, committed and baked)")
-    p.add_argument("--models", help=f"comma-separated subset of {', '.join(['ecmwf_raw', 'gfs_raw', 'fusion', 'calibrated'])}")
+    p.add_argument(
+        "--models", help=f"comma-separated subset of {', '.join(['ecmwf_raw', 'gfs_raw', 'fusion', 'calibrated'])}"
+    )
     p.add_argument("--observation-rule", default="max of all readings")
     p.add_argument("--pin", action="store_true", help="write manifest.json so the shadow loads these")
 
@@ -476,10 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gap-window-seconds", default="900")
     p.add_argument(
         "--state-db",
-        help=(
-            "research state store for the streaming engine "
-            "(default: WQ_PERFORMANCE_STATE_DB_PATH)"
-        ),
+        help=("research state store for the streaming engine (default: WQ_PERFORMANCE_STATE_DB_PATH)"),
     )
     p.add_argument(
         "--reset",
@@ -627,9 +619,13 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
 
     markets = [
         {
-            "market_id": r[0], "event_id": r[1], "bracket_label": r[2],
-            "bracket_low": r[3], "bracket_high": r[4],
-            "bracket_low_inclusive": r[5], "bracket_high_inclusive": r[6],
+            "market_id": r[0],
+            "event_id": r[1],
+            "bracket_label": r[2],
+            "bracket_low": r[3],
+            "bracket_high": r[4],
+            "bracket_low_inclusive": r[5],
+            "bracket_high_inclusive": r[6],
         }
         for r in rows
     ]
@@ -654,15 +650,16 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
         for record in index:
             if str(record.get("market_id")) in wanted and record.get("resolved_outcome") is not None:
                 payout = float(record["resolved_outcome"])
-                outcomes.append({
-                    "market_id": str(record["market_id"]),
-                    "is_winner": payout == 1.0,
-                    "yes_price": payout,
-                })
+                outcomes.append(
+                    {
+                        "market_id": str(record["market_id"]),
+                        "is_winner": payout == 1.0,
+                        "yes_price": payout,
+                    }
+                )
     else:
         print(
-            "no --settlements given: the venue side will be empty and the "
-            "verdict will be no_outcome",
+            "no --settlements given: the venue side will be empty and the verdict will be no_outcome",
             file=sys.stderr,
         )
 
@@ -677,8 +674,11 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
             start, end = local_day_bounds_utc(day)
             observations = [
                 {
-                    "obs_time_utc": r[0], "temp_f": r[1], "temp_c": r[2],
-                    "report_type": r[3], "source": r[4],
+                    "obs_time_utc": r[0],
+                    "temp_f": r[1],
+                    "temp_c": r[2],
+                    "report_type": r[3],
+                    "source": r[4],
                 }
                 for r in odb.execute(
                     "SELECT obs_time_utc, temp_f, temp_c, report_type, source "
@@ -705,9 +705,11 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
     )
     print(f"event {result.event_id} on {args.date}: {result.verdict}")
     print(f"  {result.detail}")
-    print(f"  observed max {result.observed_max_f} ({result.observed_max_whole_f}F), "
-          f"{result.distinct_hours}/{result.expected_hours} hours, "
-          f"{result.n_readings} readings, {result.n_excluded_special} SPECI excluded")
+    print(
+        f"  observed max {result.observed_max_f} ({result.observed_max_whole_f}F), "
+        f"{result.distinct_hours}/{result.expected_hours} hours, "
+        f"{result.n_readings} readings, {result.n_excluded_special} SPECI excluded"
+    )
 
     if args.persist:
         from weatherquant.storage.research import initialize_research
@@ -717,18 +719,18 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
             written, failed = persist_verification_results(pdb, [result])
         finally:
             pdb.close()
-        print(f"  persisted {written} row(s) to {args.persist}"
-              + (f"; FAILED: {failed}" if failed else ""))
+        print(f"  persisted {written} row(s) to {args.persist}" + (f"; FAILED: {failed}" if failed else ""))
 
     if args.out:
         # The queue's contract: only a two-way MATCH marks the pair verified.
         pairs = []
         if result.verdict == "match":
-            winners = [
-                str(m["market_id"]) for m in markets
-                if any(o["market_id"] == str(m["market_id"]) and o["is_winner"] for o in outcomes)
+            checked = {o["market_id"] for o in outcomes if o["yes_price"] in (0.0, 1.0)}
+            pairs = [
+                {"market_id": str(m["market_id"]), "target_date": args.date}
+                for m in markets
+                if str(m["market_id"]) in checked
             ]
-            pairs = [{"market_id": mid, "target_date": args.date} for mid in winners]
         _atomic_write_json(Path(args.out), pairs)
         print(f"  verified pairs: {len(pairs)} -> {args.out}")
     return 0
@@ -791,6 +793,7 @@ def cmd_backfill_settlements(settings: Settings, args: argparse.Namespace) -> in
 
 def _http_get(client):
     """Adapt httpx.Client to the (url, params, timeout) shape fetch_resolution wants."""
+
     def _get(url, *, params=None, timeout=20.0):
         return client.get(url, params=params, timeout=timeout).json()
 
@@ -809,9 +812,7 @@ def _atomic_write_json(path: Path, payload) -> None:
 
     directory = path.parent
     directory.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=directory, suffix=".tmp", delete=False
-    ) as handle:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, suffix=".tmp", delete=False) as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
         handle.flush()
         os.fsync(handle.fileno())
@@ -924,9 +925,7 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
-def _build_performance_streaming(
-    settings: Settings, args: argparse.Namespace, settlements: list[dict]
-) -> int:
+def _build_performance_streaming(settings: Settings, args: argparse.Namespace, settlements: list[dict]) -> int:
     """The production path: ingest what is new, then publish one generation."""
     from weatherquant.performance.state import PerformanceStateError, StateMismatch
     from weatherquant.performance.streaming import build_performance_streaming
@@ -983,8 +982,7 @@ def _build_performance_streaming(
     print(f"generation: {result['generation_id']}")
     summary = result["summary"]
     print(
-        "  episodes {opportunity_episodes}, accept observations {accept_observations}, "
-        "win rate {win_rate}".format(
+        "  episodes {opportunity_episodes}, accept observations {accept_observations}, win rate {win_rate}".format(
             win_rate=summary["realized_directional_win_rate"], **summary
         )
     )

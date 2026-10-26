@@ -37,7 +37,7 @@ RULES_TEXT = (
     "This market will resolve to the temperature range that contains the "
     "highest temperature recorded at the LaGuardia Airport Station (KLGA), "
     "NY, according to https://www.weather.gov/wrh/timeseries?site=klga, "
-    "based on the highest reading under the \"Temp\" column for all times on "
+    'based on the highest reading under the "Temp" column for all times on '
     "this day. This market measures temperatures to whole degrees Fahrenheit. "
     "If no data for the observation date is available from NOAA at 11:59 PM "
     "ET on the day following, this market will resolve to the lowest bracket. "
@@ -62,27 +62,26 @@ def _rules(**overrides) -> dict:
 
 
 def _markets(low: float, high: float, label: str | None = None, market_id: str = "m-1") -> list[dict]:
-    return [{
-        "market_id": market_id,
-        "bracket_label": label or f"{low}-{high}",
-        "bracket_low": low,
-        "bracket_high": high,
-        "bracket_low_inclusive": True,
-        "bracket_high_inclusive": True,
-    }]
+    return [
+        {
+            "market_id": market_id,
+            "bracket_label": label or f"{low}-{high}",
+            "bracket_low": low,
+            "bracket_high": high,
+            "bracket_low_inclusive": True,
+            "bracket_high_inclusive": True,
+        }
+    ]
 
 
 def _outcome(market_id: str, *, winner: bool = True) -> dict:
     return {"market_id": market_id, "is_winner": winner, "yes_price": 1.0 if winner else 0.0}
 
 
-def _obs(day: date, hour_utc: int, temp: float, *, source: str = "noaa-timeseries",
-         minute: int = 0) -> dict:
+def _obs(day: date, hour_utc: int, temp: float, *, source: str = "noaa-timeseries", minute: int = 0) -> dict:
     # hour_utc may exceed 23: it rolls into the following UTC day, which is
     # how the tests express "the window that spans the local midnight".
-    when = datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(
-        hours=hour_utc, minutes=minute
-    )
+    when = datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(hours=hour_utc, minutes=minute)
     return {"obs_time_utc": when, "temp_f": temp, "source": source}
 
 
@@ -228,10 +227,8 @@ def test_partial_coverage_is_its_own_verdict_not_a_guess() -> None:
 def test_zero_readings_with_a_lowest_bracket_rule_follows_it() -> None:
     day = date(2026, 10, 13)
     markets = [
-        {"market_id": "m-low", "bracket_label": "<=60°F", "bracket_low": None,
-         "bracket_high": 60.0},
-        {"market_id": "m-mid", "bracket_label": "61-80°F", "bracket_low": 61.0,
-         "bracket_high": 80.0},
+        {"market_id": "m-low", "bracket_label": "<=60°F", "bracket_low": None, "bracket_high": 60.0},
+        {"market_id": "m-mid", "bracket_label": "61-80°F", "bracket_low": 61.0, "bracket_high": 80.0},
     ]
     result = verify_market_rules(
         rules=_rules(),
@@ -308,15 +305,18 @@ def test_rules_missing_required_fields_are_unusable_never_guessed() -> None:
 def test_venue_ambiguity_and_silence_are_verdicts_of_their_own() -> None:
     day = date(2026, 10, 13)
     observations = [_obs(day, h, 60) for h in range(4, 28)]
-    base = dict(rules=_rules(), markets=_markets(59, 61, "59-61°F", market_id="m-win"),
-                observations=observations, target_date=day, event_id=EVENT)
+    base = dict(
+        rules=_rules(),
+        markets=_markets(59, 61, "59-61°F", market_id="m-win"),
+        observations=observations,
+        target_date=day,
+        event_id=EVENT,
+    )
 
     ambiguous = verify_market_rules(
         markets=[
-            {"market_id": "m-a", "bracket_label": "59-61°F", "bracket_low": 59.0,
-             "bracket_high": 61.0},
-            {"market_id": "m-b", "bracket_label": "61-63°F", "bracket_low": 61.0,
-             "bracket_high": 63.0},
+            {"market_id": "m-a", "bracket_label": "59-61°F", "bracket_low": 59.0, "bracket_high": 61.0},
+            {"market_id": "m-b", "bracket_label": "61-63°F", "bracket_low": 61.0, "bracket_high": 63.0},
         ],
         outcomes=[_outcome("m-a"), _outcome("m-b")],
         **{k: v for k, v in base.items() if k != "markets"},
@@ -341,9 +341,13 @@ def test_verification_rows_persist_with_full_provenance(tmp_path) -> None:
 
     db = tmp_path / "research.duckdb"
     con, _applied = initialize_research(db)
-    assert any("market_rule_verification" in name for name in _applied) or con.execute(
-        "SELECT count(*) FROM information_schema.tables WHERE table_name='market_rule_verification'"
-    ).fetchone()[0] == 1
+    assert (
+        any("market_rule_verification" in name for name in _applied)
+        or con.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name='market_rule_verification'"
+        ).fetchone()[0]
+        == 1
+    )
 
     day = date(2026, 10, 13)
     observations = [_obs(day, h, 70) for h in range(4, 16)]  # deliberately partial
@@ -355,9 +359,7 @@ def test_verification_rows_persist_with_full_provenance(tmp_path) -> None:
         target_date=day,
         event_id=EVENT,
     )
-    written, failed = persist_verification_results(
-        con, [result], verified_at_utc=dt(2026, 10, 26, 12, 0, tzinfo=UTC)
-    )
+    written, failed = persist_verification_results(con, [result], verified_at_utc=dt(2026, 10, 26, 12, 0, tzinfo=UTC))
     assert (written, failed) == (1, [])
 
     row = con.execute(
@@ -457,7 +459,7 @@ def test_speci_reports_never_win_even_when_warmer() -> None:
     counted (not silently dropped) and still not the qualifying value."""
     day = date(2026, 10, 24)
     observations = [_metar(day, h, 12.0) for h in range(4, 28)]
-    observations.append(_metar(day, 21, 16.7))          # routine peak -> 62F
+    observations.append(_metar(day, 21, 16.7))  # routine peak -> 62F
     observations.append(_metar(day, 22, 19.9, special=True))  # SPECI, warmer
 
     result = verify_market_rules(
@@ -572,44 +574,72 @@ def test_verify_market_cli_matches_and_emits_verified_pairs(tmp_path) -> None:
     con.close()
 
     settlements = tmp_path / "settlements.json"
-    settlements.write_text(json.dumps([
-        {"market_id": "700001", "target_date": "2026-10-24",
-         "settlement_status": "RESOLVED", "resolved_outcome": 1.0,
-         "verification_status": "UNVERIFIED", "fetched_at_utc": NOW_ISO},
-    ]), encoding="utf-8")
+    settlements.write_text(
+        json.dumps(
+            [
+                {
+                    "market_id": "700001",
+                    "target_date": "2026-10-24",
+                    "settlement_status": "RESOLVED",
+                    "resolved_outcome": 1.0,
+                    "verification_status": "UNVERIFIED",
+                    "fetched_at_utc": NOW_ISO,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     day = date(2026, 10, 24)
     readings = []
     for hour in range(4, 28):
         when = datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(hours=hour)
-        readings.append({"obs_time_utc": when.isoformat(), "temp_c": 12.0,
-                         "report_type": "METAR", "source": "aviationweather-metar"})
+        readings.append(
+            {
+                "obs_time_utc": when.isoformat(),
+                "temp_c": 12.0,
+                "report_type": "METAR",
+                "source": "aviationweather-metar",
+            }
+        )
     peak = datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(hours=21)
-    readings.append({"obs_time_utc": peak.isoformat(), "temp_c": 16.7,
-                     "report_type": "METAR", "source": "aviationweather-metar"})
+    readings.append(
+        {"obs_time_utc": peak.isoformat(), "temp_c": 16.7, "report_type": "METAR", "source": "aviationweather-metar"}
+    )
     obs_file = tmp_path / "observations.json"
     obs_file.write_text(json.dumps(readings), encoding="utf-8")
 
     out = tmp_path / "verified.json"
     research = tmp_path / "research.duckdb"
-    code = main([
-        "verify-market",
-        "--collector-copy", str(collector),
-        "--date", "2026-10-24",
-        "--settlements", str(settlements),
-        "--observations-file", str(obs_file),
-        "--persist", str(research),
-        "--out", str(out),
-    ])
+    code = main(
+        [
+            "verify-market",
+            "--collector-copy",
+            str(collector),
+            "--date",
+            "2026-10-24",
+            "--settlements",
+            str(settlements),
+            "--observations-file",
+            str(obs_file),
+            "--persist",
+            str(research),
+            "--out",
+            str(out),
+        ]
+    )
     assert code == 0
 
     pairs = json.loads(out.read_text(encoding="utf-8"))
     assert pairs == [{"market_id": "700001", "target_date": "2026-10-24"}]
 
-    row = duckdb.connect(str(research), read_only=True).execute(
-        "SELECT verdict, parser_version, n_excluded_special, observed_max_whole_f "
-        "FROM market_rule_verification"
-    ).fetchall()
+    row = (
+        duckdb.connect(str(research), read_only=True)
+        .execute(
+            "SELECT verdict, parser_version, n_excluded_special, observed_max_whole_f FROM market_rule_verification"
+        )
+        .fetchall()
+    )
     verdict, parser_version, _special, whole = row[0]
     assert verdict == "match"
     assert parser_version == "settlement-rules-1", "the rules version must land"
@@ -627,3 +657,56 @@ def _rules_text() -> str:
 
     fixture = Path(__file__).parent / "fixtures" / "rules" / "klga_metar_2026.txt"
     return fixture.read_text(encoding="utf-8")
+
+
+def test_cli_verifies_resolved_losers_as_well_as_the_winner(tmp_path):
+    import duckdb
+
+    from weatherquant.cli import main
+
+    db = tmp_path / "collector.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute(
+        "CREATE TABLE markets (market_id VARCHAR, event_id VARCHAR, bracket_label VARCHAR, "
+        "bracket_low DOUBLE, bracket_high DOUBLE, bracket_low_inclusive BOOLEAN, "
+        "bracket_high_inclusive BOOLEAN, rules_text VARCHAR, target_date DATE)"
+    )
+    for mid, low, high in [("winner", 80, 81), ("loser", 82, 83)]:
+        con.execute(
+            "INSERT INTO markets VALUES (?, 'event', ?, ?, ?, true, true, ?, ?)",
+            [mid, mid, low, high, RULES_TEXT, date(2026, 10, 13)],
+        )
+    con.close()
+    observations = [_obs(date(2026, 10, 13), hour, 81) for hour in range(4, 28)]
+    obs = tmp_path / "observations.json"
+    obs.write_text(json.dumps(observations, default=str), encoding="utf-8")
+    settlements = tmp_path / "settlements.json"
+    settlements.write_text(
+        json.dumps(
+            [
+                {"market_id": "winner", "resolved_outcome": 1.0},
+                {"market_id": "loser", "resolved_outcome": 0.0},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "verified.json"
+    assert (
+        main(
+            [
+                "verify-market",
+                "--date",
+                "2026-10-13",
+                "--collector-copy",
+                str(db),
+                "--observations-file",
+                str(obs),
+                "--settlements",
+                str(settlements),
+                "--out",
+                str(out),
+            ]
+        )
+        == 0
+    )
+    assert {row["market_id"] for row in json.loads(out.read_text())} == {"winner", "loser"}

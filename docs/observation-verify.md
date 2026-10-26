@@ -138,3 +138,8 @@ precision（判 `unusable_rules`），强行补 precision 后 °C 读数被直�
 仍需 NAS/人工：观测侧 T 组解析的采集路径（把 METAR 报文拆成 temp_c+report_type
 行存入 `klga_observations`）是 collector 侧依赖，verify-market 消费其产物；
 生产事件的批量核验待观测数据接入后进行。
+
+
+### 评审修复验证
+
+事件与观测核对为 match 后，--out 同时输出已有明确 0/1 payout 的获胜和失败市场。未结算或缺少结果的市场不写入清单，避免只验证赢家而排除 LOSS 样本。
