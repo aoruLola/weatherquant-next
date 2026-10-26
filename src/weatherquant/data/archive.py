@@ -171,6 +171,7 @@ class RawArchive:
         self._chains: dict[tuple[str, date], dict[str, Any]] = {}
         # Partitions whose files have had their archive_seq baseline read.
         self._seen_partitions: set[tuple[str, date]] = set()
+        self._pending_sidecars: set[tuple[str, date]] = set()
 
     # -- writing -----------------------------------------------------------
 
@@ -263,11 +264,8 @@ class RawArchive:
         digest = hashlib.sha256(torn).hexdigest()
         quarantine_dir = self.root / "quarantine" / path.parent.name
         quarantine_dir.mkdir(parents=True, exist_ok=True)
-        quarantine_path = (
-            quarantine_dir
-            / f"{path.name}.{datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%S%fZ')}.torn"
-        )
-        qfd = os.open(quarantine_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        quarantine_path = quarantine_dir / f"{path.name}.{datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%S%fZ')}.torn"
+        qfd = os.open(quarantine_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
         try:
             _write_full(qfd, torn)
             os.fsync(qfd)
@@ -319,7 +317,9 @@ class RawArchive:
         }
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            fd = os.open(self.root / "recovery.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            fd = os.open(
+                self.root / "recovery.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644
+            )
             try:
                 data = (json.dumps(entry, separators=(",", ":"), default=str) + "\n").encode()
                 offset = 0
@@ -371,6 +371,9 @@ class RawArchive:
         if self._write_uncertain:
             raise RuntimeError("archive write outcome uncertain; refusing a duplicate-prone retry")
         if not self._buffer:
+            for key in list(self._pending_sidecars):
+                _write_sidecar(self._partition_path(key), self._chains[key])
+                self._pending_sidecars.remove(key)
             self._last_flush = datetime.now(tz=UTC)
             return 0
 
@@ -399,7 +402,7 @@ class RawArchive:
             payload = ("\n".join(lines) + "\n").encode("utf-8")
             # O_APPEND protects the line boundary even after a short write.
             # The collector lock guarantees this process is the sole writer.
-            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644)
             try:
                 original_size = os.fstat(fd).st_size
                 if original_size:
@@ -460,12 +463,13 @@ class RawArchive:
             chain_state["chain"] = chain
             chain_state["bytes"] += len(payload)
             chain_state["lines"] += len(lines)
-            _write_sidecar(path, chain_state)
-
             durable += len(lines)
             self.records_written += len(lines)
             pending = [(partition, line) for partition, line in pending if partition != key]
             self._buffer = [line for _, line in pending]
+            self._pending_sidecars.add(key)
+            _write_sidecar(path, chain_state)
+            self._pending_sidecars.remove(key)
 
         self._last_flush = datetime.now(tz=UTC)
         return durable
@@ -539,7 +543,7 @@ def _write_sidecar(path: Path, state: dict[str, Any]) -> None:
         separators=(",", ":"),
     )
     tmp = _sidecar_path(path).with_suffix(".sha256.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o644)
     try:
         data = payload.encode("utf-8")
         offset = 0
@@ -619,7 +623,7 @@ def _last_seq_in_file(path: Path) -> int:
         return 0
     if not file_size:
         return 0
-    fd = os.open(path, os.O_RDONLY)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     try:
         newline_at = _scan_last_newline(fd, file_size)
         if newline_at < 0:
@@ -693,8 +697,7 @@ def verify_archive_tree(root: str | Path) -> list[dict[str, Any]]:
         else:
             if sidecar.get("chain") != chain:
                 problems.append(
-                    f"chain mismatch: sidecar {str(sidecar.get('chain'))[:16]}... "
-                    f"vs recomputed {chain[:16]}..."
+                    f"chain mismatch: sidecar {str(sidecar.get('chain'))[:16]}... vs recomputed {chain[:16]}..."
                 )
             if sidecar.get("lines") != lines:
                 problems.append(f"line count mismatch: sidecar {sidecar.get('lines')} vs {lines}")
@@ -705,10 +708,7 @@ def verify_archive_tree(root: str | Path) -> list[dict[str, Any]]:
                     if file_bytes > int(sidecar.get("bytes", 0))
                     else "file is shorter than the checksum trail claims"
                 )
-                problems.append(
-                    f"byte count mismatch: sidecar {sidecar.get('bytes')} vs file "
-                    f"{file_bytes} - {kind}"
-                )
+                problems.append(f"byte count mismatch: sidecar {sidecar.get('bytes')} vs file {file_bytes} - {kind}")
         results.append(
             {
                 "path": str(path),

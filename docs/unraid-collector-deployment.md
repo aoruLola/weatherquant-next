@@ -777,3 +777,8 @@ WebSocket 无限速文档；实测热门 token 约 15–20 条 `price_change` / 
 - **无下单代码**：`weatherquant.data.*` 里没有任何可以发出订单的路径。
 - **只读 API 集合**：Gamma `GET`、CLOB `GET /book`、WS `market` 频道订阅。
 - 镜像内**不含**数据库、配置密钥或本地 `.env`（`.dockerignore` 排除）。
+
+
+### 评审修复验证
+
+整合修复保留三项回归：摘要发布失败只重试元数据；归档与备份采用 Windows 可用的二进制/可写句柄；watchdog 不等待故障文件系统恢复才退出。

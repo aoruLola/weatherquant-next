@@ -164,9 +164,7 @@ def test_a_121_second_old_heartbeat_is_stale_but_a_119_second_one_is_not(tmp_pat
 
 def test_a_declared_pause_is_allowed_and_an_undecided_one_is_not() -> None:
     """allow() is a budget, not a switch: overrunning it still fires."""
-    watchdog = LoopWatchdog(
-        object(), stuck_seconds=0.15, check_interval=0.02, on_stuck=lambda msg: None
-    )
+    watchdog = LoopWatchdog(object(), stuck_seconds=0.15, check_interval=0.02, on_stuck=lambda msg: None)
     fired: list[str] = []
     watchdog._on_stuck = fired.append
     watchdog.start()
@@ -186,9 +184,7 @@ def test_a_declared_pause_is_allowed_and_an_undecided_one_is_not() -> None:
 
 
 def test_a_tick_clears_an_open_declaration() -> None:
-    watchdog = LoopWatchdog(
-        object(), stuck_seconds=0.3, check_interval=0.02, on_stuck=lambda msg: None
-    )
+    watchdog = LoopWatchdog(object(), stuck_seconds=0.3, check_interval=0.02, on_stuck=lambda msg: None)
     watchdog.start()
     try:
         for _ in range(8):  # 8 * 0.05s = 0.4s > stuck threshold, but ticking
@@ -230,10 +226,7 @@ def test_a_blocked_loop_is_detected_and_the_final_heartbeat_names_it(
     con = duckdb.connect(str(settings.db_path))
     try:
         kinds = [
-            row[0]
-            for row in con.execute(
-                "SELECT kind FROM collector_events WHERE kind = 'fault_injection'"
-            ).fetchall()
+            row[0] for row in con.execute("SELECT kind FROM collector_events WHERE kind = 'fault_injection'").fetchall()
         ]
         assert kinds == ["fault_injection"], kinds
     finally:
@@ -289,16 +282,11 @@ def test_the_run_after_a_watchdog_kill_writes_no_duplicates(
     try:
         # Two runs recorded, both closed out.
         assert con.execute("SELECT COUNT(*) FROM collector_runs").fetchone()[0] == 2
-        statuses = {
-            row[0]
-            for row in con.execute("SELECT status FROM collector_runs").fetchall()
-        }
+        statuses = {row[0] for row in con.execute("SELECT status FROM collector_runs").fetchall()}
         assert statuses == {"stopped"}
 
         # No gap left open: the restart dated its outage instead of hiding it.
-        open_gaps = con.execute(
-            "SELECT COUNT(*) FROM collection_gaps WHERE ended_at_utc IS NULL"
-        ).fetchone()[0]
+        open_gaps = con.execute("SELECT COUNT(*) FROM collection_gaps WHERE ended_at_utc IS NULL").fetchone()[0]
         assert open_gaps == 0
 
         # The same books seen by both runs are stored once each: the fake
@@ -327,3 +315,24 @@ def test_the_run_after_a_watchdog_kill_writes_no_duplicates(
         assert lines, f"{path} unexpectedly empty"
         for line in lines:
             json.loads(line)
+
+
+def test_blocked_diagnostic_filesystem_cannot_prevent_watchdog_exit():
+    entered = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+
+    class Worker:
+        def publish_stuck_heartbeat(self, message):
+            entered.set()
+            release.wait(5)
+
+    watchdog = LoopWatchdog(Worker(), stuck_seconds=1, on_stuck=lambda message: exited.set())
+    thread = threading.Thread(target=lambda: watchdog._fire(121), daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(1)
+        assert exited.wait(2), "exit must not wait for the stalled heartbeat mount"
+    finally:
+        release.set()
+        thread.join(timeout=2)
