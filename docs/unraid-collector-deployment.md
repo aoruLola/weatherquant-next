@@ -697,6 +697,34 @@ B 不重复: 优雅停止后开库断言——runs≥2、恰好 1 个 run 非 st
 配套单测 `tests/test_collector_watchdog.py`：探针 119s/121s 边界、watchdog 对
 阻塞循环触发并写出诊断心跳、健康循环不误触发、`allow()` 预算超支仍触发、
 故障标记一次性消费、被杀后重启无重复写入。
+### 12.6 运行、缺口与备份的审计查询(WQN-5)
+
+异常退出(被 kill、OOM、watchdog 退出——容器全程可能是 Up 的)会留下
+`status='running'` 的 run 行;**下一次启动**会把它标为 `failed` 并写明原因
+(`run did not exit cleanly (crash, kill, or watchdog exit)`),同时关闭其
+未关闭的 collection gap。所以下面这些审计问题都只是一条 SQL:
+
+```bash
+# 1) 哪些 run 异常结束?(stopped=正常;failed=未正常退出,看 stop_reason)
+docker exec weatherquant-collector python -c "
+import duckdb; c = duckdb.connect('/data/weatherquant.duckdb', read_only=True)
+print(c.execute(\"SELECT run_id, started_at_utc, stopped_at_utc, stop_reason
+                 FROM collector_runs WHERE status != 'stopped' ORDER BY started_at_utc\").fetchall())"
+
+# 2) 哪些时段没有采集?每条 gap 的起止;ended 为空说明还在停摆中:
+#    SELECT * FROM collection_gaps WHERE ended_at_utc IS NULL
+
+# 3) 备份生命周期时间线(每次尝试的开始/验证/失败/超时):
+docker exec weatherquant-collector python -c "
+import duckdb; c = duckdb.connect('/data/weatherquant.duckdb', read_only=True)
+print(c.execute(\"SELECT ts_utc, level, kind, message FROM collector_events
+                 WHERE kind LIKE 'backup%' ORDER BY ts_utc\").fetchall())"
+```
+
+配套单测 `tests/test_run_gap_audit.py`:被杀 run 由下一次启动标 failed、
+gap 覆盖整个停摆时段(停摆+死亡+重启间隙都落在 `[started, ended]` 内)、
+干净退出的 run 不被误标、备份失败(含异常路径)必留 `backup_failed` 事件
+且不影响 run 本身以 `stopped` 收尾。
 
 ---
 

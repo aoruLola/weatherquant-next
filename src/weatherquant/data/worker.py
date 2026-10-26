@@ -303,6 +303,19 @@ class CollectorWorker:
                 checkpoint_seconds=300.0,
             )
             self._writer.open()
+            # Before this run registers itself: anything still 'running' was
+            # abandoned by a process that died without closing (SIGKILL, OOM,
+            # watchdog exit - the container can stay Up through all of them).
+            # Failing those rows now is what makes "which runs ended
+            # abnormally" answerable by query (WQN-5).
+            abandoned = self._writer.mark_abandoned_runs_failed()
+            if abandoned:
+                self._event(
+                    "warning",
+                    "restart",
+                    f"marked {len(abandoned)} abandoned run(s) as failed",
+                    {"run_ids": abandoned[:20]},
+                )
             self._writer.start_run(
                 app_version=__version__,
                 git_sha=self.git_sha,
