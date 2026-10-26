@@ -679,7 +679,6 @@ RESULT: PASSED
 | 非交易时段不误报 | ✅ 未单列阶段；由单测 `test_a_quiet_market_stays_healthy` 覆盖 |
 | 磁盘告警 | ✅ 未在本机触发（磁盘充足）；单测覆盖 <15% / <5% 两档 |
 
-<<<<<<< HEAD
 ### 12.5 容器级心跳识别与自动恢复实测（WQN-2，2026-10-26）
 
 `scripts/wqn2_container_recovery_test.sh` 在本机（Debian + Docker 26.1.5）构建
@@ -698,7 +697,6 @@ B 不重复: 优雅停止后开库断言——runs≥2、恰好 1 个 run 非 st
 配套单测 `tests/test_collector_watchdog.py`：探针 119s/121s 边界、watchdog 对
 阻塞循环触发并写出诊断心跳、健康循环不误触发、`allow()` 预算超支仍触发、
 故障标记一次性消费、被杀后重启无重复写入。
-=======
 ### 12.6 运行、缺口与备份的审计查询(WQN-5)
 
 异常退出(被 kill、OOM、watchdog 退出——容器全程可能是 Up 的)会留下
@@ -727,7 +725,6 @@ print(c.execute(\"SELECT ts_utc, level, kind, message FROM collector_events
 gap 覆盖整个停摆时段(停摆+死亡+重启间隙都落在 `[started, ended]` 内)、
 干净退出的 run 不被误标、备份失败(含异常路径)必留 `backup_failed` 事件
 且不影响 run 本身以 `stopped` 收尾。
->>>>>>> zcode/wqn-5-run-gap-audit
 
 ---
 
@@ -781,4 +778,7 @@ WebSocket 无限速文档；实测热门 token 约 15–20 条 `price_change` / 
 
 ### 评审修复验证
 
+备份文件的 fsync 使用可写二进制句柄，Windows 与 Linux 都可验证并发布备份。新增正常文件 fsync 回归测试。
+JSONL fsync 成功后立即确认该批数据已持久化。若 .sha256 发布失败，后续 flush/close 只重试待发布摘要，不重复追加数据。归档、摘要和尾部扫描统一使用二进制文件描述符。
+watchdog 的最后诊断心跳在独立 daemon 线程写入，最多等待 0.5 秒。即使挂载存储阻塞，进程仍退出以触发 restart 策略。
 整合修复保留三项回归：摘要发布失败只重试元数据；归档与备份采用 Windows 可用的二进制/可写句柄；watchdog 不等待故障文件系统恢复才退出。
