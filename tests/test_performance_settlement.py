@@ -202,3 +202,56 @@ def test_the_request_goes_to_the_right_host_with_the_right_parameter() -> None:
     assert seen["url"] == f"{DATA_API_BASE}/v2/resolutions"
     assert seen["params"] == {"condition": "0xabc"}
     assert seen["timeout"] == 5.0
+
+
+# --- the wire price is fixed-point with 18 decimals (real API samples) --------
+
+
+def _fixture(name: str) -> dict:
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).parent / "fixtures" / "polymarket" / name
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_a_yes_winner_parses_from_the_1e18_fixed_point_body() -> None:
+    """Captured 2026-10-26 from /v2/resolutions: a winning market's price is
+    "1000000000000000000". Reading only {"0", "1"} left every winner PENDING
+    forever - a win rate biased toward losses (caught in local acceptance)."""
+    body = _fixture("resolutions_winner_1e18.json")
+    records = parse_resolutions(body)
+    assert len(records) == 1
+    assert records[0].status == "resolved"
+    assert records[0].price == 1.0, f"the winner must parse as a payout, got {records[0].price}"
+    assert classify(records[0]) == SettlementStatus.RESOLVED
+    assert yes_payout(records[0]) == 1.0
+
+
+def test_a_loser_parses_from_the_real_body() -> None:
+    body = _fixture("resolutions_loser.json")
+    record = parse_resolutions(body)[0]
+    assert record.price == 0.0
+    assert classify(record) == SettlementStatus.RESOLVED
+    assert yes_payout(record) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1000000000000000000", 1.0),  # the wire's YES winner
+        ("0", 0.0),
+        ("1", 1.0),  # the legacy plain-scale answer the old fixtures used
+        ("69", None),  # the sentinel: no payout determined
+        ("500000000000000000", None),  # intermediate fixed-point: not an answer
+        ("1e18", None),  # not the wire's spelling; refusing beats guessing
+        ("", None),
+        ("resolved", None),
+        (None, None),
+        (True, None),
+    ],
+)
+def test_price_normalisation_accepts_only_answers(raw, expected) -> None:
+    from weatherquant.performance.settlement import _normalise_price
+
+    assert _normalise_price(raw) == expected

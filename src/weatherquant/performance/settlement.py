@@ -15,8 +15,15 @@ notes in this repo implied, and each one is a trap:
 * **``price`` is a string, and ``"69"`` is a sentinel.** It is not a payout
   of 69 dollars; it means no payout has been determined. A resolved market
   still carries ``reproposed_price: "69"`` alongside a real ``price``, so
-  the sentinel has to be read off the right field. Only ``"0"`` and ``"1"``
-  are answers.
+  the sentinel has to be read off the right field.
+
+* **A YES winner's ``price`` is ``"1000000000000000000"``** - fixed-point
+  with 18 decimals, not the plain ``"1"`` the first fixtures happened to
+  use. Parsing only ``{"0", "1"}`` left every winning market PENDING
+  forever, which biases a win rate toward losses while looking like a
+  sparse-settlement problem. Only 0.0 and 1.0 are answers; everything else
+  (the sentinel, intermediate fixed-point values, junk) normalises to None
+  and stays out of the denominator.
 
 * **Python's default User-Agent is refused.** ``urllib`` gets HTTP 403 with
   a Cloudflare ``error code: 1010``; ``httpx`` gets 200. The collector
@@ -36,7 +43,7 @@ from typing import Any
 
 __all__ = [
     "DATA_API_BASE",
-    "RESOLVED_PRICE_VALUES",
+    "FIXED_POINT_SCALE",
     "SENTINEL_PRICE",
     "Resolution",
     "SettlementStatus",
@@ -48,8 +55,13 @@ __all__ = [
 
 DATA_API_BASE = "https://data-api.polymarket.com"
 
-#: The only two values that are an answer. Anything else is not decided yet.
-RESOLVED_PRICE_VALUES = frozenset({"0", "1"})
+#: Polymarket prices arrive as fixed-point strings with 18 decimals: a YES
+#: winner is ``"1000000000000000000"`` (1e18), a loser ``"0"``. The first
+#: fixtures only ever showed ``"0"``, and reading ``{"0", "1"}`` made every
+#: winning market parse as undetermined - a win rate biased toward losses
+#: that looks exactly like a sparse-settlement problem. The scale is part of
+#: the wire format, not a detail of one response.
+FIXED_POINT_SCALE = 10**18
 
 #: Polymarket's "no payout determined" marker. It shows up in `price` while
 #: a proposal is outstanding, and also in `reproposed_price` on a market that
@@ -89,21 +101,31 @@ class Resolution:
 
 
 def _normalise_price(value: object) -> float | None:
-    """``"1"`` -> 1.0, ``"69"`` -> None, anything unexpected -> None.
+    """``"1000000000000000000"`` -> 1.0, ``"69"`` -> None, junk -> None.
 
-    Returning ``None`` for an unrecognised value is deliberate: an unknown
-    price is an unanswered question, and the caller must then report
-    ``UNVERIFIABLE`` rather than inherit a guess.
+    The wire format is fixed-point with 18 decimals, so the integer string is
+    divided by 1e18 and only 0.0 / 1.0 survive - a payout of anything between
+    (the sentinel, ``"500000000000000000"``, a truncated number) is an
+    unanswered question, and the caller must report it as such rather than
+    inherit a guess. Plain ``"0"`` / ``"1"`` are accepted too: they are the
+    same answers in the scale the first fixtures used, and a wider reader
+    here costs nothing.
     """
     if value is None or isinstance(value, bool):
         return None
     text = str(value).strip()
-    if text not in RESOLVED_PRICE_VALUES:
+    if text == SENTINEL_PRICE:
         return None
     try:
-        return float(text)
-    except ValueError:  # pragma: no cover - guarded by the membership test
+        number = int(text)
+    except ValueError:
         return None
+    scaled = number / FIXED_POINT_SCALE
+    if scaled in (0.0, 1.0):
+        return scaled
+    if number in (0, 1):  # the legacy plain-scale answer
+        return float(number)
+    return None
 
 
 def parse_resolutions(payload: Any) -> list[Resolution]:
