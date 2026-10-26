@@ -51,3 +51,8 @@ calibrated 源 run 不匹配 / 模式缺失 / 周期混模式 / LIVE 行被重�
 
 - 对生产 `shadow.duckdb` 历史跑一次 `alignment`，核对四模型追溯与模式分布；
 - 若生产存在历史 `mode=NULL`/`UNKNOWN` 行（理论上不应有），确认处置方式后再清理。
+
+
+### 评审修复验证
+
+model_predictions 按模型、版本、站点、日期、事件与 forecast run 保存一次，可被后续 LIVE 周期和较早 REPLAY 时点复用。审计核对 forecast run、可发布时间及日期，不要求首次计算时间与每次决策时间相同。

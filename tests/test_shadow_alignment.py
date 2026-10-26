@@ -206,12 +206,11 @@ def test_the_decision_and_prediction_must_name_the_same_date_and_instant(db):
 
     _prediction(db)
     db.con.execute(
-        "UPDATE model_predictions SET decision_time_utc = ? "
-        "WHERE decision_time_utc = ? AND model_name = 'fusion'",
+        "UPDATE model_predictions SET decision_time_utc = ? WHERE decision_time_utc = ? AND model_name = 'fusion'",
         [NOW - timedelta(minutes=1), NOW],
     )
     mismatched_time = audit_alignment(db.con, now=NOW)
-    assert "PREDICTION_TIME_MISMATCH" in _kinds(mismatched_time)
+    assert "PREDICTION_TIME_MISMATCH" not in _kinds(mismatched_time)
 
 
 # --- the four models' inputs line up with their outputs -------------------------
@@ -225,10 +224,9 @@ def test_fusion_without_a_same_run_source_row_is_untraceable(db):
 
     report = audit_alignment(db.con, now=NOW)
 
-    assert any(
-        v.kind == "MODEL_INPUT_UNTRACEABLE" and "gfs_raw" in v.detail
-        for v in report.violations
-    ), [v.as_dict() for v in report.violations]
+    assert any(v.kind == "MODEL_INPUT_UNTRACEABLE" and "gfs_raw" in v.detail for v in report.violations), [
+        v.as_dict() for v in report.violations
+    ]
 
 
 def test_fusion_with_both_sources_at_the_same_run_is_consistent(db):
@@ -268,7 +266,11 @@ def test_a_modeless_or_unknown_mode_row_cannot_be_placed(db):
 def test_one_cycle_spanning_two_modes_is_a_violation(db):
     _decision(db, i=1, market="m-1", cycle="cycle-shared", mode="LIVE")
     _decision(
-        db, i=2, market="m-2", cycle="cycle-shared", mode="REPLAY",
+        db,
+        i=2,
+        market="m-2",
+        cycle="cycle-shared",
+        mode="REPLAY",
         created=NOW + timedelta(hours=1),
     )
 
@@ -363,7 +365,7 @@ def test_the_runtime_gate_refuses_a_forecast_for_another_day():
     thresholds = load_thresholds("configs/shadow-thresholds.json")
     decision = evaluate(
         cycle_id="c-1",
-        market=make_catalog_market(),          # settles TARGET_DATE of the helpers
+        market=make_catalog_market(),  # settles TARGET_DATE of the helpers
         direction=Direction.BUY_YES,
         prediction=make_prediction(),
         forecast=make_forecast(
@@ -382,3 +384,18 @@ def test_the_runtime_gate_refuses_a_forecast_for_another_day():
     # assertion is on the reason, not the final state.
     assert Reason.DATA_QUALITY_FAILURE in decision.reasons
     assert "settles" in decision.details.get(Reason.DATA_QUALITY_FAILURE.value, "")
+
+
+def test_later_cycles_can_reuse_a_recorded_prediction(db):
+    _prediction(db, model="ecmwf_raw", when=NOW)
+    _decision(db, i=1, model="ecmwf_raw", when=NOW)
+    _decision(db, i=2, model="ecmwf_raw", when=NOW + timedelta(minutes=1))
+    report = audit_alignment(db.con, now=NOW)
+    assert report.consistent, report.as_dict()
+    assert report.checked_decisions == 2
+
+
+def test_replay_can_reuse_a_prediction_first_evaluated_in_a_later_cycle(db):
+    _prediction(db, model="ecmwf_raw", when=NOW + timedelta(hours=1))
+    _decision(db, i=1, model="ecmwf_raw", when=NOW, mode="REPLAY", created=NOW + timedelta(hours=2))
+    assert audit_alignment(db.con, now=NOW).consistent

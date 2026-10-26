@@ -161,9 +161,7 @@ class AlignmentReport:
 
     def add(self, violation: AlignmentViolation) -> None:
         self.violations.append(violation)
-        self.violation_counts[violation.kind] = (
-            self.violation_counts.get(violation.kind, 0) + 1
-        )
+        self.violation_counts[violation.kind] = self.violation_counts.get(violation.kind, 0) + 1
 
 
 def audit_alignment(con: Any, *, now: datetime | None = None) -> AlignmentReport:
@@ -218,9 +216,16 @@ def _audit_prediction_alignment(con: Any, report: AlignmentReport) -> None:
         report.checked_decisions += len(page)
         for row in page:
             (
-                decision_id, model_name, decision_target, decision_time,
-                forecast_run, prediction_target, publishable_at, prediction_time,
-                n_hours, n_missing_hours,
+                decision_id,
+                model_name,
+                decision_target,
+                decision_time,
+                forecast_run,
+                prediction_target,
+                publishable_at,
+                _prediction_time,
+                n_hours,
+                n_missing_hours,
             ) = row
             if model_name not in ALIGNMENT_MODEL_NAMES and model_name not in report.unknown_models:
                 report.unknown_models.append(str(model_name))
@@ -273,18 +278,9 @@ def _audit_prediction_alignment(con: Any, report: AlignmentReport) -> None:
                         decision_id=str(decision_id),
                     )
                 )
-            if prediction_time is not None and prediction_time != decision_time:
-                report.add(
-                    AlignmentViolation(
-                        kind="PREDICTION_TIME_MISMATCH",
-                        detail=(
-                            f"prediction claims instant "
-                            f"{prediction_time.isoformat()} but the decision "
-                            f"records {decision_time.isoformat()}"
-                        ),
-                        decision_id=str(decision_id),
-                    )
-                )
+            # Predictions are immutable per model/version/run/event/day. A later
+            # LIVE cycle or an earlier REPLAY cycle can reuse that distribution;
+            # its first evaluation timestamp is not the forecast availability.
             if n_hours is not None and n_missing_hours is not None and int(n_missing_hours) > 0:
                 # The local civil day is the unit the market settles and the
                 # model was fitted on. A partially covered day remains a legal
@@ -408,11 +404,7 @@ def _audit_model_traceability(con: Any, report: AlignmentReport) -> None:
                             f"{run_time.isoformat()}) has no same-instant "
                             f"{source} row to trace to"
                         )
-                        + (
-                            "; fusion must average one initialisation, not two"
-                            if model == "fusion"
-                            else ""
-                        ),
+                        + ("; fusion must average one initialisation, not two" if model == "fusion" else ""),
                     )
                 )
 
@@ -432,8 +424,7 @@ def _audit_exposure(con: Any, report: AlignmentReport) -> None:
     ).fetchall()
     for station, target_date, decisions, accepts, _markets in same_day:
         ids = con.execute(
-            "SELECT DISTINCT market_id, event_id FROM shadow_decisions "
-            "WHERE station = ? AND target_date = ?",
+            "SELECT DISTINCT market_id, event_id FROM shadow_decisions WHERE station = ? AND target_date = ?",
             [station, target_date],
         ).fetchall()
         report.exposure_groups.append(
