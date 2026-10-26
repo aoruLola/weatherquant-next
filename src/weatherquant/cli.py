@@ -417,6 +417,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=20.0)
 
     p = sub.add_parser(
+        "settlement-queue",
+        help=(
+            "the verification queue: every (market, target_date) that produced an ACCEPT, bucketed by settlement state"
+        ),
+    )
+    decisions = p.add_mutually_exclusive_group(required=True)
+    decisions.add_argument(
+        "--export",
+        help="decisions source: the export directory (or a .json/.jsonl file)",
+    )
+    decisions.add_argument(
+        "--state-db",
+        help="performance state store to read episodes and settlements from",
+    )
+    p.add_argument(
+        "--settlements",
+        help="settlement index written by backfill-settlements (with --export)",
+    )
+    catalog_src = p.add_mutually_exclusive_group()
+    catalog_src.add_argument(
+        "--catalog",
+        help="catalog file: JSON list with the collector markets' columns",
+    )
+    catalog_src.add_argument(
+        "--catalog-from-collector",
+        help=(
+            "read the catalog from a COPY of the collector database (a verified "
+            "backup qualifies); never the live file, whose writer holds the lease"
+        ),
+    )
+    p.add_argument("--out", required=True, help="where to write the queue (JSON)")
+
+    p = sub.add_parser(
         "verify-market",
         help=(
             "verify station observations against a market's own settlement "
@@ -572,6 +605,109 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def cmd_settlement_queue(settings: Settings, args: argparse.Namespace) -> int:
+    """Build the verification queue from recorded facts, offline.
+
+    Never opens a live database and never talks to the platform: decisions
+    come from the export or the state store, settlements from an index or the
+    state store, and the catalog from a file or a collector COPY. The only
+    networked step in this workflow is ``backfill-settlements`` itself.
+    """
+    import duckdb
+
+    from weatherquant.performance.backfill import (
+        load_decisions_with_watermark,
+        load_settlements,
+    )
+    from weatherquant.performance.settlement_queue import (
+        SettlementQueueError,
+        build_settlement_queue,
+        catalog_from_collector_copy,
+        catalog_from_file,
+    )
+
+    settlements: list[dict]
+    try:
+        if args.state_db:
+            db = Path(args.state_db)
+            if not db.exists():
+                print(f"state store not found: {db}", file=sys.stderr)
+                return 2
+            con = duckdb.connect(str(db), read_only=True)
+            con.execute("SET TimeZone='UTC'")
+            try:
+                # Episodes are built from ACCEPT decisions only, so every
+                # episode row is an ACCEPT market by construction.
+                decisions = [
+                    {
+                        "market_id": row[0],
+                        "target_date": row[1],
+                        "station": row[2],
+                        "bracket_label": row[3],
+                        "decision_time_utc": row[4],
+                        "state": "ACCEPT",
+                    }
+                    for row in con.execute(
+                        "SELECT market_id, target_date, station, bracket_label, "
+                        "first_seen_utc FROM performance_episodes"
+                    ).fetchall()
+                ]
+                settlements = [
+                    {
+                        "market_id": row[0],
+                        "target_date": row[1],
+                        "settlement_status": row[2],
+                        "resolved_outcome": row[3],
+                        "verification_status": "VERIFIED" if row[4] else "UNVERIFIED",
+                        "fetched_at_utc": row[5].isoformat() if row[5] else None,
+                    }
+                    for row in con.execute(
+                        "SELECT market_id, target_date, status, payout, verified, "
+                        "fetched_at_utc FROM performance_settlements"
+                    ).fetchall()
+                ]
+            finally:
+                con.close()
+            source = f"state-db {args.state_db}"
+        else:
+            decisions, _watermark = load_decisions_with_watermark(args.export)
+            settlements = load_settlements(args.settlements) if args.settlements else []
+            source = f"export {args.export}"
+
+        catalog: list[dict] = []
+        if args.catalog:
+            catalog = catalog_from_file(args.catalog)
+        elif args.catalog_from_collector:
+            catalog = catalog_from_collector_copy(args.catalog_from_collector)
+
+        queue = build_settlement_queue(decisions, settlements=settlements, catalog=catalog)
+    except SettlementQueueError as exc:
+        print(f"could not build the queue: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as exc:
+        print(f"input not found: {exc}", file=sys.stderr)
+        return 2
+
+    out = Path(args.out)
+    _atomic_write_json(out, queue)
+    coverage = queue["coverage"]
+    print(f"settlement queue over {source}")
+    print(
+        f"  accept markets: {coverage['accept_markets']}"
+        + (
+            f" (skipped {coverage['accept_rows_without_market_id']} row(s) without a market id)"
+            if coverage["accept_rows_without_market_id"]
+            else ""
+        )
+    )
+    for bucket, count in sorted(coverage["buckets"].items()):
+        print(f"  {bucket:<20} {count}")
+    print(f"  catalog: {coverage['catalog_matched']} matched, {coverage['catalog_unmatched']} unmatched")
+    print(f"  WIN/LOSS eligible: {coverage['win_loss_eligible_markets']} ({coverage['win_loss_gating']})")
+    print(f"wrote {len(queue['queue'])} entr(ies) to {out}")
+    return 0
 
 
 def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
@@ -1007,6 +1143,7 @@ def main(argv: list[str] | None = None) -> int:
         "fit-models": cmd_fit_models,
         "report": cmd_report,
         "backfill-settlements": cmd_backfill_settlements,
+        "settlement-queue": cmd_settlement_queue,
         "verify-market": cmd_verify_market,
         "build-performance": cmd_build_performance,
     }

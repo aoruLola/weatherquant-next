@@ -280,7 +280,29 @@ for r in con.execute('''
 不是"数据有没有变化"。天气市场凌晨三点盘口不动是正常的；只要 REST 轮询仍然拿到
 200 响应，接触时钟就在走，探针就保持绿色。
 
-### 8.2 实操命令
+### 8.2 卡死的循环：探针看见,watchdog 处理(WQN-2)
+
+探针**识别**问题(120 秒未更新 → `unhealthy`),但 Docker 对"运行中但不健康"的
+容器**不会**重启 —— `restart: unless-stopped` 只在**进程退出**时动作。所以采集器
+进程内还有一条独立的 **loop watchdog 线程**(`--loop-stuck-seconds`,默认 120s,
+与探针的过期阈值同数):
+
+- 主循环每次迭代向它 `tick()`;有界但可能很慢的任务(每日 Parquet 导出)会先
+  `allow(预算)` 声明,声明超支照样触发;
+- 静默超过阈值 → watchdog 写**最后一条心跳**(status=`unhealthy`,
+  `fatal_error` 写明卡了多久)→ `os._exit(1)`。刻意不走优雅关闭:循环卡死时
+  `finally` 里的 flush/fsync 只会一起卡死。DuckDB 的 WAL 重放、下一次运行的
+  gap 关闭、raw 归档拒绝掩埋撕裂行,这三件事负责把状态收敛回来;
+- 于是链条完整:**120s 卡死 → 探针 unhealthy(识别)→ watchdog 退出 →
+  restart policy 拉起新进程(恢复)→ 自然键去重,不重复写入**。
+
+混沌验证(操作员主动触发,一次性):在数据目录放 `.fault-block-main` 文件
+(内容为阻塞秒数,缺省 130s),下一次启动的主循环会阻塞一次——文件在阻塞前
+**被消费**,所以随后的自动重启正常运行,不会死循环。验证脚本:
+`scripts/wqn2_container_recovery_test.sh`(本机构建镜像,跑识别+恢复两个场景,
+并断言重启后无重复写入)。
+
+### 8.3 实操命令
 
 ```bash
 # Docker 的视角
@@ -342,21 +364,33 @@ DuckDB 文件被写者**独占锁住**。在采集器运行时 `cp weatherquant.
 
 ### 9.2 采集器自带的校验备份（推荐）
 
-采集器**每天 00:00 UTC 自动**执行一次，流程是：
+采集器**每天 00:00 UTC 自动**执行一次。备份在**独立线程**上跑,主循环只负责
+启动和收割结果——所以即使备份在 FUSE 上爬几十分钟,心跳、轮询和 WS 抽水照常
+进行,健康探针不会把一个"正在备份"的采集器判成死进程:
 
-1. flush + `CHECKPOINT`（把 WAL 折进主文件）
-2. 在**同一个事务**里 `ATTACH` 一个新库，逐表 `CREATE TABLE ... AS SELECT`，
-   并重建全部索引 —— 这样快照取自单个 MVCC 一致性读点
-3. `DETACH`
-4. **用独立的只读连接重新打开**，逐表比对行数、比对 `schema_migrations` 版本
-5. 全部一致 → 原子改名为 `weatherquant-<时间戳>-<uuid>.duckdb`
-6. 任何一步不一致 → **删除半成品**，记一条 `backup_failed` 事件，**不覆盖**旧备份
+1. （主线程,毫秒级）flush + `CHECKPOINT`（把 WAL 折进主文件）
+2. （备份线程,私有连接——同进程、同一个 DuckDB 实例,不违反单写锁）
+   在**同一个事务**里 `ATTACH` 一个新库,逐表 `CREATE TABLE ... AS SELECT`,
+   并重建全部索引 —— 快照取自单个 MVCC 一致性读点;行数期望值也在同一事务里
+   读出,验证比对的是"快照自己",不是"已经跑后面的主库"
+3. `DETACH`,关闭私有连接
+4. **用独立的只读连接重新打开**半成品,逐表比对行数、比对 `schema_migrations`
+   版本与序列
+5. 全部一致 → `fsync` 半成品字节 → 原子改名为 `weatherquant-<时间戳>-<uuid>.duckdb`
+   → `fsync` 目录项。在 FUSE 上,rename 返回≠名字已落盘,目录 fsync 保证
+   "已验证"这个名字断电后还在
+6. 任何一步不一致 → **删除半成品**,记一条 `backup_failed` 事件,**不覆盖**旧备份;
+   当天晚些时候自动重试（默认每小时一次、每天最多 4 次）
+7. 超过 `--backup-timeout-seconds`（默认 1800s）仍未完成 → 记 `backup_timeout`,
+   放弃等待;线程自己完成后会丢弃半成品,**绝不**把一个没人等的结果发布出来。
+   超时当天不再重试（卡死的拷贝还在占着 I/O,再叠一份只会更糟）
 
 **只有通过第 4 步的备份才会出现在 `backups/` 里。** 目录里出现的每一个文件都已
-经被读回来验证过。
+经被读回来验证过。进程被杀时留下的 `.incomplete-*` 半成品会在下一次备份开始时
+清掉。
 
 手动触发（在容器里跑一个只读检查 + 备份是不允许的——备份必须由**持有写锁的
-采集器进程**自己做，否则又回到"复制正在写的文件"问题）。所以：等待次日 00:00 UTC，
+采集器进程**自己做,否则又回到"复制正在写的文件"问题）。所以：等待次日 00:00 UTC,
 或用下面的方式临时触发：
 
 ```bash
@@ -414,6 +448,34 @@ docker start weatherquant-collector
 
 `[待NAS验证]` 做一次恢复演练：停容器 → 换备份 → 启容器 → `SELECT COUNT(*)`
 确认数据回到备份时点，且 `collection_gaps` 里多了一条 `start_after_restart`。
+
+### 9.5 raw 归档的校验和与恢复日志(WQN-21)
+
+`raw/` 是只追加的证据链,旁边有两个伴生文件描述"写者声称已经落盘了什么":
+
+- `<日期>.jsonl.sha256` — **逐行链式摘要** sidecar:`sha256(上一摘要 ‖ 行字节)`
+  逐行折叠,与 flush 批次无关,因此可以只凭文件字节复算。同时记录已覆盖的
+  字节数与行数;超出覆盖范围的字节是"已写入但未入链"(崩溃窗口),和
+  "内容被改过"是两种不同的报告。
+- `recovery.jsonl` — **恢复日志**:撕裂尾行被自动隔离、sidecar 与文件不符需要重建、
+  从上次运行延续 `archive_seq`,每件事都留一行,绝不静默通过。
+- `quarantine/<source>/` — **撕裂片段隔离区**:崩溃写了一半的最后一行会被下一次
+  启动自动移到这里(先 fsync 隔离文件、再截断数据文件,片段的 sha256 记入恢复
+  日志),然后继续追加——**不需要人工截断**,采集器不会因为 kill -9 卡死。
+
+`archive_seq` 在单个文件内跨重启严格递增(重启会先读该文件最后一条持久
+行的序号再继续,回扫不受超长撕裂片段影响),重放不会铸造死掉的运行已经用过的序号。
+
+在 NAS 上验收(只读操作,随时可跑):
+
+```bash
+docker run --rm -v /mnt/user/appdata/weatherquant-next:/data:ro \
+  ghcr.io/<owner>/<repo>:stable \
+  python -m weatherquant.data.verify_raw_archive /data/raw
+```
+
+退出码 0 = 所有分区链验证通过;1 = 有分区报告问题(逐条列出);2 = 目录不可读。
+建议接入 User Scripts 每日跑一次,与 §9.3 的异地复制放在一起。
 
 ---
 
@@ -488,6 +550,7 @@ print('code supports  :', __import__('glob').glob('/app/.venv/lib/python3.12/sit
 | 15 | 无对外端口 | `docker port weatherquant-collector` → 空 |
 | 16 | SIGTERM 优雅退出 | `docker stop -t 60` → 日志显示 flush/checkpoint，`collector_runs.status='stopped'` |
 | 17 | 备份自校验 | `backups/` 内文件可只读打开且行数 = 主库 |
+| 18 | watchdog 自动恢复(WQN-2) | `echo 130 > /mnt/user/appdata/weatherquant-next/.fault-block-main && docker restart weatherquant-collector` → ~2 分钟后 `RestartCount` +1、容器回 `healthy`、`collector_runs` 多一行非 `stopped` 的记录、`collection_gaps` 无未关闭行 |
 | 18 | 30 分钟浸泡（含断网+重启） | 在 NAS 上跑 `python scripts/soak_test.py --minutes 30 --data /tmp/wq-soak` |
 
 ### 11.3 需要 GitHub Actions 执行的
@@ -616,6 +679,53 @@ RESULT: PASSED
 | 非交易时段不误报 | ✅ 未单列阶段；由单测 `test_a_quiet_market_stays_healthy` 覆盖 |
 | 磁盘告警 | ✅ 未在本机触发（磁盘充足）；单测覆盖 <15% / <5% 两档 |
 
+### 12.5 容器级心跳识别与自动恢复实测（WQN-2，2026-10-26）
+
+`scripts/wqn2_container_recovery_test.sh` 在本机（Debian + Docker 26.1.5）构建
+采集器镜像并用**真实的 120s 阈值**跑了两个场景，全部通过：
+
+```
+A 识别:  healthy(7s) → 主循环阻塞150s → 探针在 131s 判 unhealthy（120s 过期阈值）→ RestartCount=0（watchdog 未启用）
+B 恢复:  healthy → 阻塞130s → watchdog: "collection loop stuck for 120s (limit 120s);
+         ending the process so the container restart policy can recover it"
+         → RestartCount=1（restart: unless-stopped 自动拉起）→ 回到 healthy
+B 不重复: 优雅停止后开库断言——runs≥2、恰好 1 个 run 非 stopped（被杀的那个，
+         stop_reason 为 NULL）、collection_gaps 无未关闭行、order_books 全部
+         book_id 唯一、price_history 自然键无重复
+```
+
+配套单测 `tests/test_collector_watchdog.py`：探针 119s/121s 边界、watchdog 对
+阻塞循环触发并写出诊断心跳、健康循环不误触发、`allow()` 预算超支仍触发、
+故障标记一次性消费、被杀后重启无重复写入。
+### 12.6 运行、缺口与备份的审计查询(WQN-5)
+
+异常退出(被 kill、OOM、watchdog 退出——容器全程可能是 Up 的)会留下
+`status='running'` 的 run 行;**下一次启动**会把它标为 `failed` 并写明原因
+(`run did not exit cleanly (crash, kill, or watchdog exit)`),同时关闭其
+未关闭的 collection gap。所以下面这些审计问题都只是一条 SQL:
+
+```bash
+# 1) 哪些 run 异常结束?(stopped=正常;failed=未正常退出,看 stop_reason)
+docker exec weatherquant-collector python -c "
+import duckdb; c = duckdb.connect('/data/weatherquant.duckdb', read_only=True)
+print(c.execute(\"SELECT run_id, started_at_utc, stopped_at_utc, stop_reason
+                 FROM collector_runs WHERE status != 'stopped' ORDER BY started_at_utc\").fetchall())"
+
+# 2) 哪些时段没有采集?每条 gap 的起止;ended 为空说明还在停摆中:
+#    SELECT * FROM collection_gaps WHERE ended_at_utc IS NULL
+
+# 3) 备份生命周期时间线(每次尝试的开始/验证/失败/超时):
+docker exec weatherquant-collector python -c "
+import duckdb; c = duckdb.connect('/data/weatherquant.duckdb', read_only=True)
+print(c.execute(\"SELECT ts_utc, level, kind, message FROM collector_events
+                 WHERE kind LIKE 'backup%' ORDER BY ts_utc\").fetchall())"
+```
+
+配套单测 `tests/test_run_gap_audit.py`:被杀 run 由下一次启动标 failed、
+gap 覆盖整个停摆时段(停摆+死亡+重启间隙都落在 `[started, ended]` 内)、
+干净退出的 run 不被误标、备份失败(含异常路径)必留 `backup_failed` 事件
+且不影响 run 本身以 `stopped` 收尾。
+
 ---
 
 ## 13. 限速参考（官方，按 IP / 10 秒滑动窗口）
@@ -664,3 +774,11 @@ WebSocket 无限速文档；实测热门 token 约 15–20 条 `price_change` / 
 - **无下单代码**：`weatherquant.data.*` 里没有任何可以发出订单的路径。
 - **只读 API 集合**：Gamma `GET`、CLOB `GET /book`、WS `market` 频道订阅。
 - 镜像内**不含**数据库、配置密钥或本地 `.env`（`.dockerignore` 排除）。
+
+
+### 评审修复验证
+
+备份文件的 fsync 使用可写二进制句柄，Windows 与 Linux 都可验证并发布备份。新增正常文件 fsync 回归测试。
+JSONL fsync 成功后立即确认该批数据已持久化。若 .sha256 发布失败，后续 flush/close 只重试待发布摘要，不重复追加数据。归档、摘要和尾部扫描统一使用二进制文件描述符。
+watchdog 的最后诊断心跳在独立 daemon 线程写入，最多等待 0.5 秒。即使挂载存储阻塞，进程仍退出以触发 restart 策略。
+整合修复保留三项回归：摘要发布失败只重试元数据；归档与备份采用 Windows 可用的二进制/可写句柄；watchdog 不等待故障文件系统恢复才退出。

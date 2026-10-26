@@ -17,6 +17,7 @@ from weatherquant.data.heartbeat import (
 from weatherquant.data.lock import LockError, SingleInstanceLock
 from weatherquant.data.ratelimit import RateLimitError, RateLimitRegistry, SlidingWindowLimiter
 from weatherquant.data.writer import (
+    BackupJob,
     BackupReport,
     CollectorWriter,
     IntegrityReport,
@@ -28,6 +29,7 @@ from weatherquant.data.writer import (
 
 __all__ = [
     "ArchiveRecord",
+    "BackupJob",
     "BackupReport",
     "CollectionStats",
     "CollectorWriter",

@@ -54,7 +54,12 @@ from weatherquant.data.heartbeat import (
 from weatherquant.data.http import ResilientHttp
 from weatherquant.data.lock import LockError, SingleInstanceLock
 from weatherquant.data.ratelimit import RateLimitRegistry
-from weatherquant.data.writer import CollectorWriter
+from weatherquant.data.watchdog import LoopWatchdog
+from weatherquant.data.writer import (
+    DEFAULT_BACKUP_TIMEOUT_SECONDS,
+    BackupJob,
+    CollectorWriter,
+)
 
 log = logging.getLogger(__name__)
 
@@ -105,6 +110,9 @@ class CollectorWorker:
         integrity_seconds: float = 300.0,
         parquet_daily: bool = True,
         backup_daily: bool = True,
+        backup_timeout_seconds: float = DEFAULT_BACKUP_TIMEOUT_SECONDS,
+        backup_retry_seconds: float = 3600.0,
+        loop_stuck_seconds: float = 120.0,
         stream_enabled: bool = True,
         once: bool = False,
     ) -> None:
@@ -120,6 +128,11 @@ class CollectorWorker:
         self.integrity_seconds = integrity_seconds
         self.parquet_daily = parquet_daily
         self.backup_daily = backup_daily
+        self.backup_timeout_seconds = backup_timeout_seconds
+        self.backup_retry_seconds = backup_retry_seconds
+        # 120s by default: the same number the health probe uses to call a
+        # heartbeat stale. Pass 0 to run without the watchdog (diagnostics).
+        self.loop_stuck_seconds = loop_stuck_seconds
         self.stream_enabled = stream_enabled
         self.once = once
 
@@ -130,6 +143,7 @@ class CollectorWorker:
         self._writer: CollectorWriter | None = None
         self._archive: RawArchive | None = None
         self._http: ResilientHttp | None = None
+        self._watchdog: LoopWatchdog | None = None
 
         # Heartbeat pacing uses its own monotonic clock: comparing
         # time.monotonic() against a wall-clock timestamp mixes two unrelated
@@ -140,6 +154,15 @@ class CollectorWorker:
         self._last_integrity_mono = -1e18
         self._last_parquet_day: date | None = None
         self._last_backup_day: date | None = None
+        # Daily backup bookkeeping. The job runs off-thread (see
+        # CollectorWriter.start_backup); the loop only ever *polls* it here,
+        # so a backup stuck on FUSE can no longer stall collection.
+        self._backup_job: BackupJob | None = None
+        self._backup_attempts_day: date | None = None
+        self._backup_attempts_today = 0
+        self._last_backup_attempt_mono = -1e18
+        self._last_backup_ok: str | None = None
+        self._last_backup_error: str | None = None
 
         self._last_rest_mid: dict[str, tuple[datetime, float]] = {}
         self._last_mismatch_note = datetime.min.replace(tzinfo=UTC)
@@ -280,6 +303,19 @@ class CollectorWorker:
                 checkpoint_seconds=300.0,
             )
             self._writer.open()
+            # Before this run registers itself: anything still 'running' was
+            # abandoned by a process that died without closing (SIGKILL, OOM,
+            # watchdog exit - the container can stay Up through all of them).
+            # Failing those rows now is what makes "which runs ended
+            # abnormally" answerable by query (WQN-5).
+            abandoned = self._writer.mark_abandoned_runs_failed()
+            if abandoned:
+                self._event(
+                    "warning",
+                    "restart",
+                    f"marked {len(abandoned)} abandoned run(s) as failed",
+                    {"run_ids": abandoned[:20]},
+                )
             self._writer.start_run(
                 app_version=__version__,
                 git_sha=self.git_sha,
@@ -330,9 +366,19 @@ class CollectorWorker:
                 detail=f"run={self.run_id} pid={os.getpid()} host={self.hostname}",
             )
 
+            self._start_watchdog()
+            self._maybe_inject_fault_block()
+
             self._loop(http, discovery, stream, publisher, archive)
             status = HealthStatus.STOPPED
             reason = self.shutdown.reason or "shutdown requested"
+            # Drain safety net (WQN-4): frames the producer queued during the
+            # last tick are data too. A graceful exit may not drop them; a
+            # crash path never gets here, which is what the gap record and
+            # the raw archive's tail discipline are for. Bounded, so a full
+            # queue cannot hold SIGTERM hostage (the frames beyond the budget
+            # are the next run's upstream refresh).
+            self._final_drain(archive)
         except Exception as exc:
             log.exception("collector fatal error")
             self._fatal = f"{type(exc).__name__}: {exc}"
@@ -345,6 +391,12 @@ class CollectorWorker:
                 except Exception:
                     log.exception("could not record fatal event")
         finally:
+            # Stop the watchdog before any teardown: the steps below are
+            # deliberately allowed to take longer than a loop tick (backup
+            # join, checkpoint, archive close), and a watchdog that fired
+            # mid-clean-shutdown would convert every graceful stop into a kill.
+            if self._watchdog is not None:
+                self._watchdog.stop()
             # Each shutdown step is isolated: a stream that fails to stop must
             # not prevent the writer from flushing, checkpointing and recording
             # the run's exit. Without this, one subsystem's failure silently
@@ -368,6 +420,28 @@ class CollectorWorker:
                     status = HealthStatus.FATAL
                 finally:
                     self._archive_records = archive.records_written
+            if self._backup_job is not None:
+                # The copy runs on its own connection, so it survives the
+                # archive close above. SIGTERM arriving mid-backup is exactly
+                # when a verified copy is worth a bounded wait - but never
+                # hold the container hostage to it: beyond this window the
+                # daemon thread is killed and the next run's backup sweeps
+                # the .incomplete- file.
+                job = self._backup_job
+                if not job.done:
+                    job.join(30.0)
+                report = job.poll()
+                if report is not None:
+                    # Recorded before the writer closes, so the run's exit
+                    # includes the backup outcome it was still holding.
+                    if report.ok:
+                        self._event(
+                            "info", "backup", f"verified backup {report.destination.name} (shutdown)"
+                        )
+                    else:
+                        self._event(
+                            "error", "backup_failed", report.error or "unknown (shutdown)"
+                        )
             if self._writer is not None:
                 # Close this run's own gap before the writer goes away. A run
                 # that opened a gap at start must close it at exit whatever the
@@ -410,6 +484,8 @@ class CollectorWorker:
         self._stream = stream
         cycles = 0
         while not self.shutdown.requested():
+            if self._watchdog is not None:
+                self._watchdog.tick()
             now = time.monotonic()
             cycles += 1
 
@@ -460,6 +536,72 @@ class CollectorWorker:
             self.shutdown.wait(self.tick_seconds)
 
     # -- tasks -------------------------------------------------------------
+
+    def _start_watchdog(self) -> None:
+        """Arm the loop watchdog (WQN-2): an independent thread that ends the
+        process when the loop stops ticking, so the container restart policy
+        can recover it. A heartbeat going stale tells the *probe* something is
+        wrong; the exit tells *Docker* to do something about it."""
+        if self.loop_stuck_seconds <= 0:
+            log.info("loop watchdog disabled (loop_stuck_seconds <= 0)")
+            return
+        # Sample ~4x per threshold so a stuck loop is caught within a
+        # fraction of its budget at any scale - including the compressed
+        # thresholds tests use.
+        check_interval = min(5.0, max(0.02, self.loop_stuck_seconds / 4.0))
+        self._watchdog = LoopWatchdog(
+            self, stuck_seconds=self.loop_stuck_seconds, check_interval=check_interval
+        )
+        self._watchdog.start()
+        log.info(
+            "loop watchdog armed: a silent main loop will exit the process after %.0fs",
+            self.loop_stuck_seconds,
+        )
+
+    # A deliberate, operator-placed fault: touch this file in the data
+    # directory to make the next run's loop block once, for chaos testing the
+    # watchdog + restart-policy path (WQN-2 acceptance). The file is consumed
+    # *before* blocking, so the restart that follows runs normally - the
+    # recovery arc, not a crash loop.
+    FAULT_BLOCK_MARKER = ".fault-block-main"
+
+    def _maybe_inject_fault_block(self) -> None:
+        marker = self.settings.db_path.parent / self.FAULT_BLOCK_MARKER
+        try:
+            raw = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            return
+        try:
+            seconds = float(raw) if raw else self.loop_stuck_seconds + 10.0
+        except ValueError:
+            seconds = self.loop_stuck_seconds + 10.0
+        # Consume first: if the watchdog ends the process mid-block, the
+        # restart must come up clean.
+        marker.unlink(missing_ok=True)
+        message = (
+            f"fault injection: blocking the main loop for {seconds:.0f}s "
+            "(operator chaos test; the watchdog is expected to end the process)"
+        )
+        log.warning("%s", message)
+        self._event("warning", "fault_injection", message)
+        if self._watchdog is not None:
+            # The block itself is the stuck state under test: no allowance.
+            time.sleep(seconds)
+        else:
+            log.warning("watchdog disabled; sleeping the fault block out instead")
+
+    def publish_stuck_heartbeat(self, message: str) -> None:
+        """A last heartbeat that names the stuck loop, written by the watchdog.
+
+        Best-effort on purpose: if even this write hangs, the process exit
+        must still happen - that is the one action that cannot be skipped.
+        """
+        self._status = HealthStatus.UNHEALTHY
+        self._fatal = message
+        publisher = HeartbeatWriter(
+            self.settings.db_path.parent / "health" / "heartbeat.json"
+        )
+        self._publish(publisher, None)
 
     def _run_discovery(self, discovery: GammaDiscovery, archive: RawArchive | None) -> None:
         if self._writer is None or archive is None:
@@ -775,6 +917,14 @@ class CollectorWorker:
     def _run_integrity(self) -> None:
         if self._writer is None:
             return
+        if self._backup_job is not None:
+            # Defer, don't skip: the next cycle (tick_seconds away) runs it
+            # once the copy has published or failed. The check's queries are
+            # catalog-pinned now and would not block on the backup, but a
+            # 30-minute NAS copy meets the 300s cadence many times over, and
+            # keeping the two apart costs the loop nothing.
+            log.debug("integrity check deferred: a backup job is in flight")
+            return
         try:
             report = self._writer.integrity_check()
             if not report.ok:
@@ -803,6 +953,11 @@ class CollectorWorker:
             return
         today = datetime.now(tz=UTC).date()
         if self.parquet_daily and self._last_parquet_day != today:
+            # Bounded but unboundedly slow on a NAS: the watchdog gets a
+            # declared budget so a legitimate export cannot look like a stuck
+            # loop. An export that overruns it still trips the watchdog.
+            if self._watchdog is not None:
+                self._watchdog.allow(600.0)
             try:
                 report = self._writer.export_parquet_day(
                     today - timedelta(days=1), self.settings.raw_dir.parent / "parquet"
@@ -815,24 +970,111 @@ class CollectorWorker:
             except Exception as exc:
                 log.warning("parquet export failed: %s", exc)
         if self.backup_daily and self._last_backup_day != today:
-            try:
-                report = self._writer.backup(self.settings.db_path.parent / "backups")
-                if report.ok:
-                    log.info(
-                        "backup verified: %s (%d bytes, %d tables)",
-                        report.destination.name,
-                        report.bytes_written,
-                        len(report.row_counts),
+            self._advance_daily_backup(today)
+
+    # A clean backup failure (bad destination, verification mismatch, ENOSPC)
+    # is worth retrying later the same day; a *timeout* is not, because the
+    # copy is still holding its private connection open and a second one an
+    # hour later would only double the I/O the first is stuck on.
+    BACKUP_MAX_ATTEMPTS_PER_DAY = 4
+
+    def _advance_daily_backup(self, today: date) -> None:
+        """Drive the daily backup job: poll, enforce the timeout, retry.
+
+        Called from the loop every tick, this method never blocks on the
+        copy itself - that is the isolation WQN-1 asked for. Everything it
+        does while a job is in flight is a few attribute reads and, at most
+        once, recording an event.
+        """
+        if self._writer is None:
+            return
+        if self._backup_attempts_day != today:
+            self._backup_attempts_day = today
+            self._backup_attempts_today = 0
+
+        job = self._backup_job
+        if job is not None:
+            report = job.poll()
+            if report is None:
+                if job.expired() and job.abandon(
+                    f"no finished backup after {job.elapsed_seconds():.0f}s "
+                    f"(limit {self.backup_timeout_seconds:.0f}s)"
+                ):
+                    message = (
+                        f"backup {job.final.name} abandoned after "
+                        f"{job.elapsed_seconds():.0f}s; the copy continues "
+                        "on its own thread and will discard its file"
                     )
-                    self._event(
-                        "info", "backup", f"verified backup {report.destination.name}"
-                    )
-                else:
-                    log.error("backup failed: %s", report.error)
-                    self._event("error", "backup_failed", report.error or "unknown")
+                    log.error("%s", message)
+                    self._event("error", "backup_timeout", message)
+                    self._last_backup_error = "backup_timeout"
+                    self._backup_attempts_today += 1
+                    self._last_backup_attempt_mono = time.monotonic()
+                    # No same-day retry after a timeout: the stuck copy is
+                    # still holding its private connection, and a second
+                    # one would only double the I/O it is stuck on.
+                    self._last_backup_day = today
+                    # Detached, not forgotten: the thread discards its own
+                    # file when (if) it completes. Keeping the handle would
+                    # re-enter this branch every tick and storm the log.
+                    self._backup_job = None
+                # Either still running or just abandoned: nothing to start.
+                return
+
+            self._backup_job = None
+            self._backup_attempts_today += 1
+            self._last_backup_attempt_mono = time.monotonic()
+            if report.ok:
+                self._last_backup_ok = report.destination.name
+                self._last_backup_error = None
+                log.info(
+                    "backup verified: %s (%d bytes, %d tables)",
+                    report.destination.name,
+                    report.bytes_written,
+                    len(report.row_counts),
+                )
+                self._event("info", "backup", f"verified backup {report.destination.name}")
                 self._last_backup_day = today
-            except Exception as exc:
-                log.warning("backup failed: %s", exc)
+            else:
+                log.error("backup failed: %s", report.error)
+                self._event("error", "backup_failed", report.error or "unknown")
+                self._last_backup_error = (report.error or "unknown")[:200]
+                if self._backup_attempts_today >= self.BACKUP_MAX_ATTEMPTS_PER_DAY:
+                    self._last_backup_day = today
+            return
+
+        if self._last_backup_day == today:
+            return
+        if self._backup_attempts_today >= self.BACKUP_MAX_ATTEMPTS_PER_DAY:
+            return
+        if self._backup_attempts_today and (
+            time.monotonic() - self._last_backup_attempt_mono < self.backup_retry_seconds
+        ):
+            return
+        try:
+            # The flush + checkpoint inside are the only synchronous part and
+            # are bounded by the pending batch, not by the database size.
+            job = self._writer.start_backup(
+                self.settings.db_path.parent / "backups",
+                timeout_seconds=self.backup_timeout_seconds,
+            )
+        except Exception as exc:
+            # The exception path is the one the acceptance cares about:
+            # a backups mount that vanished or filled up must leave an
+            # audit trail, not just a log line on a rotating container.
+            # (WQN-5; subsumed into the job-based flow of WQN-1.)
+            log.warning("backup could not start: %s", exc)
+            self._event("error", "backup_failed", f"start: {type(exc).__name__}: {exc}")
+            self._last_backup_error = f"start: {exc}"[:200]
+            self._backup_attempts_today += 1
+            self._last_backup_attempt_mono = time.monotonic()
+            if self._backup_attempts_today >= self.BACKUP_MAX_ATTEMPTS_PER_DAY:
+                self._last_backup_day = today
+            return
+        self._backup_job = job
+        self._backup_attempts_today += 1
+        self._last_backup_attempt_mono = time.monotonic()
+        self._event("info", "backup_started", str(job.final.name))
 
     def _drain_stream(self, archive: RawArchive | None) -> None:
         # Sampled *before* the writer guard: queue depth is a property of the
@@ -854,6 +1096,32 @@ class CollectorWorker:
                 break
             drained += 1
             self._handle_stream_frame(frame, archive)
+
+    # A graceful exit drains the backlog, but only a bounded one: SIGTERM must
+    # stay bounded even when the producer outpaced the loop for a whole sweep.
+    FINAL_DRAIN_MAX_FRAMES = 5000
+    FINAL_DRAIN_MAX_SECONDS = 5.0
+
+    def _final_drain(self, archive: RawArchive | None) -> None:
+        if self._writer is None or archive is None:
+            return
+        deadline = time.monotonic() + self.FINAL_DRAIN_MAX_SECONDS
+        total = 0
+        while total < self.FINAL_DRAIN_MAX_FRAMES and time.monotonic() < deadline:
+            before = self._ws_queue.qsize()
+            self._drain_stream(archive)
+            total += before - self._ws_queue.qsize()
+            if self._ws_queue.empty():
+                break
+        if total:
+            log.info("final drain: %d queued frame(s) processed before exit", total)
+            try:
+                self._writer.flush(force=True)
+            except Exception:
+                log.exception("could not flush the final drain's rows")
+            leftover = self._ws_queue.qsize()
+            if leftover:
+                log.warning("final drain budget reached; %d frame(s) not processed", leftover)
 
     def _handle_stream_frame(self, frame: Any, archive: RawArchive) -> None:
         received_at, payload = frame
@@ -919,6 +1187,12 @@ class CollectorWorker:
                 "budget_seconds": self.POLL_BUDGET_SECONDS,
                 "exceeded": self._poll_budget_exceeded,
                 "deferred_tokens": self._poll_deferred,
+            },
+            "backup": {
+                "running": self._backup_job is not None,
+                "attempts_today": self._backup_attempts_today,
+                "last_ok": self._last_backup_ok,
+                "last_error": self._last_backup_error,
             },
             "ws_queue": {
                 "depth": depth,
@@ -1296,6 +1570,19 @@ def worker_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--discovery-seconds", type=float, default=900.0)
     parser.add_argument("--book-poll-seconds", type=float, default=5.0)
     parser.add_argument("--heartbeat-seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--backup-timeout-seconds",
+        type=float,
+        default=DEFAULT_BACKUP_TIMEOUT_SECONDS,
+        help="abandon the daily backup if it runs longer than this (default: %(default)ss)",
+    )
+    parser.add_argument(
+        "--loop-stuck-seconds",
+        type=float,
+        default=120.0,
+        help="exit the process if the main loop is silent this long, so the "
+        "restart policy recovers it (0 disables; default: %(default)ss)",
+    )
     parser.add_argument("--once", action="store_true", help="run one discovery+poll cycle then exit")
     args = parser.parse_args(argv)
 
@@ -1318,6 +1605,8 @@ def worker_main(argv: list[str] | None = None) -> int:
         discovery_seconds=args.discovery_seconds,
         book_poll_seconds=args.book_poll_seconds,
         heartbeat_seconds=args.heartbeat_seconds,
+        backup_timeout_seconds=args.backup_timeout_seconds,
+        loop_stuck_seconds=args.loop_stuck_seconds,
         once=args.once,
     )
     return worker.run()

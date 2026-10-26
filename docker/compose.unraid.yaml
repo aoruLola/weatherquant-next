@@ -14,6 +14,11 @@
 #      reach the process and be allowed to flush, checkpoint and release the
 #      lock before the container is killed. Docker's default 10s is tight
 #      against a 5s flush plus a 300s checkpoint on a busy filesystem.
+#   4. `restart: unless-stopped` is the recovery half of WQN-2: the loop
+#      watchdog (default 120s) exits the process when the main loop goes
+#      silent - a heartbeat the probe can *see* - and this policy turns that
+#      exit into an automatic restart. Docker does not restart an
+#      unhealthy-but-running container on its own; see docs/... §8.2.
 
 x-common: &common
   # Published by .github/workflows/release.yml. `stable` tracks the newest tag
@@ -24,11 +29,29 @@ x-common: &common
   restart: unless-stopped
   stop_grace_period: 60s
   user: "1000:1000"
+  # The container's own memory ceiling, matched to DuckDB's in-process budget
+  # (WQ_DUCKDB_MEMORY_LIMIT=3GB below): the budget bounds the engine, but not
+  # Python or native allocations, and `memory_limit` spills rather than fails.
+  # 6 GB is the hard cap: hitting it means the kernel OOM-kills THIS container
+  # alone instead of starving the whole host - which a 16 GB, no-swap Unraid
+  # box shared with a Shadow and a KVM guest cannot survive again.
+  # mem_limit == memswap_limit means no swap beyond the limit: a container that
+  # goes past 6 GB is killed, not paged to an array disk.
+  mem_limit: 6g
+  memswap_limit: 6g
   environment:
     TZ: UTC
     WQ_DB_PATH: /data/weatherquant.duckdb
     WQ_RAW_DIR: /data/raw
     WQ_LOG_LEVEL: INFO
+    # The engine's in-process budget. Must stay well under the container's 6 GB
+    # ceiling so spill, Python and native allocations all have room.
+    WQ_DUCKDB_MEMORY_LIMIT: 3GB
+    WQ_DUCKDB_THREADS: "4"
+    # Where DuckDB spills when a query exceeds the budget. Under /data (the NAS
+    # array), never tmpfs: a tmpfs spill IS a memory allocation and would defeat
+    # the budget it exists to enforce.
+    WQ_DUCKDB_TEMP_DIR: /data/duckdb-spill
     # Build provenance, stamped by CI. Shown in the heartbeat and in
     # collector_runs so "which version produced this row?" is always answerable.
     GIT_SHA: ${GIT_SHA:-unknown}
@@ -54,8 +77,10 @@ services:
 # Backups are performed *by the collector itself* (see
 # docs/unraid-collector-deployment.md §9): the database file is locked for the
 # writer's whole life, so an external process cannot take a consistent copy of
-# it. The collector flushes, checkpoints, replays into a second database inside
-# one transaction, then re-opens the result read-only and compares row counts
-# before publishing it under backups/.
+# it. Since WQN-1 the copy runs on a background thread with its own connection
+# to the same in-process DuckDB instance: collection, heartbeats and the
+# health probe keep running while a multi-gigabyte backup crawls over FUSE.
+# A copy that exceeds --backup-timeout-seconds (default 1800) is abandoned and
+# the half-written .incomplete- file is discarded, never published.
 #
 # Moving that copy off the NAS is a separate schedule - see §9.3 in the guide.
