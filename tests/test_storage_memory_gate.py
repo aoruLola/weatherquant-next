@@ -74,12 +74,10 @@ def test_compose_points_spill_at_a_real_filesystem() -> None:
 def test_compose_carries_the_engine_budget_environment() -> None:
     text = _compose_text()
     assert re_search(r"WQ_DUCKDB_MEMORY_LIMIT:\s*3GB", text), (
-        "the engine budget must be explicit in the deployment, not left to "
-        "whatever the image defaults to"
+        "the engine budget must be explicit in the deployment, not left to whatever the image defaults to"
     )
     assert re_search(r"WQ_DUCKDB_THREADS:\s*\"4\"", text), (
-        "the thread pool must be pinned: one thread per core starves the "
-        "services this container shares the host with"
+        "the thread pool must be pinned: one thread per core starves the services this container shares the host with"
     )
 
 
@@ -91,9 +89,7 @@ def test_compose_budget_stays_well_under_the_container_cap() -> None:
     assert limit and cap
     engine_gb = float(limit.group(1)) * (1 if limit.group(2) == "GB" else 1 / 1024)
     cap_gb = float(cap.group(1)) * (1 if cap.group(2) == "g" else 1 / 1024)
-    assert engine_gb * 2 <= cap_gb, (
-        "engine budget leaves no room for spill, Python and native allocations"
-    )
+    assert engine_gb * 2 <= cap_gb, "engine budget leaves no room for spill, Python and native allocations"
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +199,7 @@ def test_a_sigkill_mid_write_loses_no_committed_transaction(tmp_path: Path) -> N
 
     journalled = _journal_batches(data)
     assert max_batch == rows // 500, "committed batches are not contiguous"
-    assert journalled <= max_batch <= journalled + 1, (
-        "the committed prefix moved backwards across a hard kill"
-    )
+    assert journalled <= max_batch <= journalled + 1, "the committed prefix moved backwards across a hard kill"
 
     # The replay folded in: a forced checkpoint must shrink the WAL away.
     con = connect(data / "weatherquant.duckdb")
@@ -226,7 +220,7 @@ _BACKUP_CHILD = textwrap.dedent(
     """
     import os, sys
     from pathlib import Path
-    from datetime import UTC, datetime, timedelta
+    from datetime import UTC, datetime
     data = Path(sys.argv[1])
     os.environ["WQ_DUCKDB_MEMORY_LIMIT"] = "512MB"
     os.environ["WQ_DUCKDB_TEMP_DIR"] = str(data / "spill")
@@ -242,18 +236,26 @@ _BACKUP_CHILD = textwrap.dedent(
         hostname="test", pid=os.getpid(),
     )
     now = datetime.now(tz=UTC)
-    for batch in range(60):
-        stamp = now - timedelta(seconds=batch)
-        for i in range(500):
-            n = batch * 500 + i
-            content = f"budget-{n:012x}"
-            writer.stage_book((
-                content, "BUDGET-M", f"TOKEN-{n % 100:03d}",
-                '[[0.55,"500"]]', '[[0.57,"450"]]', 0.55, 0.57, 0.02,
-                500.0, 450.0, "", stamp, stamp, "rest", "venue", content, "ok",
-                "budget-backup-test",
-            ))
-        writer.flush(force=True)
+    # Build the same 30,000-row backup workload in one engine operation.
+    # Per-row Python executemany can consume the entire timeout on slower
+    # Windows disks before the backup phase this test is meant to exercise.
+    writer.con.execute(
+        '''INSERT INTO order_books (
+            book_id, market_id, token_id, bids_json, asks_json,
+            best_bid, best_ask, spread, bid_depth_usd, ask_depth_usd,
+            defects, venue_ts, fetched_at_utc, source, venue_ts_origin,
+            content_hash, quality, run_id
+        ) SELECT
+            printf('budget-%012x', n), 'BUDGET-M', printf('TOKEN-%03d', n % 100),
+            '[[0.55,"500"]]', '[[0.57,"450"]]', 0.55, 0.57, 0.02, 500, 450, '',
+            ?::TIMESTAMPTZ - (n // 500) * INTERVAL '1 second',
+            ?::TIMESTAMPTZ - (n // 500) * INTERVAL '1 second',
+            'rest', 'venue', printf('budget-%012x', n), 'ok', 'budget-backup-test'
+        FROM range(30000) AS fixture(n)''',
+        [now, now],
+    )
+    writer.flush(force=True)
+    assert writer.con.execute("SELECT COUNT(*) FROM order_books").fetchone()[0] == 30000
     report = writer.backup(data / "backups")
     writer.close(status="stopped", reason="test done")
     print(f"BACKUP verified={report.ok} bytes={report.bytes_written or 0} "
