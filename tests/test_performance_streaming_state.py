@@ -212,9 +212,7 @@ def test_a_part_that_changed_after_being_consumed_is_refused(tmp_path) -> None:
     # Rewrite the last part with different content but the same row count.
     part = export / "parts" / "part-000000004.jsonl"
     replacement = [_dataset(seed=99, rows=100)]
-    part.write_text(
-        "".join(json.dumps(row) + "\n" for row in replacement[0]), encoding="utf-8"
-    )
+    part.write_text("".join(json.dumps(row) + "\n" for row in replacement[0]), encoding="utf-8")
 
     with pytest.raises(PerformanceStateError, match="changed after it was consumed"):
         _ingest_export(export, state_db)
@@ -315,20 +313,25 @@ def test_a_settlement_revision_updates_the_result_without_reingesting(tmp_path) 
     out = tmp_path / "performance"
 
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=settlements, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=settlements,
+        now=NOW,
     )
     before = _read_generation(out)["win-rate.json"]["data"]["overall"]
     assert before["valid_samples"] > 0
 
     # Every market flips its outcome.
-    flipped = [
-        {**row, "resolved_outcome": 0.0 if row["resolved_outcome"] == 1.0 else 1.0}
-        for row in settlements
-    ]
+    flipped = [{**row, "resolved_outcome": 0.0 if row["resolved_outcome"] == 1.0 else 1.0} for row in settlements]
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=flipped, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=flipped,
+        now=NOW,
     )
     after = _read_generation(out)["win-rate.json"]["data"]["overall"]
     assert after["valid_samples"] == before["valid_samples"]
@@ -337,7 +340,11 @@ def test_a_settlement_revision_updates_the_result_without_reingesting(tmp_path) 
 
     # And a run with no index at all keeps the answers it already has.
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture", now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        now=NOW,
     )
     kept = _read_generation(out)["win-rate.json"]["data"]["overall"]
     assert kept == after
@@ -350,14 +357,22 @@ def test_rebuilding_without_touching_the_export_is_supported(tmp_path) -> None:
     state_db = tmp_path / "state.duckdb"
     out = tmp_path / "performance"
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=_settlements(rows), now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=_settlements(rows),
+        now=NOW,
     )
     first = _read_generation(out)
 
     result = build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        ingest=False, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        ingest=False,
+        now=NOW,
     )
     assert result["ingest"] is None
     second = _read_generation(out)
@@ -383,16 +398,19 @@ def test_a_kept_settlement_answer_carries_its_retrieval_time(tmp_path) -> None:
     out = tmp_path / "performance"
 
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=index, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=index,
+        now=NOW,
     )
     first = _read_generation(out)
     answers = first["settlements.json"]["data"]["answers"]
     assert answers and all(row["fetched_at_utc"] for row in answers)
     assert all(row["verification_status"] == "VERIFIED" for row in answers)
     assert all(row["resolution_source"] for row in answers) is False, (
-        "this fixture records no source; NULL means 'not recorded', and it must "
-        "stay NULL rather than be filled in"
+        "this fixture records no source; NULL means 'not recorded', and it must stay NULL rather than be filled in"
     )
     freshness = first["settlements.json"]["data"]["freshness"]
     assert freshness["answers_without_retrieval_time"] == 0
@@ -402,11 +420,16 @@ def test_a_kept_settlement_answer_carries_its_retrieval_time(tmp_path) -> None:
 
     # No index this time.
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture", now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        now=NOW,
     )
     second = _read_generation(out)
-    assert second["win-rate.json"]["data"]["overall"]["valid_samples"] == (
-        first["win-rate.json"]["data"]["overall"]["valid_samples"]
+    assert (
+        second["win-rate.json"]["data"]["overall"]["valid_samples"]
+        == (first["win-rate.json"]["data"]["overall"]["valid_samples"])
     )
     assert second["settlements.json"]["data"]["freshness"] == freshness
     assert second["settlements.json"]["data"]["answers"] == answers
@@ -420,8 +443,12 @@ def test_an_answer_with_no_retrieval_time_says_so(tmp_path) -> None:
     state_db = tmp_path / "state.duckdb"
     out = tmp_path / "performance"
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=index, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=index,
+        now=NOW,
     )
     payload = _read_generation(out)["settlements.json"]
     freshness = payload["data"]["freshness"]
@@ -438,14 +465,15 @@ def test_only_the_revised_market_changes(tmp_path) -> None:
     state_db = tmp_path / "state.duckdb"
     out = tmp_path / "performance"
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=index, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=index,
+        now=NOW,
     )
     before = _read_generation(out)
-    before_episodes = {
-        row["episode_id"]: row["outcome"]
-        for row in published_episodes(tmp_path / "performance")
-    }
+    before_episodes = {row["episode_id"]: row["outcome"] for row in published_episodes(tmp_path / "performance")}
     target = index[0]
     flipped = [
         {**row, "resolved_outcome": 1.0 - row["resolved_outcome"]}
@@ -454,14 +482,15 @@ def test_only_the_revised_market_changes(tmp_path) -> None:
         for row in index
     ]
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=flipped, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=flipped,
+        now=NOW,
     )
     after = _read_generation(out)
-    after_episodes = {
-        row["episode_id"]: row["outcome"]
-        for row in published_episodes(tmp_path / "performance")
-    }
+    after_episodes = {row["episode_id"]: row["outcome"] for row in published_episodes(tmp_path / "performance")}
     changed = {key for key in before_episodes if before_episodes[key] != after_episodes[key]}
     affected = {
         row["episode_id"]
@@ -470,8 +499,8 @@ def test_only_the_revised_market_changes(tmp_path) -> None:
     }
     assert changed, "the revised market must change something"
     assert changed <= affected, "no other market may move"
-    assert before["summary.json"]["data"]["accept_observations"] == (
-        after["summary.json"]["data"]["accept_observations"]
+    assert (
+        before["summary.json"]["data"]["accept_observations"] == (after["summary.json"]["data"]["accept_observations"])
     ), "a settlement revision must not change a single episode aggregate"
 
 
@@ -489,8 +518,12 @@ def test_a_withdrawn_settlement_is_retracted_and_not_resurrected(tmp_path) -> No
     state_db = tmp_path / "state.duckdb"
     out = tmp_path / "performance"
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=index, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=index,
+        now=NOW,
     )
     before = _read_generation(out)
     assert len(before["settlements.json"]["data"]["answers"]) == len(index)
@@ -499,48 +532,50 @@ def test_a_withdrawn_settlement_is_retracted_and_not_resurrected(tmp_path) -> No
     remaining = [
         row
         for row in index
-        if (row["market_id"], row["target_date"])
-        != (withdrawn["market_id"], withdrawn["target_date"])
+        if (row["market_id"], row["target_date"]) != (withdrawn["market_id"], withdrawn["target_date"])
     ]
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=remaining, settlements_replace=True, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=remaining,
+        settlements_replace=True,
+        now=NOW,
     )
     after = _read_generation(out)
     answers = after["settlements.json"]["data"]["answers"]
     assert len(answers) == len(remaining)
     assert not any(
-        row["market_id"] == withdrawn["market_id"]
-        and row["target_date"] == withdrawn["target_date"]
-        for row in answers
+        row["market_id"] == withdrawn["market_id"] and row["target_date"] == withdrawn["target_date"] for row in answers
     )
     # Only the withdrawn (market, target date) loses its outcome; the same
     # market's other days keep theirs, because a retraction is per answer.
     retracted = [
         row
         for row in published_episodes(tmp_path / "performance")
-        if row["market_id"] == withdrawn["market_id"]
-        and row["target_date"] == withdrawn["target_date"]
+        if row["market_id"] == withdrawn["market_id"] and row["target_date"] == withdrawn["target_date"]
     ]
     assert retracted and all(row["outcome"] == "UNAVAILABLE" for row in retracted)
     still_scored = [
         row
         for row in published_episodes(tmp_path / "performance")
-        if row["market_id"] == withdrawn["market_id"]
-        and row["target_date"] != withdrawn["target_date"]
+        if row["market_id"] == withdrawn["market_id"] and row["target_date"] != withdrawn["target_date"]
     ]
     assert any(row["outcome"] in {"WIN", "LOSS"} for row in still_scored)
 
     # A later run with no index keeps the retraction.
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture", now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        now=NOW,
     )
     kept = _read_generation(out)["settlements.json"]["data"]["answers"]
     assert len(kept) == len(remaining)
     assert not any(
-        row["market_id"] == withdrawn["market_id"]
-        and row["target_date"] == withdrawn["target_date"]
-        for row in kept
+        row["market_id"] == withdrawn["market_id"] and row["target_date"] == withdrawn["target_date"] for row in kept
     )
 
 
@@ -559,8 +594,12 @@ def test_an_empty_settlement_index_is_refused_without_confirmation(tmp_path) -> 
     state_db = tmp_path / "state.duckdb"
     out = tmp_path / "performance"
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=index, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=index,
+        now=NOW,
     )
     before = _read_generation(out)
     assert len(before["settlements.json"]["data"]["answers"]) == len(index)
@@ -569,8 +608,13 @@ def test_an_empty_settlement_index_is_refused_without_confirmation(tmp_path) -> 
 
     with pytest.raises(PerformanceStateError, match="refusing to replace"):
         build_performance_streaming(
-            export=export, out_dir=out, state_db=state_db, dataset="fixture",
-            settlements=[], settlements_replace=True, now=NOW,
+            export=export,
+            out_dir=out,
+            state_db=state_db,
+            dataset="fixture",
+            settlements=[],
+            settlements_replace=True,
+            now=NOW,
         )
 
     after = _read_generation(out)
@@ -581,9 +625,7 @@ def test_an_empty_settlement_index_is_refused_without_confirmation(tmp_path) -> 
     # store is opened, so the watermark cannot have advanced either.
     with PerformanceStateStore(state_db) as store:
         assert store.load_state() == watermark_before
-    assert not list(tmp_path.glob("*.retracted-*.json")), (
-        "a refused retraction wrote a backup, so it did something"
-    )
+    assert not list(tmp_path.glob("*.retracted-*.json")), "a refused retraction wrote a backup, so it did something"
 
 
 def test_a_confirmed_empty_retraction_retracts_and_leaves_a_backup(tmp_path) -> None:
@@ -599,27 +641,32 @@ def test_a_confirmed_empty_retraction_retracts_and_leaves_a_backup(tmp_path) -> 
     state_db = tmp_path / "state.duckdb"
     out = tmp_path / "performance"
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=index, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=index,
+        now=NOW,
     )
     assert len(_read_generation(out)["settlements.json"]["data"]["answers"]) == len(index)
 
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=[], settlements_replace=True, confirm_empty_retraction=True,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=[],
+        settlements_replace=True,
+        confirm_empty_retraction=True,
         settlements_source="/tmp/settlements.json",
         retraction_reason="platform returned no resolutions for this window",
         now=NOW,
     )
 
     after = _read_generation(out)
-    assert after["settlements.json"]["data"]["answers"] == [], (
-        "the confirmed retraction did not retract"
-    )
+    assert after["settlements.json"]["data"]["answers"] == [], "the confirmed retraction did not retract"
     rate = after["win-rate.json"]["data"]["overall"]
-    assert rate["counts"]["WIN"] == 0 and rate["counts"]["LOSS"] == 0, (
-        "a retracted answer was still scored"
-    )
+    assert rate["counts"]["WIN"] == 0 and rate["counts"]["LOSS"] == 0, "a retracted answer was still scored"
     assert rate["valid_samples"] == 0
 
     backups = list(tmp_path.glob("*.retracted-*.json"))
@@ -642,17 +689,24 @@ def test_a_reason_is_recorded_as_null_rather_than_invented(tmp_path) -> None:
     export = _write_parts(tmp_path, rows, 2)
     state_db = tmp_path / "state.duckdb"
     build_performance_streaming(
-        export=export, out_dir=tmp_path / "p", state_db=state_db,
-        dataset="fixture", settlements=_settlements(rows), now=NOW,
+        export=export,
+        out_dir=tmp_path / "p",
+        state_db=state_db,
+        dataset="fixture",
+        settlements=_settlements(rows),
+        now=NOW,
     )
     build_performance_streaming(
-        export=export, out_dir=tmp_path / "p", state_db=state_db,
-        dataset="fixture", settlements=[], settlements_replace=True,
-        confirm_empty_retraction=True, now=NOW,
+        export=export,
+        out_dir=tmp_path / "p",
+        state_db=state_db,
+        dataset="fixture",
+        settlements=[],
+        settlements_replace=True,
+        confirm_empty_retraction=True,
+        now=NOW,
     )
-    payload = json.loads(
-        next(tmp_path.glob("*.retracted-*.json")).read_text(encoding="utf-8")
-    )
+    payload = json.loads(next(tmp_path.glob("*.retracted-*.json")).read_text(encoding="utf-8"))
     assert payload["reason"] is None
     assert payload["input_source"] is None
 
@@ -672,10 +726,14 @@ def test_confirm_empty_retraction_alone_is_refused(tmp_path, capsys) -> None:
     code = research_main(
         [
             "build-performance",
-            "--export", str(export),
-            "--out", str(tmp_path / "out"),
-            "--dataset", "fixture",
-            "--state-db", str(tmp_path / "state.duckdb"),
+            "--export",
+            str(export),
+            "--out",
+            str(tmp_path / "out"),
+            "--dataset",
+            "fixture",
+            "--state-db",
+            str(tmp_path / "state.duckdb"),
             "--confirm-empty-retraction",
         ]
     )
@@ -698,9 +756,17 @@ def test_the_empty_retraction_refusal_reaches_the_command(tmp_path, capsys) -> N
     assert (
         research_main(
             [
-                "build-performance", "--export", str(export),
-                "--out", str(tmp_path / "out"), "--dataset", "fixture",
-                "--state-db", str(state_db), "--settlements", str(index),
+                "build-performance",
+                "--export",
+                str(export),
+                "--out",
+                str(tmp_path / "out"),
+                "--dataset",
+                "fixture",
+                "--state-db",
+                str(state_db),
+                "--settlements",
+                str(index),
             ]
         )
         == 0
@@ -708,10 +774,18 @@ def test_the_empty_retraction_refusal_reaches_the_command(tmp_path, capsys) -> N
 
     code = research_main(
         [
-            "build-performance", "--export", str(export),
-            "--out", str(tmp_path / "out"), "--dataset", "fixture",
-            "--state-db", str(state_db),
-            "--settlements", str(empty), "--settlements-replace",
+            "build-performance",
+            "--export",
+            str(export),
+            "--out",
+            str(tmp_path / "out"),
+            "--dataset",
+            "fixture",
+            "--state-db",
+            str(state_db),
+            "--settlements",
+            str(empty),
+            "--settlements-replace",
         ]
     )
     assert code == 2
@@ -737,13 +811,17 @@ def test_an_existing_state_database_keeps_working(tmp_path) -> None:
     export = _write_parts(tmp_path, rows, 2)
     state_db = tmp_path / "state.duckdb"
     build_performance_streaming(
-        export=export, out_dir=tmp_path / "p", state_db=state_db,
-        dataset="fixture", settlements=_settlements(rows), now=NOW,
+        export=export,
+        out_dir=tmp_path / "p",
+        state_db=state_db,
+        dataset="fixture",
+        settlements=_settlements(rows),
+        now=NOW,
     )
 
     versions = [spec.version for spec in available_migrations(PERFORMANCE_MIGRATIONS_DIR)]
     assert versions == sorted(versions, key=int), versions
-    assert versions == ["0001", "0002", "0003"], (
+    assert versions == ["0001", "0002", "0003", "0004"], (
         "0003 adds the ingest columns for the write-sequence cursor (WQN-20); "
         "any other new one here means an existing state database has to be "
         "upgraded before it can be read, which is a decision to make openly"
@@ -756,8 +834,11 @@ def test_an_existing_state_database_keeps_working(tmp_path) -> None:
     assert before
 
     build_performance_streaming(
-        export=export, out_dir=tmp_path / "p", state_db=state_db,
-        dataset="fixture", now=NOW,
+        export=export,
+        out_dir=tmp_path / "p",
+        state_db=state_db,
+        dataset="fixture",
+        now=NOW,
     )
     with PerformanceStateStore(state_db) as store:
         assert len(store.load_settlements()) == len(before), (
@@ -775,8 +856,12 @@ def test_the_settlement_layer_records_where_it_came_from(tmp_path) -> None:
     export = _write_parts(tmp_path, rows, 2)
     out = tmp_path / "performance"
     build_performance_streaming(
-        export=export, out_dir=out, state_db=tmp_path / "state.duckdb", dataset="fixture",
-        settlements=index, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=tmp_path / "state.duckdb",
+        dataset="fixture",
+        settlements=index,
+        now=NOW,
     )
     payload = _read_generation(out)["settlements.json"]["data"]
     assert all(row["resolution_source"] == "clob:/v2/resolutions" for row in payload["answers"])
@@ -787,15 +872,18 @@ def test_the_settlement_layer_records_where_it_came_from(tmp_path) -> None:
     assert manifest["generated_at_utc"]
 
 
-
 def test_the_manifest_describes_how_the_batch_was_built(tmp_path) -> None:
     rows = _dataset(seed=121, rows=300)
     export = _write_parts(tmp_path, rows, 2)
     state_db = tmp_path / "state.duckdb"
     out = tmp_path / "performance"
     result = build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=_settlements(rows), now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=_settlements(rows),
+        now=NOW,
     )
     generation = resolve_generation(out)
     assert generation.manifest is not None
@@ -814,9 +902,7 @@ def test_the_manifest_describes_how_the_batch_was_built(tmp_path) -> None:
     assert manifest["streaming"]["open_episodes"] >= 0
     # Every file carries the same generation id as the pointer names.
     for name in ("summary.json", "edge.json", "win-rate.json", "opportunities.json"):
-        assert json.loads((generation.directory / name).read_text())["generation_id"] == manifest[
-            "generation_id"
-        ]
+        assert json.loads((generation.directory / name).read_text())["generation_id"] == manifest["generation_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +918,7 @@ def test_peak_memory_does_not_grow_with_the_history(tmp_path) -> None:
     DuckDB's, bounded by ``memory_limit`` and spilled to disk, so they do not
     show up here - which is the point of the split.
     """
+
     def peak(total_rows: int) -> int:
         # The *part* size is held constant, because a part is the batch and a
         # bigger batch is a bigger buffer by design. What must not grow is the
@@ -903,11 +990,16 @@ def test_the_documented_streaming_command_publishes_a_generation(tmp_path, capsy
     code = research_main(
         [
             "build-performance",
-            "--export", str(export),
-            "--out", str(out),
-            "--dataset", "fixture",
-            "--settlements", str(settlement_path),
-            "--state-db", str(state_db),
+            "--export",
+            str(export),
+            "--out",
+            str(out),
+            "--dataset",
+            "fixture",
+            "--settlements",
+            str(settlement_path),
+            "--state-db",
+            str(state_db),
         ]
     )
     printed = capsys.readouterr().out
@@ -918,15 +1010,22 @@ def test_the_documented_streaming_command_publishes_a_generation(tmp_path, capsy
     assert state_db.exists()
 
     # A second run has nothing to ingest but still republishes.
-    assert research_main(
-        [
-            "build-performance",
-            "--export", str(export),
-            "--out", str(out),
-            "--dataset", "fixture",
-            "--state-db", str(state_db),
-        ]
-    ) == 0
+    assert (
+        research_main(
+            [
+                "build-performance",
+                "--export",
+                str(export),
+                "--out",
+                str(out),
+                "--dataset",
+                "fixture",
+                "--state-db",
+                str(state_db),
+            ]
+        )
+        == 0
+    )
     assert "consumed 0 row(s)" in capsys.readouterr().out
 
 
@@ -935,16 +1034,18 @@ def test_the_command_refuses_to_mix_a_file_export_with_a_state_store(tmp_path, c
 
     rows = _dataset(seed=141, rows=50)
     export_file = tmp_path / "decisions.jsonl"
-    export_file.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
-    )
+    export_file.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     code = research_main(
         [
             "build-performance",
-            "--export", str(export_file),
-            "--out", str(tmp_path / "out"),
-            "--dataset", "fixture",
-            "--state-db", str(tmp_path / "state.duckdb"),
+            "--export",
+            str(export_file),
+            "--out",
+            str(tmp_path / "out"),
+            "--dataset",
+            "fixture",
+            "--state-db",
+            str(tmp_path / "state.duckdb"),
         ]
     )
     assert code == 2
@@ -959,9 +1060,12 @@ def test_in_memory_on_a_directory_warns_before_doing_it(tmp_path, capsys) -> Non
     code = research_main(
         [
             "build-performance",
-            "--export", str(export),
-            "--out", str(tmp_path / "out"),
-            "--dataset", "fixture",
+            "--export",
+            str(export),
+            "--out",
+            str(tmp_path / "out"),
+            "--dataset",
+            "fixture",
             "--in-memory",
         ]
     )
@@ -969,9 +1073,7 @@ def test_in_memory_on_a_directory_warns_before_doing_it(tmp_path, capsys) -> Non
     assert "WARNING: --in-memory" in capsys.readouterr().err
 
 
-def test_a_state_store_built_from_another_export_is_refused_by_the_command(
-    tmp_path, capsys
-) -> None:
+def test_a_state_store_built_from_another_export_is_refused_by_the_command(tmp_path, capsys) -> None:
     from weatherquant.cli import main as research_main
 
     rows = _dataset(seed=161, rows=200)
@@ -983,10 +1085,14 @@ def test_a_state_store_built_from_another_export_is_refused_by_the_command(
     code = research_main(
         [
             "build-performance",
-            "--export", str(other_export),
-            "--out", str(tmp_path / "out"),
-            "--dataset", "fixture",
-            "--state-db", str(state_db),
+            "--export",
+            str(other_export),
+            "--out",
+            str(tmp_path / "out"),
+            "--dataset",
+            "fixture",
+            "--state-db",
+            str(state_db),
         ]
     )
     assert code == 2
@@ -1003,12 +1109,18 @@ def test_the_detail_window_is_configurable_from_the_command(tmp_path, capsys) ->
     code = research_main(
         [
             "build-performance",
-            "--export", str(export),
-            "--out", str(out),
-            "--dataset", "fixture",
-            "--state-db", str(tmp_path / "state.duckdb"),
-            "--detail-window-episodes", "7",
-            "--detail-window-days", "3650",
+            "--export",
+            str(export),
+            "--out",
+            str(out),
+            "--dataset",
+            "fixture",
+            "--state-db",
+            str(tmp_path / "state.duckdb"),
+            "--detail-window-episodes",
+            "7",
+            "--detail-window-days",
+            "3650",
         ]
     )
     assert code == 0, capsys.readouterr().err
@@ -1043,14 +1155,23 @@ def test_an_empty_authoritative_index_retracts_everything(tmp_path) -> None:
     state_db = tmp_path / "state.duckdb"
     out = tmp_path / "performance"
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=index, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=index,
+        now=NOW,
     )
     assert _read_generation(out)["settlements.json"]["data"]["answers"]
 
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=[], settlements_replace=True, confirm_empty_retraction=True,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=[],
+        settlements_replace=True,
+        confirm_empty_retraction=True,
         now=NOW,
     )
     after = _read_generation(out)
@@ -1075,14 +1196,23 @@ def test_an_authoritative_index_keeps_what_it_lists(tmp_path) -> None:
     state_db = tmp_path / "state.duckdb"
     out = tmp_path / "performance"
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=index, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=index,
+        now=NOW,
     )
     kept = index[: len(index) // 2]
     flipped = [{**row, "resolved_outcome": 1.0 if not row["resolved_outcome"] else 0.0} for row in kept]
     build_performance_streaming(
-        export=export, out_dir=out, state_db=state_db, dataset="fixture",
-        settlements=flipped, settlements_replace=True, now=NOW,
+        export=export,
+        out_dir=out,
+        state_db=state_db,
+        dataset="fixture",
+        settlements=flipped,
+        settlements_replace=True,
+        now=NOW,
     )
     answers = _read_generation(out)["settlements.json"]["data"]["answers"]
     assert len(answers) == len(kept)
@@ -1110,12 +1240,12 @@ def test_a_store_from_the_previous_migration_upgrades_in_place(tmp_path) -> None
     from weatherquant.storage.migrator import available_migrations
 
     state_db = tmp_path / "old-state.duckdb"
-    legacy = next(
-        spec for spec in available_migrations(PERFORMANCE_MIGRATIONS_DIR) if spec.version == "0001"
-    )
+    legacy = next(spec for spec in available_migrations(PERFORMANCE_MIGRATIONS_DIR) if spec.version == "0001")
     con = connect(state_db)
-    con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR PRIMARY KEY, "
-                "name VARCHAR NOT NULL, checksum VARCHAR NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR PRIMARY KEY, "
+        "name VARCHAR NOT NULL, checksum VARCHAR NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    )
     con.execute(legacy.sql)
     con.execute(
         "INSERT INTO schema_migrations (version, name, checksum) VALUES (?, ?, ?)",
@@ -1143,10 +1273,24 @@ def test_a_store_from_the_previous_migration_upgrades_in_place(tmp_path) -> None
         "edge_count, sum_edges, first_edge, last_edge, max_edge, min_edge, is_open, "
         "opened_seq, ingested_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            "ep-old", episode_key_hash(EpisodeKey("m-0", "2026-10-13", "calibrated", "buy_yes", "LIVE")),
-            "m-0", "2026-10-13", "calibrated", "buy_yes", "LIVE",
-            datetime(2026, 10, 12, tzinfo=UTC), datetime(2026, 10, 12, 0, 5, tzinfo=UTC),
-            1, 1, 0.05, 0.05, 0.05, 0.05, 0.05, False, 0,
+            "ep-old",
+            episode_key_hash(EpisodeKey("m-0", "2026-10-13", "calibrated", "buy_yes", "LIVE")),
+            "m-0",
+            "2026-10-13",
+            "calibrated",
+            "buy_yes",
+            "LIVE",
+            datetime(2026, 10, 12, tzinfo=UTC),
+            datetime(2026, 10, 12, 0, 5, tzinfo=UTC),
+            1,
+            1,
+            0.05,
+            0.05,
+            0.05,
+            0.05,
+            0.05,
+            False,
+            0,
             datetime(2026, 10, 12, tzinfo=UTC),
         ],
     )

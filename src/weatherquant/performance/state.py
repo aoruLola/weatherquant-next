@@ -84,7 +84,7 @@ __all__ = [
 #: Bumped whenever the *fold* changes in a way that invalidates stored
 #: aggregates. The store refuses to be extended across a change: the numbers
 #: would be a mixture of two algorithms, which is worse than a rebuild.
-PERFORMANCE_ALGORITHM_VERSION = "performance-streaming-1"
+PERFORMANCE_ALGORITHM_VERSION = "performance-streaming-2"
 
 PERFORMANCE_MIGRATIONS_DIR = Path(__file__).parent.parent / "storage" / "migrations_performance"
 
@@ -195,9 +195,7 @@ class IngestState:
         return (self.last_end_cursor_time, self.last_end_cursor_id or "")
 
     def folder_state(self) -> FolderState:
-        return FolderState(
-            row_seq=self.row_seq, last_instant=self.last_instant, prev_instant=self.prev_instant
-        )
+        return FolderState(row_seq=self.row_seq, last_instant=self.last_instant, prev_instant=self.prev_instant)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -295,10 +293,34 @@ def _frame(columns: Sequence[str], specs: Sequence[str], rows: Sequence[Sequence
 
 
 _EPISODE_SPECS = (
-    "text", "text", "text", "text", "text", "text", "text", "ts", "ts",
-    "int", "int", "float", "float", "float", "float", "float",
-    "float", "float", "float", "text", "text", "text", "float", "bool", "text",
-    "int", "int", "ts",
+    "text",
+    "text",
+    "text",
+    "text",
+    "text",
+    "text",
+    "text",
+    "ts",
+    "ts",
+    "int",
+    "int",
+    "float",
+    "float",
+    "float",
+    "float",
+    "float",
+    "float",
+    "float",
+    "float",
+    "text",
+    "text",
+    "text",
+    "float",
+    "bool",
+    "text",
+    "int",
+    "int",
+    "ts",
 )
 
 _EPISODE_COLUMNS = (
@@ -349,7 +371,16 @@ _SETTLEMENT_COLUMNS = (
     "updated_at_utc",
 )
 _SETTLEMENT_SPECS = (
-    "text", "text", "text", "text", "float", "bool", "text", "text", "ts", "ts",
+    "text",
+    "text",
+    "text",
+    "text",
+    "float",
+    "bool",
+    "text",
+    "text",
+    "ts",
+    "ts",
 )
 
 _PART_COLUMNS = ("part_index", "rows", "end_cursor_time", "end_cursor_id", "sha256", "consumed_at_utc")
@@ -550,8 +581,7 @@ class PerformanceStateStore:
 
     def recorded_parts(self) -> dict[int, PartRecord]:
         rows = self.fetchall(
-            "SELECT part_index, rows, end_cursor_time, end_cursor_id, sha256 "
-            "FROM performance_parts ORDER BY part_index"
+            "SELECT part_index, rows, end_cursor_time, end_cursor_id, sha256 FROM performance_parts ORDER BY part_index"
         )
         return {
             int(r[0]): PartRecord(
@@ -569,14 +599,16 @@ class PerformanceStateStore:
             "performance_parts",
             _PART_COLUMNS,
             _PART_SPECS,
-            [[
-                part.index,
-                part.rows,
-                part.end_cursor_time,
-                part.end_cursor_id,
-                part.sha256,
-                datetime.now(tz=UTC),
-            ]],
+            [
+                [
+                    part.index,
+                    part.rows,
+                    part.end_cursor_time,
+                    part.end_cursor_id,
+                    part.sha256,
+                    datetime.now(tz=UTC),
+                ]
+            ],
             replace=True,
         )
 
@@ -609,9 +641,7 @@ class PerformanceStateStore:
         column_list = ", ".join(columns)
         self.con.register(staging, frame)
         try:
-            self.con.execute(
-                f"{verb} INTO {table} ({column_list}) SELECT {column_list} FROM {staging}"
-            )
+            self.con.execute(f"{verb} INTO {table} ({column_list}) SELECT {column_list} FROM {staging}")
         finally:
             self.con.unregister(staging)
 
@@ -702,12 +732,8 @@ class PerformanceStateStore:
         """
         self._write_episode_rows([self._closed_row(episode, open_ep, closed_seq)])
 
-    def upsert_closed_episodes(
-        self, records: Iterable[tuple[Episode, OpenEpisode, int]]
-    ) -> None:
-        self._write_episode_rows(
-            [self._closed_row(episode, open_ep, seq) for episode, open_ep, seq in records]
-        )
+    def upsert_closed_episodes(self, records: Iterable[tuple[Episode, OpenEpisode, int]]) -> None:
+        self._write_episode_rows([self._closed_row(episode, open_ep, seq) for episode, open_ep, seq in records])
 
     @staticmethod
     def _closed_row(episode: Episode, open_ep: OpenEpisode, closed_seq: int) -> list[Any]:
@@ -743,9 +769,7 @@ class PerformanceStateStore:
         ]
 
     def _write_episode_rows(self, rows: list[list[Any]]) -> None:
-        self._insert_rows(
-            "performance_episodes", _EPISODE_COLUMNS, _EPISODE_SPECS, rows, replace=True
-        )
+        self._insert_rows("performance_episodes", _EPISODE_COLUMNS, _EPISODE_SPECS, rows, replace=True)
 
     #: Every column a published episode needs. One list, so the two cursors
     #: below cannot disagree about the shape of a row.
@@ -757,9 +781,7 @@ class PerformanceStateStore:
         "opened_seq, is_open, end_reason FROM performance_episodes"
     )
 
-    def iter_detail_window(
-        self, *, since: datetime, limit: int
-    ) -> Iterator[StoredEpisode]:
+    def iter_detail_window(self, *, since: datetime, limit: int) -> Iterator[StoredEpisode]:
         """The most recent episodes, newest first, capped.
 
         The store's twin of ``snapshot.detail_window``: same predicate
@@ -768,8 +790,7 @@ class PerformanceStateStore:
         which is what lets a keyset cursor be reproducible.
         """
         cursor = self.cursor(
-            f"{self._EPISODE_SELECT} WHERE first_seen_utc >= ? "
-            "ORDER BY first_seen_utc DESC, episode_id DESC LIMIT ?",
+            f"{self._EPISODE_SELECT} WHERE first_seen_utc >= ? ORDER BY first_seen_utc DESC, episode_id DESC LIMIT ?",
             [since, limit],
         )
         while True:
@@ -780,11 +801,7 @@ class PerformanceStateStore:
                 yield _stored_episode(row)
 
     def count_episodes_since(self, since: datetime) -> int:
-        return int(
-            self.fetchone(
-                "SELECT count(*) FROM performance_episodes WHERE first_seen_utc >= ?", [since]
-            )[0]
-        )
+        return int(self.fetchone("SELECT count(*) FROM performance_episodes WHERE first_seen_utc >= ?", [since])[0])
 
     def iter_episodes(self) -> Iterator[StoredEpisode]:
         """Walk every episode in the order the whole-history builder published.
@@ -798,8 +815,7 @@ class PerformanceStateStore:
         sequence number the fold assigned.
         """
         cursor = self.cursor(
-            f"{self._EPISODE_SELECT} "
-            "ORDER BY first_seen_utc, is_open, COALESCE(closed_seq, opened_seq)"
+            f"{self._EPISODE_SELECT} ORDER BY first_seen_utc, is_open, COALESCE(closed_seq, opened_seq)"
         )
         while True:
             rows = cursor.fetchmany(1000)
@@ -842,9 +858,7 @@ class PerformanceStateStore:
     def distinct_counts(self) -> dict[str, int]:
         return {
             "markets": int(self.fetchone("SELECT count(*) FROM performance_markets_seen")[0]),
-            "target_dates": int(
-                self.fetchone("SELECT count(*) FROM performance_target_dates_seen")[0]
-            ),
+            "target_dates": int(self.fetchone("SELECT count(*) FROM performance_target_dates_seen")[0]),
             "models": int(self.fetchone("SELECT count(*) FROM performance_models_seen")[0]),
         }
 
@@ -903,9 +917,7 @@ class PerformanceStateStore:
                 fetched_at,
             ) in answers.items()
         ]
-        self._insert_rows(
-            "performance_settlements", _SETTLEMENT_COLUMNS, _SETTLEMENT_SPECS, rows, replace=True
-        )
+        self._insert_rows("performance_settlements", _SETTLEMENT_COLUMNS, _SETTLEMENT_SPECS, rows, replace=True)
 
     def replace_settlements(
         self,
@@ -928,8 +940,7 @@ class PerformanceStateStore:
         removed = sorted(existing - keep)
         if removed:
             self.con.execute(
-                "DELETE FROM performance_settlements WHERE key_hash IN "
-                f"({', '.join(['?'] * len(removed))})",
+                f"DELETE FROM performance_settlements WHERE key_hash IN ({', '.join(['?'] * len(removed))})",
                 removed,
             )
         self.upsert_settlements(answers)
