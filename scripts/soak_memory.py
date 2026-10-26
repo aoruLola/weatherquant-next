@@ -208,8 +208,7 @@ def run_collection(data_dir: Path, minutes: float, interval_s: float) -> PhaseRe
             )
             if proc.poll() is not None:
                 report.events.append(
-                    f"collector exited early with code {proc.returncode} "
-                    f"after {(time.monotonic() - started):.0f}s"
+                    f"collector exited early with code {proc.returncode} after {(time.monotonic() - started):.0f}s"
                 )
                 break
             time.sleep(interval_s)
@@ -246,20 +245,24 @@ def _synthetic_books(batch_index: int, rows: int, run_id: str, base: datetime) -
         content = f"synthetic-{n:016x}"
         out.append(
             (
-                content,           # book_id
-                "SOAK-MARKET",     # market_id
-                token,             # token_id
-                bids, asks,        # levels json
-                0.55, 0.57, 0.02,  # best bid / ask / spread
-                800.0, 700.0,      # depths
-                "",                # defects
-                stamp,             # venue_ts
-                stamp,             # fetched_at_utc
-                "rest",            # source
-                "venue",           # venue_ts_origin
-                content,           # content_hash column
-                "ok",              # quality
-                run_id,            # run_id
+                content,  # book_id
+                "SOAK-MARKET",  # market_id
+                token,  # token_id
+                bids,
+                asks,  # levels json
+                0.55,
+                0.57,
+                0.02,  # best bid / ask / spread
+                800.0,
+                700.0,  # depths
+                "",  # defects
+                stamp,  # venue_ts
+                stamp,  # fetched_at_utc
+                "rest",  # source
+                "venue",  # venue_ts_origin
+                content,  # content_hash column
+                "ok",  # quality
+                run_id,  # run_id
             )
         )
     return out
@@ -311,8 +314,7 @@ def run_backup_cycle(
         time.sleep(2.0)
     if lock_path.exists():
         raise RuntimeError(
-            "the collector's single-instance lock is still held; the backup "
-            "cycle phase refuses to open a second writer"
+            "the collector's single-instance lock is still held; the backup cycle phase refuses to open a second writer"
         )
 
     writer = CollectorWriter(
@@ -429,16 +431,16 @@ def _report(
     spill = Path(os.environ.get("WQ_DUCKDB_TEMP_DIR", data_dir / "spill"))
     if spill.exists():
         total = sum(p.stat().st_size for p in spill.rglob("*") if p.is_file())
-        print(f"\n  spill directory     {spill}: {total / 1024 / 1024:.1f} MiB "
-              "(on disk, not in RAM - the budget's escape valve)")
+        print(
+            f"\n  spill directory     {spill}: {total / 1024 / 1024:.1f} MiB "
+            "(on disk, not in RAM - the budget's escape valve)"
+        )
 
     failures: list[str] = []
     if any("exited early" in e for e in collection.events):
         failures.append("the collector exited before the window closed")
     if collection.peak_rss() > float(gates["max_rss_mb"]):
-        failures.append(
-            f"peak RSS {collection.peak_rss():.0f} MiB above the gate {gates['max_rss_mb']} MiB"
-        )
+        failures.append(f"peak RSS {collection.peak_rss():.0f} MiB above the gate {gates['max_rss_mb']} MiB")
     if collection.slope_mb_per_min() > float(gates["max_slope_mb_per_min"]):
         failures.append(
             f"RSS slope {collection.slope_mb_per_min():.1f} MiB/min above the gate "
@@ -451,6 +453,12 @@ def _report(
         )
     if not backup_summary.get("verified"):
         failures.append(f"backup did not verify: {backup_summary.get('error')}")
+
+    backup_peak = max(backup.peak_rss(), float(backup_summary.get("hwm_mb") or 0.0))
+    if backup_peak > float(gates["max_rss_mb"]):
+        failures.append(f"backup peak RSS {backup_peak:.0f} MiB above the gate {gates['max_rss_mb']} MiB")
+    if backup.peak_psi_full() > float(gates["max_psi_full"]):
+        failures.append(f"backup memory PSI full avg10 peaked at {backup.peak_psi_full():.2f}%")
 
     hb = read_heartbeat(data_dir)
     if hb is None:
@@ -490,11 +498,15 @@ def main() -> int:
     parser.add_argument("--max-rss-mb", type=float, default=3072.0)
     parser.add_argument("--max-slope-mb-per-min", type=float, default=8.0)
     parser.add_argument("--max-psi-full", type=float, default=2.0)
-    parser.add_argument("--backup-batches", type=int, default=400,
-                        help="synthetic batches fed before the backup (batch = 500 rows)")
-    parser.add_argument("--flush-rows", type=int, default=500,
-                        help="writer flush threshold for the backup-cycle phase; "
-                             "500 is production cadence, raise it for fewer commits")
+    parser.add_argument(
+        "--backup-batches", type=int, default=400, help="synthetic batches fed before the backup (batch = 500 rows)"
+    )
+    parser.add_argument(
+        "--flush-rows",
+        type=int,
+        default=500,
+        help="writer flush threshold for the backup-cycle phase; 500 is production cadence, raise it for fewer commits",
+    )
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
 
@@ -515,9 +527,7 @@ def main() -> int:
     if not db_path.exists():
         print("collector produced no database; nothing to run the backup against", file=sys.stderr)
         return 2
-    backup, backup_summary = run_backup_cycle(
-        db_path, data_dir, args.backup_batches, 500, flush_rows=args.flush_rows
-    )
+    backup, backup_summary = run_backup_cycle(db_path, data_dir, args.backup_batches, 500, flush_rows=args.flush_rows)
 
     gates = {
         "max_rss_mb": args.max_rss_mb,

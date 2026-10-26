@@ -217,3 +217,8 @@ cat /proc/pressure/memory
 4. `mem_limit` / `memswap_limit` 是 compose v2 的非 swarm 字段。Unraid
    Compose Manager 使用 docker compose v2，支持它们；若换部署方式，需把
    限制迁移成 `deploy.resources.limits` 并重跑 §4.2 的检查。
+
+
+### 评审修复验证
+
+资源门禁覆盖采集与备份两个阶段。备份阶段采样 RSS、进程 VmHWM 和 PSI 任一超限都导致非零退出，备份校验成功不会覆盖资源超限。
