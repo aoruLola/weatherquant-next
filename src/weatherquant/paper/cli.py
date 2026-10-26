@@ -27,6 +27,7 @@ from weatherquant.paper.books import ArchiveBookSource
 from weatherquant.paper.config import PaperSettings
 from weatherquant.paper.consumer import SignalConsumer
 from weatherquant.paper.fills import FillEngine
+from weatherquant.paper.ledger import Ledger
 from weatherquant.paper.store import ACCOUNT_ID, PaperStore
 from weatherquant.storage.paper import PaperDatabase
 
@@ -123,6 +124,13 @@ def _cmd_init(settings: PaperSettings) -> int:
             initial_capital_usdc=settings.initial_capital_usdc,
             now=datetime.now(tz=UTC),
         )
+        # The ledger opens with the account: the OPEN entry and the balances
+        # row are the first two facts every later figure is derived from.
+        ledger = Ledger(store)
+        ledger.open_account(
+            initial_capital_usdc=settings.initial_capital_usdc,
+            now=datetime.now(tz=UTC),
+        )
         run_id = db.start_run(
             "paper-init",
             {
@@ -214,10 +222,15 @@ def _cmd_status(settings: PaperSettings) -> int:
     if db_path.exists():
         with PaperDatabase(db_path) as db:
             store = PaperStore(db)
+            ledger = Ledger(store)
             payload["account"] = store.account()
+            payload["balances"] = ledger.balances()
+            payload["open_positions"] = [p.as_dict() for p in ledger.positions()]
             payload["signals"] = store.signal_counts()
             payload["refusals"] = store.refusal_counts()
             payload["quality_events"] = store.quality_counts()
+            if ledger.balances() is not None:
+                payload["ledger_consistent"] = ledger.verify()["consistent"]
     print(json.dumps(payload, sort_keys=True, default=str, indent=2))
     return 0
 

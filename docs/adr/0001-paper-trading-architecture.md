@@ -85,6 +85,25 @@ paper 包内:无 venue client、无钱包、无私钥、无订单签名;不产�
 接口层面不存在)。所有"成交"都是本引擎数据库里的一行,由
 `execution/pricing.py` 按真实盘口深度计算。
 
+### D7. 记账:六个桶分开,一个守恒律兜底(WQN-42)
+
+现金(available)、占用(occupied,持仓成本占用)、已实现盈亏(realized,
+**只来自卖出**,未结算仓位一律没有已实现盈亏)、仓位(份额/均价/成本基)、
+台账(append-only,每笔带现金流水余额)、估值(读取时计算,缺标记报
+`MARK_UNAVAILABLE`,绝不补零、绝不静默跳过)分别建账。守恒律:
+
+```
+available + occupied == initial_capital + realized_pnl
+```
+
+三层执行:存储层 CHECK 拒绝负余额;`Ledger.verify()` 用台账重放对账
+(重启恢复的证明);`entry_id = hash(kind|ref)` 让重放结算天然幂等
+(不重复扣款/释放)。现金金额用**交易所真实口径**:买入流出 =
+fill + fees,卖出流入 = fill − fees;execution buffer 是影子定价的
+保守边际,不是现金,永不进台账。每次成交 = 台账变动 + 仓位变动 +
+fill 行 + 信号状态迁移,同一事务;任何一层拒绝(无资金/无库存)则
+整笔不落账。
+
 ## 后果
 
 * 正面:四个引擎生命周期(collector/shadow/research/paper)互不可写;
@@ -100,5 +119,8 @@ paper 包内:无 venue client、无钱包、无私钥、无订单签名;不产�
 
 
 ### 评审修复验证
+
+成交保持批次内业务时间顺序。回归用同批先买后卖验证库存释放和两笔成交均落账，避免按哈希 ID 提前拒绝卖单。
+
 
 同一消费批次的待成交信号按决策时间排序，decision_id 只用于同一时刻的稳定排序，避免哈希顺序反转先买后卖。

@@ -45,6 +45,12 @@ from weatherquant.execution.pricing import (
 from weatherquant.markets.models import Side
 from weatherquant.paper.books import ArchiveBookSource, BookEvidence
 from weatherquant.paper.events import RefusalReason
+from weatherquant.paper.ledger import (
+    InsufficientFunds,
+    InsufficientInventory,
+    Ledger,
+    LedgerError,
+)
 from weatherquant.paper.store import PaperStore
 
 __all__ = ["FillEngine", "FillOutcome", "FillResult", "PaperFill"]
@@ -134,6 +140,7 @@ class FillEngine:
         max_book_age_seconds: float = 90.0,
         clock: Any = None,
         batch_signals: int = 100,
+        ledger: Ledger | None = None,
     ) -> None:
         if buffer_fraction < 0.0:
             raise ValueError("buffer_fraction must be >= 0")
@@ -146,13 +153,16 @@ class FillEngine:
         self.max_book_age_seconds = float(max_book_age_seconds)
         self.clock = clock or (lambda: datetime.now(tz=UTC))
         self.batch_signals = int(batch_signals)
+        self.ledger = ledger if ledger is not None else Ledger(store)
 
     def fill_pending(self) -> FillResult:
         """Fill every ACCEPTED signal currently in the account, bounded.
 
-        Fill rows, outcome transitions and the batch commit together: a
-        signal is never left ACCEPTED with a fill row beside it, nor FILLED
-        without one.
+        The ledger movement, the fill row, the position and the outcome
+        transition commit together, in one transaction per batch: a signal is
+        never left ACCEPTED with a fill row beside it, nor FILLED without its
+        debit. A ledger refusal (no funds, no inventory) converts the signal
+        to a recorded refusal instead of writing half a trade.
         """
         result = FillResult()
         try:
@@ -168,12 +178,21 @@ class FillEngine:
             with self.store.db.transaction():
                 for outcome in outcomes:
                     if outcome.filled and outcome.fill is not None:
-                        self.store.record_fill(outcome.fill)
+                        settled, refusal = self._settle(outcome.fill, now)
+                        if settled:
+                            self.store.record_fill(outcome.fill)
+                            self.store.set_signal_outcome(
+                                outcome.decision_id,
+                                outcome="FILLED",
+                            )
+                            continue
+                        outcome.filled = False
+                        outcome.reason, outcome.detail = refusal
                     self.store.set_signal_outcome(
                         outcome.decision_id,
-                        outcome="FILLED" if outcome.filled else "REFUSED",
-                        refusal_reason=outcome.reason if not outcome.filled else None,
-                        refusal_detail=outcome.detail if not outcome.filled else None,
+                        outcome="REFUSED",
+                        refusal_reason=outcome.reason,
+                        refusal_detail=outcome.detail,
                     )
             for outcome in outcomes:
                 if outcome.filled:
@@ -185,6 +204,32 @@ class FillEngine:
         except Exception as exc:  # a side channel must not raise
             result.notes.append(f"fill pass failed: {type(exc).__name__}: {exc}")
         return result
+
+    def _settle(self, fill: PaperFill, now: datetime) -> tuple[bool, tuple[str, str] | None]:
+        """Move the cash and the position for a priced fill.
+
+        Returns ``(True, None)`` when settled, or ``(False, (reason, detail))``
+        when the ledger refused. The ledger's own methods raise rather than
+        write half a movement, and the caller's transaction makes the
+        refusal leave nothing behind.
+        """
+        is_buy = fill.side == "buy"
+        try:
+            if is_buy:
+                applied = self.ledger.apply_buy(fill, now=now)
+            else:
+                applied = self.ledger.apply_sell(fill, now=now)
+        except InsufficientFunds as exc:
+            return False, (RefusalReason.INSUFFICIENT_FUNDS.value, str(exc))
+        except InsufficientInventory as exc:
+            return False, (RefusalReason.NO_INVENTORY.value, str(exc))
+        except LedgerError as exc:
+            return False, (RefusalReason.UNPRICABLE_EVENT.value, f"ledger refused: {exc}")
+        if not applied:
+            # Already settled by an earlier pass: nothing to do, the fill row
+            # exists (or the decision was refused) and must not change.
+            return False, (RefusalReason.UNPRICABLE_EVENT.value, "settle replayed; no state change")
+        return True, None
 
     # -- one signal ---------------------------------------------------------
 

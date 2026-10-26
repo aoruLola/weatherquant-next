@@ -19,6 +19,7 @@ from weatherquant.paper.books import ArchiveBookSource
 from weatherquant.paper.consumer import SignalConsumer
 from weatherquant.paper.events import parse_signal_event
 from weatherquant.paper.fills import FillEngine
+from weatherquant.paper.ledger import Ledger
 from weatherquant.paper.store import PaperStore
 from weatherquant.storage.paper import PaperDatabase
 
@@ -33,6 +34,8 @@ def engine_env(tmp_path):
     with PaperDatabase(tmp_path / "paper.duckdb") as db:
         store = PaperStore(db)
         store.ensure_account(initial_capital_usdc=100.0, now=NOW)
+        # Fills settle through the ledger, so the account's books must be open.
+        Ledger(store).open_account(initial_capital_usdc=100.0, now=NOW)
         yield store, events_dir, raw_dir, db
 
 
@@ -146,8 +149,11 @@ class TestHappyPath:
         assert single[1] == 0.55
 
     def test_sell_walks_bids_and_nets_proceeds(self, engine_env):
+        # A sell needs inventory (WQN-43's rule, enforced by the ledger since
+        # WQN-42): buy first, then sell, then inspect the sell's fill row.
         store, _events, raw_dir, _db = engine_env
-        event = seed_accepted(store, raw_dir, direction="sell_yes")
+        seed_accepted(store, raw_dir, decision_id="b" * 32)
+        event = seed_accepted(store, raw_dir, decision_id="s" * 32, direction="sell_yes")
         make_engine(store, raw_dir).fill_pending()
         fill = store.fill_of(event.decision_id)
         # SELL hits the bid side: 500 shares resting at 0.52 fill all 100.
