@@ -29,6 +29,7 @@ from weatherquant.paper.consumer import SignalConsumer
 from weatherquant.paper.fills import FillEngine
 from weatherquant.paper.ledger import Ledger
 from weatherquant.paper.risk import RiskGate, load_risk_rules
+from weatherquant.paper.settlements import SettlementParseError, read_settlement_feed
 from weatherquant.paper.store import ACCOUNT_ID, PaperStore
 from weatherquant.storage.paper import PaperDatabase
 
@@ -49,6 +50,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_consume(settings, batch_lines=args.batch_lines)
         if args.command == "fill":
             return _cmd_fill(settings)
+        if args.command == "settle":
+            return _cmd_settle(settings, feed=args.feed)
     except ValueError as exc:
         # The enablement flag's parse error lands here: say it plainly and
         # exit non-zero rather than pretending the flag was absent.
@@ -77,6 +80,11 @@ def _parser() -> argparse.ArgumentParser:
         "fill",
         help="price accepted signals against their point-in-time books (requires enablement)",
     )
+    settle = sub.add_parser(
+        "settle",
+        help="apply a published settlement feed: payouts, releases, corrections",
+    )
+    settle.add_argument("feed", help="path to the published settlement feed (JSONL)")
     return parser
 
 
@@ -214,6 +222,41 @@ def _cmd_fill(settings: PaperSettings) -> int:
         db.close()
         lock.release()
     print(json.dumps(result.as_dict(), sort_keys=True, indent=2, default=str))
+    return 0
+
+
+def _cmd_settle(settings: PaperSettings, *, feed: str) -> int:
+    _require_enabled(settings)
+    try:
+        events = read_settlement_feed(feed)
+    except (SettlementParseError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        db, lock = _open_under_lock(settings, "paper-settle")
+    except LockError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 4
+    try:
+        store = PaperStore(db)
+        ledger = Ledger(store)
+        if ledger.balances() is None:
+            print(
+                "error: the ledger is not open; run `weatherquant-paper init` first",
+                file=sys.stderr,
+            )
+            return 3
+        outcomes = []
+        with db.transaction():
+            for event in events:
+                outcomes.append(ledger.apply_settlement(event, now=datetime.now(tz=UTC)))
+        payload = {"outcomes": outcomes, "review": ledger.review_required()}
+        run_id = db.start_run("paper-settle", {"feed": feed, "records": len(events)})
+        db.finish_run(run_id, status="stopped", stats=payload)
+    finally:
+        db.close()
+        lock.release()
+    print(json.dumps(payload, sort_keys=True, indent=2, default=str))
     return 0
 
 

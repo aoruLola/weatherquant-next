@@ -104,6 +104,23 @@ fill + fees,卖出流入 = fill − fees;execution buffer 是影子定价的
 fill 行 + 信号状态迁移,同一事务;任何一层拒绝(无资金/无库存)则
 整笔不落账。
 
+### D8. 结算:只认官方已验证答案,修订是补偿事件(WQN-44)
+
+结算输入是**发布的** settlement feed(JSONL,按 market+revision 键),
+词汇表复用 `performance/settlement.py` 的五态。规则:
+
+1. 只有 `RESOLVED` 且 payout ∈ {0,1} 移动台账;PENDING / DISPUTED /
+   UNAVAILABLE / UNVERIFIABLE 一律只记录不应用——**未结算永远没有
+   已实现盈亏**;RESOLVED 之外的任何记录带 payout 直接是解析错误。
+2. 修订不编辑历史:更高 revision 且 payout 变化 → 台账追加 CORRECTION
+   补偿条目(Δ = (新−旧)×结算份额),原 SETTLE_PAYOUT 原样保留。
+3. 不可自动补偿的情形**标记人工复核、余额不动**:回拨会让现金变负
+   (钱已经花掉,自动回拨等于把审计问题换成资不抵债)、或 RESOLVED
+   之后又 DISPUTED(最终答案未知,维持或撤销都是编造)。结算行带
+   `review_required` 与理由,`weatherquant-paper status`/settle 输出可见。
+4. 幂等:`UNIQUE(market_id, revision)` 自然键 + `(applied revision)`
+   判断,重放整个 feed 是 no-op;更旧 revision 视为被取代。
+
 ## 后果
 
 * 正面:四个引擎生命周期(collector/shadow/research/paper)互不可写;
@@ -116,6 +133,11 @@ fill 行 + 信号状态迁移,同一事务;任何一层拒绝(无资金/无库�
 * 未决(后续 ADR/工单):风控闸门的取值与版本化(WQN-43)、结算源的
   具体形态(WQN-44)、以及任何 NAS 部署验收(本机无法验证的部分在
   各 PR 中标注)。
+
+
+### 评审修复验证
+
+结算确认和多次更正保留最新 payout，但份额始终追溯原始 SETTLE_PAYOUT 台账。更正不因最新 revision 没有 positions 明细而退化成零金额。
 
 
 同一消费批次的待成交信号按决策时间排序，decision_id 只用于同一时刻的稳定排序，避免哈希顺序反转先买后卖。
