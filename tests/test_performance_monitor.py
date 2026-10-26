@@ -61,9 +61,7 @@ def _publish_tree(work: Path, rows: int = 60) -> Path:
                 }
             )
         )
-    (parts_dir / "part-000000001.jsonl").write_text(
-        "".join(line + "\n" for line in lines), encoding="utf-8"
-    )
+    (parts_dir / "part-000000001.jsonl").write_text("".join(line + "\n" for line in lines), encoding="utf-8")
     from datetime import datetime as dt
 
     build_performance_streaming(
@@ -241,9 +239,7 @@ def test_a_422_on_the_clamp_probe_fails_rather_than_passing(tmp_path: Path) -> N
         max_response_mb=32.0,
         transport=httpx.MockTransport(handler),
     )
-    assert any("clamp" in failure and "422" in failure for failure in report["failures"]), (
-        report["failures"]
-    )
+    assert any("clamp" in failure and "422" in failure for failure in report["failures"]), report["failures"]
 
 
 def test_core_probes_fail_on_5xx(tmp_path: Path) -> None:
@@ -264,3 +260,28 @@ def test_core_probes_fail_on_5xx(tmp_path: Path) -> None:
     # The /summary reachability check itself answers 500, which is its own
     # failure before the endpoint loop runs.
     assert report["failures"], "an unhealthy source must fail"
+
+
+def test_intermittent_503_is_not_hidden_by_the_last_200():
+    monitor = _load_monitor()
+    import httpx
+
+    counts = {}
+
+    def handler(request):
+        if request.url.params.get("limit") == "1000000":
+            return httpx.Response(200, json={"data": {"items": []}})
+        key = str(request.url)
+        counts[key] = counts.get(key, 0) + 1
+        fail = counts[key] == (2 if request.url.path.endswith("/summary") else 1)
+        return httpx.Response(503 if fail else 200, json={"data": {"items": []}})
+
+    report = monitor.probe_dashboard(
+        "http://dashboard.test",
+        token=None,
+        probes=2,
+        max_p95_ms=1000,
+        max_response_mb=32,
+        transport=httpx.MockTransport(handler),
+    )
+    assert any("503" in error for error in report["failures"])

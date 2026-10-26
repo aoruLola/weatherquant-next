@@ -186,9 +186,7 @@ def probe_dashboard(
             report["failures"].append(f"dashboard unreachable: {exc}")
             return report
         if health.status_code != 200:
-            report["failures"].append(
-                f"/summary answered {health.status_code}; gates need a healthy source"
-            )
+            report["failures"].append(f"/summary answered {health.status_code}; gates need a healthy source")
             return report
 
         for name, path in CORE_PROBES:
@@ -205,6 +203,8 @@ def probe_dashboard(
                     break
                 samples.append((time.perf_counter() - started) * 1000)
                 status = response.status_code
+                if status != 200:
+                    report["failures"].append(f"{name} probe answered {status}")
                 payload_bytes = max(payload_bytes, len(response.content))
             if samples and samples[-1] != float("inf"):
                 samples.sort()
@@ -228,13 +228,10 @@ def probe_dashboard(
                     )
                     continue
                 if p95 > max_p95_ms:
-                    report["failures"].append(
-                        f"{name} p95 {p95:.0f}ms above the gate {max_p95_ms}ms"
-                    )
+                    report["failures"].append(f"{name} p95 {p95:.0f}ms above the gate {max_p95_ms}ms")
                 if payload_bytes > response_limit:
                     report["failures"].append(
-                        f"{name} served {payload_bytes / 1024 / 1024:.1f} MiB "
-                        f"(gate {max_response_mb} MiB)"
+                        f"{name} served {payload_bytes / 1024 / 1024:.1f} MiB (gate {max_response_mb} MiB)"
                     )
 
         # The clamp: a client asking for a million rows gets 200 at most.
@@ -251,13 +248,10 @@ def probe_dashboard(
         }
         if clamped.status_code != 200:
             report["failures"].append(
-                f"limit clamp probe answered {clamped.status_code}; the clamp "
-                "can only be verified against a 200"
+                f"limit clamp probe answered {clamped.status_code}; the clamp can only be verified against a 200"
             )
         elif items > 200:
-            report["failures"].append(
-                f"limit=1000000 served {items} items: the server-side clamp is gone"
-            )
+            report["failures"].append(f"limit=1000000 served {items} items: the server-side clamp is gone")
 
     return report
 
@@ -270,8 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--probes", type=int, default=8, help="requests per endpoint")
     parser.add_argument("--max-small-file-mb", type=float, default=5.0)
     parser.add_argument("--max-part-mb", type=float, default=64.0)
-    parser.add_argument("--max-total-mb", type=float, default=8192.0,
-                        help="generations tree size gate (default 8 GiB)")
+    parser.add_argument("--max-total-mb", type=float, default=8192.0, help="generations tree size gate (default 8 GiB)")
     parser.add_argument("--max-p95-ms", type=float, default=1000.0)
     parser.add_argument("--max-response-mb", type=float, default=32.0)
     parser.add_argument("--report", help="write the JSON report here")
@@ -292,9 +285,7 @@ def main(argv: list[str] | None = None) -> int:
         failures.append("current.json names no readable generation")
     else:
         print(f"  current generation: {generation_id}")
-        profile = check_snapshot_profile(
-            generation, max_small_mb=args.max_small_file_mb, max_part_mb=args.max_part_mb
-        )
+        profile = check_snapshot_profile(generation, max_small_mb=args.max_small_file_mb, max_part_mb=args.max_part_mb)
         for name, facts in profile["files"].items():
             size = facts["bytes"]
             extra = f" ({facts['parts']} parts)" if "parts" in facts else ""
@@ -320,10 +311,7 @@ def main(argv: list[str] | None = None) -> int:
             max_response_mb=args.max_response_mb,
         )
         for probe in probes["probes"]:
-            print(
-                f"    {probe['endpoint']:<24} {probe['bytes']:>10,} B  "
-                f"p95 {probe['p95_ms']:>7.1f} ms"
-            )
+            print(f"    {probe['endpoint']:<24} {probe['bytes']:>10,} B  p95 {probe['p95_ms']:>7.1f} ms")
         if "limit_clamp" in probes:
             clamp = probes["limit_clamp"]
             print(f"    limit clamp: asked {clamp['requested']}, served {clamp['served_items']}")
@@ -337,8 +325,10 @@ def main(argv: list[str] | None = None) -> int:
         code = 1
     else:
         print("RESULT: PASSED")
-        print("  aggregates bounded, detail sharded, generations on a diet,"
-              + (" endpoints cheap." if args.dashboard else "."))
+        print(
+            "  aggregates bounded, detail sharded, generations on a diet,"
+            + (" endpoints cheap." if args.dashboard else ".")
+        )
         code = 0
 
     if args.report:
