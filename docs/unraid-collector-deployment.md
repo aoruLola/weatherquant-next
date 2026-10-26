@@ -706,3 +706,8 @@ WebSocket 无限速文档；实测热门 token 约 15–20 条 `price_change` / 
 - **无下单代码**：`weatherquant.data.*` 里没有任何可以发出订单的路径。
 - **只读 API 集合**：Gamma `GET`、CLOB `GET /book`、WS `market` 频道订阅。
 - 镜像内**不含**数据库、配置密钥或本地 `.env`（`.dockerignore` 排除）。
+
+
+### 评审修复验证
+
+watchdog 的最后诊断心跳在独立 daemon 线程写入，最多等待 0.5 秒。即使挂载存储阻塞，进程仍退出以触发 restart 策略。

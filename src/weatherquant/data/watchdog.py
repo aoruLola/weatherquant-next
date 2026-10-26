@@ -137,13 +137,19 @@ class LoopWatchdog:
         )
         log.error("%s", message)
         worker = self._worker
+
         # A final heartbeat that says *why*: without it the probe would only
         # ever see an increasingly stale file and the operator would have to
         # guess between "stuck", "hung in backup", and "dead".
-        try:
-            worker.publish_stuck_heartbeat(message)
-        except Exception:
-            log.debug("watchdog could not publish its heartbeat", exc_info=True)
+        def publish_diagnostic() -> None:
+            try:
+                worker.publish_stuck_heartbeat(message)
+            except Exception:
+                log.debug("watchdog could not publish its heartbeat", exc_info=True)
+
+        diagnostic = threading.Thread(target=publish_diagnostic, daemon=True)
+        diagnostic.start()
+        diagnostic.join(timeout=0.5)
         callback = self._on_stuck
         if callback is not None:
             callback(message)
