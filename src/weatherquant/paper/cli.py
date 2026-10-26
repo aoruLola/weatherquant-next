@@ -191,8 +191,7 @@ def _cmd_fill(settings: PaperSettings) -> int:
         store = PaperStore(db)
         if store.account() is None:
             print(
-                f"error: account {ACCOUNT_ID} does not exist; run "
-                "`weatherquant-paper init` first",
+                f"error: account {ACCOUNT_ID} does not exist; run `weatherquant-paper init` first",
                 file=sys.stderr,
             )
             return 3
@@ -205,7 +204,7 @@ def _cmd_fill(settings: PaperSettings) -> int:
             risk=RiskGate(
                 Ledger(store),
                 load_risk_rules(settings.risk_rules_path),
-                initial_capital_usdc=settings.initial_capital_usdc,
+                initial_capital_usdc=float(store.account()["initial_capital_usdc"]),
             ),
         )
         result = engine.fill_pending()
