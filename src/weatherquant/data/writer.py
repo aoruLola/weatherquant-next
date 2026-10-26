@@ -79,9 +79,7 @@ _BOOK_COLUMNS = (
 )
 _BOOK_PLACEHOLDERS = ", ".join("?" for _ in range(len(_BOOK_COLUMNS.split(","))))
 
-_PRICE_COLUMNS = (
-    "market_id, token_id, ts, mid_usd_per_share, source, fetched_at_utc, venue_ts_origin, run_id"
-)
+_PRICE_COLUMNS = "market_id, token_id, ts, mid_usd_per_share, source, fetched_at_utc, venue_ts_origin, run_id"
 _PRICE_PLACEHOLDERS = ", ".join("?" for _ in range(len(_PRICE_COLUMNS.split(","))))
 
 _COLLECTOR_EVENT_COLUMNS = "event_id, run_id, ts_utc, level, kind, message, details_json"
@@ -157,9 +155,7 @@ def canonical_levels_json(levels: Sequence[tuple[float, float]]) -> str:
     )
 
 
-def book_content_hash(
-    token_id: str, bids_json: str, asks_json: str, venue_ts: datetime | None
-) -> str:
+def book_content_hash(token_id: str, bids_json: str, asks_json: str, venue_ts: datetime | None) -> str:
     """Content address for a book snapshot.
 
     Two snapshots with the same hash are the *same observation* as far as
@@ -247,7 +243,7 @@ DEFAULT_BACKUP_TIMEOUT_SECONDS = 1800.0
 def fsync_file(path: Path) -> None:
     """Flush a file's bytes to storage. Raises ``OSError``; callers decide
     whether that failure is fatal for what they were about to publish."""
-    fd = os.open(path, os.O_RDONLY)
+    fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
     try:
         os.fsync(fd)
     finally:
@@ -315,9 +311,7 @@ class BackupJob:
         self.report: BackupReport | None = None
         self._done = threading.Event()
         self._before_copy = before_copy
-        self.thread = threading.Thread(
-            target=self._run, name=f"wq-backup-{final.stem[-8:]}", daemon=True
-        )
+        self.thread = threading.Thread(target=self._run, name=f"wq-backup-{final.stem[-8:]}", daemon=True)
 
     # -- caller side ---------------------------------------------------------
 
@@ -337,9 +331,7 @@ class BackupJob:
         return self.report if self._done.is_set() else None
 
     def expired(self) -> bool:
-        return not self._done.is_set() and (
-            time.monotonic() - self.started_at_mono > self.timeout_seconds
-        )
+        return not self._done.is_set() and (time.monotonic() - self.started_at_mono > self.timeout_seconds)
 
     def abandon(self, reason: str) -> bool:
         """Mark the job as given up on. Returns ``False`` if it already finished
@@ -456,10 +448,7 @@ class _Batch:
     collector_events: list[tuple[Any, ...]] = field(default_factory=list)
 
     def __len__(self) -> int:
-        return sum(
-            len(x)
-            for x in (self.books, self.prices, self.events, self.markets, self.collector_events)
-        )
+        return sum(len(x) for x in (self.books, self.prices, self.events, self.markets, self.collector_events))
 
     def clear(self) -> None:
         self.books.clear()
@@ -546,9 +535,9 @@ class CollectorWriter:
                 ).fetchone()
             )
             tables = int(
-                probe.execute(
-                    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main'"
-                ).fetchone()[0]
+                probe.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main'").fetchone()[
+                    0
+                ]
             )
             if not has_ledger and tables > 0:
                 raise RuntimeError(
@@ -658,9 +647,7 @@ class CollectorWriter:
             log.info("closed %d gap(s) left open by a previous run", len(rows))
         return len(rows)
 
-    def log_event(
-        self, level: str, kind: str, message: str, details: dict | None = None
-    ) -> None:
+    def log_event(self, level: str, kind: str, message: str, details: dict | None = None) -> None:
         event_id = next_event_id(self.run_id)
         self._batch.collector_events.append(
             (
@@ -798,9 +785,7 @@ class CollectorWriter:
         book_ids = [r[0] for r in rows]
         existing = {
             r[0]
-            for r in self.con.execute(
-                "SELECT book_id FROM order_books WHERE book_id = ANY(?)", [book_ids]
-            ).fetchall()
+            for r in self.con.execute("SELECT book_id FROM order_books WHERE book_id = ANY(?)", [book_ids]).fetchall()
         }
         fresh = [r for r in rows if r[0] not in existing]
         if fresh:
@@ -833,7 +818,7 @@ class CollectorWriter:
                 for _ in rows
             )
             + ") AS t(market_id, token_id, ts, mid_usd_per_share, source, fetched_at_utc, "
-              "venue_ts_origin, run_id)",
+            "venue_ts_origin, run_id)",
             [value for row in rows for value in row],
         )
         try:
@@ -871,8 +856,7 @@ class CollectorWriter:
         if not rows:
             return
         self.con.executemany(
-            f"INSERT INTO collector_events ({_COLLECTOR_EVENT_COLUMNS}) "
-            f"VALUES ({_COLLECTOR_EVENT_PLACEHOLDERS})",
+            f"INSERT INTO collector_events ({_COLLECTOR_EVENT_COLUMNS}) VALUES ({_COLLECTOR_EVENT_PLACEHOLDERS})",
             rows,
         )
         self.stats["collector_events_inserted"] += len(rows)
@@ -915,8 +899,7 @@ class CollectorWriter:
             return int(self.con.execute(sql).fetchone()[0])
 
         orphans = one(
-            "SELECT COUNT(*) FROM markets m LEFT JOIN events e ON m.event_id = e.event_id "
-            "WHERE e.event_id IS NULL"
+            "SELECT COUNT(*) FROM markets m LEFT JOIN events e ON m.event_id = e.event_id WHERE e.event_id IS NULL"
         )
         if orphans:
             problems.append(f"{orphans} market(s) reference a missing event")
@@ -938,20 +921,14 @@ class CollectorWriter:
 
         # A venue timestamp must never be a local-clock fabrication: origin must
         # agree with presence.
-        mismatched = one(
-            "SELECT COUNT(*) FROM order_books "
-            "WHERE (venue_ts IS NULL) <> (venue_ts_origin = 'missing')"
-        )
+        mismatched = one("SELECT COUNT(*) FROM order_books WHERE (venue_ts IS NULL) <> (venue_ts_origin = 'missing')")
         if mismatched:
             problems.append(
                 f"{mismatched} order_book row(s) disagree about whether venue_ts is present "
                 "vs its venue_ts_origin - a timestamp provenance bug"
             )
 
-        bad_price = one(
-            "SELECT COUNT(*) FROM price_history WHERE mid_usd_per_share < 0 "
-            "OR mid_usd_per_share > 1"
-        )
+        bad_price = one("SELECT COUNT(*) FROM price_history WHERE mid_usd_per_share < 0 OR mid_usd_per_share > 1")
         if bad_price:
             problems.append(f"{bad_price} price_history row(s) outside [0, 1]")
 
@@ -1078,10 +1055,7 @@ class CollectorWriter:
         con.execute(f"ATTACH DATABASE '{escape_duckdb_string(str(tmp))}' AS {alias}")
         try:
             con.execute("BEGIN TRANSACTION")
-            expected = {
-                name: int(con.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0])
-                for name in tables
-            }
+            expected = {name: int(con.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]) for name in tables}
             for name in tables:
                 con.execute(f'CREATE TABLE {alias}."{name}" AS SELECT * FROM "{name}"')
             for stmt in self._index_statements(alias):
@@ -1095,17 +1069,11 @@ class CollectorWriter:
             raise
         finally:
             self._detach_with_retry(con, alias)
-        versions = tuple(
-            sorted(v for (v,) in con.execute("SELECT version FROM schema_migrations").fetchall())
-        )
-        expected_sequences = {
-            r[0] for r in con.execute("SELECT sequence_name FROM duckdb_sequences()").fetchall()
-        }
+        versions = tuple(sorted(v for (v,) in con.execute("SELECT version FROM schema_migrations").fetchall()))
+        expected_sequences = {r[0] for r in con.execute("SELECT sequence_name FROM duckdb_sequences()").fetchall()}
         return expected, versions, expected_sequences
 
-    def _detach_with_retry(
-        self, con: duckdb.DuckDBPyConnection, alias: str, *, attempts: int = 5
-    ) -> None:
+    def _detach_with_retry(self, con: duckdb.DuckDBPyConnection, alias: str, *, attempts: int = 5) -> None:
         """Detach the backup catalog, or fail loudly.
 
         The attachment lives on the database *instance*, which the collector's
@@ -1148,22 +1116,15 @@ class CollectorWriter:
                 last_error = exc
                 time.sleep(0.1 * (attempt + 1))
         if probe is None:
-            return BackupReport(
-                path, False, {}, expected, versions, error=f"cannot open backup: {last_error}"
-            )
+            return BackupReport(path, False, {}, expected, versions, error=f"cannot open backup: {last_error}")
         try:
             for name in expected:
                 row = probe.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()
                 actual[name] = int(row[0]) if row else -1
             got_versions = tuple(
-                sorted(
-                    v
-                    for (v,) in probe.execute("SELECT version FROM schema_migrations").fetchall()
-                )
+                sorted(v for (v,) in probe.execute("SELECT version FROM schema_migrations").fetchall())
             )
-            got_sequences = {
-                r[0] for r in probe.execute("SELECT sequence_name FROM duckdb_sequences()").fetchall()
-            }
+            got_sequences = {r[0] for r in probe.execute("SELECT sequence_name FROM duckdb_sequences()").fetchall()}
         except Exception as exc:
             return BackupReport(path, False, {}, expected, versions, error=f"backup read-back failed: {exc}")
         finally:
@@ -1181,16 +1142,21 @@ class CollectorWriter:
             )
         if got_versions != versions:
             return BackupReport(
-                path, False, actual, expected, versions,
+                path,
+                False,
+                actual,
+                expected,
+                versions,
                 error=f"schema versions differ: {versions} vs {got_versions}",
             )
         if got_sequences != expected_sequences:
             return BackupReport(
-                path, False, actual, expected, versions,
-                error=(
-                    "sequence set differs: "
-                    f"expected {sorted(expected_sequences)}, got {sorted(got_sequences)}"
-                ),
+                path,
+                False,
+                actual,
+                expected,
+                versions,
+                error=(f"sequence set differs: expected {sorted(expected_sequences)}, got {sorted(got_sequences)}"),
             )
         return BackupReport(path, True, actual, expected, versions)
 
@@ -1240,9 +1206,7 @@ class CollectorWriter:
             if not match:
                 log.warning("could not parse sequence DDL from migration: %s", clause)
                 continue
-            statements.append(
-                f"CREATE SEQUENCE IF NOT EXISTS {alias}.{match.group('name')}{match.group('rest')}"
-            )
+            statements.append(f"CREATE SEQUENCE IF NOT EXISTS {alias}.{match.group('name')}{match.group('rest')}")
         return statements
 
     def _index_statements(self, alias: str) -> list[str]:
@@ -1266,8 +1230,7 @@ class CollectorWriter:
                 log.warning("could not parse index DDL from migration: %s", clause)
                 continue
             statements.append(
-                f'CREATE INDEX {match.group("name")} ON {alias}."{match.group("table")}" '
-                f"({match.group('cols')})"
+                f'CREATE INDEX {match.group("name")} ON {alias}."{match.group("table")}" ({match.group("cols")})'
             )
         return statements
 
@@ -1294,12 +1257,14 @@ class CollectorWriter:
             target = target_dir / "data.parquet"
             try:
                 if column == "target_date":
-                    predicate = f'"{column}" = DATE \'{day.isoformat()}\''
+                    predicate = f"\"{column}\" = DATE '{day.isoformat()}'"
                 else:
-                    predicate = f'"{column}" >= TIMESTAMP \'{day.isoformat()} 00:00:00\' ' \
-                                f'AND "{column}" < TIMESTAMP \'{(day + timedelta(days=1)).isoformat()} 00:00:00\''
+                    predicate = (
+                        f"\"{column}\" >= TIMESTAMP '{day.isoformat()} 00:00:00' "
+                        f"AND \"{column}\" < TIMESTAMP '{(day + timedelta(days=1)).isoformat()} 00:00:00'"
+                    )
                 cur = self.con.execute(
-                    f"COPY (SELECT * FROM \"{table}\" WHERE {predicate}) "
+                    f'COPY (SELECT * FROM "{table}" WHERE {predicate}) '
                     f"TO '{escape_duckdb_string(str(target))}' (FORMAT PARQUET)"
                 )
                 cur.fetchall()

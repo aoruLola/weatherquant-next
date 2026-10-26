@@ -44,9 +44,35 @@ def _event() -> tuple:
 
 def _market() -> tuple:
     return (
-        "mkt-1", "evt-1", "cond-1", "q?", "60-61", "range", "degF", 60.0, 61.0, True, True,
-        "nearest_integer_f", "tokY", "tokN", TODAY, "KLGA", 0.01, 5.0, 0.05, 1.0,
-        "NWS", "rules", True, False, True, NOW, "{}", "gamma", "run-1",
+        "mkt-1",
+        "evt-1",
+        "cond-1",
+        "q?",
+        "60-61",
+        "range",
+        "degF",
+        60.0,
+        61.0,
+        True,
+        True,
+        "nearest_integer_f",
+        "tokY",
+        "tokN",
+        TODAY,
+        "KLGA",
+        0.01,
+        5.0,
+        0.05,
+        1.0,
+        "NWS",
+        "rules",
+        True,
+        False,
+        True,
+        NOW,
+        "{}",
+        "gamma",
+        "run-1",
     )
 
 
@@ -57,9 +83,24 @@ def _book(best_bid: float = 0.48, fetched_at: datetime = NOW) -> tuple:
     asks = canonical_levels_json([(round(best_bid + 0.04, 4), 100.0), (round(best_bid + 0.09, 4), 400.0)])
     digest = book_content_hash("tokY", bids, asks, None)
     return (
-        digest, "mkt-1", "tokY", bids, asks, best_bid, round(best_bid + 0.04, 4), 0.04,
-        best_bid * 100.0, (best_bid + 0.04) * 100.0, "",
-        None, fetched_at, "rest", "missing", digest, "ok", "run-1",
+        digest,
+        "mkt-1",
+        "tokY",
+        bids,
+        asks,
+        best_bid,
+        round(best_bid + 0.04, 4),
+        0.04,
+        best_bid * 100.0,
+        (best_bid + 0.04) * 100.0,
+        "",
+        None,
+        fetched_at,
+        "rest",
+        "missing",
+        digest,
+        "ok",
+        "run-1",
     )
 
 
@@ -234,9 +275,7 @@ def test_integrity_checks_and_table_listings_ignore_an_attached_backup_catalog(
         holder.close()
 
 
-def test_integrity_is_deferred_while_a_backup_is_in_flight(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_integrity_is_deferred_while_a_backup_is_in_flight(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     """The loop checks integrity every tick, but not while a copy is open."""
     import time as _time
 
@@ -289,9 +328,7 @@ def test_integrity_is_deferred_while_a_backup_is_in_flight(
     assert result.get("code") == ExitCode.OK
 
 
-def test_collection_writes_commit_while_a_backup_is_in_flight(
-    writer: CollectorWriter, tmp_path: Path
-) -> None:
+def test_collection_writes_commit_while_a_backup_is_in_flight(writer: CollectorWriter, tmp_path: Path) -> None:
     """The single-writer lock must isolate, not interlock.
 
     While the copy is blocked on its hook, the writer's own connection keeps
@@ -325,9 +362,7 @@ def test_collection_writes_commit_while_a_backup_is_in_flight(
     assert after == before + 1
 
 
-def test_a_timed_out_backup_is_abandoned_and_discards_its_own_file(
-    writer: CollectorWriter, tmp_path: Path
-) -> None:
+def test_a_timed_out_backup_is_abandoned_and_discards_its_own_file(writer: CollectorWriter, tmp_path: Path) -> None:
     release = threading.Event()
     job = writer.start_backup(
         tmp_path / "backups",
@@ -358,9 +393,7 @@ def test_a_timed_out_backup_is_abandoned_and_discards_its_own_file(
     assert second is not None and second.ok, second and second.error
 
 
-def test_abandoning_a_job_that_already_finished_keeps_the_backup(
-    writer: CollectorWriter, tmp_path: Path
-) -> None:
+def test_abandoning_a_job_that_already_finished_keeps_the_backup(writer: CollectorWriter, tmp_path: Path) -> None:
     job = writer.start_backup(tmp_path / "backups")
     job.join(60.0)
     assert job.done
@@ -409,8 +442,11 @@ def test_publication_is_ordered_after_durability(
     ], "bytes must be durable before the name exists, and the name flushed after"
 
 
-def test_a_failed_rename_publishes_nothing(writer: CollectorWriter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_failed_rename_publishes_nothing(
+    writer: CollectorWriter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """FUSE can fail the rename itself; the report must say so, honestly."""
+
     def broken_replace(source: Any, target: Any) -> Any:
         raise OSError("injected EIO on rename")
 
@@ -426,9 +462,7 @@ def test_a_failed_rename_publishes_nothing(writer: CollectorWriter, tmp_path: Pa
     assert leftovers == []
 
 
-def test_the_next_backup_sweeps_tmp_files_a_crash_left_behind(
-    writer: CollectorWriter, tmp_path: Path
-) -> None:
+def test_the_next_backup_sweeps_tmp_files_a_crash_left_behind(writer: CollectorWriter, tmp_path: Path) -> None:
     dest = tmp_path / "backups"
     dest.mkdir()
     stale = dest / ".incomplete-20260101T000000Z-deadbeef.duckdb"
@@ -482,9 +516,7 @@ def _heartbeat_state(settings: Settings) -> tuple[datetime, int]:
     return heartbeat.updated_at_utc, heartbeat.stats.rest_requests_ok
 
 
-def test_the_loop_keeps_collecting_while_a_backup_copies(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_the_loop_keeps_collecting_while_a_backup_copies(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     """WQN-1 acceptance: with the copy deliberately stalled, heartbeats and
     polls continue; once released, the published backup is complete."""
     backup_started = threading.Event()
@@ -617,9 +649,7 @@ def test_a_hung_backup_times_out_and_the_day_is_not_retry_burned(
         return real_start(self, dest_dir, **kwargs, before_copy=lambda: release.wait(30))
 
     monkeypatch.setattr(CollectorWriter, "start_backup", hung_start)
-    worker = _start_worker(
-        settings, monkeypatch, run_label="timeout", backup_timeout_seconds=0.1
-    )
+    worker = _start_worker(settings, monkeypatch, run_label="timeout", backup_timeout_seconds=0.1)
 
     result: dict[str, Any] = {}
 
@@ -653,3 +683,12 @@ def test_a_hung_backup_times_out_and_the_day_is_not_retry_burned(
     assert not list((settings.db_path.parent / "backups").glob("weatherquant-*.duckdb")), (
         "an abandoned backup must never publish"
     )
+
+
+def test_backup_fsync_uses_a_writable_binary_handle(tmp_path):
+    from weatherquant.data.writer import fsync_file
+
+    target = tmp_path / "backup.duckdb"
+    target.write_bytes(b"durable bytes\n")
+    fsync_file(target)
+    assert target.read_bytes() == b"durable bytes\n"
