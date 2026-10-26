@@ -131,9 +131,7 @@ class TestPayout:
             assert b["realized_pnl_usdc"] == 0.0
             assert b["occupied_usdc"] == pytest.approx(56.079)
         # All four are in the audit table; none was applied.
-        applied = ledger.db.execute(
-            "SELECT COUNT(*) FROM paper_settlements WHERE applied"
-        ).fetchone()[0]
+        applied = ledger.db.execute("SELECT COUNT(*) FROM paper_settlements WHERE applied").fetchone()[0]
         assert applied == 0
 
     def test_settlement_without_a_position_is_recorded(self, tmp_path):
@@ -252,9 +250,7 @@ class TestCorrections:
     def test_dispute_after_payout_is_flagged_and_touches_nothing(self, env):
         _store, ledger, db = env
         apply(ledger, db, settlement(revision=1, yes_payout=1.0))
-        outcome = apply(
-            ledger, db, settlement(revision=2, status="DISPUTED", yes_payout=None)
-        )
+        outcome = apply(ledger, db, settlement(revision=2, status="DISPUTED", yes_payout=None))
         assert outcome["action"] == "REVIEW_REQUIRED"
         # The dispute does not keep the payout as profit (that would
         # fabricate realised P&L) and does not reverse it either (that would
@@ -262,3 +258,14 @@ class TestCorrections:
         assert ledger.balances()["realized_pnl_usdc"] == pytest.approx(43.921)
         assert ledger.review_required()[0]["status"] == "DISPUTED"
 
+
+@pytest.mark.parametrize("payouts", [(1.0, 1.0, 0.0), (1.0, 0.0, 1.0, 0.0)])
+def test_confirmations_and_multiple_corrections_keep_original_shares(env, payouts):
+    _store, ledger, db = env
+    for revision, payout in enumerate(payouts, start=1):
+        apply(ledger, db, settlement(revision=revision, yes_payout=payout))
+        balances = ledger.balances()
+        assert balances["available_usdc"] == pytest.approx(100.0 - 56.079 + 100 * payout)
+        assert balances["realized_pnl_usdc"] == pytest.approx(100 * payout - 56.079)
+        assert ledger._applied_settlement("mkt-1")["settled_shares"] == 100.0
+        assert ledger.verify()["consistent"]

@@ -279,9 +279,13 @@ class TestRefusalNamesTheBindingConstraint:
             with db.transaction():
                 ledger.apply_buy(
                     make_fill(
-                        decision_id=f"d{i}", shares=17.0, fill_cost=9.95,
-                        fees_usd=0.047, price=0.553,
-                        market_id=f"mkt-{i}", token_id=f"tok-{i}",
+                        decision_id=f"d{i}",
+                        shares=17.0,
+                        fill_cost=9.95,
+                        fees_usd=0.047,
+                        price=0.553,
+                        market_id=f"mkt-{i}",
+                        token_id=f"tok-{i}",
                     ),
                     now=NOW,
                 )
@@ -448,3 +452,32 @@ class TestIntegration:
             assert row["outcome"] == "REFUSED"
             assert row["refusal_reason"] in ("RISK_BUDGET_EXCEEDED", "INSUFFICIENT_FUNDS")
             assert ledger.balances()["available_usdc"] == 1.0
+
+
+def test_fill_uses_persisted_opening_capital_after_environment_changes(tmp_path, monkeypatch, capsys):
+    from weatherquant.paper.cli import main
+
+    monkeypatch.setenv("WQ_PAPER_ENABLED", "true")
+    monkeypatch.setenv("WQ_PAPER_DB_PATH", str(tmp_path / "paper.duckdb"))
+    monkeypatch.setenv("WQ_PAPER_RAW_DIR", str(tmp_path / "raw"))
+    monkeypatch.setenv("WQ_PAPER_INITIAL_CAPITAL_USDC", "10")
+    assert main(["init"]) == 0
+    with PaperDatabase(tmp_path / "paper.duckdb") as db:
+        store = PaperStore(db)
+        event = parse_signal_event(export_row(token_id=TOKEN, proposed_shares=10.0, book_id=None))
+        write_archive(
+            tmp_path / "raw",
+            source="ws",
+            day="2026-10-26",
+            lines=[ws_line(two_level_book(), received=event.decision_time_utc - timedelta(seconds=20))],
+        )
+        store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
+    monkeypatch.delenv("WQ_PAPER_INITIAL_CAPITAL_USDC")
+    capsys.readouterr()
+    assert main(["fill"]) == 0
+    with PaperDatabase(tmp_path / "paper.duckdb") as db:
+        assert db.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0] == 0
+        assert PaperStore(db).signal(event.decision_id)["refusal_reason"] in {
+            "RISK_BUDGET_EXCEEDED",
+            "RISK_EXPOSURE_EXCEEDED",
+        }
