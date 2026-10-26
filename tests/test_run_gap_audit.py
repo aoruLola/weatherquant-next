@@ -210,10 +210,12 @@ def test_a_backup_attempt_leaves_start_and_outcome_on_the_trail(
     fails loudly on the trail while the run itself stays clean."""
     monkeypatch.setattr(worker_module, "ResilientHttp", FakeHttp)
 
-    def refuse(self: CollectorWriter, dest_dir: Any) -> Any:
+    def refuse(self: CollectorWriter, dest_dir: Any, **kwargs: Any) -> Any:
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(CollectorWriter, "backup", refuse)
+    # The integrated worker starts backups via start_backup (WQN-1); failing
+    # it at the source is the same audit event either way (WQN-5).
+    monkeypatch.setattr(CollectorWriter, "start_backup", refuse)
     worker = _worker(settings, run_id="backup-audit", backup_daily=True)
     result: dict[str, Any] = {}
 
