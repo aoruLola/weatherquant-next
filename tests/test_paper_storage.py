@@ -56,12 +56,11 @@ class TestMigrations:
 
     def test_reopening_is_a_noop_and_never_rewrites_history(self, tmp_path):
         path = tmp_path / "paper.duckdb"
-        with PaperDatabase(path):
-            pass
+        with PaperDatabase(path) as first:
+            applied = dict(first.applied_migrations())
+            assert set(applied) == {"0001", "0002"}
         with PaperDatabase(path) as again:
-            assert again.applied_migrations() == {"0001": pytest.approx(
-                again.applied_migrations()["0001"]
-            )}
+            assert again.applied_migrations() == applied
 
     def test_foreign_databases_are_refused_by_name(self, tmp_path):
         cases = [

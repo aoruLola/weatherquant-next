@@ -1,4 +1,4 @@
-"""WQN-39: the paper CLI's enablement gate and account lifecycle."""
+"""WQN-39/40: the paper CLI's enablement gate, account lifecycle, and consume."""
 
 from __future__ import annotations
 
@@ -74,3 +74,54 @@ def test_status_reports_an_empty_engine(paper_env, monkeypatch, capsys):
     assert payload["enabled"] is False
     assert payload["account"]["initial_capital_usdc"] == 100.0
     assert payload["signals"] == {}
+
+
+def test_consume_requires_enablement(paper_env, capsys):
+    assert main(["consume"]) == 2
+    assert "WQ_PAPER_ENABLED" in capsys.readouterr().err
+
+
+def test_consume_requires_an_account(paper_env, monkeypatch, capsys):
+    monkeypatch.setenv("WQ_PAPER_ENABLED", "true")
+    assert main(["consume"]) == 3
+    assert "init" in capsys.readouterr().err
+
+
+def test_consume_reads_the_published_export(paper_env, monkeypatch, capsys):
+    # End to end over the file channel: an export part lands, one consume
+    # pass takes it in, a second pass reports caught up.
+    monkeypatch.setenv("WQ_PAPER_ENABLED", "true")
+    monkeypatch.setenv("WQ_PAPER_MAX_SIGNAL_AGE_SECONDS", "600")
+    main(["init"])
+    capsys.readouterr()
+
+    events_dir = paper_env.parent.parent / "decisions-export"  # as the fixture configured
+    (events_dir / "parts").mkdir(parents=True)
+    row = {
+        "decision_id": "a" * 32,
+        "run_id": "r" * 32,
+        "cycle_id": "c" * 16,
+        "market_id": "mkt-1",
+        "direction": "buy_yes",
+        "state": "ACCEPT",
+        "mode": "LIVE",
+        "decision_time_utc": "2026-10-26T12:04:00+00:00",
+        "book_id": "b" * 64,
+        "fee_rate": 0.05,
+    }
+    with (events_dir / "parts" / "part-000000001.jsonl").open("w") as handle:
+        handle.write(json.dumps(row) + "\n")
+
+    assert main(["consume"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["accepted"] == 1
+    assert first["signals_recorded"] == 1
+
+    assert main(["consume"]) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["caught_up"] is True
+
+    monkeypatch.setenv("WQ_PAPER_ENABLED", "false")
+    assert main(["status"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["signals"] == {"ACCEPTED": 1}
