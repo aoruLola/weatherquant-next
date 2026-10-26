@@ -35,6 +35,7 @@ def quality_event_id(*, kind: str, path: str, line_no: int | None, detail: str) 
     basis = "|".join([kind, path, str(line_no if line_no is not None else ""), detail])
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
 
+
 #: The virtual account's singleton id. One engine, one account; anything
 #: more is a portfolio, which is a different project.
 ACCOUNT_ID = "paper-main"
@@ -215,10 +216,123 @@ class PaperStore:
         return cursor.fetchone() is not None
 
     def quality_counts(self) -> dict[str, int]:
-        rows = self.db.execute(
-            "SELECT kind, COUNT(*) FROM paper_quality_events GROUP BY kind ORDER BY kind"
-        ).fetchall()
+        rows = self.db.execute("SELECT kind, COUNT(*) FROM paper_quality_events GROUP BY kind ORDER BY kind").fetchall()
         return {str(row[0]): int(row[1]) for row in rows}
+
+    # -- fills ---------------------------------------------------------------
+
+    def signals_with_outcome(self, outcome: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT decision_id, market_id, token_id, direction, outcome, decision_time_utc "
+            "FROM paper_signals WHERE outcome = ? ORDER BY consumed_at_utc, decision_time_utc, decision_id LIMIT ?",
+            [outcome, int(limit)],
+        ).fetchall()
+        return [
+            {
+                "decision_id": str(row[0]),
+                "market_id": str(row[1]),
+                "token_id": row[2],
+                "direction": str(row[3]),
+                "outcome": str(row[4]),
+                "decision_time_utc": row[5],
+            }
+            for row in rows
+        ]
+
+    def set_signal_outcome(
+        self,
+        decision_id: str,
+        *,
+        outcome: str,
+        refusal_reason: str | None = None,
+        refusal_detail: str | None = None,
+    ) -> None:
+        self.db.execute(
+            "UPDATE paper_signals SET outcome = ?, refusal_reason = ?, refusal_detail = ? WHERE decision_id = ?",
+            [outcome, refusal_reason, refusal_detail, decision_id],
+        )
+
+    def event_of(self, decision_id: str):
+        """Re-decode the signal's stored published row, verbatim."""
+        row = self.db.execute("SELECT event_json FROM paper_signals WHERE decision_id = ?", [decision_id]).fetchone()
+        if row is None:
+            return None
+        from weatherquant.paper.events import parse_signal_event
+
+        try:
+            return parse_signal_event(json.loads(str(row[0])))
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def record_fill(self, fill) -> bool:
+        """Insert one fill. Returns False if this decision already has one."""
+        cursor = self.db.execute(
+            "INSERT INTO paper_fills ("
+            "decision_id, market_id, token_id, direction, side, book_id, book_source, "
+            "book_venue_ts_utc, book_collector_received_at_utc, book_age_ms, "
+            "requested_shares, filled_shares, avg_price_usd_per_share, "
+            "best_price_usd_per_share, slippage_usd_per_share, fill_cost_usd, fees_usd, "
+            "execution_buffer_usd, total_cost_usd, net_proceeds_usd, levels_consumed, "
+            "complete, consumed_levels_json, decision_time_utc, filled_at_utc, fee_rate, "
+            "thresholds_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (decision_id) DO NOTHING RETURNING decision_id",
+            [
+                fill.decision_id,
+                fill.market_id,
+                fill.token_id,
+                fill.direction,
+                fill.side,
+                fill.book_id,
+                fill.book_source,
+                fill.book_venue_ts_utc,
+                fill.book_collector_received_at_utc,
+                fill.book_age_ms,
+                fill.requested_shares,
+                fill.filled_shares,
+                fill.avg_price_usd_per_share,
+                fill.best_price_usd_per_share,
+                fill.slippage_usd_per_share,
+                fill.fill_cost_usd,
+                fill.fees_usd,
+                fill.execution_buffer_usd,
+                fill.total_cost_usd,
+                fill.net_proceeds_usd,
+                fill.levels_consumed,
+                bool(fill.complete),
+                fill.consumed_levels_json(),
+                fill.decision_time_utc,
+                fill.filled_at_utc,
+                fill.fee_rate,
+                fill.thresholds_version,
+            ],
+        )
+        return cursor.fetchone() is not None
+
+    def fill_of(self, decision_id: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT decision_id, filled_shares, avg_price_usd_per_share, fees_usd, "
+            "total_cost_usd, net_proceeds_usd, levels_consumed, complete, consumed_levels_json, "
+            "slippage_usd_per_share, best_price_usd_per_share, execution_buffer_usd "
+            "FROM paper_fills WHERE decision_id = ?",
+            [decision_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "decision_id": str(row[0]),
+            "filled_shares": float(row[1]),
+            "avg_price_usd_per_share": float(row[2]),
+            "fees_usd": float(row[3]),
+            "total_cost_usd": row[4],
+            "net_proceeds_usd": row[5],
+            "levels_consumed": int(row[6]),
+            "complete": bool(row[7]),
+            "consumed_levels": json.loads(str(row[8])),
+            "slippage_usd_per_share": float(row[9]),
+            "best_price_usd_per_share": float(row[10]),
+            "execution_buffer_usd": float(row[11]),
+        }
 
     # -- cursor state -------------------------------------------------------
 
@@ -231,9 +345,7 @@ class PaperStore:
         )
 
     def load_state(self, key: str) -> dict[str, Any] | None:
-        row = self.db.execute(
-            "SELECT value_json FROM paper_state WHERE key = ?", [key]
-        ).fetchone()
+        row = self.db.execute("SELECT value_json FROM paper_state WHERE key = ?", [key]).fetchone()
         if row is None:
             return None
         try:
