@@ -389,6 +389,17 @@ def evaluate(
         ok, why = forecast.usable_at(decision_time, max_age_hours=max_forecast_age_hours)
         if not ok:
             fail(_map_forecast(why), why or "forecast refused")
+        elif market.target_date is not None and forecast.target_date != market.target_date:
+            # The resolver is keyed on the market's own target date, so a
+            # mismatch here means the layers have come apart - pricing today's
+            # bracket with yesterday's forecast is exactly the cross-date mix
+            # the alignment audit (WQN-25) exists to prevent, and this is the
+            # last runtime place to catch it.
+            fail(
+                Reason.DATA_QUALITY_FAILURE,
+                f"forecast is for {forecast.target_date.isoformat()} but market "
+                f"{market.market_id} settles {market.target_date.isoformat()}",
+            )
         elif market.bracket is not None:
             label = market.bracket.label
             probs = prediction.probabilities
