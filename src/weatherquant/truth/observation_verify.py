@@ -62,7 +62,7 @@ __all__ = [
 
 #: Bumped when the comparison rules change; every persisted row carries it,
 #: so a verdict can always be re-run under the version that produced it.
-MARKET_VERIFY_VERSION = "observation-verify-2"
+MARKET_VERIFY_VERSION = "observation-verify-3"
 
 #: The parser version to record when a rules dict carries a hash but no
 #: parser_version field - i.e. it was built before the parser stamped itself.
@@ -252,12 +252,15 @@ def verify_market_rules(
     # Rows carry the report type verbatim; only an explicit rules filter
     # turns it into an exclusion, so legacy families are untouched.
     exclude_special = str(rules.get("observation_filter") or "") == "routine_excluding_speci"
-    del station  # validated above; common already carries it
+    other_station = 0
     in_day: list[tuple[datetime, float]] = []
     out_of_day = malformed = 0
     excluded_special = 0
     sources: dict[str, dict[str, Any]] = {}
     for item in observations:
+        if str(item.get("station") or "").strip().upper() != station:
+            other_station += 1
+            continue
         when_raw = item.get("obs_time_utc")
         value_raw = item.get(temp_key)
         try:
@@ -289,13 +292,13 @@ def verify_market_rules(
             # they carry a higher reading; they are counted, not dropped.
             excluded_special += 1
             continue
+        if not (start <= when < end):
+            out_of_day += 1
+            continue
         stats = sources.setdefault(source, {"n": 0, "first": when, "last": when})
         stats["n"] += 1
         stats["first"] = min(stats["first"], when)
         stats["last"] = max(stats["last"], when)
-        if not (start <= when < end):
-            out_of_day += 1
-            continue
         in_day.append((when, value))
 
     distinct = {w.replace(minute=0, second=0, microsecond=0) for w, _ in in_day}
@@ -325,6 +328,8 @@ def verify_market_rules(
 
     # --- zero readings: the rules' no-data clause decides -------------------
     if not in_day:
+        if other_station:
+            return result(NO_OBSERVATION, f"no readings attributable to {station} in the target day")
         no_data_rule = str(rules.get("no_data_resolution") or "").lower()
         venue = _venue_winners(markets, outcomes)
         if venue is None or len(venue) != 1:
@@ -374,11 +379,11 @@ def verify_market_rules(
     computed = [
         market
         for market in markets
-        if bracket_contains(market.get("bracket_low"), market.get("bracket_high"), observed_whole)
+        if _contains_observation(market, observed_whole)
     ]
     # --- venue → observation ------------------------------------------------
     venue = _venue_winners(markets, outcomes)
-    if venue is None:
+    if not venue:
         return result(
             NO_OUTCOME,
             f"the venue paid on nothing for {target_date}; nothing to verify against",
@@ -398,19 +403,17 @@ def verify_market_rules(
     paid = venue[0]
     paid_label = str(paid.get("bracket_label"))
 
-    forward = paid_label in computed_labels
+    forward = len(computed) == 1 and str(computed[0].get("market_id")) == str(paid.get("market_id"))
     # The reverse direction, separately: the bracket the venue paid on must
     # contain the observed maximum. Same comparison by construction; stating
     # both keeps a failure legible as to *which* direction broke.
-    reverse = bracket_contains(
-        paid.get("bracket_low"), paid.get("bracket_high"), observed_whole
-    )
+    reverse = _contains_observation(paid, observed_whole)
 
     if forward and reverse:
         verdict, detail = MATCH, (
             f"observed {observed_whole}°F → bracket {paid_label}; venue paid {paid_label}"
         )
-    elif len(computed_labels) > 1:
+    elif len(computed) > 1:
         verdict, detail = AMBIGUOUS_WINNER, (
             f"observed {observed_whole}°F falls in {sorted(computed_labels)}: "
             "the event's brackets overlap"
@@ -430,6 +433,18 @@ def verify_market_rules(
         observed_max_f=observed,
         observed_max_whole_f=observed_whole,
     )
+
+
+def _contains_observation(market: Mapping[str, Any], value: float) -> bool:
+    low = market.get("bracket_low")
+    high = market.get("bracket_high")
+    if market.get("bracket_kind") == "exact":
+        return value == low
+    if value == low and market.get("bracket_low_inclusive") is False:
+        return False
+    if value == high and market.get("bracket_high_inclusive") is False:
+        return False
+    return bracket_contains(low, high, value)
 
 
 def _venue_winners(

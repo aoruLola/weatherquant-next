@@ -45,7 +45,7 @@ bracket"，则比较平台赔付与事件最低档（含"X°F or below"型只有
 每条验证落入研究库 `market_rule_verification`（迁移 0003），一行携带：
 
 - 规则文本 SHA-256 + 解析器版本（`settlement-rules-1`）+ 校验器版本
-  （`observation-verify-1`）——**规则版本保留**，任何 verdict 都能在产生
+  （当前为 `observation-verify-3`）——**规则版本保留**，任何 verdict 都能在产生
   它的版本下重跑；
 - 观测来源逐个列出：source 名、读数条数、首末观测时刻（**原始来源时间**）；
 - `local_day_start_utc` / `local_day_end_utc`（时区/夏令时证据）、
@@ -135,6 +135,8 @@ precision（判 `unusable_rules`），强行补 precision 后 °C 读数被直�
 - 2026-10-24 案例（验收手算 16.7°C → 62.06°F → 62 → 62-63°F 与平台一致）
   现为端到端测试：CLI 全流程 MATCH 且产出 verified 对。
 
+观测文件的每条记录都必须带有 `station`。只有规则指定机场的观测参与覆盖小时数和日最高温计算。旧文件缺少站点时，需从原始报文或研究库重新导出。相同目标日有多个事件时，通过 `--event-id` 选择本次核验的事件。精确温度档只覆盖该温度；观测落入多个档位时结果为 `ambiguous_winner`。
+
 仍需 NAS/人工：观测侧 T 组解析的采集路径（把 METAR 报文拆成 temp_c+report_type
 行存入 `klga_observations`）是 collector 侧依赖，verify-market 消费其产物；
 生产事件的批量核验待观测数据接入后进行。
@@ -143,3 +145,5 @@ precision（判 `unusable_rules`），强行补 precision 后 °C 读数被直�
 ### 评审修复验证
 
 事件与观测核对为 match 后，--out 同时输出已有明确 0/1 payout 的获胜和失败市场。未结算或缺少结果的市场不写入清单，避免只验证赢家而排除 LOSS 样本。
+
+核验清单保存 `market_id`、`target_date`、`condition_id` 和实际核对过的 `resolved_outcome`。再次回填时，只有当前官方合约和赔付都匹配的已结算结果才计入 WIN/LOSS。普通增量导入按官方结果的检索时间保留最新记录；显式全量替换使用调用方提供的完整清单。旧格式清单需从原观测和结算索引重新生成。

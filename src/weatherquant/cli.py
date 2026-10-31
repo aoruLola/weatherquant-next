@@ -405,7 +405,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--verified",
-        help="optional JSON list of {market_id, target_date} that passed observation cross-check",
+        help="verified market/date/condition/payout records from verify-market --out",
     )
     p.add_argument("--out", required=True, help="where to write the settlement index (JSON)")
     p.add_argument(
@@ -453,7 +453,7 @@ def build_parser() -> argparse.ArgumentParser:
         "verify-market",
         help=(
             "verify station observations against a market's own settlement "
-            "terms, two-way, and emit the verified (market, date) pairs"
+            "terms, two-way, and emit the verified market payouts"
         ),
     )
     p.add_argument(
@@ -474,10 +474,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     obs_src.add_argument(
         "--observations-file",
-        help="JSON list of readings: {obs_time_utc, temp_f/temp_c, report_type, source}",
+        help="JSON readings with station, obs_time_utc, temp_f/temp_c, report_type and source",
     )
     p.add_argument("--persist", help="research DB to write market_rule_verification rows into")
-    p.add_argument("--out", help="write the verified (market_id, target_date) pairs here")
+    p.add_argument("--out", help="write the verified market/date/condition/payout records here")
 
     p = sub.add_parser(
         "build-performance",
@@ -726,6 +726,7 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
     import duckdb
 
     from weatherquant.markets.settlement_rules import parse_rules_text
+    from weatherquant.performance.settlement_queue import latest_settlement_rows
     from weatherquant.truth.observation_verify import (
         persist_verification_results,
         verify_market_rules,
@@ -743,7 +744,7 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
             params.append(args.event_id)
         rows = con.execute(
             "SELECT market_id, event_id, bracket_label, bracket_low, bracket_high, "
-            "bracket_low_inclusive, bracket_high_inclusive, rules_text "
+            "bracket_low_inclusive, bracket_high_inclusive, rules_text, condition_id, bracket_kind "
             f"FROM markets WHERE target_date = ?{event_filter} ORDER BY market_id",
             params,
         ).fetchall()
@@ -753,15 +754,21 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
         print(f"no markets for {args.date} in {args.collector_copy}", file=sys.stderr)
         return 2
 
+    if len({row[1] for row in rows}) > 1:
+        print(f"multiple events for {args.date}; select one with --event-id", file=sys.stderr)
+        return 2
+
     markets = [
         {
             "market_id": r[0],
             "event_id": r[1],
             "bracket_label": r[2],
+            "bracket_kind": r[-1],
             "bracket_low": r[3],
             "bracket_high": r[4],
             "bracket_low_inclusive": r[5],
             "bracket_high_inclusive": r[6],
+            "condition_id": r[8],
         }
         for r in rows
     ]
@@ -782,17 +789,16 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
     if args.settlements:
         with Path(args.settlements).open(encoding="utf-8") as handle:
             index = _json.load(handle)
-        wanted = {str(m["market_id"]) for m in markets}
-        for record in index:
-            if str(record.get("market_id")) in wanted and record.get("resolved_outcome") is not None:
-                payout = float(record["resolved_outcome"])
-                outcomes.append(
-                    {
-                        "market_id": str(record["market_id"]),
-                        "is_winner": payout == 1.0,
-                        "yes_price": payout,
-                    }
-                )
+        wanted = {str(m["market_id"]): str(m["condition_id"] or "").lower() for m in markets}
+        for (market_id, target_date), record in latest_settlement_rows(index).items():
+            condition = (record.get("raw_source_reference") or {}).get("condition_id")
+            payout = record.get("resolved_outcome")
+            if (
+                condition and str(condition).lower() == wanted.get(market_id)
+                and target_date == args.date and record.get("settlement_status") == "RESOLVED"
+                and type(payout) in (int, float) and payout in (0, 1)
+            ):
+                outcomes.append({"market_id": market_id, "is_winner": payout == 1, "yes_price": payout})
     else:
         print(
             "no --settlements given: the venue side will be empty and the verdict will be no_outcome",
@@ -815,9 +821,10 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
                     "temp_c": r[2],
                     "report_type": r[3],
                     "source": r[4],
+                    "station": r[5],
                 }
                 for r in odb.execute(
-                    "SELECT obs_time_utc, temp_f, temp_c, report_type, source "
+                    "SELECT obs_time_utc, temp_f, temp_c, report_type, source, station "
                     "FROM klga_observations WHERE obs_time_utc >= ? AND obs_time_utc < ?",
                     [start, end],
                 ).fetchall()
@@ -861,14 +868,17 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
         # The queue's contract: only a two-way MATCH marks the pair verified.
         pairs = []
         if result.verdict == "match":
-            checked = {o["market_id"] for o in outcomes if o["yes_price"] in (0.0, 1.0)}
+            checked = {o["market_id"]: o["yes_price"] for o in outcomes}
             pairs = [
-                {"market_id": str(m["market_id"]), "target_date": args.date}
+                {
+                    "market_id": str(m["market_id"]), "target_date": args.date,
+                    "condition_id": m["condition_id"], "resolved_outcome": checked[str(m["market_id"])],
+                }
                 for m in markets
                 if str(m["market_id"]) in checked
             ]
         _atomic_write_json(Path(args.out), pairs)
-        print(f"  verified pairs: {len(pairs)} -> {args.out}")
+        print(f"  verified payouts: {len(pairs)} -> {args.out}")
     return 0
 
 
