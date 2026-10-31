@@ -46,6 +46,7 @@ def settlement(market_id="mkt-1", revision=1, status="RESOLVED", yes_payout=1.0,
         "status": status,
         "yes_payout": yes_payout,
         "settled_at_utc": NOW.isoformat(),
+        "verification_status": "VERIFIED",
         "transaction_hash": "0xabc",
         "source": "data-api.polymarket.com/v2/resolutions",
     }
@@ -269,3 +270,45 @@ def test_confirmations_and_multiple_corrections_keep_original_shares(env, payout
         assert balances["realized_pnl_usdc"] == pytest.approx(100 * payout - 56.079)
         assert ledger._applied_settlement("mkt-1")["settled_shares"] == 100.0
         assert ledger.verify()["consistent"]
+
+@pytest.mark.parametrize("latest_status,latest_payout,late_status,late_payout", [
+    ("DISPUTED", None, "RESOLVED", 1.0),
+    ("RESOLVED", 1.0, "DISPUTED", None),
+])
+def test_older_revision_cannot_change_latest_decision(env, latest_status, latest_payout, late_status, late_payout):
+    _, ledger, db = env
+    apply(ledger, db, settlement(revision=2, status=latest_status, yes_payout=latest_payout))
+    before = ledger.balances(), ledger.positions(), ledger.ledger_entries()
+    db.close()
+    db.open()
+    older = settlement(revision=1, status=late_status, yes_payout=late_payout)
+    assert apply(ledger, db, older)["action"] == "NOOP"
+    assert apply(ledger, db, older)["action"] == "NOOP"
+    assert (ledger.balances(), ledger.positions(), ledger.ledger_entries()) == before
+    assert ledger.review_required() == []
+    assert db.execute("SELECT revision, applied, review_required FROM paper_settlements ORDER BY revision").fetchall() == [
+        (1, False, False), (2, latest_status == "RESOLVED", False),
+    ]
+
+
+@pytest.mark.parametrize("verification", [None, "UNVERIFIED"])
+def test_verification_controls_initial_payout_withdrawal_and_correction(env, verification):
+    _, ledger, db = env
+    row = settlement()
+    if verification is None:
+        del row["verification_status"]
+    else:
+        row["verification_status"] = verification
+    before = ledger.balances(), ledger.positions(), ledger.ledger_entries()
+    assert apply(ledger, db, row)["action"] == "RECORDED"
+    assert (ledger.balances(), ledger.positions(), ledger.ledger_entries()) == before
+
+    assert apply(ledger, db, settlement(revision=2))["action"] == "APPLIED"
+    paid = ledger.balances(), ledger.positions(), ledger.ledger_entries()
+    assert apply(ledger, db, dict(row, revision=3, yes_payout=0))["action"] == "REVIEW_REQUIRED"
+    assert (ledger.balances(), ledger.positions(), ledger.ledger_entries()) == paid
+    assert [entry["revision"] for entry in ledger.review_required()] == [3]
+    assert apply(ledger, db, settlement(revision=4, yes_payout=0))["action"] == "APPLIED"
+    assert apply(ledger, db, settlement(revision=4, yes_payout=0))["action"] == "NOOP"
+    assert [e["kind"] for e in ledger.ledger_entries()] == ["OPEN", "BUY_SETTLE", "SETTLE_PAYOUT", "CORRECTION"]
+    assert ledger.verify()["consistent"]

@@ -109,17 +109,12 @@ fill 行 + 信号状态迁移,同一事务;任何一层拒绝(无资金/无库�
 结算输入是**发布的** settlement feed(JSONL,按 market+revision 键),
 词汇表复用 `performance/settlement.py` 的五态。规则:
 
-1. 只有 `RESOLVED` 且 payout ∈ {0,1} 移动台账;PENDING / DISPUTED /
-   UNAVAILABLE / UNVERIFIABLE 一律只记录不应用——**未结算永远没有
-   已实现盈亏**;RESOLVED 之外的任何记录带 payout 直接是解析错误。
-2. 修订不编辑历史:更高 revision 且 payout 变化 → 台账追加 CORRECTION
-   补偿条目(Δ = (新−旧)×结算份额),原 SETTLE_PAYOUT 原样保留。
-3. 不可自动补偿的情形**标记人工复核、余额不动**:回拨会让现金变负
-   (钱已经花掉,自动回拨等于把审计问题换成资不抵债)、或 RESOLVED
-   之后又 DISPUTED(最终答案未知,维持或撤销都是编造)。结算行带
-   `review_required` 与理由,`weatherquant-paper status`/settle 输出可见。
-4. 幂等:`UNIQUE(market_id, revision)` 自然键 + `(applied revision)`
-   判断,重放整个 feed 是 no-op;更旧 revision 视为被取代。
+1. 发布方应同时写入 `status`、`verification_status` 和 `yes_payout`。只有 `RESOLVED`、`VERIFIED` 且赔付为 0 或 1 的记录可以结算。未验证的决议和缺少验证字段的旧格式记录仅供审计。发布方完成验证后用更高的 revision 发送确认。
+2. 更高版本的已验证赔付发生变化时，账本追加 CORRECTION，金额为赔付差额乘以原始结算份额。
+3. 已入账的赔付被撤回验证、出现争议或无法确认时，保留原始余额并标记人工复核。赔付更正会使现金为负时也需人工复核。
+4. 每个市场的 revision 单调推进。迟到的旧版本留存审计，既不变动资金也不触发复核。重复投递同一版本无额外影响。
+
+升级前已经入账的旧记录保留原账。旧引擎未保存验证状态，历史账务需与官方证据逐笔核对；若有差异，通过更高版本发布更正。
 
 ### D9. 盘口证据:成交行携带完整双向快照,不可执行即 NOT_EXECUTABLE(WQN-24)
 
