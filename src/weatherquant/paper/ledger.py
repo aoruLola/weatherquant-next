@@ -122,13 +122,19 @@ class Ledger:
         write wins, exactly like the account row itself.
         """
         if self.balances() is not None:
-            return False
-        self.db.execute(
-            "INSERT INTO paper_balances (account_id, available_usdc, occupied_usdc, "
-            "realized_pnl_usdc, updated_at_utc) VALUES (?, ?, 0.0, 0.0, ?) "
-            "ON CONFLICT (account_id) DO NOTHING",
-            [ACCOUNT_ID, float(initial_capital_usdc), now],
-        )
+            if self._entry_exists(ledger_entry_id(kind="OPEN", ref_id=ACCOUNT_ID)):
+                return False
+            # Before atomic init, a crash could leave funded balances without OPEN.
+            # Restore only the missing entry from the immutable account record.
+            account = self.store.account()
+            initial_capital_usdc = account["initial_capital_usdc"]
+            now = account["created_at_utc"]
+        else:
+            self.db.execute(
+                "INSERT INTO paper_balances (account_id, available_usdc, occupied_usdc, "
+                "realized_pnl_usdc, updated_at_utc) VALUES (?, ?, 0.0, 0.0, ?)",
+                [ACCOUNT_ID, float(initial_capital_usdc), now],
+            )
         self._insert_entry(
             kind="OPEN",
             ts_utc=now,
@@ -830,7 +836,11 @@ class Ledger:
         # only this counter can. Ordering the ledger by (ts, entry_id) once
         # shuffled such a batch and broke the running-balance audit chain.
         # (A wasted sequence on a conflicting insert is a gap, not a problem.)
-        seq = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM paper_ledger").fetchone()[0]
+        if kind == "OPEN":
+            # A recovered opening precedes any fills recorded before init was retried.
+            seq = self.db.execute("SELECT COALESCE(MIN(seq) - 1, 1) FROM paper_ledger").fetchone()[0]
+        else:
+            seq = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM paper_ledger").fetchone()[0]
         self.db.execute(
             "INSERT INTO paper_ledger (entry_id, seq, ts_utc, kind, currency, amount_usdc, "
             "balance_after_usdc, ref_type, ref_id, detail_json) "

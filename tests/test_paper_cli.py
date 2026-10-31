@@ -125,3 +125,56 @@ def test_consume_reads_the_published_export(paper_env, monkeypatch, capsys):
     assert main(["status"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["signals"] == {"ACCEPTED": 1}
+
+
+def test_interrupted_init_rolls_back_and_can_be_retried(paper_env, monkeypatch):
+    from weatherquant.paper.ledger import Ledger
+
+    monkeypatch.setenv("WQ_PAPER_ENABLED", "true")
+
+    def interrupted(*args, **kwargs):
+        raise RuntimeError("injected failure before OPEN")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(Ledger, "_insert_entry", interrupted)
+        with pytest.raises(RuntimeError, match="injected failure"):
+            main(["init"])
+
+    with PaperDatabase(paper_env) as db:
+        for table in ("paper_accounts", "paper_balances", "paper_ledger"):
+            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+    assert main(["init"]) == 0
+    assert main(["init"]) == 0
+    with PaperDatabase(paper_env) as db:
+        assert db.execute("SELECT available_usdc FROM paper_balances").fetchall() == [(100.0,)]
+        assert db.execute("SELECT kind, amount_usdc FROM paper_ledger").fetchall() == [("OPEN", 100.0)]
+
+
+@pytest.mark.parametrize("with_fill", [False, True])
+def test_reinit_restores_only_the_missing_legacy_open(paper_env, monkeypatch, with_fill):
+    from paper_fills_support import make_fill
+    from weatherquant.paper.ledger import Ledger
+    from weatherquant.paper.store import PaperStore
+
+    monkeypatch.setenv("WQ_PAPER_ENABLED", "true")
+    assert main(["init"]) == 0
+    with PaperDatabase(paper_env) as db:
+        store = PaperStore(db)
+        ledger = Ledger(store)
+        account = store.account()
+        db.execute("DELETE FROM paper_ledger WHERE kind = 'OPEN'")
+        if with_fill:
+            with db.transaction():
+                ledger.apply_buy(make_fill(decision_id="before-repair"), now=account["created_at_utc"])
+        before = ledger.balances(), ledger.positions(), ledger.ledger_entries()
+
+    assert main(["init"]) == 0
+    assert main(["init"]) == 0
+    with PaperDatabase(paper_env) as db:
+        ledger = Ledger(PaperStore(db))
+        opening, *movements = ledger.ledger_entries()
+        assert opening["kind"] == "OPEN"
+        assert opening["amount_usdc"] == opening["balance_after_usdc"] == account["initial_capital_usdc"]
+        assert opening["ts_utc"] == account["created_at_utc"]
+        assert (ledger.balances(), ledger.positions(), movements) == before
+        assert ledger.verify()["consistent"]
