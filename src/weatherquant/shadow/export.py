@@ -252,7 +252,9 @@ class DecisionExporter:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.parts_dir.mkdir(parents=True, exist_ok=True)
 
-        existing = sorted(self.parts_dir.glob("part-*.jsonl"))
+        # An empty row count is not evidence that a part was published.
+        accounted = int(state.get("next_part") or 1) if state.get("rows_exported") else 1
+        existing = _published_parts(self.parts_dir, next_part=accounted)
         if existing:
             last = existing[-1]
             end = _end_cursor_of(last)
@@ -268,15 +270,7 @@ class DecisionExporter:
                 stored_seq = state.get("cursor_seq")
                 if stored_seq is None or int(end_seq) > int(stored_seq):
                     state["cursor_seq"] = int(end_seq)
-            # Everything below `accounted` is already inside rows_exported.
-            #
-            # A state that names parts but counts no rows is not one this
-            # can trust - the two are written together - so it is treated as
-            # absent and the count is rebuilt.
-            accounted = (
-                int(state.get("next_part") or 1) if state.get("rows_exported") else 1
-            )
-            state["next_part"] = max(accounted, _index_of(last) + 1)
+            state["next_part"] = len(existing) + 1
             # Only the parts the state does not already cover are counted.
             #
             # Counting them all means reading every part, and this call
@@ -293,7 +287,7 @@ class DecisionExporter:
             # entirely counts everything - once: the next write records the
             # total again, and that tick still exports, because the budget is
             # not consulted until a part has been written.
-            tail = [path for path in existing if _index_of(path) >= accounted]
+            tail = existing[accounted - 1:]
             if tail:
                 state["rows_exported"] = int(
                     state.get("rows_exported") or 0
@@ -766,7 +760,10 @@ class DecisionExporter:
         An export that cannot be reconciled is worse than no export: the
         research side would score against a set of rows nobody can audit.
         """
-        state = self._load()
+        try:
+            state = self._load()
+        except _ExportPartGap as exc:
+            return {"consistent": False, "first_divergence": str(exc)}
         parts = sorted(self.parts_dir.glob("part-*.jsonl")) if self.parts_dir.exists() else []
         counted = _count_rows(parts)
         claimed = int(state.get("rows_exported") or 0)
@@ -797,7 +794,10 @@ class DecisionExporter:
         reported as the first divergence rather than as a bare boolean, so
         an operator can act on the answer.
         """
-        state = self._load()
+        try:
+            state = self._load()
+        except _ExportPartGap as exc:
+            return {"consistent": False, "first_divergence": str(exc)}
         cursor_seq = state.get("cursor_seq")
         report: dict[str, Any] = {
             "state_version": state.get("version"),
@@ -971,6 +971,25 @@ def _index_of(path: Path) -> int:
         return 0
 
 
+class _ExportPartGap(ValueError):
+    """Published files do not cover the part sequence recorded by the writer."""
+
+
+def _published_parts(directory: Path, *, next_part: int = 1) -> list[Path]:
+    parts = sorted(directory.glob("part-*.jsonl"))
+    for index, path in enumerate(parts, start=1):
+        if _index_of(path) != index:
+            raise _ExportPartGap(
+                f"decision export gap in {directory}: expected part-{index:09d}.jsonl, found {path.name}"
+            )
+    if len(parts) + 1 < next_part:
+        raise _ExportPartGap(
+            f"decision export gap in {directory}: missing part-{len(parts) + 1:09d}.jsonl; "
+            f"saved state accounts for {next_part - 1} parts"
+        )
+    return parts
+
+
 def _read_last_line(path: Path) -> str | None:
     try:
         with path.open("rb") as handle:
@@ -1110,16 +1129,7 @@ def read_export_with_watermark(
     root = Path(directory) / "parts"
     if not root.exists():
         return [], None
-    parts = sorted(root.glob("part-*.jsonl"))
-    indices = [_index_of(path) for path in parts]
-    if indices != list(range(1, len(indices) + 1)):
-        missing = sorted(set(range(1, len(indices) + 1)) - set(indices))
-        raise ValueError(
-            f"the decisions export has a gap: part index(es) {missing} are "
-            f"missing from {root}. A watermark taken from the highest part "
-            "would claim coverage of rows that are not here, so the export is "
-            "refused rather than published under a cursor it never reached."
-        )
+    parts = _published_parts(root)
     rows: list[dict[str, Any]] = []
     for path in parts:
         with path.open(encoding="utf-8") as handle:
@@ -1151,7 +1161,7 @@ def export_watermark(directory: str | Path) -> list[str] | None:
     parts = Path(directory) / "parts"
     if not parts.is_dir():
         return None
-    existing = sorted(parts.glob("part-*.jsonl"))
+    existing = _published_parts(parts)
     if not existing:
         return None
     end = _end_cursor_of(existing[-1])

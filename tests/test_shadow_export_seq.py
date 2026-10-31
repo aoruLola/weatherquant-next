@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from weatherquant.shadow.export import DecisionExporter, read_export
+from weatherquant.shadow.export import DecisionExporter, export_watermark, read_export
 from weatherquant.storage.shadow import ShadowDatabase
 
 NOW = datetime(2026, 10, 14, 8, 0, tzinfo=UTC)
@@ -817,3 +817,37 @@ def test_the_streaming_consumer_accepts_a_trailing_rollback_part(db, tmp_path):
     assert result.rows_consumed == 9
     assert state is not None
     assert state.last_export_seq is not None  # the v2 rows still bind it
+
+
+@pytest.mark.parametrize(("missing", "lose_state"), [(1, False), (2, True), (3, False)])
+def test_broken_part_sequence_blocks_recovery_until_restored(db, tmp_path, missing, lose_state):
+    for i in range(1, 4):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i), seq=i)
+    exporter = _exporter(db, tmp_path, batch_rows=1)
+    assert exporter.run_batch().rows_exported == 3
+
+    part = exporter.parts_dir / f"part-{missing:09d}.jsonl"
+    parked = part.rename(tmp_path / part.name)
+    if lose_state:
+        exporter.state_path.unlink()
+    state_before = None if lose_state else exporter.state_path.read_bytes()
+    _insert(db, i=4, when=NOW + timedelta(seconds=4), seq=4)
+
+    result = exporter.run_batch()
+    assert result.rows_exported == result.parts_written == 0
+    assert not result.caught_up
+    assert part.name in " ".join(result.notes)
+    for report in (exporter.verify(), exporter.reconcile()):
+        assert report["consistent"] is False
+        assert part.name in report["first_divergence"]
+    assert (exporter.state_path.read_bytes() if exporter.state_path.exists() else None) == state_before
+    if missing < 3:
+        with pytest.raises(ValueError, match=part.name):
+            export_watermark(exporter.directory)
+        with pytest.raises(ValueError, match=part.name):
+            read_export(exporter.directory)
+
+    parked.rename(part)
+    _run_to_caught_up(exporter)
+    assert _ids(exporter.directory) == [f"id-{i:04d}" for i in range(1, 5)]
+    assert exporter.reconcile()["consistent"]
