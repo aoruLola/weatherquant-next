@@ -18,6 +18,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "winrate_acceptance.py"
 _spec = importlib.util.spec_from_file_location("wq_winrate_acceptance", _SCRIPT)
 assert _spec and _spec.loader
@@ -63,3 +65,17 @@ def test_the_tally_counts_episodes_and_respects_sell_yes() -> None:
     assert counts["UNVERIFIABLE"] == 1, "sell_yes is counted, never scored"
     assert counts["PENDING"] == 1, "pending is counted, never scored"
     assert counts["LOSS"] == 0
+
+
+def test_cli_preserves_existing_evidence(tmp_path, monkeypatch, capsys):
+    report = tmp_path / "previous.json"
+    report.write_bytes(b"previous evidence")
+    monkeypatch.setattr(sys, "argv", ["winrate_acceptance.py", "--out", str(tmp_path), "--report", str(report)])
+
+    with pytest.raises(SystemExit) as refusal:
+        acceptance.main()
+
+    assert refusal.value.code == 2
+    assert "new or empty directory" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == [report]
+    assert report.read_bytes() == b"previous evidence"

@@ -21,6 +21,8 @@
 
 ## 2. 验收脚本与测试
 
+每次运行使用新的或空的输出目录。省略 `--out` 时，脚本创建独立的临时目录并打印路径。已有验收文件的目录会被保留。
+
 ```bash
 # 三案例端到端：零有效样本 / 不足阈值 / 完整样本（含两次运行的可复现性）
 uv run python scripts/winrate_acceptance.py --out /tmp/wq-winrate-acceptance \
