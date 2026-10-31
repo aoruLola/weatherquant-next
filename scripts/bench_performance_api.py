@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import sys
 import time
@@ -121,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
                     "bytes": len(measured.content),
                     "items": len(response.json().get("data", {}).get("items", []) or []),
                     "median_ms": round(statistics.median(samples), 1),
-                    "p95_ms": round(samples[max(0, int(len(samples) * 0.95) - 1)], 1),
+                    "p95_ms": round(samples[math.ceil(len(samples) * 0.95) - 1], 1),
                     "max_ms": round(samples[-1], 1),
                     "request_peak_mb": round(high / 1e6, 2),
                 }

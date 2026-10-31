@@ -468,3 +468,25 @@ def test_reference_capital_does_not_copy_the_history(published) -> None:
     assert len(body["results_sample"]) <= 50
     assert body["results_total"] == body["executable_count"] + body["not_executable_count"]
     assert sum(body["not_executable_reason_counts"].values()) == body["not_executable_count"]
+
+
+def test_monitor_recognizes_dashboard_limit_validation_and_previous_cursor(published, monkeypatch):
+    import httpx
+
+    root = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(root / "scripts"))
+    import performance_monitor as monitor
+
+    def through_dashboard(request):
+        response = published.get(str(request.url))
+        return httpx.Response(response.status_code, content=response.content)
+
+    route = "/api/v1/performance/opportunities"
+    current = published.get(route, params={"limit": 10}).json()["data"]["next_cursor"]
+    report = monitor.probe_dashboard(
+        "http://testserver", token=None, probes=1, max_p95_ms=1000, max_response_mb=32,
+        previous_cursor=current, transport=httpx.MockTransport(through_dashboard),
+    )
+    assert report["limit_clamp"]["rejected_above"] == 200
+    assert report["previous_cursor_status"] == 200
+    assert report["failures"] == ["previous generation cursor answered 200; expected 409"]
