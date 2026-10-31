@@ -212,8 +212,8 @@ def test_losing_the_state_file_does_not_duplicate_a_range(db, tmp_path):
     for i in range(20):
         _insert(db, i=i, when=NOW + timedelta(seconds=i))
     ex = _exporter(db, tmp_path, batch_rows=7, max_parts_per_run=10)
-    while not ex.run_batch().caught_up:
-        pass
+    result = ex.run_batch()
+    assert result.caught_up, result.notes
 
     (tmp_path / "export" / "state.json").unlink()  # crash before state was written
 

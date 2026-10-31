@@ -108,14 +108,14 @@ def test_the_migration_opens_a_non_empty_pre_0005_database(old_db_path: Path) ->
         ).fetchall()
         assert [int(seqs[0][0]), int(seqs[1][0])] == [1, 2]
 
-        # The index exists (0006) - the exporter's positioning read needs it.
+        # The legacy sequence can be repaired without rewriting indexed decision keys.
         indexes = {
             r[0]
             for r in database.con.execute(
                 "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'shadow_decisions'"
             ).fetchall()
         }
-        assert "idx_decisions_export_seq" in indexes
+        assert "idx_decisions_export_seq" not in indexes
     finally:
         database.close()
 

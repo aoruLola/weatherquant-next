@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -114,6 +115,42 @@ def test_a_row_written_late_with_an_earlier_business_time_is_exported(db, tmp_pa
     assert late_id in ids
     assert len(ids) == len(set(ids)) == 6
     assert ex.reconcile()["consistent"] is True
+
+
+def test_indexed_database_upgrades_with_live_cursor_and_late_legacy_row(tmp_path, monkeypatch):
+    from weatherquant.storage import shadow
+
+    old_migrations = tmp_path / "indexed_migrations"
+    old_migrations.mkdir()
+    for path in shadow.SHADOW_MIGRATIONS_DIR.glob("*.sql"):
+        if path.name[:4] <= "0006":
+            shutil.copyfile(path, old_migrations / path.name)
+
+    db_path = tmp_path / "shadow.duckdb"
+    with monkeypatch.context() as patch:
+        patch.setattr(shadow, "SHADOW_MIGRATIONS_DIR", old_migrations)
+        with ShadowDatabase(db_path) as old:
+            seq = old.execute("SELECT nextval('seq_shadow_decision_export')").fetchone()[0]
+            live_id = _insert(old, i=1, when=NOW, seq=seq)
+            exporter = _exporter(old, tmp_path)
+            assert exporter.run_batch().cursor_seq == seq
+            first_part = next(exporter.parts_dir.glob("*.jsonl"))
+            first_bytes = first_part.read_bytes()
+            late_id = _insert(old, i=2, when=NOW - timedelta(hours=1), mode="REPLAY")
+
+    with ShadowDatabase(db_path) as upgraded:
+        exporter = _exporter(upgraded, tmp_path)
+        assert exporter.state()["cursor_seq"] == seq
+        result = exporter.run_batch()
+        assert result.rows_exported == result.late_rows == 1
+        assert result.cursor_seq > seq
+        assert first_part.read_bytes() == first_bytes
+
+    with ShadowDatabase(db_path) as restarted:
+        exporter = _exporter(restarted, tmp_path)
+        assert exporter.run_batch().rows_exported == 0
+        assert _ids(tmp_path / "export") == [live_id, late_id]
+        assert exporter.reconcile()["consistent"] is True
 
 
 def test_a_replay_run_backfilling_history_is_exported_in_full(db, tmp_path):
@@ -231,8 +268,7 @@ def test_a_lost_state_file_recovers_the_sequence_cursor_from_the_parts(db, tmp_p
     for i in range(20):
         _insert(db, i=i, when=NOW + timedelta(seconds=i))
     ex = _exporter(db, tmp_path, batch_rows=6)
-    while not ex.run_batch().caught_up:
-        pass
+    _run_to_caught_up(ex)
     before = _ids(tmp_path / "export")
 
     ex.state_path.unlink()
@@ -451,11 +487,13 @@ def test_the_transition_exports_rows_the_v1_cursor_skipped(db, tmp_path):
 
     ex = _exporter(db, tmp_path, batch_rows=4)
     results = []
-    while True:
+    for _ in range(50):
         result = ex.run_batch()
         results.append(result)
         if result.caught_up:
             break
+    else:
+        pytest.fail(f"export did not catch up: {result.notes}")
 
     ids = _ids(tmp_path / "export")
     assert missed in ids, "the v1-skipped row stayed skipped"
@@ -713,8 +751,7 @@ def test_legacy_parts_then_sequenced_parts_still_ingest(db, tmp_path):
     _write_v1_export(db, tmp_path, exported)
 
     ex = _exporter(db, tmp_path)
-    while not ex.run_batch().caught_up:
-        pass
+    _run_to_caught_up(ex)
     _insert(db, i=50, when=NOW - timedelta(hours=1), mode="REPLAY", seq=5000)
     _run_to_caught_up(ex)
 
