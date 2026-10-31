@@ -15,6 +15,7 @@ lost, nothing twice" via ``reconcile()``.
 
 from __future__ import annotations
 
+import itertools
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -392,7 +393,7 @@ def _backfill_like_migration_0005(db) -> None:
     )
 
 
-def _write_v1_export(db, tmp_path: Path, exported_ids: list[str]) -> None:
+def _write_v1_export(db, tmp_path: Path, exported_ids: list[str], *, rows_per_part: int = 4) -> None:
     """Publish parts in the v1 shape: business order, no export_seq field."""
     parts_dir = tmp_path / "export" / "parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
@@ -402,8 +403,8 @@ def _write_v1_export(db, tmp_path: Path, exported_ids: list[str]) -> None:
         "ORDER BY decision_time_utc, decision_id",
         exported_ids,
     ).fetchall()
-    for index in range(0, len(ordered), 4):
-        chunk = ordered[index : index + 4]
+    for index in range(0, len(ordered), rows_per_part):
+        chunk = ordered[index : index + rows_per_part]
         lines = [
             json.dumps(
                 {
@@ -415,7 +416,7 @@ def _write_v1_export(db, tmp_path: Path, exported_ids: list[str]) -> None:
             )
             for row in chunk
         ]
-        (parts_dir / f"part-{(index // 4) + 1:09d}.jsonl").write_text(
+        (parts_dir / f"part-{(index // rows_per_part) + 1:09d}.jsonl").write_text(
             "\n".join(lines) + "\n", encoding="utf-8"
         )
     last = ordered[-1]
@@ -423,7 +424,7 @@ def _write_v1_export(db, tmp_path: Path, exported_ids: list[str]) -> None:
     _atomic_state(
         tmp_path / "export" / "state.json",
         {
-            "next_part": (len(ordered) + 3) // 4 + 1,
+            "next_part": (len(ordered) + rows_per_part - 1) // rows_per_part + 1,
             "rows_exported": len(ordered),
             "watermark": watermark,
             "last_run_at_utc": NOW.isoformat(),
@@ -471,7 +472,7 @@ def test_the_transition_exports_rows_the_v1_cursor_skipped(db, tmp_path):
     assert "export_seq" not in v1_part.read_text(encoding="utf-8")
 
 
-def test_the_transition_is_bounded_and_resumable_across_restarts(tmp_path):
+def test_the_transition_is_bounded_and_resumable_across_restarts(tmp_path, monkeypatch):
     """A mid-transition restart resumes from the recorded progress.
 
     The scan's id table is a *real* table, so a restart picks up at the
@@ -493,7 +494,11 @@ def test_the_transition_is_bounded_and_resumable_across_restarts(tmp_path):
         _write_v1_export(database, tmp_path, exported)  # 10 parts of 4 rows
 
         ex = _exporter(database, tmp_path, batch_rows=4, max_seconds=0.001)
-        first = ex.run_batch()
+        # Force a mid-scan restart even when the first eight tiny files take
+        # less than one tick of the host's monotonic clock.
+        with monkeypatch.context() as patch:
+            patch.setattr("weatherquant.shadow.export.time.monotonic", itertools.count(0, 1).__next__)
+            first = ex.run_batch()
         assert first.transition_done is False, "one tick did everything"
         assert any("stopped the scan" in note for note in first.notes), first.notes
         state = json.loads(ex.state_path.read_text(encoding="utf-8"))
@@ -547,8 +552,6 @@ def test_the_transition_scan_respects_the_wall_clock_budget(db, tmp_path, monkey
     The clock is driven explicitly (the repo's own pattern) so the test
     cannot pass against code that ignores the budget.
     """
-    import itertools
-
     from weatherquant.shadow import export as export_module
 
     exported = [_insert(db, i=i, when=NOW + timedelta(seconds=i)) for i in range(40)]
@@ -583,17 +586,12 @@ def test_the_transition_scan_respects_the_wall_clock_budget(db, tmp_path, monkey
     assert ex.reconcile()["consistent"] is True
 
 
-def test_a_large_transition_completes_quickly_with_bulk_id_loading(db, tmp_path):
-    """The wall-clock smoke behind the 18-minute acceptance failure.
-
-    Per-row executemany into a keyed table cost ~33s per 20k rows; the scan
-    now loads each part with one read_json statement. 48 parts x 150 rows is
-    small next to production, but the old path would already spend seconds
-    here and the bound keeps the regression measurable.
-    """
+@pytest.mark.parametrize(("part_count", "rows_per_part"), [(1800, 4), (6, 1200)])
+def test_a_large_transition_completes_quickly_with_bulk_id_loading(db, tmp_path, part_count, rows_per_part):
+    """Both fragmented and compact histories must migrate within the same time budget."""
     import time as _time
 
-    rows = 48 * 150
+    rows = part_count * rows_per_part
     for start in range(0, rows, 5000):
         db.con.execute(
             "INSERT INTO shadow_decisions ("
@@ -614,15 +612,17 @@ def test_a_large_transition_completes_quickly_with_bulk_id_loading(db, tmp_path)
         db,
         tmp_path,
         [f"id-{i:06d}" for i in range(rows)],
+        rows_per_part=rows_per_part,
     )
 
     ex = _exporter(db, tmp_path, batch_rows=150)
     started = _time.monotonic()
-    while not ex.run_batch().transition_done:
-        pass
+    result = ex.run_batch()
     elapsed = _time.monotonic() - started
 
-    assert elapsed < 5.0, f"the transition scan took {elapsed:.1f}s for 48 parts"
+    assert result.transition_done, result.notes
+    assert elapsed < 5.0, f"the transition scan took {elapsed:.1f}s for {part_count} parts"
+    assert ex.state()["transition"]["parts_scanned"] == part_count
     assert ex.reconcile()["consistent"] is True
 
 

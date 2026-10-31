@@ -334,23 +334,21 @@ class DecisionExporter:
         existed. Idempotent (only NULL rows are touched), bounded per part,
         and recorded in the state so the repair is auditable after the fact.
         """
-        parts = sorted(self.parts_dir.glob("part-*.jsonl"))
-        if not parts:
-            return []
-        v2_indices = [_index_of(p) for p in parts if _end_seq_of(p) is not None]
-        if not v2_indices:
-            # A pure v1 history: the one-time transition owns it.
-            return []
-        tail = [p for p in parts if _index_of(p) > max(v2_indices)]
-        if not tail:
-            return []
         cursor = state.get("cursor_seq")
         if cursor is None:
             # v2 parts exist but the state lost its cursor: the transition
             # will recover it from the parts, and the repair runs next tick.
             return []
+        parts = sorted(self.parts_dir.glob("part-*.jsonl"))
+        for index in range(len(parts) - 1, -1, -1):
+            if _end_seq_of(parts[index]) is not None:
+                break
+        else:
+            # A pure v1 history: the one-time transition owns it.
+            return []
         cursor = int(cursor)
         pinned = 0
+        tail = parts[index + 1 :]
         for path in tail:
             row = self.con.execute(
                 "SELECT COUNT(*) FROM shadow_decisions d WHERE d.export_seq IS NULL "
@@ -477,12 +475,25 @@ class DecisionExporter:
                         f"transition: stopped the scan at the {self.max_seconds:g}s budget"
                     )
                     break
-                self.con.execute(
-                    f"INSERT OR IGNORE INTO {_TRANSITION_IDS_TABLE} "
-                    "SELECT DISTINCT decision_id FROM read_json_auto(?, "
-                    "columns={'decision_id': 'VARCHAR'}) WHERE decision_id IS NOT NULL",
-                    [[str(path) for path in batch]],
-                )
+                # For tiny parts the setup cost of a DuckDB JSON reader per
+                # file dominates. Keep this in-memory path bounded by bytes.
+                if sum(path.stat().st_size for path in batch) <= 256 * 1024:
+                    ids = []
+                    for path in batch:
+                        with path.open("rb") as lines:
+                            ids.extend(json.loads(line).get("decision_id") for line in lines if line.strip())
+                    self.con.execute(
+                        f"INSERT OR IGNORE INTO {_TRANSITION_IDS_TABLE} "
+                        "SELECT id FROM unnest(?::VARCHAR[]) AS t(id) WHERE id IS NOT NULL",
+                        [ids],
+                    )
+                else:
+                    self.con.execute(
+                        f"INSERT OR IGNORE INTO {_TRANSITION_IDS_TABLE} "
+                        "SELECT DISTINCT decision_id FROM read_json_auto(?, "
+                        "columns={'decision_id': 'VARCHAR'}) WHERE decision_id IS NOT NULL",
+                        [[str(path) for path in batch]],
+                    )
                 next_scan += len(batch)
                 did_scan_work = True
             state["transition"] = {"phase": "scan_parts", "next_part": next_scan}
