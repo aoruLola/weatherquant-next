@@ -1309,6 +1309,8 @@ class CollectorWorker:
             pid=os.getpid(),
             hostname=self.hostname,
             app_version=__version__,
+            git_sha=self.git_sha,
+            image_tag=self.image_tag,
             updated_at_utc=wall,
             started_at_utc=self.started_at,
             uptime_seconds=(wall - self.started_at).total_seconds(),

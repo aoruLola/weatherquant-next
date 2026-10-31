@@ -481,6 +481,28 @@ docker run --rm -v /mnt/user/appdata/weatherquant-next:/data:ro \
 
 ## 10. 回滚到上一个 SHA 版本
 
+### 部署前后核对采集器
+
+发布工作流的摘要记录完整 Git SHA 和 `ghcr.io/...@sha256:...`。在有仓库副本和 Docker 的主机上，
+把这两个值分别赋给 `SOURCE_SHA`、`IMAGE_REF`。以下命令核对目标镜像的源码、运行台账和心跳，测试数据写入临时卷。
+
+```bash
+docker pull "$IMAGE_REF"
+bash scripts/verify_worker_image.sh "$IMAGE_REF" "$SOURCE_SHA"
+```
+
+在获准部署前后各记录一次运行中容器的镜像 ID、注册表摘要和实际 worker 文件哈希。部署后再与目标版本比对。
+
+```bash
+running_id=$(docker inspect -f '{{.Image}}' weatherquant-collector)
+docker image inspect --format '{{.Id}} {{json .RepoDigests}} {{json .Config.Labels}}' "$running_id"
+running_hash=$(docker exec weatherquant-collector python -c 'import hashlib,pathlib,weatherquant.data.worker as w; print(hashlib.sha256(pathlib.Path(w.__file__).read_bytes()).hexdigest())')
+echo "$running_hash"
+# 部署后的验收
+test "$running_id" = "$(docker image inspect -f '{{.Id}}' "$IMAGE_REF")"
+test "$running_hash" = "$(git show "$SOURCE_SHA:src/weatherquant/data/worker.py" | sha256sum | cut -d' ' -f1)"
+```
+
 镜像按 **不可变 SHA** 发布：`ghcr.io/<owner>/<repo>:sha-<git sha>`。
 SHA 标签**永不被重写**，`stable` 只是它的移动指针。
 

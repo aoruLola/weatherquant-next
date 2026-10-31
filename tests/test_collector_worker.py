@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import pytest
 
 from weatherquant.config import Settings
@@ -172,12 +173,16 @@ def test_a_full_cycle_collects_and_shuts_down_cleanly(
 def test_the_final_heartbeat_reports_the_runs_achievements(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    code, _ = _run(settings, monkeypatch)
+    sha = "a" * 40
+    code, _ = _run(settings, monkeypatch, git_sha=sha, image_tag=f"sha-{sha}")
     assert code == ExitCode.OK
 
     heartbeat = read_heartbeat(settings.db_path.parent / "health" / "heartbeat.json")
     assert heartbeat is not None
     assert str(heartbeat.status) == "stopped"
+    assert (heartbeat.git_sha, heartbeat.image_tag) == (sha, f"sha-{sha}")
+    with duckdb.connect(str(settings.db_path), read_only=True) as con:
+        assert con.execute("SELECT git_sha, image_tag FROM collector_runs").fetchall() == [(sha, f"sha-{sha}")]
     # Contact bookkeeping must survive the shutdown, where http is already closed.
     assert heartbeat.last_upstream_contact_utc is not None, (
         "the final heartbeat must not zero the contact clock"
