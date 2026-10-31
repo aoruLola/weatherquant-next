@@ -550,7 +550,7 @@ print('code supports  :', __import__('glob').glob('/app/.venv/lib/python3.12/sit
 | 15 | 无对外端口 | `docker port weatherquant-collector` → 空 |
 | 16 | SIGTERM 优雅退出 | `docker stop -t 60` → 日志显示 flush/checkpoint，`collector_runs.status='stopped'` |
 | 17 | 备份自校验 | `backups/` 内文件可只读打开且行数 = 主库 |
-| 18 | watchdog 自动恢复(WQN-2) | `echo 130 > /mnt/user/appdata/weatherquant-next/.fault-block-main && docker restart weatherquant-collector` → ~2 分钟后 `RestartCount` +1、容器回 `healthy`、`collector_runs` 多一行非 `stopped` 的记录、`collection_gaps` 无未关闭行 |
+| 18 | watchdog 自动恢复 | `bash scripts/wqn2_container_recovery_test.sh` 使用独立测试卷，验证约 120 秒后自动重启一次、恢复采集并关闭遗留缺口。 |
 | 18 | 30 分钟浸泡（含断网+重启） | 在 NAS 上跑 `python scripts/soak_test.py --minutes 30 --data /tmp/wq-soak` |
 
 ### 11.3 需要 GitHub Actions 执行的
@@ -697,6 +697,10 @@ B 不重复: 优雅停止后开库断言——runs≥2、恰好 1 个 run 非 st
 配套单测 `tests/test_collector_watchdog.py`：探针 119s/121s 边界、watchdog 对
 阻塞循环触发并写出诊断心跳、健康循环不误触发、`allow()` 预算超支仍触发、
 故障标记一次性消费、被杀后重启无重复写入。
+
+当前版本重启后会把上次运行记为 `failed`，并在 `stop_reason` 记录异常退出，详见 §12.6。
+复验脚本默认从当前工作区构建镜像，也支持通过 `IMAGE` 指定本地待验收镜像。它会记录镜像 ID、
+实际重启策略和过期心跳的探针输出。恢复场景要求有可访问的上游市场，在确认新进程写入盘口和价格后才停止容器核对数据库。
 ### 12.6 运行、缺口与备份的审计查询(WQN-5)
 
 异常退出(被 kill、OOM、watchdog 退出——容器全程可能是 Up 的)会留下
