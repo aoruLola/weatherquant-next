@@ -319,8 +319,10 @@ def ledger_payload(con: Any, *, now: datetime, query: dict[str, Any] | None = No
         if cursor:
             try:
                 seq_cursor = int(cursor)
-            except (TypeError, ValueError):
-                return {"kind": "ledger", "status": "error", "reason": "cursor must be a ledger seq (integer)"}
+            except ValueError:
+                seq_cursor = None
+            if seq_cursor is None or not -(2**63) <= seq_cursor < 2**63:
+                return {"kind": "ledger", "status": "error", "reason": "cursor must be a signed 64-bit ledger seq"}
             where = "WHERE seq > ? "
             params.append(seq_cursor)
         rows = con.execute(

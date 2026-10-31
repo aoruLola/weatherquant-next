@@ -58,7 +58,7 @@ class TestMigrations:
         path = tmp_path / "paper.duckdb"
         with PaperDatabase(path) as first:
             applied = dict(first.applied_migrations())
-            assert set(applied) == {"0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008"}
+            assert set(applied) == {"0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009"}
         with PaperDatabase(path) as again:
             assert again.applied_migrations() == applied
 
@@ -209,3 +209,60 @@ class TestRunBookkeeping:
         assert row[0] == "stopped"
         assert row[1] == "done"
         assert "cycles" in row[2]
+
+
+@pytest.mark.parametrize("history", ["legacy", "mixed", "unreconciled"])
+def test_legacy_ledger_sequence_upgrade(tmp_path, history):
+    from shutil import copy2
+
+    from weatherquant.paper.api import ledger_payload
+    from weatherquant.storage.db import connect
+    from weatherquant.storage.migrator import MigrationError, migrate
+    from weatherquant.storage.paper import PAPER_MIGRATIONS_DIR
+
+    old = tmp_path / "migrations"
+    old.mkdir()
+    for sql in sorted(PAPER_MIGRATIONS_DIR.glob("*.sql")):
+        if sql.name[:4] <= "0005":
+            copy2(sql, old)
+    db_path = tmp_path / "pre-0006.duckdb"
+    with connect(db_path) as con:
+        migrate(con, old)
+        # Same timestamp, IDs in reverse lexical order. Only the recorded
+        # cash chain agrees with the insertion order.
+        entries = [("z", "OPEN", 100, 100), ("y", "BUY_SETTLE", -3, 97), ("x", "BUY_SETTLE", -2, 95)]
+        if history == "unreconciled":
+            entries[-1] = ("x", "BUY_SETTLE", -2, 90)
+        for entry_id, kind, amount, after in entries:
+            con.execute("INSERT INTO paper_ledger VALUES (?, ?, ?, 'USDC', ?, ?, 'fixture', ?, '{}')",
+                        [entry_id, NOW, kind, amount, after, entry_id])
+        if history == "mixed":
+            for sql in PAPER_MIGRATIONS_DIR.glob("*.sql"):
+                if "0006" <= sql.name[:4] <= "0008":
+                    copy2(sql, old)
+            migrate(con, old)
+            con.execute("INSERT INTO paper_ledger VALUES ('w', ?, 'SELL_SETTLE', 'USDC', 8, 103, "
+                        "'fixture', 'w', '{}', 1)", [NOW])
+        if history == "unreconciled":
+            with pytest.raises(MigrationError, match="manual review"):
+                migrate(con, PAPER_MIGRATIONS_DIR)
+            assert con.execute("SELECT count(seq), count(*) FROM paper_ledger").fetchone() == (0, 3)
+            assert con.execute("SELECT COUNT(*) FROM schema_migrations WHERE version='0009'").fetchone() == (0,)
+            return
+
+    with PaperDatabase(db_path) as db:
+        paged = []
+        query = {"limit": 1}
+        expected = [("z", 1, 100), ("y", 2, 97), ("x", 3, 95)]
+        if history == "mixed":
+            expected = [("z", -2, 100), ("y", -1, 97), ("x", 0, 95), ("w", 1, 103)]
+        for _ in expected:
+            page = ledger_payload(db.con, now=NOW, query=query)["data"]
+            row, = page["entries"]
+            paged.append((row["ref_id"], row["seq"], row["balance_after_usdc"]))
+            query["cursor"] = page["next_cursor"]
+        assert query["cursor"] is None
+        assert paged == expected
+
+    with PaperDatabase(db_path) as db:
+        assert db.execute("SELECT ref_id, seq, balance_after_usdc FROM paper_ledger ORDER BY seq").fetchall() == expected

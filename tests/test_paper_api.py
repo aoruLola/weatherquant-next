@@ -211,8 +211,9 @@ class TestHttpLayer:
         assert status == 200
         assert second["data"]["entries"][0]["seq"] > first["data"]["entries"][0]["seq"]
 
-    def test_invalid_ledger_cursor_is_a_client_error(self, server):
-        status, payload = self._get(server, "/api/v1/paper/ledger?cursor=not-an-integer")
+    @pytest.mark.parametrize("cursor", ["not-an-integer", str(2**63), str(-(2**63) - 1)])
+    def test_invalid_ledger_cursor_is_a_client_error(self, server, cursor):
+        status, payload = self._get(server, f"/api/v1/paper/ledger?cursor={cursor}")
         assert status == 400
         assert "cursor" in payload["reason"]
 
@@ -220,19 +221,28 @@ class TestHttpLayer:
         from urllib.parse import urlencode
 
         store = PaperStore(populated)
-        decisions = ["!a &+/测试", "!b"]
-        for decision in decisions:
+        filled = ["!a &+/测试", "!b"]
+        refused = ["!c &+/测试", "!d"]
+        for decision in [*filled, *refused]:
             event = parse_signal_event(export_row(decision_id=decision))
-            store.record_signal(event, tradeable=False, outcome="REFUSED", consumed_at_utc=NOW)
-            store.record_fill(make_fill(decision_id=decision, shares=1.0))
+            with populated.transaction():
+                if decision in filled:
+                    store.record_signal(event, tradeable=True, outcome="FILLED", consumed_at_utc=NOW)
+                    fill = make_fill(decision_id=decision, shares=1.0, fill_cost=0.55, fees_usd=0.01)
+                    Ledger(store).apply_buy(fill, now=NOW)
+                    store.record_fill(fill)
+                else:
+                    store.record_signal(event, tradeable=False, outcome="REFUSED", consumed_at_utc=NOW)
 
-        for endpoint, items in (("orders", "items"), ("rejections", "items"), ("fills", "fills")):
+        for endpoint, items, expected in (
+            ("orders", "items", filled), ("rejections", "items", refused), ("fills", "fills", filled),
+        ):
             path = f"/api/v1/paper/{endpoint}?limit=1"
             status, first = self._get(server, path)
-            assert status == 200 and first["data"]["next_cursor"] == decisions[0]
+            assert status == 200 and first["data"]["next_cursor"] == expected[0]
             status, second = self._get(server, path + "&" + urlencode({"cursor": first["data"]["next_cursor"]}))
             assert status == 200
-            assert [row["decision_id"] for row in second["data"][items]] == [decisions[1]]
+            assert [row["decision_id"] for row in second["data"][items]] == [expected[1]]
 
     def test_bad_limit_is_a_400_signal(self, server):
         status, payload = self._get(server, "/api/v1/paper/ledger?limit=abc")
