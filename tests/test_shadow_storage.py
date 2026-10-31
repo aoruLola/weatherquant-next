@@ -344,3 +344,57 @@ def test_restart_keeps_the_same_frame_and_source_id_as_the_decision(shadow_db):
     restarted.load_books(store.load_book_rows())
     assert state.book_for(newest.token_id).source_event_id == newest.source_event_id
     assert restarted.book_for(newest.token_id) == state.book_for(newest.token_id)
+
+
+def test_populated_shadow_upgrade_preserves_book_and_decision_identity(tmp_path, monkeypatch):
+    import shutil
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from test_shadow_decision import _evaluate
+    from weatherquant.shadow.decision import Reason, State
+    from weatherquant.storage import shadow
+
+    old_dir = tmp_path / "before_0008"
+    old_dir.mkdir()
+    for migration in SHADOW_MIGRATIONS_DIR.glob("*.sql"):
+        if migration.name[:4] <= "0007":
+            shutil.copyfile(migration, old_dir / migration.name)
+    path = tmp_path / "shadow.duckdb"
+    d = _evaluate()
+    with monkeypatch.context() as patch:
+        patch.setattr(shadow, "SHADOW_MIGRATIONS_DIR", old_dir)
+        with ShadowDatabase(path) as old:
+            old.execute(
+                "INSERT INTO shadow_decisions (decision_id, run_id, cycle_id, market_id, token_id, "
+                "station, direction, state, mode, decision_time_utc, created_at_utc, export_seq, "
+                "book_id, book_source_event_id, fee_rate) VALUES "
+                "('original','first',?,?,?,'KLGA',?,'NO_TRADE','LIVE',?,?,19,'book','source-event',0.05)",
+                [d.cycle_id, d.market_id, d.token_id, d.direction.value, NOW, NOW],
+            )
+            old.execute(
+                "INSERT INTO rejection_reasons VALUES "
+                "('original',0,'MARKET_CLOSED',true,'closed'),('original',1,'UNKNOWN_FEE',false,'no fee')"
+            )
+            old.execute("INSERT INTO decision_book_depth VALUES ('book','[]','[]')")
+    with ShadowDatabase(path) as db:
+        store = ShadowStore(db)
+        reasons = "SELECT * FROM rejection_reasons ORDER BY ordinal"
+        assert db.execute(reasons).fetchall() == [
+            ("original", 0, "MARKET_CLOSED", True, "closed"), ("original", 1, "UNKNOWN_FEE", False, "no fee"),
+        ]
+        reobserved = replace(d, state=State.NO_TRADE, reasons=(Reason.UNKNOWN_FEE, Reason.NO_ORDERBOOK),
+                             details={"UNKNOWN_FEE": "still missing"})
+        with db.transaction():
+            store.save_decisions([reobserved], run_id="different-process", now=NOW + timedelta(seconds=1))
+        assert db.execute(reasons).fetchall() == [
+            ("original", 0, "UNKNOWN_FEE", True, "still missing"), ("original", 1, "NO_ORDERBOOK", False, None),
+        ]
+        with db.transaction():
+            store.save_decisions([d], run_id="different-process", now=NOW + timedelta(seconds=2))
+        assert db.execute(reasons).fetchall() == []
+        assert db.execute(
+            "SELECT decision_id, run_id, state, export_seq, book_id, book_source_event_id, fee_rate "
+            "FROM shadow_decisions"
+        ).fetchall() == [("original", "first", "ACCEPT", 19, "book", "source-event", 0.05)]
+        assert db.execute("SELECT * FROM decision_book_depth").fetchall() == [("book", "[]", "[]")]

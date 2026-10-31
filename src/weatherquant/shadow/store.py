@@ -330,9 +330,19 @@ class ShadowStore:
             # it. The column is nullable so pre-0005 images can still insert
             # (NULL); the exporter repairs those rows in bounded batches.
         )
+        # A replay can come from another run. The conflict key identifies the
+        # original decision, whose id and export position must survive the replay.
+        cycles = list(dict.fromkeys(d.cycle_id for d in decisions))
+        previous = {
+            (cycle, market, direction): did
+            for cycle, market, direction, did in self.db.execute(
+                "SELECT cycle_id, market_id, direction, decision_id FROM shadow_decisions "
+                f"WHERE cycle_id IN ({', '.join(['?'] * len(cycles))})", cycles,
+            ).fetchall()
+        }
         decision_rows = [
             (
-                decision_id(
+                previous.get((d.cycle_id, d.market_id, d.direction.value)) or decision_id(
                     run_id=run_id, cycle_id=d.cycle_id, market_id=d.market_id, direction=d.direction
                 ),
                 run_id,
@@ -386,8 +396,9 @@ class ShadowStore:
             )
             for d in decisions
         ]
+        latest = {row[0]: decision for row, decision in zip(decision_rows, decisions, strict=True)}
         values = "(" + ", ".join(["?"] * 49) + ", nextval('seq_shadow_decision_export'))"
-        if len({row[0] for row in decision_rows}) == len(decision_rows):
+        if len(latest) == len(decision_rows):
             self.db.execute(
                 decision_sql.format(values=", ".join([values] * len(decision_rows))),
                 [value for row in decision_rows for value in row],
@@ -397,20 +408,22 @@ class ShadowStore:
             # Repeated observations in the same call retain their original order.
             self.db.executemany(decision_sql.format(values=values), decision_rows)
 
-        reason_rows = {}
-        for d in decisions:
-            did = decision_id(
-                run_id=run_id, cycle_id=d.cycle_id, market_id=d.market_id, direction=d.direction
+        for did in latest.keys() & set(previous.values()):
+            self.db.execute(
+                "DELETE FROM rejection_reasons WHERE decision_id = ? AND reason NOT IN (SELECT unnest(?::VARCHAR[]))",
+                [did, latest[did].reason_codes],
             )
+        reason_rows = []
+        for did, d in latest.items():
             for ordinal, reason in enumerate(d.reasons):
-                reason_rows[(did, reason.value)] = (did, ordinal, reason.value, ordinal == 0, d.details.get(reason.value))
+                reason_rows.append((did, ordinal, reason.value, ordinal == 0, d.details.get(reason.value)))
         if reason_rows:
             self.db.execute(
                 "INSERT INTO rejection_reasons VALUES " + ", ".join(["(?, ?, ?, ?, ?)"] * len(reason_rows)) + " "
                 "ON CONFLICT (decision_id, reason) DO UPDATE SET "
                 "ordinal = excluded.ordinal, is_primary = excluded.is_primary, "
                 "detail = excluded.detail",
-                [value for row in reason_rows.values() for value in row],
+                [value for row in reason_rows for value in row],
             )
         return len(decisions)
 
