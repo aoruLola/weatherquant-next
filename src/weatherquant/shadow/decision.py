@@ -69,6 +69,7 @@ from weatherquant.execution.pricing import (
 )
 from weatherquant.markets.models import Side
 from weatherquant.shadow.config import Thresholds
+from weatherquant.shadow.events import BookObservation
 from weatherquant.shadow.forecast import ResolvedForecast
 from weatherquant.shadow.inference import ModelRefusal, PredictionResult
 
@@ -237,6 +238,9 @@ class Decision:
     expected_net_profit_usd: float | None = None
     net_edge: float | None = None
     decision_latency_ms: int | None = None
+    live_book: BookObservation | None = None
+    fee_rate: float | None = None
+    fee_exponent: float | None = None
 
     @property
     def primary_reason(self) -> Reason | None:
@@ -504,6 +508,9 @@ def evaluate(
         collector_received_at_utc=snapshot.collector_received_at_utc if snapshot else None,
         shadow_received_at_utc=snapshot.shadow_received_at_utc if snapshot else None,
         snapshot_age_ms=snapshot_age_ms,
+        live_book=snapshot if mode is Mode.LIVE else None,
+        fee_rate=market.fee_rate,
+        fee_exponent=market.fee_exponent,
         model_probability=q,
         market_price=_market_price(book, direction),
         best_bid=book.best_bid_usd_per_share if book else None,

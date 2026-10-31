@@ -950,3 +950,41 @@ def test_a_dead_feed_never_produces_a_live_accept(tmp_path, models_dir, monkeypa
     assert dec["by_mode"].get("LIVE", {}).get("accepted", 0) == 0
     # Whatever it did conclude about history is labelled and warned about.
     assert any("REPLAY, not LIVE" in w for w in report["warnings"])
+
+
+def test_live_export_keeps_decision_time_depth_and_fees_after_catalog_changes(make_runner, archive, tmp_path):
+    import hashlib
+
+    from weatherquant.paper.books import BookEvidence
+    from weatherquant.paper.events import parse_signal_event
+    from weatherquant.shadow.export import DecisionExporter, read_export
+
+    runner, _ = _run_one_cycle(make_runner)
+    con = runner.db.con
+    expected = {}
+    for raw in (archive / "rest" / f"{TARGET_DATE}.jsonl").read_bytes().splitlines():
+        if raw:
+            payload = json.loads(raw)["payload"]
+            expected[payload["asset_id"]] = (hashlib.sha256(raw).hexdigest(), payload)
+    old_fees = dict(con.execute("SELECT market_id, fee_rate FROM market_catalog").fetchall())
+    assert all(rate is not None and rate != 0.99 for rate in old_fees.values())
+    assert con.execute("SELECT COUNT(*) FROM decision_book_depth").fetchone() == (4,)
+    con.execute("UPDATE market_catalog SET fee_rate=0.99")
+    con.execute("UPDATE token_books SET bids_json='[]', asks_json='[]'")
+    root = tmp_path / "audit-export"
+    exporter = DecisionExporter(con, root)
+    assert exporter.run_batch().rows_exported == 8
+    rows = list(read_export(root))
+    assert {row["direction"] for row in rows} == {"buy_yes", "sell_yes"}
+    assert len({row["decision_id"] for row in rows}) == len(rows)
+    for row in rows:
+        event = parse_signal_event(row)
+        evidence = BookEvidence.from_signal(event)
+        assert evidence.book_id == event.book_id
+        source_digest, payload = expected[event.token_id]
+        assert evidence.source_event_id == source_digest
+        assert row["fee_rate"] == old_fees[event.market_id]
+        assert [(lv.price_usd_per_share, lv.size_shares) for lv in evidence.book.bids] == sorted(
+            ((float(lv["price"]), float(lv["size"])) for lv in payload["bids"]), reverse=True)
+        assert [(lv.price_usd_per_share, lv.size_shares) for lv in evidence.book.asks] == sorted(
+            (float(lv["price"]), float(lv["size"])) for lv in payload["asks"])

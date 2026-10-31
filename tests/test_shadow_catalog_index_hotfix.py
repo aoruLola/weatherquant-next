@@ -137,11 +137,9 @@ def test_the_hotfix_leaves_every_other_index_in_place() -> None:
         assert kept not in dropped, f"{kept} must survive the hotfix"
 
 
-def test_migrating_a_database_that_already_dropped_the_index_is_a_no_op() -> None:
+def test_migrating_a_database_that_already_dropped_the_index_is_a_no_op(tmp_path) -> None:
     """`IF EXISTS` means an already-patched database is not an error."""
-    tmp = Path(__file__).resolve().parents[1] / ".pytest_tmp" / "hotfix-noindex"
-    tmp.mkdir(parents=True, exist_ok=True)
-    db = ShadowDatabase(tmp / "shadow.duckdb")
+    db = ShadowDatabase(tmp_path / "shadow.duckdb")
     try:
         db.open()
         db.con.execute("DROP INDEX IF EXISTS idx_catalog_open")
@@ -151,10 +149,8 @@ def test_migrating_a_database_that_already_dropped_the_index_is_a_no_op() -> Non
         db.close()
 
 
-def test_a_fresh_database_migrates_without_the_index_and_keeps_its_key() -> None:
-    tmp = Path(__file__).resolve().parents[1] / ".pytest_tmp" / "hotfix-fresh"
-    tmp.mkdir(parents=True, exist_ok=True)
-    db = ShadowDatabase(tmp / "shadow.duckdb")
+def test_a_fresh_database_migrates_without_the_index_and_keeps_its_key(tmp_path) -> None:
+    db = ShadowDatabase(tmp_path / "shadow.duckdb")
     try:
         db.open()
         assert "idx_catalog_open" not in _indexes(db.con)

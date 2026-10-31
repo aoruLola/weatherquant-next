@@ -308,6 +308,7 @@ class BookObservation:
     collector_received_at_utc: datetime
     shadow_received_at_utc: datetime
     quality: str
+    source_event_id: str | None = None
 
     @property
     def defects(self) -> list[str]:

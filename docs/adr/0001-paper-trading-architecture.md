@@ -121,23 +121,13 @@ fill 行 + 信号状态迁移,同一事务;任何一层拒绝(无资金/无库�
 4. 幂等:`UNIQUE(market_id, revision)` 自然键 + `(applied revision)`
    判断,重放整个 feed 是 no-op;更旧 revision 视为被取代。
 
-### D9. 盘口证据:成交行携带完整双向快照,不可执行即 NOT_EXECUTABLE(WQN-24)
+### D9. LIVE 决策的盘口证据
 
-paper 与可执行回测需要**信号当时**的 token、双向 bid/ask 层级、数量、
-时间戳、来源事件标识与费用规则——绝不能用未来盘口重构:
+Shadow 在提交 LIVE 决策的同一事务中保留决策时的费率、费率指数和行情来源。买入与卖出决策各自通过 `decision_id` 关联其 token、交易所时间、采集时间和原始行情事件哈希。双向盘口的价格和数量按 `book_id` 存储，相同深度只写一份。
 
-1. `BookEvidence` 携带完整 OrderBook(双侧)与 `source_event_id`
-   (归档行的 sha256,与 collector 信封同一标识);`paper_fills` 行
-   存 `book_bids_json / book_asks_json / book_source_event_id`
-   (migration 0007),按 `decision_id` 主键天然关联;存的是
-   collector 规范层级形式,可哈希回 `book_id`(测试断言)。
-2. 盘口证据无法建立(缺失、解析超时)→ 拒绝原因 `NOT_EXECUTABLE`,
-   不记录任何成交;BOOK_STALE / BOOK_EVIDENCE_MISMATCH 保留专名
-   (证据存在但不合格)。旧拼写 NO_BOOK_EVIDENCE 仅为已记录行保留。
-3. `ArchiveBookSource` 增加 `timeout_seconds`(默认 2s,文件粒度
-   检查):超时返回已建立的部分——绝不挂起调用方;resolver 是
-   paper 进程的本地文件扫描,shadow 主循环不受其影响(跨进程、
-   只读、有界)。
+导出行携带 `evidence_version=1` 和完整盘口。Paper 使用导出行定价，即使原始档案已经轮转也可以复核。若缺少盘口、没有来源事件、采集时间晚于决策或深度哈希不符，Paper 记录 `NOT_EXECUTABLE`。交易时仍使用各自方向的深度、时效和库存规则。
+
+旧导出行没有证据版本，Paper 仍会在决策时刻之前的有界归档窗口中查找。扫描超时即拒绝成交。升级无法还原旧决策当时未记录的费率。
 
 ## 后果
 

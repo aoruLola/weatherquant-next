@@ -52,22 +52,24 @@ fee schedule, reconstructed from no frame received after the decision.
 **The scan is on a clock.** ``timeout_seconds`` bounds the whole resolution:
 the paper engine runs beside other work and a book lookup must never become
 an unbounded hunt through the archive. When the clock expires the resolver
-returns whatever it has established - possibly ``None``, which the fill
-layer records as NOT_EXECUTABLE - rather than blocking.
+returns ``None``: a partial scan cannot establish the newest book, so the
+fill layer records NOT_EXECUTABLE.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from weatherquant.data.books import parse_book_payload
-from weatherquant.data.writer import canonical_levels_json
+from weatherquant.data.books import book_from_levels_json, parse_book_payload
+from weatherquant.data.writer import book_content_hash, canonical_levels_json
 from weatherquant.markets.models import OrderBook
+from weatherquant.paper.events import SignalEvent
 
 __all__ = ["ArchiveBookSource", "BookEvidence"]
 
@@ -95,6 +97,31 @@ class BookEvidence:
     #: envelopes carry. Two fills naming the same event id priced against
     #: the same bytes.
     source_event_id: str = ""
+
+    @classmethod
+    def from_signal(cls, event: SignalEvent) -> BookEvidence | None:
+        """Read the snapshot recorded with this decision, even after the archive rotates."""
+        bids, asks = event.book_bids_json, event.book_asks_json
+        received = event.collector_received_at_utc
+        if (
+            event.evidence_version != 1
+            or not event.token_id or not event.book_id or not received
+            or received > event.decision_time_utc
+            or not event.book_source_event_id or event.book_source not in ("ws", "rest")
+            or not bids or not asks
+        ):
+            return None
+        if book_content_hash(event.token_id, bids, asks, event.venue_ts_utc) != event.book_id:
+            return None
+        book = book_from_levels_json(
+            market_id=event.market_id, token_id=event.token_id, bids_json=bids, asks_json=asks,
+            venue_ts=event.venue_ts_utc, collector_received=received,
+        )
+        return cls(
+            event.token_id, event.market_id, book,
+            event.book_id,
+            event.book_source, event.venue_ts_utc, received, "ok", event.book_source_event_id,
+        )
 
     @property
     def defects(self) -> list[str]:
@@ -147,8 +174,6 @@ class ArchiveBookSource:
         """
         if not token_id:
             return None
-        import time
-
         floor = decision_time - self.lookback
         deadline = time.monotonic() + self.timeout_seconds
         newest: BookEvidence | None = None
@@ -158,22 +183,15 @@ class ArchiveBookSource:
                 path = self.raw_dir / source / f"{day.isoformat()}.jsonl"
                 if not path.is_file():
                     continue
-                # Checked per file, not per frame: the whole resolution is
-                # bounded, and a lookup that cannot finish in its budget
-                # returns what it has rather than hanging the caller.
-                if time.monotonic() > deadline:
-                    log.warning(
-                        "book resolution for %s hit its %.1fs timeout; returning "
-                        "the newest frame found so far",
-                        token_id,
-                        self.timeout_seconds,
-                    )
-                    return newest
-                for evidence, received in self._frames_in_file(
-                    path, source, token_id, floor, decision_time
-                ):
-                    if newest_received is None or received > newest_received:
-                        newest, newest_received = evidence, received
+                try:
+                    for evidence, received in self._frames_in_file(path, source, token_id, floor, decision_time, deadline):
+                        if newest_received is None or received > newest_received:
+                            newest, newest_received = evidence, received
+                except TimeoutError:
+                    log.warning("book resolution for %s exceeded %.3fs", token_id, self.timeout_seconds)
+                    return None
+        if time.monotonic() >= deadline:
+            return None
         return newest
 
     def _frames_in_file(
@@ -183,6 +201,7 @@ class ArchiveBookSource:
         token_id: str,
         floor: datetime,
         decision_time: datetime,
+        deadline: float,
     ) -> Iterator[tuple[BookEvidence, datetime]]:
         """Yield ``(evidence, received_at)`` for every usable frame in one file.
 
@@ -190,7 +209,7 @@ class ArchiveBookSource:
         parsed yields nothing and the scan moves on. One corrupted or exotic
         frame must never cost the caller its whole fill pass.
         """
-        for envelope, payload, line_sha in _iter_tail(path, self.tail_bytes):
+        for envelope, payload, line_sha in _iter_tail(path, self.tail_bytes, deadline):
             received = envelope.get("received_at_utc")
             if not isinstance(received, str):
                 continue
@@ -223,7 +242,7 @@ class ArchiveBookSource:
             yield evidence, stamp
 
 
-def _iter_tail(path: Path, tail_bytes: int):
+def _iter_tail(path: Path, tail_bytes: int, deadline: float):
     """Yield ``(envelope, payload, line_sha256)`` from the last ``tail_bytes``
     of a JSONL file.
 
@@ -235,14 +254,19 @@ def _iter_tail(path: Path, tail_bytes: int):
     """
     import hashlib
 
-    size = path.stat().st_size
-    start = max(size - tail_bytes, 0)
     with path.open("rb") as handle:
+        size = handle.seek(0, 2)
+        start = max(size - tail_bytes, 0)
+        handle.seek(max(0, start - 1))
         if start:
-            handle.seek(start)
-            handle.readline()  # discard the partial line the window opened on
-        for raw in handle:
-            text = raw.decode("utf-8", errors="replace").strip()
+            handle.readline(size - handle.tell())
+        while handle.tell() < size:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("archive book lookup exceeded its budget")
+            raw = handle.readline(size - handle.tell())
+            if not raw.endswith(b"\n"):
+                break
+            text = raw.rstrip(b"\r\n").decode("utf-8", errors="replace")
             if not text:
                 continue
             try:
@@ -275,7 +299,7 @@ def _extract_book_element(payload: object, token_id: str) -> dict | None:
         if element.get("event_type") not in (None, "book"):
             continue
         element_token = str(element.get("asset_id") or element.get("token_id") or "")
-        if element_token and element_token != token_id:
+        if element_token != token_id:
             continue
         if element.get("bids") or element.get("asks"):
             return element

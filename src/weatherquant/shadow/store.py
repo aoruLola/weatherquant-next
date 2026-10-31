@@ -19,7 +19,8 @@ import hashlib
 import json
 from datetime import datetime
 
-from weatherquant.shadow.decision import Decision, Direction
+from weatherquant.markets.models import Side
+from weatherquant.shadow.decision import Decision, Direction, Mode
 from weatherquant.shadow.events import BookObservation, CatalogMarket
 from weatherquant.shadow.ingest import Checkpoint, QualityEvent
 from weatherquant.storage.shadow import ShadowDatabase
@@ -65,7 +66,7 @@ class ShadowStore:
         return self.db.con.execute(
             "SELECT token_id, market_id, book_id, book_source, bids_json, asks_json, "
             "venue_ts_utc, venue_ts_origin, collector_received_at_utc, "
-            "shadow_received_at_utc, quality, defects, updated_at_utc FROM token_books"
+            "shadow_received_at_utc, quality, defects, updated_at_utc, source_event_id FROM token_books"
         ).fetchall()
 
     def load_forecast_rows(self) -> tuple[list[tuple], list[tuple]]:
@@ -148,8 +149,8 @@ class ShadowStore:
         sql = (
             "INSERT INTO token_books (token_id, market_id, book_id, book_source, bids_json, "
             "asks_json, venue_ts_utc, venue_ts_origin, collector_received_at_utc, "
-            "shadow_received_at_utc, quality, defects, updated_at_utc) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "shadow_received_at_utc, quality, defects, updated_at_utc, source_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (token_id) DO UPDATE SET "
             "market_id = excluded.market_id, book_id = excluded.book_id, "
             "book_source = excluded.book_source, bids_json = excluded.bids_json, "
@@ -157,9 +158,10 @@ class ShadowStore:
             "venue_ts_origin = excluded.venue_ts_origin, "
             "collector_received_at_utc = excluded.collector_received_at_utc, "
             "shadow_received_at_utc = excluded.shadow_received_at_utc, "
-            "quality = excluded.quality, defects = excluded.defects, "
+            "quality = excluded.quality, defects = excluded.defects, source_event_id = excluded.source_event_id, "
             "updated_at_utc = excluded.updated_at_utc "
-            "WHERE excluded.collector_received_at_utc >= token_books.collector_received_at_utc"
+            "WHERE COALESCE(excluded.venue_ts_utc, excluded.collector_received_at_utc) "
+            ">= COALESCE(token_books.venue_ts_utc, token_books.collector_received_at_utc)"
         )
         rows = [
             (
@@ -190,6 +192,7 @@ class ShadowStore:
                 o.quality,
                 "+".join(o.defects),
                 now,
+                o.source_event_id,
             )
             for o in observations
         ]
@@ -313,8 +316,8 @@ class ShadowStore:
             "estimated_fees_usd, estimated_buffer_usd, estimated_cost_usd, "
             "expected_net_profit_usd, net_edge, market_closed, forecast_age_hours, "
             "thresholds_version, mode, mode_reason, decision_latency_ms, created_at_utc, "
-            "export_seq) "
-            "VALUES (" + ", ".join(["?"] * 44) + ", nextval('seq_shadow_decision_export')) "
+            "evidence_version, fee_rate, fee_exponent, book_source_event_id, book_source, export_seq) "
+            "VALUES {values} "
             "ON CONFLICT (cycle_id, market_id, direction) DO UPDATE SET "
             "state = excluded.state, primary_reason = excluded.primary_reason, "
             "mode = excluded.mode, mode_reason = excluded.mode_reason, "
@@ -327,9 +330,19 @@ class ShadowStore:
             # it. The column is nullable so pre-0005 images can still insert
             # (NULL); the exporter repairs those rows in bounded batches.
         )
+        # A replay can come from another run. The conflict key identifies the
+        # original decision, whose id and export position must survive the replay.
+        cycles = list(dict.fromkeys(d.cycle_id for d in decisions))
+        previous = {
+            (cycle, market, direction): did
+            for cycle, market, direction, did in self.db.execute(
+                "SELECT cycle_id, market_id, direction, decision_id FROM shadow_decisions "
+                f"WHERE cycle_id IN ({', '.join(['?'] * len(cycles))})", cycles,
+            ).fetchall()
+        }
         decision_rows = [
             (
-                decision_id(
+                previous.get((d.cycle_id, d.market_id, d.direction.value)) or decision_id(
                     run_id=run_id, cycle_id=d.cycle_id, market_id=d.market_id, direction=d.direction
                 ),
                 run_id,
@@ -375,33 +388,42 @@ class ShadowStore:
                 d.mode_reason,
                 d.decision_latency_ms,
                 now,
+                1 if d.mode is Mode.LIVE else None,
+                d.fee_rate,
+                d.fee_exponent,
+                d.live_book.source_event_id if d.live_book else None,
+                d.book_source,
             )
             for d in decisions
         ]
-        self.db.executemany(decision_sql, decision_rows)
-
-        reason_rows = []
-        for d in decisions:
-            did = decision_id(
-                run_id=run_id, cycle_id=d.cycle_id, market_id=d.market_id, direction=d.direction
+        latest = {row[0]: decision for row, decision in zip(decision_rows, decisions, strict=True)}
+        values = "(" + ", ".join(["?"] * 49) + ", nextval('seq_shadow_decision_export'))"
+        if len(latest) == len(decision_rows):
+            self.db.execute(
+                decision_sql.format(values=", ".join([values] * len(decision_rows))),
+                [value for row in decision_rows for value in row],
             )
+        else:
+            # DuckDB only updates the first matching key inside a VALUES batch.
+            # Repeated observations in the same call retain their original order.
+            self.db.executemany(decision_sql.format(values=values), decision_rows)
+
+        for did in latest.keys() & set(previous.values()):
+            self.db.execute(
+                "DELETE FROM rejection_reasons WHERE decision_id = ? AND reason NOT IN (SELECT unnest(?::VARCHAR[]))",
+                [did, latest[did].reason_codes],
+            )
+        reason_rows = []
+        for did, d in latest.items():
             for ordinal, reason in enumerate(d.reasons):
-                reason_rows.append(
-                    (
-                        did,
-                        ordinal,
-                        reason.value,
-                        ordinal == 0,
-                        d.details.get(reason.value),
-                    )
-                )
+                reason_rows.append((did, ordinal, reason.value, ordinal == 0, d.details.get(reason.value)))
         if reason_rows:
-            self.db.executemany(
-                "INSERT INTO rejection_reasons VALUES (?, ?, ?, ?, ?) "
+            self.db.execute(
+                "INSERT INTO rejection_reasons VALUES " + ", ".join(["(?, ?, ?, ?, ?)"] * len(reason_rows)) + " "
                 "ON CONFLICT (decision_id, reason) DO UPDATE SET "
                 "ordinal = excluded.ordinal, is_primary = excluded.is_primary, "
                 "detail = excluded.detail",
-                reason_rows,
+                [value for row in reason_rows for value in row],
             )
         return len(decisions)
 
@@ -419,19 +441,20 @@ class ShadowStore:
                 seen.setdefault(d.snapshot_id, d)
         if not seen:
             return
+        values = "(" + ", ".join(["?"] * 22) + ")"
         sql = (
             "INSERT INTO market_snapshots ("
             "snapshot_id, market_id, token_id, book_id, book_source, venue_ts_utc, "
             "venue_ts_origin, collector_received_at_utc, shadow_received_at_utc, "
             "decision_time_utc, snapshot_age_ms, latency_ms, best_bid, best_ask, spread, "
             "bid_depth_usd, ask_depth_usd, levels_bid, levels_ask, defects, quality, "
-            "created_at_utc) VALUES ("
-            + ", ".join(["?"] * 22)
-            + ") ON CONFLICT (snapshot_id) DO NOTHING"
+            "created_at_utc) VALUES " + ", ".join([values] * len(seen))
+            + " ON CONFLICT (snapshot_id) DO NOTHING"
         )
         rows = []
         for sid, d in seen.items():
             is_buy = d.direction is Direction.BUY_YES
+            observation = d.live_book
             rows.append(
                 (
                     sid,
@@ -449,16 +472,27 @@ class ShadowStore:
                     d.best_bid,
                     d.best_ask,
                     d.spread,
-                    None if is_buy else d.available_depth_usd,
-                    d.available_depth_usd if is_buy else None,
-                    0,
-                    0,
-                    "",
-                    "ok",
+                    observation.book.depth_notional_usd(Side.SELL) if observation else (None if is_buy else d.available_depth_usd),
+                    observation.book.depth_notional_usd(Side.BUY) if observation else (d.available_depth_usd if is_buy else None),
+                    len(observation.book.bids) if observation else 0,
+                    len(observation.book.asks) if observation else 0,
+                    "+".join(observation.defects) if observation else "",
+                    observation.quality if observation else "ok",
                     now,
                 )
             )
-        self.db.executemany(sql, rows)
+        self.db.execute(sql, [value for row in rows for value in row])
+
+        # token_books was committed with the ingest checkpoint before evaluation.
+        # Copy the exact referenced ids in one statement, reusing its serialized
+        # levels. A second decision on the same depth adds no new row.
+        book_ids = [d.book_id for d in seen.values() if d.live_book and d.live_book.source_event_id]
+        if book_ids:
+            self.db.execute(
+                "INSERT INTO decision_book_depth SELECT book_id, bids_json, asks_json FROM token_books "
+                "WHERE book_id IN (SELECT unnest(?::VARCHAR[])) ON CONFLICT (book_id) DO NOTHING",
+                [book_ids],
+            )
 
     def save_metrics(self, *, run_id: str, payload: dict, computed_at: datetime) -> None:
         self.db.execute(
