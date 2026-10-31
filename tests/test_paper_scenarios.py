@@ -20,6 +20,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -248,6 +252,8 @@ class TestCrashRecovery:
                 result = consumer.consume_once()
                 assert any("consume failed" in note for note in result.notes)
                 # Nothing landed: the transaction rolled back whole.
+                assert result.signals_recorded == result.accepted == result.refused == result.quality_events == 0
+                assert result.cursor.as_dict() == {"part": 1, "lines": 0}
                 assert crashed.store.signal_counts() == {}
 
                 # A fresh process replays the batch from the committed cursor.
@@ -266,6 +272,7 @@ class TestCrashRecovery:
         try:
             for harness in (clean, crashed):
                 harness.publish_signal(market_id="mkt-a")
+                harness.publish_signal(market_id="mkt-b")
                 harness.advance(30)
                 harness.consumer().consume_once()
             clean.fill_engine().fill_pending()
@@ -276,25 +283,104 @@ class TestCrashRecovery:
 
             def exploding(*args, **kwargs):
                 calls["n"] += 1
-                if calls["n"] == 1:
-                    raise RuntimeError("injected: killed between debit and fill row")
+                if calls["n"] == 2:
+                    raise RuntimeError("injected: second settlement failed")
                 return original(*args, **kwargs)
 
             engine.ledger.apply_buy = exploding
             result = engine.fill_pending()
             assert any("fill pass failed" in note for note in result.notes)
             # The signal is still ACCEPTED, the cash is still all there.
-            assert crashed.store.signal_counts() == {"ACCEPTED": 1}
+            assert result.attempted == 2 and result.filled == result.refused == 0
+            assert crashed.store.signal_counts() == {"ACCEPTED": 2}
             assert crashed.ledger.balances()["available_usdc"] == 100.0
 
             # The restart prices and settles it exactly once.
             crashed.restart()
-            assert crashed.fill_engine().fill_pending().filled == 1
+            assert crashed.fill_engine().fill_pending().filled == 2
             assert crashed.state()["fills"] == clean.state()["fills"]
             assert crashed.state()["balances"] == clean.state()["balances"]
         finally:
             clean.close()
             crashed.close()
+
+    @pytest.mark.parametrize("boundary", ["before", "after"])
+    def test_process_exit_at_fill_commit_matches_clean_ledger(self, tmp_path, monkeypatch, boundary):
+        # Seed a populated database from before the outcome-index migration.
+        from weatherquant.storage import paper
+
+        old_migrations = tmp_path / "old_migrations"
+        old_migrations.mkdir()
+        for migration in paper.PAPER_MIGRATIONS_DIR.glob("*.sql"):
+            if migration.name[:4] <= "0007":
+                shutil.copyfile(migration, old_migrations / migration.name)
+
+        def seed(harness):
+            harness.publish_signal(market_id="mkt-a", duplicate=True)
+            harness.publish_signal(market_id="mkt-b")
+            result = harness.consumer().consume_once()
+            assert (result.accepted, result.duplicates) == (2, 1)
+
+        root = tmp_path / "crash"
+        with monkeypatch.context() as patch:
+            patch.setattr(paper, "PAPER_MIGRATIONS_DIR", old_migrations)
+            old = Harness(root)
+            try:
+                seed(old)
+            finally:
+                old.close()
+        # Exit inside the real fill transaction or immediately after its COMMIT.
+        # Neither exit calls DuckDB.close(); the parent must recover the WAL.
+        child = """
+import os, sys
+from contextlib import contextmanager
+from pathlib import Path
+from test_paper_scenarios import Harness
+
+h = Harness(Path(sys.argv[1]))
+transaction = h.db.transaction
+@contextmanager
+def interrupt():
+    with transaction():
+        yield
+        assert h.store.signal_counts() == {"FILLED": 2}
+        if sys.argv[2] == "before":
+            os._exit(77)
+    os._exit(77)
+h.db.transaction = interrupt
+raise RuntimeError(h.fill_engine().fill_pending().as_dict())
+"""
+        paths = [str(Path(__file__).parent.resolve()), str(Path(__file__).resolve().parents[1] / "src")]
+        if os.environ.get("PYTHONPATH"):
+            paths.append(os.environ["PYTHONPATH"])
+        result = subprocess.run(
+            [sys.executable, "-c", child, str(root), boundary],
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(paths)},
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 77, result.stderr
+        baseline = Harness(tmp_path / "clean")
+        recovered = Harness(root)
+        try:
+            seed(baseline)
+            assert baseline.fill_engine().fill_pending().filled == 2
+            committed = boundary == "after"
+            assert recovered.store.signal_counts() == ({"FILLED": 2} if committed else {"ACCEPTED": 2})
+            assert recovered.db.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0] == (2 if committed else 0)
+            recovered.assert_conservation()
+            recovered.assert_ledger_agrees()
+            assert recovered.fill_engine().fill_pending().filled == (0 if committed else 2)
+            assert recovered.consumer().consume_once().caught_up
+            assert recovered.fill_engine().fill_pending().caught_up
+            recovered.assert_conservation()
+            recovered.assert_ledger_agrees()
+            assert recovered.state() == baseline.state()
+            for table, order in [("paper_ledger", "seq"), ("paper_positions", "market_id"), ("paper_fills", "decision_id")]:
+                sql = f"SELECT * FROM {table} ORDER BY {order}"
+                assert recovered.db.execute(sql).fetchall() == baseline.db.execute(sql).fetchall()
+        finally:
+            recovered.close()
+            baseline.close()
 
     def test_restarting_between_every_phase_changes_nothing(self, h):
         """A restart is new objects over the same disk - never a new result."""
