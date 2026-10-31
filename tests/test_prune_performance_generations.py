@@ -13,10 +13,14 @@ def tree(tmp_path, monkeypatch):
     import prune_performance_generations as prune
 
     paths = [tmp_path / "generations" / f"2026100{n}T000000Z-test" for n in (1, 2, 3)]
+    from weatherquant.performance.snapshot import build_performance, publish_performance
+
     for path in paths:
-        path.mkdir(parents=True)
-        for name in prune.REQUIRED_FILES:
-            (path / name).write_text("{}")
+        payloads = build_performance(decisions=[], dataset="fixture")
+        if path == paths[0]:
+            payloads["opportunities.json"]["data"]["episodes"] = []
+            payloads["summary.json"]["data"]["reference_capital"]["results"] = []
+        publish_performance(payloads, tmp_path, generation_id=path.name)
     (tmp_path / "current.json").write_text(json.dumps({"generation_id": paths[0].name}))
     monkeypatch.setattr(sys, "argv", ["prune", "--performance", str(tmp_path), "--keep-recent", "1",
                                       "--keep-monthly", "0", "--apply"])
