@@ -46,15 +46,18 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
 @dataclass
@@ -77,7 +80,7 @@ class PhaseReport:
     events: list[str] = field(default_factory=list)
 
     def peak_rss(self) -> float:
-        return max((s.rss_mb for s in self.samples), default=0.0)
+        return max((max(s.rss_mb, s.hwm_mb) for s in self.samples), default=0.0)
 
     def peak_psi_full(self) -> float:
         return max((s.psi_full for s in self.samples), default=0.0)
@@ -110,20 +113,12 @@ class PhaseReport:
 
 
 def read_psi() -> tuple[float, float]:
-    """Kernel memory PSI: (some avg10, full avg10). 0.0 when unavailable."""
-    try:
-        text = Path("/proc/pressure/memory").read_text()
-    except OSError:
-        return 0.0, 0.0
-    some = full = 0.0
-    for line in text.splitlines():
-        kind, _, rest = line.partition(" ")
-        values = dict(pair.split("=") for pair in rest.split())
-        if kind == "some":
-            some = float(values.get("avg10", 0.0))
-        elif kind == "full":
-            full = float(values.get("avg10", 0.0))
-    return some, full
+    """Read both kernel PSI measurements; missing evidence cannot mean zero pressure."""
+    text = Path("/proc/pressure/memory").read_text()
+    averages = dict(re.findall(r"^(some|full) avg10=([\d.]+)", text, re.MULTILINE))
+    if "some" not in averages or "full" not in averages:
+        raise ValueError("missing some/full avg10 in /proc/pressure/memory")
+    return float(averages["some"]), float(averages["full"])
 
 
 def read_rss_mb(pid: int) -> tuple[float, float]:
@@ -211,8 +206,9 @@ def run_collection(data_dir: Path, minutes: float, interval_s: float) -> PhaseRe
                     f"collector exited early with code {proc.returncode} after {(time.monotonic() - started):.0f}s"
                 )
                 break
-            time.sleep(interval_s)
+            time.sleep(min(interval_s, max(0.0, deadline - time.monotonic())))
     finally:
+        report.duration_s = time.monotonic() - started
         if proc.poll() is None:
             proc.send_signal(15)  # SIGTERM: the graceful path a container stop uses
             try:
@@ -221,7 +217,8 @@ def run_collection(data_dir: Path, minutes: float, interval_s: float) -> PhaseRe
                 proc.kill()
                 proc.wait(timeout=10)
                 report.events.append("collector ignored SIGTERM; SIGKILLed")
-        report.duration_s = time.monotonic() - started
+        if proc.returncode != 0:
+            report.events.append(f"collector exit code {proc.returncode}")
         report.events.append(f"collected {len(logs)} log lines (tail kept separately)")
 
     last = report.samples[-1] if report.samples else None
@@ -329,7 +326,7 @@ def run_backup_cycle(
         app_version="soak-memory",
         git_sha=os.environ.get("GIT_SHA"),
         image_tag="soak",
-        hostname=os.uname().nodename,
+        hostname=socket.gethostname(),
         pid=os.getpid(),
     )
     print(
@@ -369,7 +366,28 @@ def run_backup_cycle(
 
         rss_before, _ = read_rss_mb(os.getpid())
         backup_started = time.monotonic()
-        backup_report = writer.backup(dest)
+        books = int(writer.stats["books_inserted"])
+        prices = int(writer.stats["prices_inserted"])
+        stop_sampling = threading.Event()
+
+        def sample_backup() -> None:
+            while True:
+                rss, hwm = read_rss_mb(os.getpid())
+                some, full = read_psi()
+                report.samples.append(Sample(time.monotonic() - started, rss, hwm, some, full, "backup", books, prices))
+                if stop_sampling.wait(1):
+                    return
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            sampler = pool.submit(sample_backup)
+            try:
+                backup_report = writer.backup(dest)
+            finally:
+                stop_sampling.set()
+            sampler.result()
+        some, full = read_psi()
+        rss, hwm = read_rss_mb(os.getpid())
+        report.samples.append(Sample(time.monotonic() - started, rss, hwm, some, full, "backup", books, prices))
         backup_seconds = time.monotonic() - backup_started
         rss_after, hwm_after = read_rss_mb(os.getpid())
         report.events.append(
@@ -410,7 +428,7 @@ def _report(
     backup: PhaseReport,
     backup_summary: dict,
     data_dir: Path,
-    gates: dict[str, object],
+    gates: dict[str, float],
 ) -> int:
     print("\n" + "=" * 72)
     print("MEMORY SOAK REPORT")
@@ -437,10 +455,16 @@ def _report(
         )
 
     failures: list[str] = []
-    if any("exited early" in e for e in collection.events):
-        failures.append("the collector exited before the window closed")
-    if collection.peak_rss() > float(gates["max_rss_mb"]):
-        failures.append(f"peak RSS {collection.peak_rss():.0f} MiB above the gate {gates['max_rss_mb']} MiB")
+    failures.extend(e for e in collection.events if "exited early" in e or e.startswith("collector exit code"))
+    if collection.duration_s < gates["collection_seconds"]:
+        failures.append("the collector did not run for the requested observation window")
+    if len(collection.samples[len(collection.samples) // 2 :]) < 10:
+        failures.append("fewer than ten second-half samples; RSS slope is unmeasured")
+    if not backup.samples or any(s.rss_mb <= 0 for phase in (collection, backup) for s in phase.samples):
+        failures.append("missing process RSS measurement")
+    collection_peak = collection.peak_rss()
+    if collection_peak > float(gates["max_rss_mb"]):
+        failures.append(f"peak RSS {collection_peak:.0f} MiB above the gate {gates['max_rss_mb']} MiB")
     if collection.slope_mb_per_min() > float(gates["max_slope_mb_per_min"]):
         failures.append(
             f"RSS slope {collection.slope_mb_per_min():.1f} MiB/min above the gate "
@@ -470,6 +494,11 @@ def _report(
         print(f"\n  final health        {verdict.status.value} (exit {verdict.exit_code})")
         if verdict.exit_code != 0:
             failures.append(f"final health verdict not clean: {verdict.reasons}")
+        if hb.get("status") != "stopped":
+            failures.append("missing graceful stop heartbeat")
+        stats = hb.get("stats", {})
+        if not stats.get("books_rows_inserted") or not stats.get("price_points_inserted"):
+            failures.append("no evidence of both collected books and prices")
 
     print("\n" + "=" * 72)
     if failures:
@@ -508,12 +537,37 @@ def main() -> int:
         help="writer flush threshold for the backup-cycle phase; 500 is production cadence, raise it for fewer commits",
     )
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--acceptance", action="store_true", help="require a 12h run in a 6 GiB, zero-swap cgroup v2 container")
     args = parser.parse_args()
 
+    if not (args.minutes > 0 and args.interval > 0 and args.backup_batches > 0 and args.flush_rows > 0):
+        parser.error("duration, interval, backup batch count and flush size must be positive")
+    if args.acceptance:
+        if not (
+            args.minutes >= 720
+            and 0 < args.max_rss_mb <= 3072
+            and 0 < args.max_slope_mb_per_min <= 8
+            and 0 < args.max_psi_full <= 2
+        ):
+            parser.error("acceptance requires at least 720 minutes and the documented memory gates")
+        from weatherquant.storage.db import DEFAULT_MEMORY_LIMIT, DEFAULT_THREADS
+
+        if DEFAULT_MEMORY_LIMIT.strip().upper() != "3GB" or str(DEFAULT_THREADS) != "4":
+            parser.error("acceptance requires the production DuckDB budget of 3GB and 4 threads")
+        for name, expected in (("memory.max", 6 * 1024**3), ("memory.swap.max", 0)):
+            path = CGROUP_ROOT / name
+            if not path.exists() or path.read_text().strip() != str(expected):
+                parser.error(f"acceptance requires {path} = {expected} in the test container")
+            print(f"{path} = {expected}")
+    try:
+        read_psi()
+    except (OSError, ValueError) as exc:
+        parser.error(f"host memory PSI is required: {exc}")
     data_dir = args.data.resolve()
-    if data_dir.exists():
-        shutil.rmtree(data_dir)
-    data_dir.mkdir(parents=True)
+    try:
+        data_dir.mkdir(parents=True)
+    except FileExistsError:
+        parser.error("--data must be a new directory reserved for this soak")
 
     print(f"memory soak: {args.minutes:.0f} min collection over {data_dir}")
     print(
@@ -530,6 +584,7 @@ def main() -> int:
     backup, backup_summary = run_backup_cycle(db_path, data_dir, args.backup_batches, 500, flush_rows=args.flush_rows)
 
     gates = {
+        "collection_seconds": args.minutes * 60,
         "max_rss_mb": args.max_rss_mb,
         "max_slope_mb_per_min": args.max_slope_mb_per_min,
         "max_psi_full": args.max_psi_full,
