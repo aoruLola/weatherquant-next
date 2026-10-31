@@ -128,6 +128,12 @@ reconcile INCONSISTENT、流式永久拒绝）。
 运维命令：`weatherquant-shadow export-verify [--json]`（引擎须停止）输出对账报告，
 exit code 0/1 对应一致/不一致。
 
+如果已发布的分片缺号，`export-verify --json` 返回退出码 1，并在 `first_divergence`
+中列出首个缺失文件。引擎保留导出游标，继续记录决策，通过 `decision_export_failed`
+报告受阻的导出。恢复原分片后，下次导出从已有游标继续。若状态文件也已丢失，则从连续分片重建游标。
+对账结果中的 `source_rows_total` 是源库决策总数，`source_rows_pending` 包括游标之后及尚未分配序号的决策。
+生产追平时，已导出范围应一致且待导出数应为零。下游消费进度和已消费分片的 SHA-256 由 Performance 单独复核。
+
 ## 7. 需 NAS 人工验收的部分
 
 - 生产 `shadow.duckdb` 上执行迁移 0005/0006（约 70 万行回填）与一次性过渡的实际耗时观察；
