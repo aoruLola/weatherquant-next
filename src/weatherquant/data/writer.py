@@ -14,8 +14,7 @@ skipped count is still reported, because "we polled and nothing changed" is
 itself evidence the poll worked.
 
 **Checkpointing.** ``CHECKPOINT`` folds the write-ahead log into the main file.
-It is what keeps the WAL from growing without bound over weeks of uptime and
-what makes a subsequent backup meaningful.
+It keeps the WAL from growing without bound over weeks of uptime.
 
 **Consistent backup, off the collection thread.** The database file is locked
 for the writer's entire life, so copying it from outside would either fail or
@@ -41,7 +40,6 @@ import json
 import logging
 import math
 import os
-import re
 import shutil
 import threading
 import time
@@ -49,6 +47,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from graphlib import TopologicalSorter
 from pathlib import Path
 from typing import Any
 
@@ -274,7 +273,7 @@ class BackupJob:
     Ownership rules, which are the whole point of this class:
 
     * The writer's connection is touched exactly once, synchronously, before
-      the thread starts (flush + checkpoint in :meth:`CollectorWriter.start_backup`).
+      the thread starts (flush in :meth:`CollectorWriter.start_backup`).
       Everything after that runs on a private connection to the same in-process
       database instance, so the collector's single DuckDB writer keeps
       committing while the copy is in flight.
@@ -363,7 +362,13 @@ class BackupJob:
         # a reason that has nothing to do with this copy.
         alias = f"wq_backup_{uuid.uuid4().hex[:8]}"
         con: duckdb.DuckDBPyConnection | None = None
+        renamed = False
         try:
+            dest = self.final.parent
+            dest.mkdir(parents=True, exist_ok=True)
+            for stale in dest.glob(".incomplete-*"):
+                with contextlib.suppress(OSError):
+                    stale.unlink()
             if self._before_copy is not None:
                 self._before_copy()
             # Private connection to the *same instance*: same file lock, same
@@ -388,27 +393,14 @@ class BackupJob:
                     )
                 )
                 return
-            if self.abandoned:
-                self.tmp.unlink(missing_ok=True)
-                self._finish(
-                    BackupReport(
-                        destination=self.final,
-                        verified=False,
-                        row_counts=report.row_counts,
-                        expected_counts=expected,
-                        schema_versions=versions,
-                        error=f"abandoned before publication: {self.abandon_reason}",
-                    )
-                )
-                return
-            # Durability before visibility: the bytes are on storage before
-            # the final name exists, and the directory entry is flushed after
-            # the rename. A failure in either fsync surfaces as a failed job
-            # rather than a backup the report calls verified but a crash
-            # could still take away.
             fsync_file(self.tmp)
+            if self.abandoned:
+                raise RuntimeError(f"abandoned before publication: {self.abandon_reason}")
             os.replace(self.tmp, self.final)
+            renamed = True
             fsync_directory(self.final.parent)
+            if self.abandoned:
+                raise RuntimeError(f"abandoned during publication: {self.abandon_reason}")
             self._finish(
                 BackupReport(
                     destination=self.final,
@@ -421,7 +413,7 @@ class BackupJob:
             )
         except Exception as exc:
             with contextlib.suppress(OSError):
-                self.tmp.unlink(missing_ok=True)
+                (self.final if renamed else self.tmp).unlink(missing_ok=True)
             log.error("backup job failed: %s", exc)
             self._finish(
                 BackupReport(
@@ -1015,13 +1007,10 @@ class CollectorWriter:
     ) -> BackupJob:
         """Hand the database copy to a background job and return immediately.
 
-        What runs inline, on the caller's connection, is bounded and fast:
-        ``flush`` folds the pending batch into one transaction and
-        ``CHECKPOINT`` folds the WAL into the main file. Everything after that
-        - the table replay, the read-back verification, the fsyncs and the
-        rename - runs on the job's own thread against its own connection, so
-        the collector's loop keeps polling, flushing and publishing heartbeats
-        while a multi-gigabyte copy crawls over FUSE.
+        Only the pending writer batch is flushed inline. The job opens the
+        destination, copies a committed snapshot and publishes it on its
+        own thread. A logical snapshot includes committed WAL transactions
+        without a checkpoint on the collection thread.
 
         The job's connection is opened *in this process*, which is what keeps
         the single-writer rule intact: DuckDB allows one process to hold the
@@ -1035,13 +1024,6 @@ class CollectorWriter:
         in flight are simply outside it - they are in the next day's backup.
         """
         dest = Path(dest_dir)
-        dest.mkdir(parents=True, exist_ok=True)
-        # A previous run killed mid-copy leaves .incomplete- files behind; a
-        # file with that prefix was never published, so it is litter. Only the
-        # single-instance lock guarantees no other collector is mid-copy.
-        for stale in dest.glob(".incomplete-*"):
-            with contextlib.suppress(OSError):
-                stale.unlink()
         stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
         # The uuid is part of the *final* name, not just the temp name: two
         # backups started in the same second would otherwise publish to the same
@@ -1051,11 +1033,7 @@ class CollectorWriter:
         tmp = dest / f".incomplete-{suffix}.duckdb"
         final = dest / f"weatherquant-{suffix}.duckdb"
 
-        # Inline, on the caller's connection, before the snapshot exists: the
-        # checkpoint is what makes the copy complete rather than "main file
-        # plus whatever the WAL happens to contribute".
         self.flush(force=True)
-        self.checkpoint(force=True)
 
         job = BackupJob(
             self,
@@ -1081,20 +1059,40 @@ class CollectorWriter:
         snapshot it was taken from - not against a database that has since
         moved on.
         """
-        tables = self._backup_tables(con)
         # `ATTACH DATABASE '<path>' AS alias` - DuckDB 1.5 rejects the
         # `(FILE)` option form, and a plain `ATTACH 'path'` is accepted but
         # resolves differently when the file already exists.
         con.execute(f"ATTACH DATABASE '{escape_duckdb_string(str(tmp))}' AS {alias}")
         try:
             con.execute("BEGIN TRANSACTION")
+            source = con.execute("SELECT current_database()").fetchone()[0]
+            tables = self._backup_tables(con)
             expected = {name: int(con.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]) for name in tables}
-            for name in tables:
-                con.execute(f'CREATE TABLE {alias}."{name}" AS SELECT * FROM "{name}"')
-            for stmt in self._index_statements(alias):
-                con.execute(stmt)
-            for stmt in self._sequence_statements(alias):
-                con.execute(stmt)
+            versions = tuple(sorted(v for (v,) in con.execute("SELECT version FROM schema_migrations").fetchall()))
+            expected_sequences = {
+                row[0] for row in con.execute(
+                    "SELECT sequence_name FROM duckdb_sequences() WHERE database_name = current_database()"
+                ).fetchall()
+            }
+            # CTAS drops PKs and defaults, so a copy can pass row-count checks
+            # and still reject the collector's first ON CONFLICT after restore.
+            quoted_source = source.replace('"', '""')
+            con.execute(f'COPY FROM DATABASE "{quoted_source}" TO {alias} (SCHEMA)')
+            # DuckDB 1.5 COPY ... (DATA) can insert markets before events,
+            # violating the foreign keys it just copied. Follow the live schema.
+            order = TopologicalSorter()
+            for schema, table in con.execute(
+                "SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = current_database()"
+            ).fetchall():
+                order.add((schema, table))
+            for schema, child, parent in con.execute(
+                "SELECT schema_name, table_name, referenced_table FROM duckdb_constraints() "
+                "WHERE database_name = current_database() AND constraint_type = 'FOREIGN KEY'"
+            ).fetchall():
+                order.add((schema, child), (schema, parent))
+            for schema, table in order.static_order():
+                qualified = ".".join('"' + part.replace('"', '""') + '"' for part in (schema, table))
+                con.execute(f'INSERT INTO {alias}.{qualified} SELECT * FROM "{quoted_source}".{qualified}')
             con.execute("COMMIT")
         except BaseException:
             with contextlib.suppress(duckdb.Error):
@@ -1102,8 +1100,6 @@ class CollectorWriter:
             raise
         finally:
             self._detach_with_retry(con, alias)
-        versions = tuple(sorted(v for (v,) in con.execute("SELECT version FROM schema_migrations").fetchall()))
-        expected_sequences = {r[0] for r in con.execute("SELECT sequence_name FROM duckdb_sequences()").fetchall()}
         return expected, versions, expected_sequences
 
     def _detach_with_retry(self, con: duckdb.DuckDBPyConnection, alias: str, *, attempts: int = 5) -> None:
@@ -1222,50 +1218,6 @@ class CollectorWriter:
         database would look unmigrated and the migrator would try to rebuild it.
         """
         return [*self._user_tables(con), "schema_migrations"]
-
-    def _sequence_statements(self, alias: str) -> list[str]:
-        """Recreate sequences on the backup.
-
-        Sequences are not tables, so ``CREATE TABLE ... AS SELECT`` never
-        touches them - and a backup missing ``collector_events_seq`` would fail
-        the moment the restored collector logged its first event.
-        """
-        statements: list[str] = []
-        pattern = re.compile(r"CREATE\s+SEQUENCE\s+(?P<name>\w+)(?P<rest>.*)$", re.IGNORECASE)
-        for clause in iter_ddl_statements():
-            if not clause.upper().startswith("CREATE SEQUENCE"):
-                continue
-            match = pattern.search(clause)
-            if not match:
-                log.warning("could not parse sequence DDL from migration: %s", clause)
-                continue
-            statements.append(f"CREATE SEQUENCE IF NOT EXISTS {alias}.{match.group('name')}{match.group('rest')}")
-        return statements
-
-    def _index_statements(self, alias: str) -> list[str]:
-        """Recreate, on the backup, every index declared in our migrations.
-
-        Index names are qualified against the backup's table rather than
-        rewritten by string substitution: an unqualified ``ON markets`` would
-        create the index on the *source* database, where it already exists, and
-        the backup would silently end up unindexed.
-        """
-        statements: list[str] = []
-        pattern = re.compile(
-            r"CREATE\s+INDEX\s+(?P<name>\w+)\s+ON\s+(?P<table>\w+)\s*\((?P<cols>.*?)\)\s*$",
-            re.IGNORECASE | re.DOTALL,
-        )
-        for clause in iter_ddl_statements():
-            if not clause.upper().startswith("CREATE INDEX"):
-                continue
-            match = pattern.search(clause)
-            if not match:
-                log.warning("could not parse index DDL from migration: %s", clause)
-                continue
-            statements.append(
-                f'CREATE INDEX {match.group("name")} ON {alias}."{match.group("table")}" ({match.group("cols")})'
-            )
-        return statements
 
     # -- parquet -----------------------------------------------------------
 
