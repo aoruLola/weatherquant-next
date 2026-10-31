@@ -31,7 +31,6 @@ import argparse
 import json
 import os
 import random
-import resource
 import shutil
 import subprocess
 import sys
@@ -176,6 +175,8 @@ def generate_export(
 
 def peak_rss_bytes() -> int:
     """The kernel's high-water mark for this process, in bytes."""
+    import resource
+
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
 
 
