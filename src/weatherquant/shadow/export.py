@@ -783,23 +783,16 @@ class DecisionExporter:
     def reconcile(self) -> dict[str, Any]:
         """Prove the export against the source table: nothing lost, nothing twice.
 
-        The v2 invariant makes this cheap and exact: the exported set is the
-        prefix ``{rows with export_seq <= cursor_seq}``. If that holds, then
-
-        * no loss  - every source row at or below the cursor is in the parts
-          (the counts agree), and every row above it is simply pending;
-        * no duplication - the sequences strictly increase across the whole
-          concatenation of parts, and the source row count at or below the
-          cursor equals the row count on disk.
-
-        A duplicate line would repeat a sequence; a hole in the parts would
-        make the on-disk count smaller than the source count. Both are
-        reported as the first divergence rather than as a bare boolean, so
-        an operator can act on the answer.
+        Check the counts, sequence order and identity of the exported prefix.
+        Every ID must occur exactly once on disk and exist in the source
+        prefix. For v2 lines its sequence must also match the source row.
         """
         state = self._load()
         cursor_seq = state.get("cursor_seq")
+        parts = sorted(self.parts_dir.glob("part-*.jsonl"))
         report: dict[str, Any] = {
+            "parts": len(parts),
+            "watermark": state.get("watermark"),
             "state_version": state.get("version"),
             "cursor_seq": cursor_seq,
             "rows_in_state": int(state.get("rows_exported") or 0),
@@ -835,12 +828,10 @@ class DecisionExporter:
         report["source_rows_unsequenced"] = int(unsequenced)
         report["source_rows_at_or_below_cursor"] = int(at_or_below)
 
-        parts = sorted(self.parts_dir.glob("part-*.jsonl")) if self.parts_dir.exists() else []
         rows_on_disk = 0
         max_seq: int | None = None
         monotone = True
         divergence: str | None = None
-        legacy_ids: list[str] = []
         for path in parts:
             with path.open(encoding="utf-8") as handle:
                 for line in handle:
@@ -862,7 +853,7 @@ class DecisionExporter:
                         # Either way they are legal *if* their ids sit in the
                         # exported prefix - verified against the source below,
                         # which is the honest check; position alone was not.
-                        legacy_ids.append(str(row.get("decision_id") or ""))
+                        report["legacy_lines"] += 1
                         continue
                     seq = int(seq)
                     if max_seq is not None and seq <= max_seq:
@@ -878,32 +869,17 @@ class DecisionExporter:
         report["rows_on_disk"] = rows_on_disk
         report["max_seq_on_disk"] = max_seq
         report["seq_monotone"] = monotone
-        report["legacy_lines"] = len(legacy_ids)
 
         if divergence:
             report["first_divergence"] = divergence
         elif not monotone:
             report["first_divergence"] = "parts are not monotone in export_seq"
-        elif legacy_ids and not self._legacy_ids_within_prefix(legacy_ids, int(cursor_seq or 0)):
-            report["first_divergence"] = (
-                "a part written in the legacy format carries decision id(s) the "
-                "source does not hold inside the exported prefix (export_seq "
-                "missing or above the cursor); those rows are neither counted "
-                "nor exportable as-is"
-            )
         elif rows_on_disk != int(state.get("rows_exported") or 0):
             report["first_divergence"] = (
                 f"state claims {state.get('rows_exported')} row(s) but the parts "
                 f"hold {rows_on_disk}"
             )
-        elif max_seq is None and int(at_or_below) not in (0, rows_on_disk):
-            # All-legacy parts: the prefix invariant cannot be checked against
-            # the sequence, so the only honest claim is the row-count match.
-            report["first_divergence"] = (
-                f"the source holds {at_or_below} row(s) at or below cursor_seq "
-                f"{cursor_seq} but the parts hold {rows_on_disk}"
-            )
-        elif max_seq is not None and int(at_or_below) != rows_on_disk:
+        elif int(at_or_below) != rows_on_disk:
             report["first_divergence"] = (
                 f"the source holds {at_or_below} row(s) at or below cursor_seq "
                 f"{cursor_seq} but the parts hold {rows_on_disk}; rows were lost "
@@ -914,31 +890,31 @@ class DecisionExporter:
                 f"state cursor_seq is {cursor_seq} but the newest part ends at "
                 f"{max_seq}"
             )
+        elif rows_on_disk:
+            mismatch = self.con.execute(
+                """
+                WITH exported AS (
+                    SELECT decision_id, COUNT(*) AS copies, MAX(export_seq) AS seq
+                    FROM read_json(?, format='newline_delimited',
+                                   columns={decision_id: 'VARCHAR', export_seq: 'BIGINT'})
+                    GROUP BY decision_id
+                )
+                SELECT e.decision_id, e.copies, e.seq, d.export_seq
+                FROM exported e LEFT JOIN shadow_decisions d USING (decision_id)
+                WHERE e.copies <> 1 OR d.export_seq IS NULL OR d.export_seq > ?
+                   OR (e.seq IS NOT NULL AND e.seq <> d.export_seq)
+                LIMIT 1
+                """,
+                [[str(path) for path in parts], int(cursor_seq or 0)],
+            ).fetchone()
+            if mismatch:
+                decision_id, copies, disk_seq, source_seq = mismatch
+                report["first_divergence"] = (
+                    f"decision_id {decision_id!r}: {copies} line(s), exported seq "
+                    f"{disk_seq}, source seq {source_seq}, cursor {cursor_seq}"
+                )
         report["consistent"] = report["first_divergence"] is None
         return report
-
-    def _legacy_ids_within_prefix(self, ids: list[str], cursor: int) -> bool:
-        """Do the legacy-format lines all describe already-exported rows?
-
-        Chunked rather than one giant IN-list; an unbounded one would make
-        the reconciliation of a long rollback window itself the thing that
-        stalls the shell.
-        """
-        unique = {i for i in ids if i}
-        if len(unique) != len(ids):
-            return False  # a legacy line without an id describes nothing
-        for start in range(0, len(unique), 1000):
-            chunk = sorted(unique)[start : start + 1000]
-            placeholders = ", ".join(["?"] * len(chunk))
-            rows = self.con.execute(
-                "SELECT COUNT(*) FROM shadow_decisions "
-                f"WHERE decision_id IN ({placeholders}) AND "
-                "(export_seq IS NULL OR export_seq > ?)",
-                [*chunk, cursor],
-            ).fetchone()
-            if int(rows[0]):
-                return False
-        return True
 
 
 def _cursor_strings(stamp: Any, decision: Any) -> tuple[str, str]:

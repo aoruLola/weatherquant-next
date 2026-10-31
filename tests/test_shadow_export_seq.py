@@ -310,6 +310,30 @@ def test_reconcile_reports_a_duplicated_line(db, tmp_path):
     assert "export_seq" in (report["first_divergence"] or "")
 
 
+@pytest.mark.parametrize("replacement", ["unknown-v1", "duplicate-v2", "swapped-v2", "duplicate-across-formats"])
+def test_reconcile_detects_wrong_ids_with_unchanged_counts(db, tmp_path, replacement):
+    for i in range(3):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i))
+    ex = _exporter(db, tmp_path, batch_rows=1)
+    assert ex.run_batch().rows_exported == 3
+    parts = sorted(ex.parts_dir.glob("part-*.jsonl"))
+    rows = [json.loads(part.read_text(encoding="utf-8")) for part in parts]
+    if replacement in {"unknown-v1", "duplicate-across-formats"}:
+        del rows[0]["export_seq"]
+    if replacement == "swapped-v2":
+        rows[0]["decision_id"], rows[1]["decision_id"] = rows[1]["decision_id"], rows[0]["decision_id"]
+    else:
+        rows[0]["decision_id"] = "unknown" if replacement == "unknown-v1" else rows[1]["decision_id"]
+    for part, row in zip(parts, rows, strict=True):
+        part.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    report = ex.reconcile()
+    assert report["rows_on_disk"] == report["source_rows_at_or_below_cursor"] == 3
+    assert report["seq_monotone"]
+    assert not report["consistent"]
+    assert "decision_id" in report["first_divergence"]
+
+
 def test_reconcile_reports_rows_missing_from_the_parts(db, tmp_path):
     """A part that lost a line under-reports against the source."""
     for i in range(3):
@@ -327,6 +351,28 @@ def test_reconcile_reports_rows_missing_from_the_parts(db, tmp_path):
     report = ex.reconcile()
     assert report["consistent"] is False
     assert "source holds" in (report["first_divergence"] or "")
+
+
+def test_export_verify_cli_returns_the_source_verdict(db, tmp_path, monkeypatch, capsys):
+    from weatherquant.shadow.cli import main
+
+    monkeypatch.setenv("WQ_SHADOW_REPORT_PATH", str(tmp_path / "report.json"))
+    _insert(db, i=1, when=NOW)
+    ex = DecisionExporter(db.con, tmp_path / "decisions-export")
+    assert ex.run_batch().rows_exported == 1
+    db.close()
+    args = ["--db", str(db.path), "export-verify", "--json"]
+    assert main(args) == 0
+    clean = json.loads(capsys.readouterr().out)
+    assert clean["consistent"] and clean["parts"] == 1 and clean["watermark"]
+
+    part, = ex.parts_dir.glob("part-*.jsonl")
+    row = json.loads(part.read_text(encoding="utf-8"))
+    row["decision_id"] = "not-in-source"
+    part.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    assert main(args) == 1
+    damaged = json.loads(capsys.readouterr().out)
+    assert not damaged["consistent"] and "not-in-source" in damaged["first_divergence"]
 
 
 # --- the one-time v1 -> v2 transition ------------------------------------------
