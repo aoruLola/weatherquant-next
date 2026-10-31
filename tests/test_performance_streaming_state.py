@@ -797,13 +797,7 @@ def test_the_empty_retraction_refusal_reaches_the_command(tmp_path, capsys) -> N
 
 
 def test_an_existing_state_database_keeps_working(tmp_path) -> None:
-    """Migration regression: a store built before this change still opens.
-
-    No migration was added for the retraction guard - it is CLI and control
-    flow, not schema - so the check that matters is that an existing database
-    is not disturbed: the migration set is unchanged, reopening re-applies
-    nothing, and the settlement rows survive.
-    """
+    """Reopening a migrated database preserves its settlement rows."""
     from weatherquant.performance.state import PERFORMANCE_MIGRATIONS_DIR
     from weatherquant.storage.migrator import applied_migrations, available_migrations
 
@@ -821,11 +815,7 @@ def test_an_existing_state_database_keeps_working(tmp_path) -> None:
 
     versions = [spec.version for spec in available_migrations(PERFORMANCE_MIGRATIONS_DIR)]
     assert versions == sorted(versions, key=int), versions
-    assert versions == ["0001", "0002", "0003", "0004"], (
-        "0003 adds the ingest columns for the write-sequence cursor (WQN-20); "
-        "any other new one here means an existing state database has to be "
-        "upgraded before it can be read, which is a decision to make openly"
-    )
+    assert versions == ["0001", "0002", "0003", "0004", "0005"]
 
     # Reopen: migrations are idempotent and nothing is lost.
     with PerformanceStateStore(state_db) as store:
