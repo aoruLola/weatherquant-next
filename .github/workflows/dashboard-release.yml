@@ -46,6 +46,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch the paired rollback reader for the compatibility test
+        run: git fetch --no-tags --depth=1 origin e6698dfd39930bf1dd219410ae911b1cf496a982
+
       # Same reason as shadow-release: the dashboard image identifies itself by
       # this file, and a tag that disagrees with it makes every deployment
       # indistinguishable from the one it replaced.
