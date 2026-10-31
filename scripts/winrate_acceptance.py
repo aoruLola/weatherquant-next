@@ -32,8 +32,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import shutil
 import sys
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -509,15 +509,15 @@ def _filter_settlements(settlements: list[dict], date: str) -> list[dict]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", type=Path, default=Path("/tmp/wq-winrate-acceptance"))
+    parser.add_argument("--out", type=Path, help="new or empty output directory (default: a fresh temporary directory)")
     parser.add_argument("--report", type=Path, default=None,
                         help="write machine-readable evidence to this JSON file")
     args = parser.parse_args()
 
-    root = args.out.resolve()
-    if root.exists():
-        shutil.rmtree(root)
-    root.mkdir(parents=True)
+    root = args.out.resolve() if args.out else Path(tempfile.mkdtemp(prefix="wq-winrate-acceptance-"))
+    if root.exists() and (not root.is_dir() or any(root.iterdir())):
+        parser.error(f"--out must be a new or empty directory: {root}")
+    root.mkdir(parents=True, exist_ok=True)
 
     failures: list[str] = []
     print(f"win-rate acceptance over {root}")
