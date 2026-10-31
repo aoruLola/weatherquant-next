@@ -584,11 +584,9 @@ class CollectorWorker:
         )
         log.warning("%s", message)
         self._event("warning", "fault_injection", message)
-        if self._watchdog is not None:
-            # The block itself is the stuck state under test: no allowance.
-            time.sleep(seconds)
-        else:
-            log.warning("watchdog disabled; sleeping the fault block out instead")
+        # The independent health probe must observe the same block even when
+        # the watchdog is disabled for a diagnostic run.
+        time.sleep(seconds)
 
     def publish_stuck_heartbeat(self, message: str) -> None:
         """A last heartbeat that names the stuck loop, written by the watchdog.
