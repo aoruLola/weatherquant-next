@@ -16,15 +16,15 @@
 | 阶段 | 做什么 | 判定（全部实测） |
 |---|---|---|
 | `restore` | 源库字节复制 → 打开恢复副本 | 恢复点比对：schema 迁移版本、逐表行数、逐表内容哈希（`sum(hash(全列))`，与行序无关）、决策水位（shadow 库取 `shadow_decisions.decision_time_utc`，采集库取 `price_history.ts` / `order_books.fetched_at_utc`）——恢复副本必须与源**完全一致** |
-| `backup_cycle` | 在恢复副本上按生产节奏写入并执行 `Writer.backup()`，再把**那份备份**恢复到第三个目录、再次比对恢复点 | backup verified=True；backup→restore→verify 全链一致（`collector_runs`/`collector_events` 例外：`close()` 会在快照之后合法地写入收尾状态，比对时按名排除并记录原因） |
+| `backup_cycle` | 从已恢复的副本生成备份，再恢复到新目录 | 逐表校验备份前的恢复点，覆盖采集运行记录、事件和迁移台账。 |
 | `clean_shutdown` | 优雅 `close()` | 关闭后 `.wal` 必须为零字节（被 checkpoint 折叠） |
 | `wal_recovery` | 预算化写入子进程提交若干批后 SIGKILL（容器 OOM/断电留下的状态） | 重开重放：已提交前缀零丢失零撕裂；`CHECKPOINT` 后 WAL 折叠 |
-| `slow_io` | 在 cgroup `io.max`（4 MiB/s）限速下重跑 restore 并比对恢复点 | **正确性不因慢盘改变**；耗时如实记录。内核 io 控制器就是 NAS 慢盘的同类机制，无需 FUSE。需要 root；拿不到就记 `skip`，**绝不伪造** |
+| `slow_io` | 在 cgroup `io.max`（4 MiB/s）限速下重跑 restore 并比对恢复点 | **正确性不因慢盘改变**；耗时如实记录。使用 Linux 的 io 控制器模拟限速；NAS 的 FUSE 行为需单独观察 |
 | `incomplete_files` | 种入 `.incomplete-*` 文件（含 2026-10-17 同名残留） | 备份发现**永不**把 `.incomplete-` 当恢复候选；残留文件按体积列出供清理 |
 
 ## 2. 生命周期台账
 
-每次运行向 `--ledger`（默认 `<work>/recovery-drills.jsonl`）追加一行：
+每次运行向 `--ledger`（默认在工作目录旁创建 `<work-name>-recovery-drills.jsonl`）追加一行：
 
 ```json
 {
@@ -63,7 +63,7 @@ source: 4.0 MiB, sha256=4ab185c0c06c663f…；recovery point: 14 tables
 
 无 root 时 `slow_io` 如实记 `skip`（单测断言了这一点，不伪造）。
 
-**测试**：`tests/test_backup_recovery_drill.py` 5 项——完整演练 + 台账形态、
+**测试**：`tests/test_backup_recovery_drill.py` 覆盖完整演练、台账形态、
 shadow 形状库的水位分支（真实 shadow 迁移构造）、外部 source 必须显式
 `--source-is-copy`、`.incomplete` 发现规则、恢复点哈希能抓到行数之外的
 内容变化。全套 `uv run pytest -q` 见 PR 描述。
@@ -71,15 +71,13 @@ shadow 形状库的水位分支（真实 shadow 迁移构造）、外部 source 
 ## 4. 定期执行（NAS，需人工排程）
 
 ```bash
-# 每周一次，对生产备份目录里最新一份 weatherquant-*.duckdb 的**副本**：
-cp /mnt/user/appdata/weatherquant-next/backups/<latest>.duckdb /tmp/drill-src.duckdb
-uv run python scripts/backup_recovery_drill.py \
-    --work /tmp/wq-drill-$(date -u +%Y%m%d) \
-    --source /tmp/drill-src.duckdb --source-is-copy \
-    --ledger /mnt/user/appdata/weatherquant-next/recovery-drills.jsonl
-rm /tmp/drill-src.duckdb
-# 判定：RESULT: PASSED，台账新增一行 verdict=PASSED；
-# 台账里 slow_io 必须 pass（NAS 上有 root）或明确 skip 并说明原因
+# PUBLISHED_BACKUP 指向已经发布的备份文件，DRILL_DISK 是隔离的测试磁盘目录。
+run=$(mktemp -d "${DRILL_DISK:?}/wqn22-XXXXXXXX") || exit 1
+cp "${PUBLISHED_BACKUP:?}" "$run/source.duckdb" || exit 1
+sudo -E uv run python scripts/backup_recovery_drill.py \
+    --work "$run/work" --source "$run/source.duckdb" --source-is-copy \
+    --require-slow-io --ledger "$DRILL_DISK/recovery-drills.jsonl"
+# 台账中的 slow_io 须为 pass，保留实际设备和运行结果。
 ```
 
 观察项（事故先兆，顺带核对）：
@@ -105,3 +103,5 @@ ls -la /mnt/user/appdata/weatherquant-next/backups/ | grep .incomplete
 ### 评审修复验证
 
 默认生命周期台账位于工作目录旁的 <work-name>-recovery-drills.jsonl，成功清理及下一次演练均保留并追加它。显式 --ledger 也应位于 --work 之外。
+
+演练只接受新的 `--work` 路径。正式慢 I/O 验收使用 `--require-slow-io`，缺少 Linux cgroup v2 或 root 时，阶段记为 skip，整体验收失败。目标设备必须实际记录恢复写入字节；NAS 的 FUSE 挂载仍需现场验证。

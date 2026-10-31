@@ -420,7 +420,7 @@ class CollectorWorker:
                     status = HealthStatus.FATAL
                 finally:
                     self._archive_records = archive.records_written
-            if self._backup_job is not None:
+            if self._backup_job is not None and not self._backup_job.abandoned:
                 # The copy runs on its own connection, so it survives the
                 # archive close above. SIGTERM arriving mid-backup is exactly
                 # when a verified copy is worth a bounded wait - but never
@@ -969,7 +969,7 @@ class CollectorWorker:
                 self._last_parquet_day = today
             except Exception as exc:
                 log.warning("parquet export failed: %s", exc)
-        if self.backup_daily and self._last_backup_day != today:
+        if self.backup_daily and (self._backup_job is not None or self._last_backup_day != today):
             self._advance_daily_backup(today)
 
     # A clean backup failure (bad destination, verification mismatch, ENOSPC)
@@ -994,6 +994,10 @@ class CollectorWorker:
 
         job = self._backup_job
         if job is not None:
+            if job.abandoned:
+                if job.done:
+                    self._backup_job = None
+                return
             report = job.poll()
             if report is None:
                 if job.expired() and job.abandon(
@@ -1008,21 +1012,16 @@ class CollectorWorker:
                     log.error("%s", message)
                     self._event("error", "backup_timeout", message)
                     self._last_backup_error = "backup_timeout"
-                    self._backup_attempts_today += 1
                     self._last_backup_attempt_mono = time.monotonic()
                     # No same-day retry after a timeout: the stuck copy is
                     # still holding its private connection, and a second
                     # one would only double the I/O it is stuck on.
                     self._last_backup_day = today
-                    # Detached, not forgotten: the thread discards its own
-                    # file when (if) it completes. Keeping the handle would
-                    # re-enter this branch every tick and storm the log.
-                    self._backup_job = None
+                    # Keep ownership until it exits, including across UTC midnight.
                 # Either still running or just abandoned: nothing to start.
                 return
 
             self._backup_job = None
-            self._backup_attempts_today += 1
             self._last_backup_attempt_mono = time.monotonic()
             if report.ok:
                 self._last_backup_ok = report.destination.name
@@ -1052,8 +1051,7 @@ class CollectorWorker:
         ):
             return
         try:
-            # The flush + checkpoint inside are the only synchronous part and
-            # are bounded by the pending batch, not by the database size.
+            # Only the pending writer batch is committed on the loop thread.
             job = self._writer.start_backup(
                 self.settings.db_path.parent / "backups",
                 timeout_seconds=self.backup_timeout_seconds,
