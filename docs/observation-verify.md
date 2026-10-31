@@ -143,3 +143,5 @@ precision（判 `unusable_rules`），强行补 precision 后 °C 读数被直�
 ### 评审修复验证
 
 事件与观测核对为 match 后，--out 同时输出已有明确 0/1 payout 的获胜和失败市场。未结算或缺少结果的市场不写入清单，避免只验证赢家而排除 LOSS 样本。
+
+核验清单保存 `market_id`、`target_date`、`condition_id` 和实际核对过的 `resolved_outcome`。再次回填时，只有当前官方合约和赔付都匹配的已结算结果才计入 WIN/LOSS。普通增量导入按官方结果的检索时间保留最新记录；显式全量替换使用调用方提供的完整清单。旧格式清单需从原观测和结算索引重新生成。

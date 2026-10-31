@@ -46,7 +46,7 @@ settlement layer and answers three questions, all from recorded facts:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -86,15 +86,38 @@ def _normalise_target(value: object) -> str | None:
     return text or None
 
 
-def _fetched_at_of(record: Mapping[str, Any]) -> datetime:
-    """The record's fetch time, for newest-wins dedup; unparseable -> min."""
+def settlement_fetch_time(record: Mapping[str, Any]) -> datetime | None:
     raw = record.get("fetched_at_utc")
     if raw is None:
-        return datetime.min.replace(tzinfo=UTC)
+        return None
     try:
-        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        stamp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
     except ValueError:
-        return datetime.min.replace(tzinfo=UTC)
+        return None
+    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=UTC)
+
+
+def latest_settlement_rows(settlements: Iterable[Any]) -> dict[tuple[str, str | None], Mapping[str, Any]]:
+    """Use the newest fetch for each market and civil date, keeping the full evidence row."""
+    oldest = datetime.min.replace(tzinfo=UTC)
+    by_key: dict[tuple[str, str | None], Mapping[str, Any]] = {}
+    for record in settlements:
+        if not isinstance(record, Mapping):
+            continue
+        market_id = str(record.get("market_id") or "")
+        target = _normalise_target(record.get("target_date"))
+        if not market_id:
+            continue
+        key = (market_id, target)
+        existing = by_key.get(key)
+        # The same pair can be backfilled twice (a re-run, a revision). The
+        # record with the newest fetch time is the answer; file order says
+        # nothing about which one that is.
+        if existing is None or (settlement_fetch_time(record) or oldest) >= (settlement_fetch_time(existing) or oldest):
+            by_key[key] = record
+
+    return by_key
+
 
 ACCEPT = "ACCEPT"
 BUCKET_MISSING = "missing"
@@ -147,19 +170,7 @@ def build_settlement_queue(
             "bless an empty settlement pipeline"
         )
 
-    by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    for record in settlements:
-        market_id = str(record.get("market_id") or "")
-        target = _normalise_target(record.get("target_date"))
-        if not market_id:
-            continue
-        key = (market_id, target)
-        existing = by_key.get(key)
-        # The same pair can be backfilled twice (a re-run, a revision). The
-        # record with the newest fetch time is the answer; file order says
-        # nothing about which one that is.
-        if existing is None or _fetched_at_of(record) >= _fetched_at_of(existing):
-            by_key[key] = record
+    by_key = latest_settlement_rows(settlements)
 
     catalog_by_id: dict[str, Mapping[str, Any]] = {}
     for row in catalog:
@@ -295,7 +306,8 @@ def _bucket_of(
     source = record.get("resolution_source")
 
     if status == "RESOLVED":
-        if verification == "VERIFIED":
+        payout = record.get("resolved_outcome")
+        if verification == "VERIFIED" and type(payout) in (float, int) and payout in (0, 1):
             return BUCKET_VERIFIED, fetched_text, source
         if verification == "UNVERIFIED":
             return BUCKET_RESOLVED_UNVERIFIED, fetched_text, source

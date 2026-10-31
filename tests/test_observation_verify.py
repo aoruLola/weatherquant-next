@@ -582,6 +582,7 @@ def test_verify_market_cli_matches_and_emits_verified_pairs(tmp_path) -> None:
                     "target_date": "2026-10-24",
                     "settlement_status": "RESOLVED",
                     "resolved_outcome": 1.0,
+                    "raw_source_reference": {"condition_id": "0xabc"},
                     "verification_status": "UNVERIFIED",
                     "fetched_at_utc": NOW_ISO,
                 },
@@ -631,7 +632,8 @@ def test_verify_market_cli_matches_and_emits_verified_pairs(tmp_path) -> None:
     assert code == 0
 
     pairs = json.loads(out.read_text(encoding="utf-8"))
-    assert pairs == [{"market_id": "700001", "target_date": "2026-10-24"}]
+    assert pairs == [{"market_id": "700001", "target_date": "2026-10-24",
+                      "condition_id": "0xabc", "resolved_outcome": 1.0}]
 
     row = (
         duckdb.connect(str(research), read_only=True)
@@ -669,12 +671,12 @@ def test_cli_verifies_resolved_losers_as_well_as_the_winner(tmp_path):
     con.execute(
         "CREATE TABLE markets (market_id VARCHAR, event_id VARCHAR, bracket_label VARCHAR, "
         "bracket_low DOUBLE, bracket_high DOUBLE, bracket_low_inclusive BOOLEAN, "
-        "bracket_high_inclusive BOOLEAN, rules_text VARCHAR, target_date DATE)"
+        "bracket_high_inclusive BOOLEAN, rules_text VARCHAR, target_date DATE, condition_id VARCHAR)"
     )
     for mid, low, high in [("winner", 80, 81), ("loser", 82, 83)]:
         con.execute(
-            "INSERT INTO markets VALUES (?, 'event', ?, ?, ?, true, true, ?, ?)",
-            [mid, mid, low, high, RULES_TEXT, date(2026, 10, 13)],
+            "INSERT INTO markets VALUES (?, 'event', ?, ?, ?, true, true, ?, ?, ?)",
+            [mid, mid, low, high, RULES_TEXT, date(2026, 10, 13), mid],
         )
     con.close()
     observations = [_obs(date(2026, 10, 13), hour, 81) for hour in range(4, 28)]
@@ -684,29 +686,36 @@ def test_cli_verifies_resolved_losers_as_well_as_the_winner(tmp_path):
     settlements.write_text(
         json.dumps(
             [
-                {"market_id": "winner", "resolved_outcome": 1.0},
-                {"market_id": "loser", "resolved_outcome": 0.0},
+                {"market_id": mid, "target_date": "2026-10-13", "settlement_status": "RESOLVED",
+                 "raw_source_reference": {"condition_id": mid}, "resolved_outcome": payout}
+                for mid, payout in [("winner", 1.0), ("loser", 0.0)]
             ]
         ),
         encoding="utf-8",
     )
     out = tmp_path / "verified.json"
-    assert (
-        main(
-            [
-                "verify-market",
-                "--date",
-                "2026-10-13",
-                "--collector-copy",
-                str(db),
-                "--observations-file",
-                str(obs),
-                "--settlements",
-                str(settlements),
-                "--out",
-                str(out),
-            ]
-        )
-        == 0
-    )
-    assert {row["market_id"] for row in json.loads(out.read_text())} == {"winner", "loser"}
+    command = [
+        "verify-market", "--date", "2026-10-13", "--collector-copy", str(db),
+        "--observations-file", str(obs), "--settlements", str(settlements), "--out", str(out),
+    ]
+    assert main(command) == 0
+    proof = json.loads(out.read_text())
+    assert {row["market_id"]: row["resolved_outcome"] for row in proof} == {"winner": 1, "loser": 0}
+
+    from test_performance_backfill import _FakePlatform
+    from weatherquant.performance.backfill import backfill_settlements
+
+    revised = backfill_settlements(proof, verified=proof, dataset="fixture",
+                                   get_json=_FakePlatform({"winner": "0", "loser": "0"}).get)
+    assert {r["market_id"]: r["verification_status"] for r in revised} == {
+        "winner": "UNVERIFIED", "loser": "VERIFIED",
+    }
+
+    originals = json.loads(settlements.read_text())
+    for changed in (
+        {"target_date": "2026-10-12"}, {"settlement_status": "DISPUTED"},
+        {"raw_source_reference": {"condition_id": "another-condition"}},
+    ):
+        settlements.write_text(json.dumps([{**originals[0], **changed}, originals[1]]), encoding="utf-8")
+        assert main(command) == 0
+        assert json.loads(out.read_text()) == []

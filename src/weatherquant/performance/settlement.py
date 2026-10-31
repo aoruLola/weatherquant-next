@@ -216,9 +216,7 @@ def fetch_resolution(
     except Exception:
         return SettlementStatus.UNAVAILABLE, None
     records = parse_resolutions(payload)
-    if not records:
-        return SettlementStatus.UNAVAILABLE, None
-    # The endpoint is one-condition-one-answer; take the first and keep the
-    # rest only if a future response ever batches them.
-    record = records[0]
-    return classify(record), record
+    for record in records:
+        if str(record.condition_id or "").lower() == condition_id.lower():
+            return classify(record), record
+    return SettlementStatus.UNAVAILABLE, None

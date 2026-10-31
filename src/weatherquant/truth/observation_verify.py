@@ -378,7 +378,7 @@ def verify_market_rules(
     ]
     # --- venue → observation ------------------------------------------------
     venue = _venue_winners(markets, outcomes)
-    if venue is None:
+    if not venue:
         return result(
             NO_OUTCOME,
             f"the venue paid on nothing for {target_date}; nothing to verify against",
