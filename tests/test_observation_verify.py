@@ -82,7 +82,7 @@ def _obs(day: date, hour_utc: int, temp: float, *, source: str = "noaa-timeserie
     # hour_utc may exceed 23: it rolls into the following UTC day, which is
     # how the tests express "the window that spans the local midnight".
     when = datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(hours=hour_utc, minutes=minute)
-    return {"obs_time_utc": when, "temp_f": temp, "source": source}
+    return {"station": "KLGA", "obs_time_utc": when, "temp_f": temp, "source": source}
 
 
 # --- the two directions, on an ordinary 24-hour day ---------------------------
@@ -284,7 +284,7 @@ def test_provenance_travels_with_the_verdict() -> None:
     assert set(sources) == {"noaa-timeseries", "wu-daily"}
     assert sources["wu-daily"]["n_readings"] == 1
     assert result.rules_sha256
-    assert result.verifier_version == "observation-verify-2"
+    assert result.verifier_version == "observation-verify-3"
     assert result.aggregation_rule.startswith("max of hourly readings")
 
 
@@ -408,6 +408,7 @@ def _current_rules(**overrides) -> dict:
 def _metar(day: date, hour_utc: int, temp_c: float, *, special: bool = False) -> dict:
     when = datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(hours=hour_utc)
     return {
+        "station": "KLGA",
         "obs_time_utc": when,
         "temp_c": temp_c,
         "source": "aviationweather-metar",
@@ -597,6 +598,7 @@ def test_verify_market_cli_matches_and_emits_verified_pairs(tmp_path) -> None:
         when = datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(hours=hour)
         readings.append(
             {
+                "station": "KLGA",
                 "obs_time_utc": when.isoformat(),
                 "temp_c": 12.0,
                 "report_type": "METAR",
@@ -605,7 +607,7 @@ def test_verify_market_cli_matches_and_emits_verified_pairs(tmp_path) -> None:
         )
     peak = datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(hours=21)
     readings.append(
-        {"obs_time_utc": peak.isoformat(), "temp_c": 16.7, "report_type": "METAR", "source": "aviationweather-metar"}
+        {"station": "KLGA", "obs_time_utc": peak.isoformat(), "temp_c": 16.7, "report_type": "METAR", "source": "aviationweather-metar"}
     )
     obs_file = tmp_path / "observations.json"
     obs_file.write_text(json.dumps(readings), encoding="utf-8")
@@ -678,6 +680,7 @@ def test_cli_verifies_resolved_losers_as_well_as_the_winner(tmp_path):
             "INSERT INTO markets VALUES (?, 'event', ?, ?, ?, true, true, ?, ?, ?)",
             [mid, mid, low, high, RULES_TEXT, date(2026, 10, 13), mid],
         )
+    con.execute("ALTER TABLE markets ADD COLUMN bracket_kind VARCHAR DEFAULT 'range'")
     con.close()
     observations = [_obs(date(2026, 10, 13), hour, 81) for hour in range(4, 28)]
     obs = tmp_path / "observations.json"
@@ -719,3 +722,74 @@ def test_cli_verifies_resolved_losers_as_well_as_the_winner(tmp_path):
         settlements.write_text(json.dumps([{**originals[0], **changed}, originals[1]]), encoding="utf-8")
         assert main(command) == 0
         assert json.loads(out.read_text()) == []
+
+
+def test_verification_uses_only_the_named_station():
+    day = date(2026, 10, 13)
+    correct = [_obs(day, hour, 81) for hour in range(4, 28)]
+    foreign = [dict(row, station="KJFK", temp_f=96, source="foreign") for row in correct]
+    unnamed = [{k: v for k, v in row.items() if k != "station"} for row in foreign]
+    options = dict(rules=_rules(), markets=_markets(81, 81), outcomes=[_outcome("m-1")],
+                   event_id=EVENT, target_date=day)
+    mixed = verify_market_rules(observations=correct + foreign, **options)
+    assert mixed.verdict == MATCH and mixed.observed_max_whole_f == 81
+    assert mixed.n_readings == 24 and len(mixed.observation_sources) == 1
+    for readings in (foreign, unnamed):
+        missing = verify_market_rules(observations=readings, **options)
+        assert missing.verdict == NO_OBSERVATION and missing.n_readings == 0
+    partial = verify_market_rules(observations=correct[:12] + foreign, **options)
+    assert partial.verdict == INCOMPLETE_OBSERVATION and partial.distinct_hours == 12
+
+
+def test_exact_and_exclusive_brackets_cannot_verify_another_temperature():
+    day = date(2026, 10, 13)
+    observed = [_obs(day, h, 81) for h in range(4, 28)]
+    exact = dict(_markets(80, None)[0], bracket_kind="exact")
+    exclusive = dict(_markets(80, 81)[0], bracket_high_inclusive=False)
+    for market in (exact, exclusive):
+        result = verify_market_rules(rules=_rules(), markets=[market], outcomes=[_outcome("m-1")],
+                                     event_id=EVENT, target_date=day, observations=observed)
+        assert result.verdict == MISMATCH
+
+
+def test_two_brackets_covering_the_observation_are_ambiguous_even_with_one_venue_winner():
+    day = date(2026, 10, 13)
+    markets = _markets(80, 81, market_id="a") + _markets(81, 82, market_id="b")
+    result = verify_market_rules(rules=_rules(), markets=markets, outcomes=[_outcome("a")],
+                                 event_id=EVENT, target_date=day, observations=[_obs(day, h, 81) for h in range(4, 28)])
+    assert result.verdict == AMBIGUOUS_WINNER and not result.observation_picks_venue_winner
+
+def test_cli_isolates_event_and_station_from_database(tmp_path, capsys):
+    import duckdb
+
+    from weatherquant.cli import main
+
+    collector = tmp_path / "markets.duckdb"
+    with duckdb.connect(str(collector)) as con:
+        con.execute("CREATE TABLE markets AS SELECT 'm' AS market_id, 'event' AS event_id, "
+                    "'81' AS bracket_label, 81 AS bracket_low, NULL::DOUBLE AS bracket_high, "
+                    "true AS bracket_low_inclusive, true AS bracket_high_inclusive, ? AS rules_text, "
+                    "'exact' AS bracket_kind, 'condition' AS condition_id, DATE '2026-10-13' AS target_date", [RULES_TEXT])
+        con.execute("INSERT INTO markets SELECT * REPLACE ('other' AS event_id, 'other-market' AS market_id) FROM markets")
+    observations = tmp_path / "obs.duckdb"
+    with duckdb.connect(str(observations)) as con:
+        con.execute("CREATE TABLE klga_observations AS SELECT station, stamp AS obs_time_utc, "
+                    "81.0 AS temp_f, NULL::DOUBLE AS temp_c, 'routine' AS report_type, 'fixture' AS source "
+                    "FROM (VALUES ('KLGA'), ('KJFK')) s(station), "
+                    "range(TIMESTAMPTZ '2026-10-13 04:00:00+00', TIMESTAMPTZ '2026-10-14 04:00:00+00', "
+                    "INTERVAL 1 HOUR) t(stamp)")
+        con.execute("UPDATE klga_observations SET temp_f=95 WHERE station='KJFK'")
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps([{"market_id": "m", "settlement_status": "RESOLVED", "resolved_outcome": 1.0,
+                                  "target_date": "2026-10-13", "raw_source_reference": {"condition_id": "condition"}}]))
+    output = tmp_path / "verified.json"
+    args = ["verify-market", "--collector-copy", str(collector), "--date", "2026-10-13", "--settlements", str(index),
+            "--observations-db", str(observations), "--out", str(output)]
+    assert main(args) == 2 and "--event-id" in capsys.readouterr().err
+    assert not output.exists()
+    assert main([*args, "--event-id", "event"]) == 0
+    assert [r["market_id"] for r in json.loads(output.read_text())] == ["m"]
+    with duckdb.connect(str(observations)) as con:
+        con.execute("UPDATE klga_observations SET temp_f=82 WHERE station='KLGA'")
+    assert main([*args, "--event-id", "event"]) == 0
+    assert json.loads(output.read_text()) == []

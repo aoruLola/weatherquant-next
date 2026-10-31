@@ -474,7 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     obs_src.add_argument(
         "--observations-file",
-        help="JSON list of readings: {obs_time_utc, temp_f/temp_c, report_type, source}",
+        help="JSON readings with station, obs_time_utc, temp_f/temp_c, report_type and source",
     )
     p.add_argument("--persist", help="research DB to write market_rule_verification rows into")
     p.add_argument("--out", help="write the verified market/date/condition/payout records here")
@@ -744,7 +744,7 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
             params.append(args.event_id)
         rows = con.execute(
             "SELECT market_id, event_id, bracket_label, bracket_low, bracket_high, "
-            "bracket_low_inclusive, bracket_high_inclusive, rules_text, condition_id "
+            "bracket_low_inclusive, bracket_high_inclusive, rules_text, condition_id, bracket_kind "
             f"FROM markets WHERE target_date = ?{event_filter} ORDER BY market_id",
             params,
         ).fetchall()
@@ -754,11 +754,16 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
         print(f"no markets for {args.date} in {args.collector_copy}", file=sys.stderr)
         return 2
 
+    if len({row[1] for row in rows}) > 1:
+        print(f"multiple events for {args.date}; select one with --event-id", file=sys.stderr)
+        return 2
+
     markets = [
         {
             "market_id": r[0],
             "event_id": r[1],
             "bracket_label": r[2],
+            "bracket_kind": r[-1],
             "bracket_low": r[3],
             "bracket_high": r[4],
             "bracket_low_inclusive": r[5],
@@ -816,9 +821,10 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
                     "temp_c": r[2],
                     "report_type": r[3],
                     "source": r[4],
+                    "station": r[5],
                 }
                 for r in odb.execute(
-                    "SELECT obs_time_utc, temp_f, temp_c, report_type, source "
+                    "SELECT obs_time_utc, temp_f, temp_c, report_type, source, station "
                     "FROM klga_observations WHERE obs_time_utc >= ? AND obs_time_utc < ?",
                     [start, end],
                 ).fetchall()
