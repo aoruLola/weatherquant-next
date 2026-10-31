@@ -211,10 +211,39 @@ class TestHttpLayer:
         assert status == 200
         assert second["data"]["entries"][0]["seq"] > first["data"]["entries"][0]["seq"]
 
+    def test_invalid_ledger_cursor_is_a_client_error(self, server):
+        status, payload = self._get(server, "/api/v1/paper/ledger?cursor=not-an-integer")
+        assert status == 400
+        assert "cursor" in payload["reason"]
+
+    def test_encoded_decision_ids_round_trip_for_every_page(self, populated, server):
+        from urllib.parse import urlencode
+
+        store = PaperStore(populated)
+        decisions = ["!a &+/测试", "!b"]
+        for decision in decisions:
+            event = parse_signal_event(export_row(decision_id=decision))
+            store.record_signal(event, tradeable=False, outcome="REFUSED", consumed_at_utc=NOW)
+            store.record_fill(make_fill(decision_id=decision, shares=1.0))
+
+        for endpoint, items in (("orders", "items"), ("rejections", "items"), ("fills", "fills")):
+            path = f"/api/v1/paper/{endpoint}?limit=1"
+            status, first = self._get(server, path)
+            assert status == 200 and first["data"]["next_cursor"] == decisions[0]
+            status, second = self._get(server, path + "&" + urlencode({"cursor": first["data"]["next_cursor"]}))
+            assert status == 200
+            assert [row["decision_id"] for row in second["data"][items]] == [decisions[1]]
+
     def test_bad_limit_is_a_400_signal(self, server):
         status, payload = self._get(server, "/api/v1/paper/ledger?limit=abc")
         assert status == 400
         assert "limit" in payload["reason"]
+
+    def test_closed_database_returns_a_json_503(self, populated, server):
+        populated.close()
+        status, payload = self._get(server, "/api/v1/paper/account")
+        assert status == 503 and payload["status"] == "unavailable"
+        assert payload["kind"] == "account"
 
     def test_unavailable_payloads_are_503(self, tmp_path):
         from weatherquant.paper.web import make_server

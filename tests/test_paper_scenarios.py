@@ -517,8 +517,7 @@ class TestNoNetworkPath:
         )
 
         # The API module (WQN-45) is a *server* over stdlib http.server; the
-        # list still holds because it names client machinery only, and the
-        # server avoids even urllib's parse helpers to keep this check exact.
+        # Only the router's incoming query decoder is allowed from urllib.
         forbidden = ("httpx", "requests", "ResilientHttp", "socket.create_connection", "urllib")
         for module in (
             paper_pkg,
@@ -536,6 +535,8 @@ class TestNoNetworkPath:
             paper_web,
         ):
             source = inspect.getsource(sys.modules[module.__name__])
+            if module is paper_web:
+                source = source.replace("from urllib.parse import parse_qsl\n", "")
             for needle in forbidden:
                 assert needle not in source, (
                     f"{module.__name__} references {needle!r}; the paper engine "

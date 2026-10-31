@@ -34,8 +34,10 @@ import json
 import logging
 import time
 from collections.abc import Callable
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qsl
 
 from weatherquant.paper.api import _MAX_LIMIT, BUILDERS, ENDPOINTS
 
@@ -56,9 +58,6 @@ class PaperAPIHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         from datetime import UTC, datetime
 
-        # Query strings are split by hand: this module deliberately imports
-        # no client-side URL machinery, keeping the structural no-network
-        # test (tests/test_paper_scenarios.py) true of the server too.
         path, _separator, raw_query = self.path.partition("?")
         if not path.startswith(_API_PREFIX):
             self._send(*self._not_found(path))
@@ -70,32 +69,25 @@ class PaperAPIHandler(BaseHTTPRequestHandler):
         builder, takes_query = BUILDERS[name]
         query: dict[str, Any] = {}
         if takes_query:
-            for pair in raw_query.split("&"):
-                if not pair:
-                    continue
-                key, _eq, value = pair.partition("=")
-                query[key] = value
             try:
-                # Paging parameters are the router's to validate: a malformed
-                # limit is a client error (400), not an engine failure (503).
+                query = dict(parse_qsl(raw_query, keep_blank_values=True, errors="strict"))
                 _validate_page(query)
             except ValueError as exc:
                 self._send(400, {"status": "error", "reason": str(exc)})
                 return
-        owner = getattr(self.con, "con", self.con)
-        request_con = owner.cursor()
         try:
-            payload = (
-                builder(request_con, now=datetime.now(tz=UTC), query=query)
-                if takes_query
-                else builder(request_con, now=datetime.now(tz=UTC))
-            )
-        except ValueError as exc:
-            self._send(400, {"status": "error", "reason": str(exc)})
+            owner = getattr(self.con, "con", self.con)
+            with closing(owner.cursor()) as request_con:
+                payload = (
+                    builder(request_con, now=datetime.now(tz=UTC), query=query)
+                    if takes_query
+                    else builder(request_con, now=datetime.now(tz=UTC))
+                )
+        except Exception:
+            log.exception("Paper API could not read %s", name)
+            self._send(503, {"kind": name, "status": "unavailable", "reason": "Paper database read failed"})
             return
-        finally:
-            request_con.close()
-        status = 200 if payload.get("status") == "ok" else 503
+        status = {"ok": 200, "error": 400}.get(payload.get("status"), 503)
         self._send(status, payload)
 
     @staticmethod
