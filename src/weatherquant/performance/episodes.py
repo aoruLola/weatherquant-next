@@ -202,20 +202,14 @@ class OpenEpisode:
                 self.max_edge = number
             if number < self.min_edge:
                 self.min_edge = number
-        if self.first_market_price is None:
-            self.first_market_price = row.market_price
-        if self.first_model_probability is None:
-            self.first_model_probability = row.model_probability
-        if self.first_available_depth_usd is None:
-            self.first_available_depth_usd = row.available_depth_usd
+        # Pricing uses the opening ACCEPT. Later observations can describe the
+        # opportunity but cannot supply a missing opening price, depth, probability or fee.
         if self.station is None:
             self.station = row.station
         if self.bracket_label is None:
             self.bracket_label = row.bracket_label
         if self.market_question is None:
             self.market_question = row.market_question
-        if self.fee_rate is None:
-            self.fee_rate = row.fee_rate
 
 
 @dataclass(frozen=True, slots=True)

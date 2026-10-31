@@ -422,12 +422,15 @@ def _ensure_chronological_episodes(store: PerformanceStateStore) -> None:
             [[str(p.path) for p in parts]],
         )
         with store.transaction():
-            store.execute("DELETE FROM performance_episodes")
+            # DuckDB 1.1 loses same-key replacements after DELETE in this transaction.
+            # Every upsert stamps ingested_at_utc. Prune only rows the re-fold did not visit.
+            store.execute("UPDATE performance_episodes SET ingested_at_utc = '-infinity'")
             while page := reader.fetchmany(5000):
                 for (raw,) in page:
                     folder.add(row_from_mapping(json.loads(raw)))
             store.upsert_closed_episodes(closed)
             store.upsert_open_episodes(folder.open_by_key.values())
+            store.execute("DELETE FROM performance_episodes WHERE ingested_at_utc = '-infinity'")
             state.row_seq = folder.state.row_seq
             state.last_instant = folder.state.last_instant
             state.prev_instant = folder.state.prev_instant
