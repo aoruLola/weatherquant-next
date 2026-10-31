@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 
@@ -105,7 +106,7 @@ def test_consume_reads_the_published_export(paper_env, monkeypatch, capsys):
         "direction": "buy_yes",
         "state": "ACCEPT",
         "mode": "LIVE",
-        "decision_time_utc": "2026-10-26T12:04:00+00:00",
+        "decision_time_utc": datetime.now(UTC).isoformat(),
         "book_id": "b" * 64,
         "fee_rate": 0.05,
     }
