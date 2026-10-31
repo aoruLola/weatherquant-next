@@ -20,8 +20,8 @@ These tests pin each layer:
 
 from __future__ import annotations
 
+import os
 import re
-import signal
 import subprocess
 import sys
 import textwrap
@@ -159,8 +159,15 @@ _CHILD = textwrap.dedent(
 def _spawn_writer_child(data_dir: Path) -> subprocess.Popen:
     child = data_dir / "writer_child.py"
     child.write_text(_CHILD, encoding="utf-8")
+    executable = sys.executable
+    env = os.environ.copy()
+    if os.name == "nt":
+        # Target the writer itself. Killing the Windows venv launcher leaves its worker holding the DB.
+        executable = sys._base_executable
+        env["__PYVENV_LAUNCHER__"] = sys.executable
     return subprocess.Popen(
-        [sys.executable, str(child), str(data_dir)],
+        [executable, str(child), str(data_dir)],
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -180,13 +187,15 @@ def test_a_sigkill_mid_write_loses_no_committed_transaction(tmp_path: Path) -> N
     data.mkdir()
     proc = _spawn_writer_child(data)
 
-    deadline = time.monotonic() + 60.0
-    while _journal_batches(data) < 8 and time.monotonic() < deadline:
-        time.sleep(0.2)
-    assert _journal_batches(data) >= 8, "child never committed; cannot test recovery"
-
-    proc.send_signal(signal.SIGKILL)  # what the kernel OOM killer delivers
-    proc.wait(timeout=30)
+    try:
+        deadline = time.monotonic() + 60.0
+        while _journal_batches(data) < 8 and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert _journal_batches(data) >= 8, "child never committed; cannot test recovery"
+    finally:
+        # SIGKILL on POSIX and TerminateProcess on Windows both bypass DuckDB shutdown.
+        proc.kill()
+        proc.wait(timeout=30)
 
     wal = data / "weatherquant.duckdb.wal"
     wal_bytes = wal.stat().st_size if wal.exists() else 0
