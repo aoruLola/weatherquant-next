@@ -751,8 +751,8 @@ def test_the_window_block_names_itself_and_its_range() -> None:
     window = {
         "episodes": 15, "episodes_all": 400, "max_episodes": 20,
         "days": 90, "complete": False,
-        "first_seen_utc_from": "2026-10-13T12:00:00+00:00",
-        "last_seen_utc_to": "2026-10-01T00:00:00+00:00",
+        "first_seen_utc_from": "2026-10-01T12:00:00+00:00",
+        "last_seen_utc_to": "2026-10-13T12:00:00+00:00",
     }
     payload = window_portfolio_payload(
         result, window=window, generation_id="gen-7", mode="portfolio",
@@ -760,8 +760,8 @@ def test_the_window_block_names_itself_and_its_range() -> None:
     )
 
     assert payload["scope"] == "window"
-    assert payload["window_start"] == "2026-10-13T12:00:00+00:00"
-    assert payload["window_end"] == "2026-10-01T00:00:00+00:00"
+    assert payload["window_start"] == "2026-10-01T12:00:00+00:00"
+    assert payload["window_end"] == "2026-10-13T12:00:00+00:00"
     assert payload["window_episode_limit"] == 20
     assert payload["total_episodes_in_window"] == 15
     assert payload["window_completeness"] == "truncated"
