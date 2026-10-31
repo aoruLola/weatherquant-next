@@ -179,6 +179,56 @@ def test_an_issue_that_was_not_publishable_yet_is_a_violation(db):
     assert "FORECAST_NOT_PUBLISHABLE" in _kinds(report)
 
 
+def test_cross_date_reuse_checks_only_the_prediction_for_each_decision(db):
+    tomorrow = TARGET + timedelta(days=1)
+    _prediction(db, model="gfs_raw")
+    _prediction(db, model="gfs_raw", target=tomorrow, publishable=NOW + timedelta(hours=1), n_missing=1)
+    _decision(db, i=1, model="gfs_raw")
+    late = _decision(db, i=2, model="gfs_raw", target=tomorrow, mode="REPLAY")
+
+    report = audit_alignment(db.con, now=NOW)
+
+    assert report.checked_decisions == report.checked_predictions == 2
+    assert report.partial_local_day_decisions == 1
+    assert report.per_mode["LIVE"]["decisions"] == report.per_mode["REPLAY"]["decisions"] == 1
+    assert [(v.kind, v.decision_id) for v in report.violations] == [("FORECAST_NOT_PUBLISHABLE", late)]
+
+
+def test_wrong_dates_do_not_supply_forecast_evidence(db):
+    for offset in (1, 2):
+        _prediction(db, model="gfs_raw", target=TARGET + timedelta(days=offset),
+                    publishable=NOW + timedelta(days=1), n_missing=1)
+    did = _decision(db, i=1, model="gfs_raw")
+
+    report = audit_alignment(db.con, now=NOW)
+
+    assert report.checked_decisions == 1
+    assert report.checked_predictions == report.partial_local_day_decisions == 0
+    assert [(v.kind, v.decision_id) for v in report.violations] == [("TARGET_DATE_MISMATCH", did)]
+
+
+def test_distinct_events_with_the_same_model_date_and_run_count_separately(db):
+    for i, event in enumerate(("e-1", "e-2")):
+        _prediction(db, model="gfs_raw", event=event)
+        _decision(db, i=i, model="gfs_raw", event=event)
+
+    report = audit_alignment(db.con, now=NOW)
+
+    assert report.consistent
+    assert report.checked_decisions == report.checked_predictions == 2
+
+
+def test_missing_decision_date_cannot_be_inferred_from_other_predictions(db):
+    _prediction(db, model="gfs_raw")
+    did = _decision(db, i=1, model="gfs_raw")
+    db.con.execute("UPDATE shadow_decisions SET target_date = NULL WHERE decision_id = ?", [did])
+
+    report = audit_alignment(db.con, now=NOW)
+
+    assert report.checked_predictions == 0
+    assert [(v.kind, v.decision_id) for v in report.violations] == [("PREDICTION_UNTRACEABLE", did)]
+
+
 def test_a_decision_citing_an_unrecorded_prediction_is_untraceable(db):
     _decision(db, i=1)  # no model_predictions row at all
 

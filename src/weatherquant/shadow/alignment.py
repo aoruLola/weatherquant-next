@@ -191,23 +191,27 @@ def _audit_prediction_alignment(con: Any, report: AlignmentReport) -> None:
 
     Streamed in pages rather than fetched whole: this is the one pass over
     every model-carrying decision, and it has to stay flat in memory against
-    a live-sized history. ``IS NOT DISTINCT FROM`` keeps a NULL event_id
-    joining to its own NULL-keyed prediction instead of reading as missing.
+    a live-sized history. Only a full prediction key supplies forecast evidence.
+    The grouped dates distinguish an absent prediction from a wrong-day one
+    without multiplying a decision by the number of available forecasts.
     """
     cursor = con.execute(
-        "SELECT d.decision_id, d.model_name, d.target_date, d.decision_time_utc, "
-        "       d.forecast_run_time_utc, p.target_date AS prediction_target_date, "
-        "       p.forecast_publishable_at_utc, p.decision_time_utc AS prediction_time, "
-        "       p.n_hours, p.n_missing_hours "
-        "FROM shadow_decisions d "
-        "LEFT JOIN model_predictions p ON "
-        "     p.model_name = d.model_name AND p.model_version = d.model_version "
-        " AND p.station = d.station "
-        " AND p.event_id IS NOT DISTINCT FROM d.event_id "
-        " AND p.forecast_run_time_utc IS NOT DISTINCT FROM d.forecast_run_time_utc "
-        "WHERE d.model_name IS NOT NULL"
+        """
+        SELECT d.decision_id, d.model_name, d.target_date, d.decision_time_utc,
+               d.forecast_run_time_utc, p.rowid, dates.first_target,
+               p.forecast_publishable_at_utc, p.n_hours, p.n_missing_hours
+        FROM shadow_decisions d
+        LEFT JOIN model_predictions p
+          USING (model_name, model_version, station, event_id, forecast_run_time_utc, target_date)
+        LEFT JOIN (
+            SELECT model_name, model_version, station, event_id, forecast_run_time_utc,
+                   MIN(target_date) AS first_target
+            FROM model_predictions GROUP BY ALL
+        ) dates USING (model_name, model_version, station, event_id, forecast_run_time_utc)
+        WHERE d.model_name IS NOT NULL
+        """
     )
-    seen_predictions: set[tuple[str, str, str]] = set()
+    seen_predictions: set[int] = set()
 
     while True:
         page = cursor.fetchmany(5000)
@@ -221,28 +225,14 @@ def _audit_prediction_alignment(con: Any, report: AlignmentReport) -> None:
                 decision_target,
                 decision_time,
                 forecast_run,
-                prediction_target,
+                prediction_rowid,
+                first_target,
                 publishable_at,
-                _prediction_time,
                 n_hours,
                 n_missing_hours,
             ) = row
             if model_name not in ALIGNMENT_MODEL_NAMES and model_name not in report.unknown_models:
                 report.unknown_models.append(str(model_name))
-            if prediction_target is None:
-                report.add(
-                    AlignmentViolation(
-                        kind="PREDICTION_UNTRACEABLE",
-                        detail=(
-                            f"decision cites {model_name}@{forecast_run} but no "
-                            "model_predictions row exists for it; the output "
-                            "cannot be traced to a recorded input"
-                        ),
-                        decision_id=str(decision_id),
-                    )
-                )
-                continue
-            seen_predictions.add((str(model_name), str(prediction_target), str(forecast_run)))
             if forecast_run is not None and forecast_run > decision_time:
                 report.add(
                     AlignmentViolation(
@@ -254,6 +244,19 @@ def _audit_prediction_alignment(con: Any, report: AlignmentReport) -> None:
                         decision_id=str(decision_id),
                     )
                 )
+            if prediction_rowid is None:
+                if decision_target is not None and first_target is not None:
+                    kind = "TARGET_DATE_MISMATCH"
+                    detail = (
+                        f"decision settles {decision_target.isoformat()} but there is no prediction "
+                        f"for that date; the first available target is {first_target.isoformat()}"
+                    )
+                else:
+                    kind = "PREDICTION_UNTRACEABLE"
+                    detail = f"no recorded prediction matches {model_name}@{forecast_run} for target {decision_target}"
+                report.add(AlignmentViolation(kind=kind, detail=detail, decision_id=str(decision_id)))
+                continue
+            seen_predictions.add(prediction_rowid)
             if publishable_at is not None and publishable_at > decision_time:
                 report.add(
                     AlignmentViolation(
@@ -267,21 +270,10 @@ def _audit_prediction_alignment(con: Any, report: AlignmentReport) -> None:
                         decision_id=str(decision_id),
                     )
                 )
-            if decision_target is not None and prediction_target != decision_target:
-                report.add(
-                    AlignmentViolation(
-                        kind="TARGET_DATE_MISMATCH",
-                        detail=(
-                            f"decision settles {decision_target.isoformat()} but "
-                            f"its prediction is for {prediction_target.isoformat()}"
-                        ),
-                        decision_id=str(decision_id),
-                    )
-                )
             # Predictions are immutable per model/version/run/event/day. A later
             # LIVE cycle or an earlier REPLAY cycle can reuse that distribution;
             # its first evaluation timestamp is not the forecast availability.
-            if n_hours is not None and n_missing_hours is not None and int(n_missing_hours) > 0:
+            if n_hours is not None and n_missing_hours is not None and n_missing_hours > 0:
                 # The local civil day is the unit the market settles and the
                 # model was fitted on. A partially covered day remains a legal
                 # forecast (the runtime gate allows it), so it is counted, not
