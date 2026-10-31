@@ -47,6 +47,10 @@ RUN uv sync --frozen --no-dev --no-editable \
 # ---------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision=${GIT_SHA}
+ENV GIT_SHA=${GIT_SHA} IMAGE_TAG=sha-${GIT_SHA}
+
 RUN groupadd --gid 1000 wq \
     && useradd --uid 1000 --gid wq --no-create-home --home-dir /app --shell /usr/sbin/nologin wq
 

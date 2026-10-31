@@ -52,10 +52,7 @@ x-common: &common
     # array), never tmpfs: a tmpfs spill IS a memory allocation and would defeat
     # the budget it exists to enforce.
     WQ_DUCKDB_TEMP_DIR: /data/duckdb-spill
-    # Build provenance, stamped by CI. Shown in the heartbeat and in
-    # collector_runs so "which version produced this row?" is always answerable.
-    GIT_SHA: ${GIT_SHA:-unknown}
-    IMAGE_TAG: ${IMAGE_TAG:-stable}
+    # GIT_SHA and IMAGE_TAG come from the collector image at build time.
   volumes:
     - /mnt/user/appdata/weatherquant-next:/data
   healthcheck:

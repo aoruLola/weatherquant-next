@@ -19,6 +19,8 @@ dependency.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -187,6 +189,53 @@ RELEASE_TAG_GUARDS = (
     "dashboard-release.yml",
     "mcp-release.yml",
 )
+
+
+def test_collector_release_verifies_the_digest_before_tagging_it() -> None:
+    release = (REPO_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    assert "git merge-base --is-ancestor HEAD origin/main" in release
+    assert "push-by-digest=true" in release
+    assert 'DIGEST: ${{ steps.build.outputs.digest }}' in release
+    verify = release.index('bash scripts/verify_worker_image.sh "$ref" "$SOURCE_SHA"')
+    promotions = [line for line in release.splitlines() if "imagetools create" in line]
+    assert len(promotions) == 2
+    assert all(release.index(line) > verify and line.endswith('"$ref"') for line in promotions)
+    compose = (REPO_ROOT / "docker/compose.unraid.yaml").read_text(encoding="utf-8")
+    assert "GIT_SHA:" not in compose and "IMAGE_TAG:" not in compose
+
+
+@pytest.mark.parametrize(("revision", "message"), [("unknown", "revision mismatch"), ("match", "worker.py differs")])
+def test_collector_verifier_rejects_wrong_image_before_starting_a_worker(revision, message):
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("Bash is required for the collector image verifier")
+    result = subprocess.run(
+        [bash, "-c", """
+        sha=$(git rev-parse HEAD)
+        revision=$1
+        docker() {
+          case "$1 ${2:-}" in
+            "version ") return 0 ;;
+            "image inspect")
+              if [[ "$4" == '{{.Id}}' ]]; then echo image-id
+              elif [[ "$revision" == match ]]; then echo "$sha"
+              else echo "$revision"; fi ;;
+            "run --rm")
+              if [[ "$*" == *"--entrypoint python"* ]]; then echo /site/weatherquant
+              else echo wrong-worker-bytes; fi ;;
+            *) echo "unexpected command $*" >&2; return 2 ;;
+          esac
+        }
+        export -f docker
+        export sha revision
+        bash scripts/verify_worker_image.sh test-image "$sha"
+        """, "test", revision],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1, result.stderr
+    assert message in result.stderr
 
 
 def test_every_release_workflow_guards_its_own_tag() -> None:
