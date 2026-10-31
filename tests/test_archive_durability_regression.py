@@ -325,7 +325,8 @@ def test_bytes_beyond_the_trail_are_reported_as_a_crash_window_not_corruption(tm
 
     verdict = {r["path"]: r for r in verify_archive_tree(root)}[str(path)]
     assert not verdict["ok"]
-    assert any("beyond" in p for p in verdict["problems"]), verdict["problems"]
+    assert len(verdict["problems"]) == 1
+    assert "beyond" in verdict["problems"][0]
 
 
 def test_a_forged_sidecar_is_rejected_by_verification(tmp_path):
@@ -467,3 +468,61 @@ def test_disk_full_kills_the_collector_loudly_and_the_restart_continues_the_arch
     # The recovery log itself is a durable JSONL file the operator reads.
     for event in _recovery_events(tmp_path / "raw"):
         assert set(event) >= {"ts_utc", "event", "run_id"}, event
+
+
+def test_restart_after_large_complete_record_keeps_sequence(tmp_path):
+    root = tmp_path / "raw"
+    record = _record()
+    with RawArchive(root, run_id=record.run_id) as first:
+        first.append(ArchiveRecord(record.source, "x" * 150000, record.received_at_utc, None, "ok", record.run_id))
+    with RawArchive(root, run_id="next") as restarted:
+        restarted.append(_record(1, run_id="next"))
+    assert [row["archive_seq"] for row in _lines(root)] == [1, 2]
+    assert _all_ok(root)
+
+
+def test_restart_refuses_to_recertify_changed_prefix(tmp_path):
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    path = next(tmp_path.glob("rest/*.jsonl"))
+    receipt = path.with_suffix(".jsonl.sha256")
+    previous_receipt = receipt.read_bytes()
+    data = path.read_bytes().replace(b'"n":0', b'"n":9') + b'{"archive_seq":2}\n'
+    path.write_bytes(data)
+    with pytest.raises(ValueError, match="checksum prefix"):
+        RawArchive(tmp_path, run_id="restart").recover_pending_partitions()
+    assert receipt.read_bytes() == previous_receipt
+    assert path.read_bytes() == data
+    assert _recovery_events(tmp_path)[-1]["event"] == "partition_recovery_failed"
+
+
+def test_failed_sequence_read_is_retried_before_minting_an_id(tmp_path, monkeypatch):
+    from weatherquant.data import archive as archive_module
+
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    writer = RawArchive(tmp_path, run_id="restart")
+
+    def fail_read(fd, size):
+        raise OSError("injected sequence read failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(archive_module, "_read_full", fail_read)
+        with pytest.raises(OSError, match="sequence read failure"):
+            writer.append(_record(run_id="restart"))
+    writer.append(_record(run_id="restart"))
+    writer.close()
+    assert [row["archive_seq"] for row in _lines(tmp_path)] == [1, 2]
+    assert _all_ok(tmp_path)
+
+
+@pytest.mark.parametrize("receipt", [b"{", b'{"bytes":-1,"lines":1,"chain_sha256":"bad"}'])
+def test_unreadable_receipt_is_preserved_and_reported(tmp_path, receipt):
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    path = next(tmp_path.glob("rest/*.jsonl.sha256"))
+    path.write_bytes(receipt)
+    with pytest.raises(ValueError, match="invalid checksum sidecar"):
+        RawArchive(tmp_path, run_id="restart").recover_pending_partitions()
+    assert path.read_bytes() == receipt
+    assert not verify_archive_tree(tmp_path)[0]["ok"]
