@@ -177,3 +177,62 @@ class TestNotExecutable:
 
 def _env_raw(env):
     return env[1]
+
+
+def test_captured_depth_prices_both_directions_without_archive_access(env, monkeypatch):
+    from paper_fills_support import build_engine
+
+    store, raw, _ = env
+    source = ArchiveBookSource(raw)
+    seed = source.resolve(token_id=TOKEN, decision_time=T_DECISION)
+
+    def unexpected_lookup(**kwargs):
+        pytest.fail("a captured decision must not rescan the collector archive")
+
+    monkeypatch.setattr(source, "resolve", unexpected_lookup)
+    for direction in ["buy_yes", "sell_yes"]:
+        event = parse_signal_event(export_row(
+            decision_id=direction, direction=direction, token_id=TOKEN, proposed_shares=100.0, book_id=seed.book_id,
+            evidence_version=1, book_bids_json=seed.bids_json(), book_asks_json=seed.asks_json(),
+            book_source=seed.book_source, book_source_event_id=seed.source_event_id,
+            venue_ts_utc=seed.venue_ts_utc.isoformat(), collector_received_at_utc=seed.collector_received_at_utc.isoformat(),
+        ))
+        store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
+        assert build_engine(store, source, clock=lambda: NOW).fill_pending().filled == 1
+        assert store.fill_of(event.decision_id)["book_source_event_id"] == seed.source_event_id
+
+
+def test_missing_captured_evidence_refuses_even_when_archive_matches(env):
+    from paper_fills_support import build_engine
+
+    store, raw, _ = env
+    event = parse_signal_event(export_row(token_id=TOKEN, book_id=real_book_id_for_seed(), evidence_version=1))
+    store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
+    assert build_engine(store, ArchiveBookSource(raw), clock=lambda: NOW).fill_pending().by_reason == {
+        "NOT_EXECUTABLE": 1
+    }
+
+
+def test_timeout_after_matching_frame_never_prices_partial_scan(env, monkeypatch):
+    from types import SimpleNamespace
+
+    from paper_fills_support import build_engine
+    from weatherquant.paper import books
+
+    store, raw, _ = env
+    source = ArchiveBookSource(raw, timeout_seconds=1)
+    clock = [0.]
+    original = books._build_evidence
+
+    def slow_frame(*args, **kwargs):
+        evidence = original(*args, **kwargs)
+        clock[0] += 2
+        return evidence
+
+    monkeypatch.setattr(books, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(books, "_build_evidence", slow_frame)
+    event = parse_signal_event(export_row(token_id=TOKEN, book_id=real_book_id_for_seed()))
+    store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
+    result = build_engine(store, source, clock=lambda: NOW).fill_pending()
+    assert result.by_reason == {"NOT_EXECUTABLE": 1}
+    assert not store.fill_of(event.decision_id)

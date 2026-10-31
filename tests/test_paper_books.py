@@ -176,3 +176,19 @@ class TestBoundedScan:
         evidence = _source(tmp_path).resolve(token_id=TOKEN, decision_time=T_DECISION)
         assert evidence is not None
 
+
+
+def test_archive_requires_a_complete_frame_and_an_explicit_token(tmp_path):
+    payload = two_level_book()
+    payload.pop("asset_id")
+    line = ws_line(payload, received=T_DECISION)
+    path = write_archive(tmp_path, source="ws", day="2026-10-26", lines=[line])
+    target = ws_line(two_level_book(), received=T_DECISION).encode()
+    with path.open("ab") as handle:
+        handle.write(target)
+    source = ArchiveBookSource(tmp_path, tail_bytes=len(target) + 1)
+    assert source.resolve(token_id=TOKEN, decision_time=T_DECISION) is None
+    assert ArchiveBookSource(tmp_path).resolve(token_id=TOKEN, decision_time=T_DECISION) is None
+    with path.open("ab") as handle:
+        handle.write(b"\n")
+    assert source.resolve(token_id=TOKEN, decision_time=T_DECISION).token_id == TOKEN

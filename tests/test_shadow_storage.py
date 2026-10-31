@@ -323,3 +323,24 @@ def test_the_session_timezone_is_pinned_to_utc(shadow_db) -> None:
     row = shadow_db.con.execute("SELECT current_setting('TimeZone')").fetchone()
     assert row[0] == "UTC"
 
+
+
+def test_restart_keeps_the_same_frame_and_source_id_as_the_decision(shadow_db):
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from weatherquant.shadow.state import ShadowState
+
+    newest = replace(make_observation(venue_ts=NOW, collector_received=NOW), source_event_id="a" * 64)
+    late = replace(
+        make_observation(venue_ts=NOW - timedelta(seconds=3), collector_received=NOW + timedelta(seconds=1)),
+        source_event_id="b" * 64,
+    )
+    state = ShadowState()
+    state.apply_books([newest, late])
+    store = ShadowStore(shadow_db)
+    store.upsert_books([newest, late], now=NOW)
+    restarted = ShadowState()
+    restarted.load_books(store.load_book_rows())
+    assert state.book_for(newest.token_id).source_event_id == newest.source_event_id
+    assert restarted.book_for(newest.token_id) == state.book_for(newest.token_id)

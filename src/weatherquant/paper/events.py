@@ -178,6 +178,12 @@ class SignalEvent:
     collector_received_at_utc: datetime | None = None
     snapshot_age_ms: float | None = None
 
+    evidence_version: int | None = None
+    book_source_event_id: str | None = None
+    book_source: str | None = None
+    book_bids_json: str | None = None
+    book_asks_json: str | None = None
+
     # The decision's own numbers.
     model_probability: float | None = None
     market_price: float | None = None
@@ -289,6 +295,11 @@ def parse_signal_event(row: Any) -> SignalEvent:
         decision_time_utc=decision_time,
         book_id=_opt_str(row.get("book_id")),
         snapshot_id=_opt_str(row.get("snapshot_id")),
+        evidence_version=row.get("evidence_version"),
+        book_source_event_id=_opt_str(row.get("book_source_event_id")),
+        book_source=_opt_str(row.get("book_source")),
+        book_bids_json=_opt_str(row.get("book_bids_json")),
+        book_asks_json=_opt_str(row.get("book_asks_json")),
         venue_ts_utc=_opt_datetime(row.get("venue_ts_utc")),
         collector_received_at_utc=_opt_datetime(row.get("collector_received_at_utc")),
         snapshot_age_ms=floats["snapshot_age_ms"],
