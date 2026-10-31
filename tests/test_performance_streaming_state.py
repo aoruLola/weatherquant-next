@@ -285,18 +285,19 @@ def test_a_second_process_is_refused_rather_than_corrupting_the_store(tmp_path) 
     _ingest(tmp_path, rows, parts=2, state_db=state_db)
     probe = [
         sys.executable, "-c",
-        "import duckdb, sys; con = duckdb.connect(sys.argv[1]); "
+        "import duckdb, sys; print('opening', flush=True); con = duckdb.connect(sys.argv[1]); "
+        "print('opened', flush=True); "
         "print(con.execute('SELECT SUM(rows) FROM performance_parts').fetchone()[0])",
         str(state_db),
     ]
     with PerformanceStateStore(state_db):
         attempt = subprocess.run(probe, capture_output=True)
         assert attempt.returncode != 0
-        assert b"ioexception" in attempt.stderr.lower(), attempt.stderr
+        assert attempt.stdout.splitlines() == [b"opening"], attempt.stderr
     # The identical process can open the same file and see its committed rows
     # once the owner releases it, regardless of the OS language.
     released = subprocess.run(probe, check=True, capture_output=True)
-    assert int(released.stdout) == len(rows)
+    assert released.stdout.splitlines() == [b"opening", b"opened", str(len(rows)).encode()]
 
 
 # ---------------------------------------------------------------------------
