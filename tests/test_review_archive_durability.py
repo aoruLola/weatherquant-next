@@ -33,6 +33,11 @@ def _read(root, source="rest"):
     return output
 
 
+def _is_data_fd(fd, root):
+    path = root / "rest" / "2026-10-10.jsonl"
+    return path.exists() and os.path.samestat(os.fstat(fd), path.stat())
+
+
 def test_short_os_write_is_completed_without_cut_lines(tmp_path, monkeypatch):
     root = tmp_path / "raw"
     archive = RawArchive(root, run_id="review-test", flush_records=1000)
@@ -43,13 +48,15 @@ def test_short_os_write_is_completed_without_cut_lines(tmp_path, monkeypatch):
 
     def short_write(fd, data):
         nonlocal calls
+        if not _is_data_fd(fd, root):
+            return real_write(fd, data)
         calls += 1
         return real_write(fd, data[:7] if calls == 1 else data)
 
     with monkeypatch.context() as patch:
         patch.setattr(os, "write", short_write)
         assert archive.flush() == 2
-    assert calls > 2
+    assert calls == 2
     assert sorted(x["payload"]["day"] for x in _read(root)) == [0, 1]
     assert archive.records_written == 2
     archive.close()
@@ -64,6 +71,8 @@ def test_write_failure_rolls_back_partial_record_and_retry_is_exact_once(tmp_pat
 
     def interrupted_write(fd, data):
         nonlocal calls
+        if not _is_data_fd(fd, root):
+            return real_write(fd, data)
         calls += 1
         if calls == 1:
             return real_write(fd, data[:9])
@@ -91,6 +100,8 @@ def test_fsync_failure_leaves_records_retryable(tmp_path, monkeypatch):
 
     def fail_once(fd):
         nonlocal failures
+        if not _is_data_fd(fd, root):
+            return real_fsync(fd)
         failures += 1
         if failures == 1:
             raise OSError("injected fsync failure")
@@ -138,8 +149,12 @@ def test_uncertain_rollback_blocks_duplicate_prone_retry(tmp_path, monkeypatch):
     archive = RawArchive(tmp_path / "raw", run_id="review-test", flush_records=1000)
     archive.append(_record())
 
+    real_write = os.write
+
     def fail_write(fd, data):
-        raise OSError("write failed")
+        if _is_data_fd(fd, tmp_path / "raw"):
+            raise OSError("write failed")
+        return real_write(fd, data)
 
     def fail_rollback(fd, length):
         raise OSError("truncate failed")

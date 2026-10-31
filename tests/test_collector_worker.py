@@ -561,3 +561,23 @@ def test_a_recent_rest_snapshot_is_used_for_the_cross_check(settings: Settings) 
     row = ("mkt-1", token, datetime.now(tz=UTC), 0.60, "ws", datetime.now(tz=UTC), "venue", "xcheck")
     worker._check_ws_against_rest(row)
     assert worker.stats.ws_rest_mismatches == 1
+
+
+def test_startup_recovers_a_partition_that_will_not_receive_new_records(settings, monkeypatch):
+    from weatherquant.data.archive import ArchiveRecord, RawArchive, read_archive_sidecar
+
+    old = datetime(2020, 1, 1, tzinfo=UTC)
+    with RawArchive(settings.raw_dir, run_id="old") as writer:
+        writer.append(ArchiveRecord("rest", {}, old, None, "ok", "old"))
+    path = settings.raw_dir / "rest" / "2020-01-01.jsonl"
+    original = path.read_bytes()
+    extra = original.replace(b'"archive_seq":1', b'"archive_seq":2')
+    with path.open("ab") as handle:
+        handle.write(extra)
+        handle.write(b'{"torn":')
+    code, _ = _run(settings, monkeypatch)
+    assert code == ExitCode.OK
+    assert path.read_bytes() == original + extra
+    assert read_archive_sidecar(path)["bytes"] == len(original + extra)
+    fragment, = (settings.raw_dir / "quarantine/rest").glob("*.torn")
+    assert fragment.read_bytes() == b'{"torn":'

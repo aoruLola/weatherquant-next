@@ -479,3 +479,91 @@ def test_failure_after_initial_success_preserves_last_committed_book(tmp_path, m
     assert runner.state.books["tok-0-yes"] != old_book
     assert runner.cycle().lines_read == 0
     runner.close(status="stopped", reason="test")
+
+
+def test_runner_never_commits_bytes_a_failed_archive_flush_rolls_back(tmp_path, monkeypatch):
+    import os
+
+    from weatherquant.data.archive import ArchiveRecord, RawArchive
+
+    raw = tmp_path / "raw"
+    archive = RawArchive(raw, run_id="collector")
+    runner = _build(tmp_path, raw)
+    _RUNNERS.append(runner)
+    runner.start()
+    archive.append(ArchiveRecord("rest", book_payload(token_id="tok", venue_ts_ms=VENUE_TS_MS),
+                                 NOW, NOW, "ok", "collector"))
+    path = raw / "rest" / f"{NOW.date()}.jsonl"
+    real_sync = os.fsync
+    reads = []
+
+    def fail_data_sync(fd):
+        if path.exists() and os.path.samestat(os.fstat(fd), path.stat()) and path.stat().st_size > 0:
+            reads.append(runner.cycle().lines_read)
+            raise OSError("injected data fsync failure")
+        real_sync(fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", fail_data_sync)
+        with pytest.raises(OSError, match="data fsync"):
+            archive.flush()
+    assert path.read_bytes() == b""
+    assert reads == [0]
+    assert not runner.db.con.execute("SELECT offset_bytes FROM ingest_checkpoints WHERE offset_bytes>0").fetchall()
+    archive.close()
+    assert runner.cycle().lines_read == 1
+    assert runner.cycle().lines_read == 0
+
+def test_restart_publishes_surviving_rows_without_another_append(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    from weatherquant.data.archive import RawArchive, read_archive_sidecar, verify_archive_tree
+
+    raw = tmp_path / "raw"
+    child = """
+import os
+import sys
+from datetime import datetime
+from weatherquant.data import archive
+
+publish = archive._write_sidecar
+def crash_before_publish(path, state):
+    if state["bytes"]:
+        os._exit(77)
+    publish(path, state)
+
+archive._write_sidecar = crash_before_publish
+writer = archive.RawArchive(sys.argv[1], run_id="interrupted")
+writer.append(archive.ArchiveRecord("rest", {}, datetime.fromisoformat(sys.argv[2]), None, "ok", "interrupted"))
+writer.flush()
+"""
+    crash = subprocess.run([sys.executable, "-c", child, str(raw), NOW.isoformat()], timeout=30)
+    assert crash.returncode == 77
+    path = raw / "rest" / f"{NOW.date()}.jsonl"
+    data = path.read_bytes()
+    assert json.loads(data)["archive_seq"] == 1
+    assert read_archive_sidecar(path)["bytes"] == 0
+
+    runner = _build(tmp_path, raw)
+    _RUNNERS.append(runner)
+    runner.start()
+    assert runner.cycle().lines_read == 0
+    archive = RawArchive(raw, run_id="restarted")
+    archive.recover_pending_partitions()
+    archive.recover_pending_partitions()
+    assert path.read_bytes() == data
+    assert read_archive_sidecar(path)["bytes"] == len(data)
+    assert all(result["ok"] for result in verify_archive_tree(raw))
+    events = [json.loads(line)["event"] for line in (raw / "recovery.jsonl").read_bytes().splitlines()]
+    assert events == ["checksum_rebuilt"]
+    assert runner.cycle().lines_read == 1
+    assert runner.db.con.execute("SELECT offset_bytes, lines_processed FROM ingest_checkpoints").fetchall() == [
+        (len(data), 1)
+    ]
+    runner.close(status="stopped", reason="restart test")
+    resumed = _build(tmp_path, raw)
+    _RUNNERS.append(resumed)
+    resumed.start()
+    assert resumed.cycle().lines_read == 0

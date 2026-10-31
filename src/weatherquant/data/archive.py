@@ -74,16 +74,14 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-__all__ = ["ArchiveRecord", "RawArchive", "verify_archive_tree"]
+__all__ = ["ArchiveRecord", "RawArchive", "read_archive_sidecar", "verify_archive_tree"]
 
 log = logging.getLogger(__name__)
 
 # The digest of an empty file - the root of every chain.
 EMPTY_CHAIN = hashlib.sha256(b"").hexdigest()
 
-# How far back to read when picking up an archive_seq baseline from an
-# existing partition file. 64 KiB covers a day's tail at any realistic line
-# length; the read happens once per partition per process.
+# Window for scanning backwards for a newline, including across long frames.
 _TAIL_READ_BYTES = 65536
 
 
@@ -175,6 +173,37 @@ class RawArchive:
 
     # -- writing -----------------------------------------------------------
 
+    def recover_pending_partitions(self) -> None:
+        """Publish complete, surviving rows from interrupted flushes under the writer lease.
+
+        A previous UTC day may never be appended to again. Inspect its published
+        byte count too. Only files with a lagging boundary need a full read.
+        """
+        for receipt in sorted(self.root.glob("*/*.jsonl.sha256")):
+            path = receipt.with_suffix("")
+            try:
+                state = read_archive_sidecar(path)
+                if state is None:
+                    continue
+                size = path.stat().st_size
+                if size == state["bytes"]:
+                    continue
+                chain, covered, lines = _scan_file_trail(path, state)
+                fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+                try:
+                    if covered < size:
+                        self._quarantine_torn_tail_locked(path, fd)
+                    else:
+                        os.fsync(fd)
+                finally:
+                    os.close(fd)
+                _write_sidecar(path, {"chain": chain, "bytes": covered, "lines": lines})
+                self._log_recovery("checksum_rebuilt", path=str(path), sidecar_bytes=state["bytes"],
+                                   trail_bytes=covered, reason="restart after interrupted flush")
+            except (OSError, ValueError) as exc:
+                self._log_recovery("partition_recovery_failed", path=str(path), error=str(exc))
+                raise
+
     def append(self, record: ArchiveRecord) -> None:
         if record.run_id != self.run_id:
             raise ValueError(
@@ -194,8 +223,8 @@ class RawArchive:
             # a claim the file contradicts.
             key = (record.source, record.received_at_utc.astimezone(UTC).date())
             if key not in self._seen_partitions:
-                self._seen_partitions.add(key)
                 self._continue_seq_from_file_locked(key)
+                self._seen_partitions.add(key)
             self._seq += 1
             line = json.dumps(
                 {
@@ -290,8 +319,9 @@ class RawArchive:
         path = self._partition_path(key)
         try:
             last_seq = _last_seq_in_file(path)
-        except OSError:
-            last_seq = 0
+        except (OSError, ValueError) as exc:
+            self._log_recovery("sequence_recovery_failed", path=str(path), error=str(exc))
+            raise
         if last_seq > self._seq:
             self._seq = last_seq
             self._log_recovery(
@@ -348,11 +378,11 @@ class RawArchive:
         if state is not None:
             return state
         size = path.stat().st_size if path.exists() else 0
-        sidecar = _read_sidecar(path)
+        sidecar = read_archive_sidecar(path)
         if sidecar is not None and size == sidecar.get("bytes"):
             state = dict(sidecar)
         elif size:
-            chain, covered_bytes, lines = _scan_file_trail(path)
+            chain, covered_bytes, lines = _scan_file_trail(path, sidecar)
             state = {"chain": chain, "bytes": covered_bytes, "lines": lines}
             self._log_recovery(
                 "checksum_rebuilt",
@@ -364,16 +394,22 @@ class RawArchive:
             )
         else:
             state = {"chain": EMPTY_CHAIN, "bytes": 0, "lines": 0}
+        if sidecar is None:
+            # Publish a zero-byte boundary before the first managed write. Any
+            # recovered legacy bytes become visible after this file is fsynced.
+            _write_sidecar(path, {"chain": EMPTY_CHAIN, "bytes": 0, "lines": 0})
+        elif size < sidecar["bytes"]:
+            raise ValueError(f"{path}: data file is shorter than its published checksum trail")
         self._chains[key] = state
         return state
 
     def _flush_locked(self) -> int:
         if self._write_uncertain:
             raise RuntimeError("archive write outcome uncertain; refusing a duplicate-prone retry")
+        for key in list(self._pending_sidecars):
+            _write_sidecar(self._partition_path(key), self._chains[key])
+            self._pending_sidecars.remove(key)
         if not self._buffer:
-            for key in list(self._pending_sidecars):
-                _write_sidecar(self._partition_path(key), self._chains[key])
-                self._pending_sidecars.remove(key)
             self._last_flush = datetime.now(tz=UTC)
             return 0
 
@@ -398,12 +434,12 @@ class RawArchive:
             # rebuild path hashes what is on disk, and after the write that
             # would already include this batch - folding the batch on top
             # would count it twice.
-            chain_state = self._chain_state_locked(key, path)
             payload = ("\n".join(lines) + "\n").encode("utf-8")
             # O_APPEND protects the line boundary even after a short write.
             # The collector lock guarantees this process is the sole writer.
             fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644)
             try:
+                chain_state = self._chain_state_locked(key, path)
                 original_size = os.fstat(fd).st_size
                 if original_size:
                     # lseek + read rather than `os.pread`: pread is
@@ -501,7 +537,7 @@ def _sidecar_path(path: Path) -> Path:
     return path.with_name(path.name + ".sha256")
 
 
-def _read_sidecar(path: Path) -> dict[str, Any] | None:
+def read_archive_sidecar(path: Path) -> dict[str, Any] | None:
     """The partition's checksum sidecar, normalised to the in-memory shape.
 
     On disk the digest is named ``chain_sha256`` (self-describing for an
@@ -509,21 +545,22 @@ def _read_sidecar(path: Path) -> dict[str, Any] | None:
     rather than letting two spellings leak through every caller - keeps the
     loaded state exactly the shape a flush updates.
     """
+    sidecar = _sidecar_path(path)
     try:
-        raw = _sidecar_path(path).read_text(encoding="utf-8")
-    except OSError:
+        raw = sidecar.read_bytes()
+    except FileNotFoundError:
         return None
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict) or "chain_sha256" not in data or "bytes" not in data:
-        return None
-    return {
-        "chain": data["chain_sha256"],
-        "bytes": data["bytes"],
-        "lines": data.get("lines", 0),
-    }
+        digest = data["chain_sha256"]
+        size, lines = data["bytes"], data["lines"]
+        if len(digest) != 64 or len(bytes.fromhex(digest)) != 32:
+            raise ValueError("invalid SHA256")
+        if type(size) is not int or type(lines) is not int or size < 0 or lines < 0:
+            raise ValueError("invalid byte or line count")
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ValueError(f"invalid checksum sidecar {sidecar}: {exc}") from exc
+    return {"chain": digest, "bytes": size, "lines": lines}
 
 
 def _write_sidecar(path: Path, state: dict[str, Any]) -> None:
@@ -570,7 +607,7 @@ def _iter_line_bytes(path: Path):
         yield from fh
 
 
-def _scan_file_trail(path: Path) -> tuple[str, int, int]:
+def _scan_file_trail(path: Path, prior: dict[str, Any] | None) -> tuple[str, int, int]:
     """``(chained digest, covered bytes, covered lines)`` of a file as it stands.
 
     Coverage stops at the first line without a trailing newline: bytes after a
@@ -581,12 +618,23 @@ def _scan_file_trail(path: Path) -> tuple[str, int, int]:
     chain = EMPTY_CHAIN
     covered = 0
     lines = 0
+    last_seq = 0
+    matched = prior is None or prior == {"chain": EMPTY_CHAIN, "bytes": 0, "lines": 0}
     for line in _iter_line_bytes(path):
         if not line.endswith(b"\n"):
             break
+        if matched or (prior is not None and covered + len(line) == prior["bytes"]):
+            seq = _archive_seq(line)
+            if seq <= last_seq:
+                raise ValueError(f"{path}: non-increasing archive_seq at byte {covered}")
+            last_seq = seq
         chain = _chain_digest(chain, line)
         covered += len(line)
         lines += 1
+        if prior is not None and covered == prior["bytes"]:
+            matched = chain == prior["chain"] and lines == prior["lines"]
+    if not matched:
+        raise ValueError(f"{path}: published checksum prefix does not match the file; cannot extend it")
     return chain, covered, lines
 
 
@@ -611,40 +659,32 @@ def _scan_last_newline(fd: int, file_size: int) -> int:
 
 
 def _last_seq_in_file(path: Path) -> int:
-    """The archive_seq of the last *complete* line, or 0 when unreadable.
-
-    A torn trailing fragment (a crash mid-write) is dropped before looking at
-    the last line: it was never durable, so its absence must not hide the
-    baseline the surviving lines do provide.
-    """
+    """Recover the sequence of the last complete record, including multi-window lines."""
     try:
-        file_size = path.stat().st_size
-    except OSError:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except FileNotFoundError:
         return 0
-    if not file_size:
-        return 0
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     try:
-        newline_at = _scan_last_newline(fd, file_size)
-        if newline_at < 0:
+        end = _scan_last_newline(fd, os.fstat(fd).st_size)
+        if end < 0:
             return 0
-        # The last complete line lies between the previous newline and this
-        # one; read back at most one window to capture it whole.
-        window_start = max(0, newline_at - _TAIL_READ_BYTES)
-        os.lseek(fd, window_start, os.SEEK_SET)
-        chunk = _read_full(fd, newline_at - window_start)
-    except OSError:
-        return 0
+        start = _scan_last_newline(fd, end) + 1
+        os.lseek(fd, start, os.SEEK_SET)
+        line = _read_full(fd, end - start)
     finally:
         os.close(fd)
-    complete = [ln for ln in chunk.split(b"\n") if ln.strip()]
-    if not complete:
-        return 0
     try:
-        obj = json.loads(complete[-1])
-        return int(obj.get("archive_seq") or 0)
-    except (json.JSONDecodeError, ValueError, TypeError):
-        return 0
+        return _archive_seq(line)
+    except ValueError as exc:
+        raise ValueError(f"{path}: last complete record has no valid archive_seq") from exc
+
+
+def _archive_seq(line: bytes) -> int:
+    row = json.loads(line)
+    seq = row.get("archive_seq") if isinstance(row, dict) else None
+    if type(seq) is not int or seq < 1:
+        raise ValueError("archive_seq must be a positive integer")
+    return seq
 
 
 def verify_archive_tree(root: str | Path) -> list[dict[str, Any]]:
@@ -665,6 +705,15 @@ def verify_archive_tree(root: str | Path) -> list[dict[str, Any]]:
         if path.name == "recovery.jsonl":
             continue
         problems: list[str] = []
+        try:
+            sidecar = read_archive_sidecar(path)
+            if sidecar is None:
+                problems.append("no readable .sha256 sidecar")
+        except (OSError, ValueError) as exc:
+            problems.append(str(exc))
+            sidecar = None
+        covered = covered_lines = 0
+        position = 0
         chain = EMPTY_CHAIN
         lines = 0
         seq: int | None = None
@@ -674,12 +723,15 @@ def verify_archive_tree(root: str | Path) -> list[dict[str, Any]]:
             if not raw_line.endswith(b"\n"):
                 torn_tail = True
                 break
-            chain = _chain_digest(chain, raw_line)
             lines += 1
+            position += len(raw_line)
+            if sidecar is not None and position <= sidecar["bytes"]:
+                chain = _chain_digest(chain, raw_line)
+                covered = position
+                covered_lines = lines
             try:
-                obj = json.loads(raw_line)
-                current = int(obj.get("archive_seq") or 0)
-            except (json.JSONDecodeError, ValueError, TypeError):
+                current = _archive_seq(raw_line)
+            except ValueError:
                 problems.append(f"line {lines} is not parseable JSON with an archive_seq")
                 current = None
             if current is not None:
@@ -691,16 +743,13 @@ def verify_archive_tree(root: str | Path) -> list[dict[str, Any]]:
         if not seq_monotonic:
             problems.append("archive_seq is not strictly increasing within the file")
 
-        sidecar = _read_sidecar(path)
-        if sidecar is None:
-            problems.append("no readable .sha256 sidecar")
-        else:
-            if sidecar.get("chain") != chain:
-                problems.append(
-                    f"chain mismatch: sidecar {str(sidecar.get('chain'))[:16]}... vs recomputed {chain[:16]}..."
-                )
-            if sidecar.get("lines") != lines:
-                problems.append(f"line count mismatch: sidecar {sidecar.get('lines')} vs {lines}")
+        if sidecar is not None:
+            if covered != sidecar["bytes"]:
+                problems.append("checksum coverage does not end at a complete record")
+            elif chain != sidecar["chain"]:
+                problems.append(f"chain mismatch: sidecar {sidecar['chain'][:16]}... vs recomputed {chain[:16]}...")
+            if covered_lines != sidecar["lines"]:
+                problems.append(f"line count mismatch: sidecar {sidecar['lines']} vs {covered_lines}")
             file_bytes = path.stat().st_size
             if sidecar.get("bytes") != file_bytes:
                 kind = (

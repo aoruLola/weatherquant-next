@@ -29,11 +29,13 @@ collapsing them would make a slow shadow look like a fast collector.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+from weatherquant.data.archive import read_archive_sidecar
 from weatherquant.shadow.events import (
     BookObservation,
     CatalogMarket,
@@ -247,13 +249,14 @@ class ArchiveTailer:
                 )
                 offset = 0
 
-            read = self._read_complete_lines(path, offset)
-            if read is None:
+            try:
+                read = self._read_complete_lines(path, offset)
+            except (OSError, ValueError) as exc:
                 quality.append(
                     QualityEvent(
                         kind="archive_file_unreadable",
                         severity="error",
-                        detail=f"could not read {path}; left at offset {offset}",
+                        detail=f"could not read {path} at offset {offset}: {exc}",
                         source=source,
                         path=key,
                         offset_bytes=offset,
@@ -369,14 +372,19 @@ class ArchiveTailer:
                 found[key] = (Path(key), checkpoint.source)
         return sorted(found.values(), key=lambda item: str(item[0]))
 
-    def _read_complete_lines(self, path: Path, offset: int) -> tuple[bytes, int, bool] | None:
-        """``(complete_bytes, next_offset, stalled)``; ``None`` on an I/O error."""
-        try:
-            with open(path, "rb") as handle:
-                handle.seek(offset)
-                data = handle.read(self.max_bytes_per_poll)
-        except OSError:
-            return None
+    def _read_complete_lines(self, path: Path, offset: int) -> tuple[bytes, int, bool]:
+        """Return complete lines, their end offset, and whether the next line exceeds the cap."""
+        with path.open("rb") as handle:
+            # Snapshot the file size before reading the boundary: legacy files
+            # receive their first sidecar before the collector appends new bytes.
+            limit = os.fstat(handle.fileno()).st_size
+            if offset >= limit:
+                return b"", offset, False
+            sidecar = read_archive_sidecar(path)
+            if sidecar is not None:
+                limit = min(limit, sidecar["bytes"])
+            handle.seek(offset)
+            data = handle.read(min(self.max_bytes_per_poll, max(0, limit - offset)))
         if not data:
             return b"", offset, False
         cut = data.rfind(b"\n")

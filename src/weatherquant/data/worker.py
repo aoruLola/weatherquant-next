@@ -331,6 +331,7 @@ class CollectorWorker:
                 self._event("warning", "restart", f"closed {reopened} open gap(s) from a prior run")
 
             self._archive = archive = RawArchive(settings.raw_dir, run_id=self.run_id)
+            archive.recover_pending_partitions()
             self._http = http = ResilientHttp(
                 timeout_seconds=settings.http_timeout_seconds,
                 retries=settings.http_retries,
