@@ -42,6 +42,7 @@ import json
 import shutil
 import sys
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,20 +50,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-#: Core files that must exist for a generation to be considered complete.
-REQUIRED_FILES = (
-    "summary.json",
-    "edge.json",
-    "win-rate.json",
-    "opportunities.json",
-    "settlements.json",
-    "models.json",
-)
+from pin_performance_generation import LEGACY, inspect  # noqa: E402
 
-#: Format families, as detected by pin_performance_generation.py
-BOUNDED = "bounded-detail"
-LEGACY = "legacy-detail"
-UNKNOWN = "unknown"
+from weatherquant.performance.generation_lock import GenerationBusy, generation_lock  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,31 +82,7 @@ class Generation:
         except (ValueError, IndexError):
             return None
 
-        # Check completeness
-        complete = all((directory / name).exists() for name in REQUIRED_FILES)
-
-        # Detect format family (mimics pin_performance_generation.py:_format_of)
-        format_family = UNKNOWN
-        detail_parts = 0
-        if complete:
-            try:
-                opportunities = json.loads((directory / "opportunities.json").read_text())
-                summary = json.loads((directory / "summary.json").read_text())
-                episodes = (opportunities.get("data") or {}).get("episodes")
-                capital = (summary.get("data") or {}).get("reference_capital") or {}
-                bounded_detail = (
-                    isinstance(episodes, dict) and episodes.get("partitioned") is True
-                )
-                bounded_capital = (
-                    "results_sample" in capital and "results" not in capital
-                )
-                if bounded_detail and bounded_capital:
-                    format_family = BOUNDED
-                    detail_parts = len(episodes.get("partitions") or [])
-                elif isinstance(episodes, list) and "results" in capital:
-                    format_family = LEGACY
-            except Exception:
-                format_family = UNKNOWN
+        info = inspect(directory)
 
         # Measure directory size
         size_bytes = sum(f.stat().st_size for f in directory.rglob("*") if f.is_file())
@@ -126,9 +92,9 @@ class Generation:
             directory=directory,
             published_at_utc=published_at_utc,
             size_bytes=size_bytes,
-            format_family=format_family,
-            complete=complete,
-            detail_parts=detail_parts,
+            format_family=info.format,
+            complete=info.complete,
+            detail_parts=info.detail_parts,
         )
 
 
@@ -260,6 +226,15 @@ def main() -> int:
         print(f"ERROR: {performance_dir} is not a directory", file=sys.stderr)
         return 1
 
+    try:
+        with generation_lock(performance_dir) if args.apply else nullcontext():
+            return _prune(performance_dir, args)
+    except GenerationBusy as exc:
+        print(exc, file=sys.stderr)
+        return 75
+
+
+def _prune(performance_dir: Path, args: argparse.Namespace) -> int:
     current_generation_id = load_current_generation(performance_dir)
     if current_generation_id:
         print(f"Current generation: {current_generation_id}")
@@ -351,6 +326,11 @@ def main() -> int:
             f"{gen.published_at_utc.strftime('%Y-%m-%d %H:%M:%S')}  "
             f"{format_size(gen.size_bytes):8s} {format_mark:17s} ({reason_str})"
         )
+
+    if not legacy_count:
+        print("No complete legacy-detail rollback generation is available.", file=sys.stderr)
+        if args.apply:
+            return 1
 
     if not args.apply:
         print("\n[DRY RUN] Pass --apply to actually delete.")
