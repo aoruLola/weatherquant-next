@@ -304,9 +304,18 @@ def test_the_run_after_a_watchdog_kill_writes_no_duplicates(
         ]
         assert "did not exit cleanly" in runs[1][2]
 
-        # No gap left open: the restart dated its outage instead of hiding it.
-        open_gaps = con.execute("SELECT COUNT(*) FROM collection_gaps WHERE ended_at_utc IS NULL").fetchone()[0]
-        assert open_gaps == 0
+        # Blocking happens before the first upstream contact. The gap spanning
+        # the killed process must date back to the seed's clean stop, and close
+        # only after the restarted worker has resumed collection.
+        window = con.execute(
+            "SELECT g.started_at_utc, g.ended_at_utc, seed.stopped_at_utc, fresh.started_at_utc "
+            "FROM collection_gaps g, collector_runs seed, collector_runs fresh "
+            "WHERE g.run_id='blocked' AND seed.run_id='seed' AND fresh.run_id='run-2'"
+        ).fetchall()
+        assert len(window) == 1
+        start, end, stopped, restarted = window[0]
+        assert start == stopped < heartbeat.updated_at_utc <= restarted <= end
+        assert con.execute("SELECT count(*) FROM collection_gaps WHERE ended_at_utc IS NULL").fetchone()[0] == 0
 
         # The same books seen by both runs are stored once each: the fake
         # upstream serves yes/no tokens, so two distinct books - and no more,

@@ -18,6 +18,9 @@ the database alone:
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -249,6 +252,12 @@ def test_a_backup_attempt_leaves_start_and_outcome_on_the_trail(
     assert ("error", "backup_failed") in found, found
     con = duckdb.connect(str(settings.db_path), read_only=True)
     try:
+        trail = con.execute(
+            "SELECT kind, details_json FROM collector_events WHERE kind LIKE 'backup%' ORDER BY ts_utc"
+        ).fetchall()
+        assert [kind for kind, _ in trail] == ["backup_started", "backup_failed"]
+        identifiers = [json.loads(details)["attempt_id"] for _, details in trail]
+        assert identifiers[0] == identifiers[1] and identifiers[0]
         # The run's own exit is normal - the backup failure is an event, not
         # a crash, which is what makes the trail trustworthy to audit.
         status = con.execute(
@@ -257,3 +266,100 @@ def test_a_backup_attempt_leaves_start_and_outcome_on_the_trail(
         assert status == "stopped"
     finally:
         con.close()
+
+def test_clean_restart_records_downtime_before_new_process(settings, monkeypatch):
+    monkeypatch.setattr(worker_module, "ResilientHttp", FakeHttp)
+    first = _worker(settings, run_id="first", once=True)
+    assert first.run() == ExitCode.OK
+    with duckdb.connect(str(settings.db_path)) as con:
+        stopped = con.execute("SELECT stopped_at_utc FROM collector_runs").fetchone()[0]
+        first_end = con.execute("SELECT ended_at_utc FROM collection_gaps").fetchone()[0]
+        assert first_end < stopped
+    second = _worker(settings, run_id="second", once=True)
+    assert second.run() == ExitCode.OK
+    with duckdb.connect(str(settings.db_path)) as con:
+        start, end = con.execute(
+            "SELECT started_at_utc, ended_at_utc FROM collection_gaps WHERE run_id='second'"
+        ).fetchone()
+    assert start == stopped < second.started_at <= end
+
+
+def test_offline_starts_keep_the_same_gap_until_contact(settings, monkeypatch):
+    class OfflineHttp(FakeHttp):
+        def get_json(self, url, **options):
+            raise RuntimeError("offline")
+
+    monkeypatch.setattr(worker_module, "ResilientHttp", OfflineHttp)
+    for run_id in ("offline-1", "offline-2"):
+        assert _worker(settings, run_id=run_id, once=True).run() == ExitCode.OK
+    with duckdb.connect(str(settings.db_path)) as con:
+        assert con.execute("SELECT run_id, ended_at_utc FROM collection_gaps").fetchall() == [("offline-1", None)]
+    monkeypatch.setattr(worker_module, "ResilientHttp", FakeHttp)
+    assert _worker(settings, run_id="resumed", once=True).run() == ExitCode.OK
+    with duckdb.connect(str(settings.db_path)) as con:
+        assert con.execute("SELECT ended_at_utc IS NOT NULL FROM collection_gaps").fetchall() == [(True,)]
+
+
+def test_legacy_open_gap_uses_last_contact_and_backup_outcome_is_recovered(settings, monkeypatch):
+    from weatherquant.data.heartbeat import CollectionStats, HealthStatus, Heartbeat, HeartbeatWriter
+
+    started = datetime.now(tz=UTC) - timedelta(hours=5)
+    contact = started + timedelta(hours=4)
+    w = CollectorWriter(settings.db_path, run_id="dead")
+    w.open()
+    w.start_run(app_version="test", git_sha=None, image_tag=None, hostname="test", pid=1)
+    w.con.execute("UPDATE collector_runs SET started_at_utc=?", [started])
+    legacy_id = w.record_gap(reason="start_after_restart", started_at_utc=started, detail="legacy marker")
+    for kind, attempt in [("backup_started", "one"), ("backup_failed", "one"), ("backup_started", "two")]:
+        w.log_event("info", kind, kind, {"attempt_id": attempt}, immediate=True)
+    w.con.close()  # leave the run open, as it would be after a hard stop
+    HeartbeatWriter(settings.db_path.parent / "health" / "heartbeat.json").write(Heartbeat(
+        status=HealthStatus.UNHEALTHY, run_id="dead", pid=1, hostname="test", app_version="test",
+        started_at_utc=started, updated_at_utc=datetime.now(tz=UTC), uptime_seconds=18000,
+        last_upstream_contact_utc=contact, stats=CollectionStats(rest_requests_ok=1),
+    ))
+    monkeypatch.setattr(worker_module, "ResilientHttp", FakeHttp)
+    assert _worker(settings, run_id="back", once=True).run() == ExitCode.OK
+    assert _worker(settings, run_id="later", once=True).run() == ExitCode.OK
+    with duckdb.connect(str(settings.db_path)) as con:
+        since, detail = con.execute("SELECT started_at_utc, detail FROM collection_gaps WHERE run_id='dead'").fetchone()
+        assert since == contact and legacy_id in detail and "legacy marker" in detail
+        assert con.execute(
+            "SELECT details_json->>'attempt_id' FROM collector_events WHERE kind='backup_interrupted'"
+        ).fetchall() == [("two",)]
+
+def test_recover_legacy_wal_using_committed_price_when_heartbeat_is_missing(settings, monkeypatch):
+    monkeypatch.setattr(worker_module, "ResilientHttp", FakeHttp)
+    assert _worker(settings, run_id="seed", once=True).run() == ExitCode.OK
+    script = """
+import os, sys
+from datetime import UTC, datetime
+from pathlib import Path
+from weatherquant.data.writer import CollectorWriter
+
+w = CollectorWriter(Path(sys.argv[1]), run_id="legacy")
+w.open()
+w.start_run(app_version="old", git_sha=None, image_tag=None, hostname="test", pid=os.getpid())
+start = datetime.now(tz=UTC)
+w.record_gap(reason="start_after_restart", started_at_utc=start, detail="legacy marker")
+observed = datetime.now(tz=UTC)
+w.stage_price(("legacy-market", "legacy-token", observed, 0.5, "rest", observed, "venue", "legacy"))
+w.flush(force=True)
+os._exit(77)
+"""
+    child = subprocess.run([sys.executable, "-c", script, str(settings.db_path)], timeout=30)
+    assert child.returncode == 77
+    assert Path(str(settings.db_path) + ".wal").stat().st_size > 0
+    (settings.db_path.parent / "health" / "heartbeat.json").unlink()
+    recovered = _worker(settings, run_id="back", once=True)
+    assert recovered.run() == ExitCode.OK
+    with duckdb.connect(str(settings.db_path)) as con:
+        observed = next(ts for run, ts in con.execute("SELECT run_id, fetched_at_utc FROM price_history").fetchall()
+                        if run == "legacy")
+        started, ended, detail = con.execute(
+            "SELECT started_at_utc, ended_at_utc, detail FROM collection_gaps WHERE run_id='legacy'"
+        ).fetchone()
+        indexed = con.execute("SELECT fetched_at_utc FROM price_history WHERE run_id='legacy'").fetchall()
+        assert indexed == [(observed,)]
+        assert started == observed < recovered.started_at <= ended
+        assert "last persisted observation" in detail

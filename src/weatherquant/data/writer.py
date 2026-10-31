@@ -53,8 +53,8 @@ from typing import Any
 
 import duckdb
 
-from weatherquant.storage import connect, initialize
-from weatherquant.storage.migrator import available_migrations
+from weatherquant.storage import connect
+from weatherquant.storage.migrator import available_migrations, migrate
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +83,7 @@ _PRICE_PLACEHOLDERS = ", ".join("?" for _ in range(len(_PRICE_COLUMNS.split(",")
 
 _COLLECTOR_EVENT_COLUMNS = "event_id, run_id, ts_utc, level, kind, message, details_json"
 _COLLECTOR_EVENT_PLACEHOLDERS = ", ".join("?" for _ in range(len(_COLLECTOR_EVENT_COLUMNS.split(","))))
+_INSERT_COLLECTOR_EVENT = f"INSERT INTO collector_events ({_COLLECTOR_EVENT_COLUMNS}) VALUES ({_COLLECTOR_EVENT_PLACEHOLDERS})"
 
 # Which column defines each table's day partition for parquet export.
 _PARQUET_PARTITION_COLUMN = {
@@ -504,8 +505,16 @@ class CollectorWriter:
         build a schema on top of someone else's data.
         """
         existed_before = self.db_path.exists() and self.db_path.stat().st_size > 0
-        self._guard_foreign_database(existed_before)
-        con, applied = initialize(self.db_path)
+        # Keep the connection that replayed the WAL. Closing a catalog-only
+        # probe here can persist stale secondary indexes in DuckDB 1.5.6.
+        con = connect(self.db_path)
+        try:
+            if existed_before:
+                self._guard_foreign_database(con)
+            applied = migrate(con)
+        except BaseException:
+            con.close()
+            raise
         self._con = con
         log.info(
             "%s database at %s (%d migration(s) applied this start)",
@@ -515,38 +524,26 @@ class CollectorWriter:
         )
         return applied
 
-    def _guard_foreign_database(self, existed_before: bool) -> None:
-        if not existed_before:
-            return
-        # Same configuration as the writer's own connection, deliberately not
-        # read_only: DuckDB refuses a second, differently-configured handle
-        # to one file within a process, so a read-only probe crashes whenever
-        # a same-process read-write connection already exists (the backup
-        # job's, or a test's). The probe only ever reads; and the file
-        # already exists, so this cannot create anything.
-        probe = connect(self.db_path)
-        try:
-            has_ledger = bool(
-                probe.execute(
-                    "SELECT 1 FROM information_schema.tables "
-                    "WHERE table_schema = 'main' AND table_name = 'schema_migrations'"
-                ).fetchone()
+    def _guard_foreign_database(self, con: duckdb.DuckDBPyConnection) -> None:
+        has_ledger = bool(
+            con.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_catalog = current_database() AND table_schema = 'main' AND table_name = 'schema_migrations'"
+            ).fetchone()
+        )
+        tables = int(
+            con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_catalog = current_database() AND table_schema = 'main'").fetchone()[
+                0
+            ]
+        )
+        if not has_ledger and tables > 0:
+            raise RuntimeError(
+                f"refusing to open {self.db_path}: it contains {tables} table(s) but no "
+                "schema_migrations ledger, so weatherquant-next did not create it. "
+                "Initialising over it would destroy whatever it holds. Move the file "
+                "aside and let the collector create a fresh database, or restore the "
+                "correct migration ledger."
             )
-            tables = int(
-                probe.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main'").fetchone()[
-                    0
-                ]
-            )
-            if not has_ledger and tables > 0:
-                raise RuntimeError(
-                    f"refusing to open {self.db_path}: it contains {tables} table(s) but no "
-                    "schema_migrations ledger, so weatherquant-next did not create it. "
-                    "Initialising over it would destroy whatever it holds. Move the file "
-                    "aside and let the collector create a fresh database, or restore the "
-                    "correct migration ledger."
-                )
-        finally:
-            probe.close()
 
     def close(self, *, status: str = "stopped", reason: str | None = None) -> None:
         """Flush, checkpoint, record the run's exit, then release the handle."""
@@ -633,14 +630,62 @@ class CollectorWriter:
         )
         return gap_id
 
-    def close_open_gaps(self, *, detail: str) -> int:
+    def begin_restart_gap(
+        self, process_start: datetime, heartbeat_run: str | None, contact: datetime | None
+    ) -> None:
+        """Date the interruption from the previous run's last known activity."""
+        prior = self.con.execute(
+            "SELECT run_id, status, started_at_utc, stopped_at_utc FROM collector_runs "
+            "WHERE run_id != ? ORDER BY started_at_utc DESC LIMIT 1", [self.run_id]
+        ).fetchone()
+        pending = self.con.execute(
+            "SELECT run_id FROM collection_gaps WHERE reason='start_after_restart' AND ended_at_utc IS NULL"
+        ).fetchall()
+        if pending and (not prior or (prior[0],) not in pending or prior[1] == "stopped"):
+            return  # Preserve the same gap across successive offline restarts.
+        since, evidence = process_start, "initial startup"
+        if prior:
+            run, status, started, stopped = prior
+            if status == "stopped" and stopped is not None:
+                since, evidence = stopped, f"clean stop of {run}"
+            else:
+                since, evidence = started, f"start of {run}; no later observation recorded"
+                if heartbeat_run == run and contact is not None and contact >= since:
+                    since, evidence = contact, f"last upstream heartbeat of {run}"
+                # Only observations after the last known bound can narrow the
+                # gap. Use the stored rows even on files recovered by older writers.
+                observed = self.con.execute(
+                    "SELECT greatest("
+                    "(SELECT max(fetched_at_utc) FILTER (WHERE run_id=?) FROM order_books WHERE fetched_at_utc>?), "
+                    "(SELECT max(fetched_at_utc) FILTER (WHERE run_id=?) FROM price_history WHERE fetched_at_utc>?))",
+                    [run, since, run, since],
+                ).fetchone()[0]
+                if observed is not None and observed > since:
+                    since, evidence = observed, f"last persisted observation of {run}"
+        if pending:
+            # Older collectors opened a gap for their entire lifetime. Narrow that
+            # run's open row only when there is evidence it actually collected.
+            if since > prior[2]:
+                # DuckDB 1.1 rewrites an indexed timestamp as a delete/insert
+                # and rejects reuse of the primary key. Keep the predecessor
+                # ID in the corrected row so the old marker stays traceable.
+                self.con.execute(
+                    "UPDATE collection_gaps SET gap_id=replace(uuid()::VARCHAR, '-', ''), "
+                    "started_at_utc=?, detail=concat(?, '; replaces legacy gap ', gap_id, '; ', detail) "
+                    "WHERE run_id=? AND reason='start_after_restart' AND ended_at_utc IS NULL AND started_at_utc < ?",
+                    [since, evidence, prior[0], since],
+                )
+            return
+        self.record_gap(reason="start_after_restart", started_at_utc=since, detail=evidence)
+
+    def close_open_gaps(self, *, detail: str, ended_at_utc: datetime | None = None) -> int:
         """Close gaps a previous unclean shutdown left open."""
         # Use DuckDB's affected-row count. UPDATE ... RETURNING can fail on
         # the gap table's indexes immediately after watchdog/WAL recovery.
         count = self.con.execute(
-            "UPDATE collection_gaps SET ended_at_utc = ?, detail = COALESCE(detail, ?) "
+            "UPDATE collection_gaps SET ended_at_utc = ?, detail = concat_ws('; ', detail, ?) "
             "WHERE ended_at_utc IS NULL",
-            [datetime.now(tz=UTC), detail],
+            [ended_at_utc or datetime.now(tz=UTC), detail],
         ).fetchone()[0]
         if count:
             log.info("closed %d gap(s) left open by a previous run", count)
@@ -659,13 +704,30 @@ class CollectorWriter:
 
         Call this *before* :meth:`start_run` (or it would fail this run too).
         """
-        reason = "run did not exit cleanly (crash, kill, or watchdog exit)"
-        rows = self.con.execute(
-            "UPDATE collector_runs SET status = 'failed', stop_reason = ?, "
-            "stopped_at_utc = ? WHERE status = 'running' RETURNING run_id",
-            [reason, datetime.now(tz=UTC)],
+        # A hard stop cannot write an outcome. Keep it distinct from a
+        # verified failure of the backup file itself.
+        interrupted = self.con.execute(
+            "SELECT s.run_id, s.details_json->>'attempt_id' FROM collector_events s "
+            "JOIN collector_runs r ON r.run_id=s.run_id AND r.status='running' "
+            "WHERE s.kind='backup_started' AND (s.details_json->>'attempt_id') IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM collector_events e "
+            "WHERE e.kind IN ('backup','backup_failed','backup_timeout','backup_interrupted') "
+            "AND (e.details_json->>'attempt_id')=(s.details_json->>'attempt_id'))"
         ).fetchall()
+        for old_run, attempt in interrupted:
+            self.log_event(
+                "warning", "backup_interrupted", "collector exited before recording the backup outcome",
+                {"attempt_id": attempt, "interrupted_run": old_run}, immediate=True,
+            )
+        reason = "run did not exit cleanly (crash, kill, or watchdog exit)"
+        rows = self.con.execute("SELECT run_id FROM collector_runs WHERE status = 'running'").fetchall()
         if rows:
+            # The collector lease excludes other writers. Avoid UPDATE ... RETURNING,
+            # which can report a duplicate primary key on DuckDB 1.1.
+            self.con.execute(
+                "UPDATE collector_runs SET status='failed', stop_reason=?, stopped_at_utc=? WHERE status='running'",
+                [reason, datetime.now(tz=UTC)],
+            )
             log.warning(
                 "marked %d abandoned run(s) as failed: %s",
                 len(rows),
@@ -673,19 +735,24 @@ class CollectorWriter:
             )
         return [str(r[0]) for r in rows]
 
-    def log_event(self, level: str, kind: str, message: str, details: dict | None = None) -> None:
-        event_id = next_event_id(self.run_id)
-        self._batch.collector_events.append(
-            (
-                int(event_id),
-                self.run_id,
-                datetime.now(tz=UTC),
-                level,
-                kind,
-                message,
-                json.dumps(details, sort_keys=True, default=str) if details else None,
-            )
+    def log_event(
+        self, level: str, kind: str, message: str, details: dict | None = None, *, immediate: bool = False
+    ) -> None:
+        row = (
+            int(next_event_id(self.run_id)),
+            self.run_id,
+            datetime.now(tz=UTC),
+            level,
+            kind,
+            message,
+            json.dumps(details, sort_keys=True, default=str) if details else None,
         )
+        if immediate:
+            # Backup boundaries must survive a hard stop before the next batch flush.
+            self.con.execute(_INSERT_COLLECTOR_EVENT, row)
+            self.stats["collector_events_inserted"] += 1
+        else:
+            self._batch.collector_events.append(row)
 
     # -- staging -----------------------------------------------------------
 
@@ -882,7 +949,7 @@ class CollectorWriter:
         if not rows:
             return
         self.con.executemany(
-            f"INSERT INTO collector_events ({_COLLECTOR_EVENT_COLUMNS}) VALUES ({_COLLECTOR_EVENT_PLACEHOLDERS})",
+            _INSERT_COLLECTOR_EVENT,
             rows,
         )
         self.stats["collector_events_inserted"] += len(rows)
