@@ -110,12 +110,17 @@ weatherquant-research build-performance \
 的东西（重建要联网），所以宁可拒绝。拒绝发生在**状态库被打开之前**：水位不推进、
 不发布世代、不写备份，即"拒绝"必须意味着什么都没动。
 
-**全部撤销会先写备份**：`<state-db>.retracted-<UTC>.json`，含 `rows_retracted`、
-`input_source`（`--settlements` 的路径）、`reason`（`--retraction-reason`，未给则为
-`null`，不猜）以及被删除的每一行。这是唯一无法从别处重做的结算操作。
+每次完整替换都会在状态库旁保存操作前的全部结算答案。使用 `--reset` 重建已有结算记录的状态库时也会先备份。文件名包含 UTC 时间和唯一后缀，日志记录路径。`rows_backed_up` 是备份总行数，`rows_retracted` 是新集合中缺少的旧键数。备份保留原始验证标记、来源和抓取时间，缺失值保留为 `null`。
 
-**定时任务不得添加 `--settlements-replace`、`--confirm-empty-retraction` 或
-`--retraction-reason`。** 这三者是人工操作，不是日常增量的一部分：调度器无法判断
+恢复时，在原导出目录和状态库上运行以下命令，将结算层恢复为备份里的完整集合并重新发布指标。恢复会先备份当时的答案。旧版的全量撤销备份也可直接读取。恢复空备份另需 `--confirm-empty-retraction`。
+
+```sh
+weatherquant-research build-performance --export "$EXPORT" --state-db "$STATE_DB" \
+  --out "$PERFORMANCE" --dataset live --no-ingest --restore-settlements-backup "$BACKUP"
+```
+
+**定时任务不得添加 `--settlements-replace`、`--confirm-empty-retraction` 、`--restore-settlements-backup` 或
+`--retraction-reason`。** 这些选项是人工操作，不是日常增量的一部分：调度器无法判断
 一次空索引是"平台故障"还是"真的全部撤销"。
 
 ---
