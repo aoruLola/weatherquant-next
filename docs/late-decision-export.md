@@ -131,7 +131,8 @@ exit code 0/1 对应一致/不一致。
 如果已发布的分片缺号，`export-verify --json` 返回退出码 1，并在 `first_divergence`
 中列出首个缺失文件。引擎保留导出游标，继续记录决策，通过 `decision_export_failed`
 报告受阻的导出。恢复原分片后，下次导出从已有游标继续。若状态文件也已丢失，则从连续分片重建游标。
-源库与已导出范围的对账、Performance 消费状态及已消费分片的 SHA-256 复核需要分别核对。
+对账结果中的 `source_rows_total` 是源库决策总数，`source_rows_pending` 包括游标之后及尚未分配序号的决策。
+生产追平时，已导出范围应一致且待导出数应为零。下游消费进度和已消费分片的 SHA-256 由 Performance 单独复核。
 
 ## 7. 需 NAS 人工验收的部分
 

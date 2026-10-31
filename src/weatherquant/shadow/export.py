@@ -803,6 +803,8 @@ class DecisionExporter:
             "state_version": state.get("version"),
             "cursor_seq": cursor_seq,
             "rows_in_state": int(state.get("rows_exported") or 0),
+            "source_rows_total": None,
+            "source_rows_pending": None,
             "source_rows_unsequenced": None,
             "source_rows_at_or_below_cursor": None,
             "rows_on_disk": None,
@@ -820,19 +822,19 @@ class DecisionExporter:
             return report
 
         try:
-            unsequenced = self.con.execute(
-                "SELECT COUNT(*) FROM shadow_decisions WHERE export_seq IS NULL"
-            ).fetchone()[0]
-            at_or_below = self.con.execute(
-                "SELECT COUNT(*) FROM shadow_decisions WHERE export_seq <= ?",
+            total, sequenced, at_or_below = self.con.execute(
+                "SELECT COUNT(*), COUNT(export_seq), COUNT(*) FILTER (WHERE export_seq <= ?) "
+                "FROM shadow_decisions",
                 [int(cursor_seq or 0)],
-            ).fetchone()[0]
+            ).fetchone()
         except Exception as exc:
             report["first_divergence"] = (
                 f"cannot read the source table: {type(exc).__name__}: {exc}"
             )
             return report
-        report["source_rows_unsequenced"] = int(unsequenced)
+        report["source_rows_total"] = total
+        report["source_rows_pending"] = total - at_or_below
+        report["source_rows_unsequenced"] = total - sequenced
         report["source_rows_at_or_below_cursor"] = int(at_or_below)
 
         parts = sorted(self.parts_dir.glob("part-*.jsonl")) if self.parts_dir.exists() else []

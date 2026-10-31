@@ -851,3 +851,18 @@ def test_broken_part_sequence_blocks_recovery_until_restored(db, tmp_path, missi
     _run_to_caught_up(exporter)
     assert _ids(exporter.directory) == [f"id-{i:04d}" for i in range(1, 5)]
     assert exporter.reconcile()["consistent"]
+
+
+def test_reconcile_distinguishes_a_valid_prefix_from_catching_up(db, tmp_path):
+    _insert(db, i=1, when=NOW, seq=1)
+    exporter = _exporter(db, tmp_path)
+    assert exporter.run_batch().rows_exported == 1
+    _insert(db, i=2, when=NOW - timedelta(days=1), mode="REPLAY", seq=2)
+    _insert(db, i=3, when=NOW + timedelta(seconds=1))
+
+    report = exporter.reconcile()
+    assert report["consistent"]
+    assert report["source_rows_total"] == 3
+    assert report["rows_on_disk"] == report["source_rows_at_or_below_cursor"] == 1
+    assert report["source_rows_unsequenced"] == 1
+    assert report["source_rows_pending"] == 2

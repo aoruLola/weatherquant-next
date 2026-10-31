@@ -281,22 +281,22 @@ def test_a_second_process_is_refused_rather_than_corrupting_the_store(tmp_path) 
     import sys
 
     rows = _dataset(seed=91, rows=200)
-    _write_parts(tmp_path, rows, 2)
     state_db = tmp_path / "state.duckdb"
+    _ingest(tmp_path, rows, parts=2, state_db=state_db)
+    probe = [
+        sys.executable, "-c",
+        "import duckdb, sys; con = duckdb.connect(sys.argv[1]); "
+        "print(con.execute('SELECT SUM(rows) FROM performance_parts').fetchone()[0])",
+        str(state_db),
+    ]
     with PerformanceStateStore(state_db):
-        attempt = subprocess.run(
-            [sys.executable, "-c", f"import duckdb; duckdb.connect({str(state_db)!r})"],
-            capture_output=True,
-            text=True,
-        )
-    assert attempt.returncode != 0
-    message = (attempt.stderr or attempt.stdout).lower()
-    # The wording is platform-specific - DuckDB says "Conflicting lock is held"
-    # on Linux and "File is already open in" on Windows - so asserting one of
-    # them makes this test pass or fail on the operating system rather than on
-    # the behaviour. What has to hold is that the second process is refused,
-    # and refused for *this* reason rather than an unrelated one.
-    assert "lock" in message or "already open" in message, message
+        attempt = subprocess.run(probe, capture_output=True)
+        assert attempt.returncode != 0
+        assert b"ioexception" in attempt.stderr.lower(), attempt.stderr
+    # The identical process can open the same file and see its committed rows
+    # once the owner releases it, regardless of the OS language.
+    released = subprocess.run(probe, check=True, capture_output=True)
+    assert int(released.stdout) == len(rows)
 
 
 # ---------------------------------------------------------------------------
