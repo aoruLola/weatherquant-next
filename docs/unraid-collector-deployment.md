@@ -443,11 +443,11 @@ docker start weatherquant-collector
 
 恢复后采集器会：
 - 读 `schema_migrations`，**只**应用缺失的迁移，**绝不**重建已有表
-- 把上一次遗留的 `collection_gaps` 全部关闭并注明原因
+- 恢复上游通信后为遗留的启动缺口写入结束时间和恢复运行 ID
 - 从当前时刻继续采集，中断期间记为一条 gap
 
 `[待NAS验证]` 做一次恢复演练：停容器 → 换备份 → 启容器 → `SELECT COUNT(*)`
-确认数据回到备份时点，且 `collection_gaps` 里多了一条 `start_after_restart`。
+核对数据恢复点，并检查 `start_after_restart` 的起止时间。连续失败的启动共用同一条未关闭记录。
 
 ### 9.5 raw 归档的校验和与恢复日志(WQN-21)
 
@@ -550,7 +550,7 @@ print('code supports  :', __import__('glob').glob('/app/.venv/lib/python3.12/sit
 | 15 | 无对外端口 | `docker port weatherquant-collector` → 空 |
 | 16 | SIGTERM 优雅退出 | `docker stop -t 60` → 日志显示 flush/checkpoint，`collector_runs.status='stopped'` |
 | 17 | 备份自校验 | `backups/` 内文件可只读打开且行数 = 主库 |
-| 18 | watchdog 自动恢复(WQN-2) | `echo 130 > /mnt/user/appdata/weatherquant-next/.fault-block-main && docker restart weatherquant-collector` → ~2 分钟后 `RestartCount` +1、容器回 `healthy`、`collector_runs` 多一行非 `stopped` 的记录、`collection_gaps` 无未关闭行 |
+| 18 | watchdog 自动恢复 | `bash scripts/wqn2_container_recovery_test.sh` 使用独立测试卷，验证约 120 秒后自动重启一次、恢复采集并关闭遗留缺口。 |
 | 18 | 30 分钟浸泡（含断网+重启） | 在 NAS 上跑 `python scripts/soak_test.py --minutes 30 --data /tmp/wq-soak` |
 
 ### 11.3 需要 GitHub Actions 执行的
@@ -697,34 +697,28 @@ B 不重复: 优雅停止后开库断言——runs≥2、恰好 1 个 run 非 st
 配套单测 `tests/test_collector_watchdog.py`：探针 119s/121s 边界、watchdog 对
 阻塞循环触发并写出诊断心跳、健康循环不误触发、`allow()` 预算超支仍触发、
 故障标记一次性消费、被杀后重启无重复写入。
-### 12.6 运行、缺口与备份的审计查询(WQN-5)
 
-异常退出(被 kill、OOM、watchdog 退出——容器全程可能是 Up 的)会留下
-`status='running'` 的 run 行;**下一次启动**会把它标为 `failed` 并写明原因
-(`run did not exit cleanly (crash, kill, or watchdog exit)`),同时关闭其
-未关闭的 collection gap。所以下面这些审计问题都只是一条 SQL:
+当前版本重启后会把上次运行记为 `failed`，并在 `stop_reason` 记录异常退出，详见 §12.6。
+复验脚本默认从当前工作区构建镜像，也支持通过 `IMAGE` 指定本地待验收镜像。它会记录镜像 ID、
+实际重启策略和过期心跳的探针输出。恢复场景要求有可访问的上游市场，在确认新进程写入盘口和价格后才停止容器核对数据库。
+### 12.6 运行、缺口与备份审计
 
-```bash
-# 1) 哪些 run 异常结束?(stopped=正常;failed=未正常退出,看 stop_reason)
-docker exec weatherquant-collector python -c "
-import duckdb; c = duckdb.connect('/data/weatherquant.duckdb', read_only=True)
-print(c.execute(\"SELECT run_id, started_at_utc, stopped_at_utc, stop_reason
-                 FROM collector_runs WHERE status != 'stopped' ORDER BY started_at_utc\").fetchall())"
+正常停机的缺口从上一次停止时间算起。异常退出时，下次启动会把遗留的运行标为 `failed`。缺口取同一运行的上游心跳联系时间与已落库盘口、价点时间中较晚的一项。缺少这两类证据时使用运行起点，并在 `detail` 注明。缺口在主循环再次确认上游通信时关闭。连续离线重启期间可以一直查询到同一条未关闭记录。
 
-# 2) 哪些时段没有采集?每条 gap 的起止;ended 为空说明还在停摆中:
-#    SELECT * FROM collection_gaps WHERE ended_at_utc IS NULL
+以下 SQL 适用于已恢复到独立目录的采集数据库。第一条列出异常运行，第二条显示缺口边界及判断依据，第三条可按同一个 `attempt_id` 配对备份事件。
 
-# 3) 备份生命周期时间线(每次尝试的开始/验证/失败/超时):
-docker exec weatherquant-collector python -c "
-import duckdb; c = duckdb.connect('/data/weatherquant.duckdb', read_only=True)
-print(c.execute(\"SELECT ts_utc, level, kind, message FROM collector_events
-                 WHERE kind LIKE 'backup%' ORDER BY ts_utc\").fetchall())"
+```sql
+SELECT run_id, started_at_utc, stopped_at_utc, stop_reason
+FROM collector_runs WHERE status = 'failed' ORDER BY started_at_utc;
+
+SELECT run_id, started_at_utc, ended_at_utc, detail
+FROM collection_gaps ORDER BY started_at_utc;
+
+SELECT ts_utc, run_id, details_json->>'attempt_id' AS attempt_id, kind, message
+FROM collector_events WHERE kind LIKE 'backup%' ORDER BY ts_utc;
 ```
 
-配套单测 `tests/test_run_gap_audit.py`:被杀 run 由下一次启动标 failed、
-gap 覆盖整个停摆时段(停摆+死亡+重启间隙都落在 `[started, ended]` 内)、
-干净退出的 run 不被误标、备份失败(含异常路径)必留 `backup_failed` 事件
-且不影响 run 本身以 `stopped` 收尾。
+`backup_interrupted` 表示上一次运行退出前没有记下备份结果。文件是否可恢复仍须校验。旧版本事件缺少 `attempt_id`，查询时保留原记录。若上一次运行遗留的旧缺口覆盖了已证实有采集的时段，更正后的行会在 `detail` 中保留原缺口 ID 和说明。已关闭的历史缺口不作重估。
 
 ---
 

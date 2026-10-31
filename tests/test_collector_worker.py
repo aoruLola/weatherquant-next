@@ -153,7 +153,7 @@ def test_a_full_cycle_collects_and_shuts_down_cleanly(
         assert reason, "a stopped run must record why it stopped"
         assert stopped_at is not None
 
-        # Exactly one gap for this run, opened at start and closed at exit.
+        # Startup covers the time until collection resumes.
         gaps = con.execute(
             "SELECT reason, started_at_utc, ended_at_utc FROM collection_gaps ORDER BY detected_at_utc"
         ).fetchall()
@@ -278,9 +278,9 @@ def test_a_previously_crashed_run_has_its_gap_closed_on_next_start(
             "SELECT COUNT(*) FROM collection_gaps WHERE ended_at_utc IS NULL"
         ).fetchone()[0]
         assert still_open == 0, "the next start must close the crashed run's gap"
-        assert con.execute(
-            "SELECT COUNT(*) FROM collection_gaps WHERE run_id='test-run-1'"
-        ).fetchone()[0] >= 1
+        assert con.execute("SELECT run_id, detail FROM collection_gaps").fetchall() == [
+            ("crashed-run", "crashed; contact resumed in test-run-1")
+        ]
     finally:
         con.close()
 

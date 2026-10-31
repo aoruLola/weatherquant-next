@@ -7,8 +7,7 @@ Three claims, three groups of tests:
 * **An independent watchdog notices a blocked loop** - a thread that owes
   nothing to the loop publishes a final heartbeat naming the stuck loop and
   ends the process, which is the only signal Docker's restart policy can act
-  on. (In these tests the exit is replaced by a recorder; the real exit path
-  runs in the container test.)
+  on. The recovery test uses a separate process and the real watchdog exit.
 * **The recovery does not duplicate writes** - a fault-blocked run that dies
   and a restarted run over the same data directory converge on the same
   facts: one book per content hash, one price row per natural key, every
@@ -18,6 +17,7 @@ Three claims, three groups of tests:
 from __future__ import annotations
 
 import json
+import multiprocessing
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -196,6 +196,16 @@ def test_a_tick_clears_an_open_declaration() -> None:
         watchdog.stop()
 
 
+def test_probe_only_fault_blocks_once_without_a_watchdog(settings, monkeypatch):
+    worker = _worker(settings, loop_stuck_seconds=0)
+    _write_fault_marker(settings, 150)
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    worker._maybe_inject_fault_block()
+    worker._maybe_inject_fault_block()
+    assert sleeps == [150]
+
+
 def test_a_blocked_loop_is_detected_and_the_final_heartbeat_names_it(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -255,22 +265,30 @@ def test_a_healthy_loop_never_fires(settings: Settings, monkeypatch: pytest.Monk
 # ---------------------------------------------------------------------------
 
 
+def _run_blocked_process(settings: Settings) -> None:
+    worker_module.ResilientHttp = FakeHttp
+    raise SystemExit(_worker(settings, run_id="blocked", loop_stuck_seconds=0.4).run())
+
+
 def test_the_run_after_a_watchdog_kill_writes_no_duplicates(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Simulate the kill itself: run 1 is blocked and its watchdog 'exit'
-    recorded; run 2 starts over the same directory. The fake upstream returns
-    the same payloads, so any duplicated write would show up as one."""
-    _, fired = _arm_recorder(monkeypatch)
+    """Replay the same upstream facts over a real unclean exit and restart."""
     monkeypatch.setattr(worker_module, "ResilientHttp", FakeHttp)
-
-    _write_fault_marker(settings, 0.6)
-    blocked = _worker(settings, run_id="run-1", loop_stuck_seconds=0.25)
-    thread, first = _run_in_thread(blocked)
-    assert fired.wait(10.0)
-    blocked.shutdown.set("simulated watchdog exit; test moves on")
-    thread.join(30.0)
-    assert first.get("code") == ExitCode.OK
+    assert _worker(settings, run_id="seed", once=True).run() == ExitCode.OK
+    _write_fault_marker(settings, 10)
+    child = multiprocessing.get_context("spawn").Process(target=_run_blocked_process, args=(settings,))
+    child.start()
+    try:
+        child.join(30)
+        assert child.exitcode == ExitCode.FATAL
+    finally:
+        if child.is_alive():
+            child.kill()
+            child.join()
+    heartbeat = read_heartbeat(settings.db_path.parent / "health" / "heartbeat.json")
+    assert heartbeat is not None and heartbeat.run_id == "blocked"
+    assert "collection loop stuck" in (heartbeat.fatal_error or "")
 
     # Foreground restart over the same data directory; `once` collects a
     # couple of cycles and shuts down cleanly, as a supervised restart would.
@@ -280,14 +298,24 @@ def test_the_run_after_a_watchdog_kill_writes_no_duplicates(
 
     con = duckdb.connect(str(settings.db_path))
     try:
-        # Two runs recorded, both closed out.
-        assert con.execute("SELECT COUNT(*) FROM collector_runs").fetchone()[0] == 2
-        statuses = {row[0] for row in con.execute("SELECT status FROM collector_runs").fetchall()}
-        assert statuses == {"stopped"}
+        runs = con.execute("SELECT run_id, status, stop_reason FROM collector_runs ORDER BY started_at_utc").fetchall()
+        assert [(key, status) for key, status, _ in runs] == [
+            ("seed", "stopped"), ("blocked", "failed"), ("run-2", "stopped"),
+        ]
+        assert "did not exit cleanly" in runs[1][2]
 
-        # No gap left open: the restart dated its outage instead of hiding it.
-        open_gaps = con.execute("SELECT COUNT(*) FROM collection_gaps WHERE ended_at_utc IS NULL").fetchone()[0]
-        assert open_gaps == 0
+        # Blocking happens before the first upstream contact. The gap spanning
+        # the killed process must date back to the seed's clean stop, and close
+        # only after the restarted worker has resumed collection.
+        window = con.execute(
+            "SELECT g.started_at_utc, g.ended_at_utc, seed.stopped_at_utc, fresh.started_at_utc "
+            "FROM collection_gaps g, collector_runs seed, collector_runs fresh "
+            "WHERE g.run_id='blocked' AND seed.run_id='seed' AND fresh.run_id='run-2'"
+        ).fetchall()
+        assert len(window) == 1
+        start, end, stopped, restarted = window[0]
+        assert start == stopped < heartbeat.updated_at_utc <= restarted <= end
+        assert con.execute("SELECT count(*) FROM collection_gaps WHERE ended_at_utc IS NULL").fetchone()[0] == 0
 
         # The same books seen by both runs are stored once each: the fake
         # upstream serves yes/no tokens, so two distinct books - and no more,
@@ -310,11 +338,13 @@ def test_the_run_after_a_watchdog_kill_writes_no_duplicates(
     # continuity across restarts is WQN-21's territory, in its own PR.)
     raw_files = list(settings.raw_dir.rglob("*.jsonl"))
     assert raw_files, "the restarted run must keep archiving payloads"
+    archived_runs = set()
     for path in raw_files:
         lines = [line for line in path.read_text().splitlines() if line.strip()]
         assert lines, f"{path} unexpectedly empty"
         for line in lines:
-            json.loads(line)
+            archived_runs.add(json.loads(line)["run_id"])
+    assert {"seed", "run-2"} <= archived_runs
 
 
 def test_blocked_diagnostic_filesystem_cannot_prevent_watchdog_exit():

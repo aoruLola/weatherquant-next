@@ -74,21 +74,23 @@ def _pid_alive(pid: int) -> bool:
     fallback below. The consequence was that an abandoned lock was never
     reclaimed and every subsequent start exited 4.
 
-    ``OpenProcess`` returns NULL exactly when there is no such process, which is
-    the answer the stale-lock check actually needs.
+    A Windows supervisor can still hold a handle to an exited process.
+    The handle is signaled on exit, even while its PID can still be opened.
     """
     if pid <= 0:
         return False
     if os.name == "nt":
-        import ctypes
+        import _winapi
 
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        kernel32.CloseHandle(handle)
-        return True
+        try:
+            handle = _winapi.OpenProcess(_winapi.SYNCHRONIZE, False, pid)
+        except OSError as exc:
+            # ERROR_INVALID_PARAMETER means that the PID no longer exists.
+            return exc.winerror != 87
+        try:
+            return _winapi.WaitForSingleObject(handle, 0) == _winapi.WAIT_TIMEOUT
+        finally:
+            _winapi.CloseHandle(handle)
 
     try:
         os.kill(pid, 0)
