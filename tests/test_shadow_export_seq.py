@@ -123,7 +123,7 @@ def test_indexed_database_upgrades_with_live_cursor_and_late_legacy_row(tmp_path
     old_migrations = tmp_path / "indexed_migrations"
     old_migrations.mkdir()
     for path in shadow.SHADOW_MIGRATIONS_DIR.glob("*.sql"):
-        if path.name[:4] <= "0006":
+        if path.name[:4] < "0009":
             shutil.copyfile(path, old_migrations / path.name)
 
     db_path = tmp_path / "shadow.duckdb"
