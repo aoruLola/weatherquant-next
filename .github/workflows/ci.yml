@@ -8,8 +8,13 @@ name: ci
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -17,10 +22,18 @@ permissions:
 
 jobs:
   lint-and-test:
+    outputs:
+      build_image: ${{ steps.image.outputs.build_image }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check image inputs on the PR merge commit
+        id: image
+        run: bash scripts/ci_image_gate.sh collector >> "$GITHUB_OUTPUT"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
@@ -47,6 +60,7 @@ jobs:
         run: uv run pytest -q --cov=weatherquant --cov-report=term-missing
 
   build-image:
+    if: needs.lint-and-test.outputs.build_image == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: lint-and-test
