@@ -399,7 +399,7 @@ class TestMoneyScenarios:
         # The platform resolves YES at 1.0.
         h.publish_settlement_feed(
             [{"market_id": "mkt-a", "revision": 1, "status": "RESOLVED",
-              "yes_payout": 1.0, "settled_at_utc": h.now().isoformat(),
+              "verification_status": "VERIFIED", "yes_payout": 1.0, "settled_at_utc": h.now().isoformat(),
               "transaction_hash": "0x1"}]
         )
         with h.db.transaction():
@@ -413,7 +413,7 @@ class TestMoneyScenarios:
         # ... and later corrects the resolution to 0.0.
         h.publish_settlement_feed(
             [{"market_id": "mkt-a", "revision": 2, "status": "RESOLVED",
-              "yes_payout": 0.0, "settled_at_utc": h.now().isoformat(),
+              "verification_status": "VERIFIED", "yes_payout": 0.0, "settled_at_utc": h.now().isoformat(),
               "transaction_hash": "0x2"}]
         )
         with h.db.transaction():

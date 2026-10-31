@@ -547,41 +547,30 @@ class Ledger:
                 "detail": "already recorded; the natural key absorbed the redelivery",
             }
 
-        if not event.is_payout:
-            # A dispute that reopens an already-settled market breaks the
-            # applied payout's finality: the final answer is unknown, and
-            # keeping OR reversing the payout would both fabricate realised
-            # profit. A human decides; the balances stay untouched.
-            applied = self._applied_settlement(market_id)
-            if applied is not None and event.status == "DISPUTED":
-                self._flag_review(
-                    event,
-                    reason=(
-                        f"market re-disputed after a payout was applied at revision "
-                        f"{applied['revision']}; whether that payout stands is a "
-                        "human decision"
-                    ),
-                )
-                return {
-                    "action": "REVIEW_REQUIRED",
-                    "market_id": market_id,
-                    "revision": event.revision,
-                    "detail": "dispute after settlement; flagged for manual review",
-                }
-            return {
-                "action": "RECORDED",
-                "market_id": market_id,
-                "revision": event.revision,
-                "detail": f"status {event.status}; unsettled positions never book realised P&L",
-            }
-
-        applied = self._applied_settlement(market_id)
-        if applied is not None and event.revision <= applied["revision"]:
+        latest = self.db.execute(
+            "SELECT MAX(revision) FROM paper_settlements WHERE market_id = ?", [market_id]
+        ).fetchone()[0]
+        if event.revision < latest:
             return {
                 "action": "NOOP",
                 "market_id": market_id,
                 "revision": event.revision,
-                "detail": f"superseded by applied revision {applied['revision']}",
+                "detail": f"superseded by recorded revision {latest}",
+            }
+
+        applied = self._applied_settlement(market_id)
+        if not event.is_payout:
+            detail = (
+                "resolution lacks VERIFIED evidence" if event.status == "RESOLVED" else f"status {event.status}"
+            )
+            if applied is not None:
+                detail = f"{detail} after payout at revision {applied['revision']}; manual review required"
+                self._flag_review(event, reason=detail)
+            return {
+                "action": "REVIEW_REQUIRED" if applied is not None else "RECORDED",
+                "market_id": market_id,
+                "revision": event.revision,
+                "detail": detail,
             }
 
         payout = float(event.yes_payout)  # guaranteed by is_payout
