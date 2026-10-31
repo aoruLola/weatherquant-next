@@ -58,7 +58,7 @@ from weatherquant.performance.capital import (
     simulate_portfolio,
     window_portfolio_payload,
 )
-from weatherquant.performance.episodes import Episode, episode_from_mapping
+from weatherquant.performance.episodes import Episode, episode_from_mapping, observation_bounds
 
 __all__ = [
     "OPPORTUNITY_FILTERS",
@@ -618,6 +618,9 @@ def performance_reference_capital(
         source = "weatherquant.performance.capital.simulate_portfolio"
 
     window = dict(payload.data.get("window") or {})
+    # Older generations describe the newest and oldest episode starts in reverse.
+    # The retained rows also carry the final observation of each episode.
+    window["first_seen_utc_from"], window["last_seen_utc_to"] = observation_bounds(episodes)
     payload_out = window_portfolio_payload(
         result,
         window=window,
