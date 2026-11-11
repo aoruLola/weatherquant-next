@@ -138,3 +138,52 @@ exit code 0/1 对应一致/不一致。
 ### 评审修复验证
 
 研究聚合升级为 performance-streaming-2，新增性能状态迁移 0004。导出定位仍以 export_seq 前进；迟到行将 episode 重建标记与游标一起提交，然后从已消费的不可变分片按业务时间重新聚合。DuckDB 在既有内存预算下排序，Python 分页读取。重建失败保留标记，下次 ingest 或 publish-only 必须先完成修复。既有状态首次升级会执行一次相同重建，保留结算层和导出位置；旧版研究镜像需要独立派生状态库或重建，不能继续写新版状态。
+
+## 8. 部署顺序与回滚（Shadow 与 Performance 必须同批）
+
+`export_seq` 是同一协议的两端：Shadow 侧改了导出格式与游标语义（0005/0006，`state.json`
+升到 v2），Performance 侧改了摄入游标与顺序校验锚点（0003 的 `performance_ingest.last_export_seq`、
+`late_rows_seen`）。只升级一侧会让两端对不上——新 Shadow 写出的 seq 行被旧消费者按业务时间
+校验，迟到 REPLAY 仍会被判为回退而拒绝；旧 Shadow 的 v1 分片没有 seq，只有新消费者的旧格式
+兼容路径能正确放行。因此**必须在同一维护窗口内成对升级，不要分两次上线**。
+
+### 8.1 升级顺序
+
+1. 记录两端镜像 digest 与当前版本；停 Shadow 后备份 `shadow.duckdb`、`state.json` 和
+   `reports/decisions-export/` 的末两个分片（步骤见 `docs/shadow-unraid-deployment.md` §9）。
+2. **先停摄入**：停 Shadow 容器；确认 Performance 的 5 分钟摄入 runner 未在运行
+   （`flock -n /var/lock/weatherquant-performance.lock true`，返回 0 且无输出表示空闲；
+   否则等本轮结束）。迁移与一次性过渡期间不应有半批消费。
+3. **先升级 Performance（研究侧）**：换新 CLI/镜像后跑一次摄入（可先 `--no-publish`）。
+   迁移 0003 是纯增量（可空列 + 默认值），旧格式分片仍按旧规则消费，此步不改变对外快照。
+4. **再升级 Shadow**：启动新 Shadow。`migrate()` 先应用 0005（列 + 回填 + 序列推进），
+   再在独立事务里应用 0006（建索引）；完成后立即 `CHECKPOINT`（见 8.2）。首 tick 进入
+   一次性过渡，把 v1 跳过的行重排到下限之上，随后按 seq 正常导出。
+5. **恢复 Performance 摄入**：确认 Shadow 已产出至少一个带 `export_seq` 的分片后，
+   恢复 cron/流式摄入；观察它按 seq 严格递增消费、`late_rows_seen` 正常累加。
+6. 验收：停引擎后 `weatherquant-shadow export-verify` 退出码 0、`reconcile()`
+   consistent=True、Dashboard 新鲜度不变；再跑一次迁移确认无重复应用。
+
+### 8.2 迁移后立即 CHECKPOINT（WQN-20 收尾）
+
+`migrate()` 在应用完任一迁移后执行 `CHECKPOINT`，把 0006 的 `CREATE INDEX` 等 DDL 从
+WAL 折进主库文件。否则"迁移已提交、首次 checkpoint 前进程被 kill -9"会留下 `.wal`，
+只读打开无法回放（`Could not write file ... Bad file descriptor`），Shadow 启动时用于
+识别外来库的只读探针会永久失败，引擎再也起不来。该 CHECKPOINT 与迁移在同一次启动中
+完成，且幂等：已迁移库再启动一次不重放、不报错、不改变数据。所有 migrations 目录
+（主库、shadow、performance、paper、research）共用同一个 `migrate()`，因此同时生效。
+
+### 8.3 回滚
+
+- **整体回滚（推荐，支持路径）**：按相反顺序成对回滚——先停摄入、停 Shadow；
+  回滚 Shadow 镜像；回滚 Performance 镜像；启动旧 Shadow；恢复旧摄入。schema 不回滚：
+  0003/0005/0006 全是纯增量（可空列、序列、索引），旧代码读新 schema 安全；
+  v2 `state.json` 的未知键会被旧代码原样保留（详见 §5）。
+- **只回滚一侧**只允许作为短窗口应急：只回滚 Performance，旧消费者按业务时间校验新
+  seq 行，迟到 REPLAY 会再次被判回退；只回滚 Shadow，新消费者可以读 v1 分片，但迟到行
+  缺陷重新出现。两者都不能作为长期状态，必须尽快补齐成对升级或成对回滚。
+- 如果旧 Performance 在回滚窗口内读过新格式分片并在状态库留下分片 sha 记录，按
+  `docs/performance-decouple-runbook.md` 重建状态库，不要手改状态。
+- **不需要数据库回滚**。若必须回到旧 schema，唯一支持方式是从停机备份恢复
+  `shadow.duckdb`，代价是丢失备份点之后的决策。
+
