@@ -143,6 +143,24 @@ class ShadowSettings(BaseSettings):
         default=72.0, gt=0, description="How far back to look for unfetched issue hours."
     )
 
+    # --- retention ---------------------------------------------------------
+    # Default: OFF. We do not delete historical rows by default, because once
+    # deleted they are gone forever (DuckDB has no soft-delete and no undo).
+    # Operators opt in explicitly by setting shadow_retention_days > 0, and
+    # shadow_retention_archive_dir to a writable location so old rows land on
+    # Parquet before they are removed - a research team can still read them.
+    shadow_retention_days: int | None = Field(
+        default=None,
+        description="Delete shadow_decisions / model_predictions older than N days. "
+        "None (default) = do not delete anything at all. Set > 0 to opt in; "
+        "shadow_retention_archive_dir must also be set to a writable path.",
+    )
+    shadow_retention_archive_dir: Path | None = Field(
+        default=None,
+        description="Where old rows are written as Parquet before deletion. "
+        "Required when shadow_retention_days is set.",
+    )
+
     # LIVE vs REPLAY. `auto` decides once per process from the archive's own
     # age: a feed younger than the silence window is LIVE, an archive older
     # than it is history being re-read. Deciding once matters - flipping to

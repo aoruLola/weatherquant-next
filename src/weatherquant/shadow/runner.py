@@ -58,6 +58,7 @@ from weatherquant.shadow.health import disk_free_percent, write_heartbeat
 from weatherquant.shadow.inference import PredictionResult, Predictor, prediction_rows
 from weatherquant.shadow.ingest import ArchiveTailer, QualityEvent
 from weatherquant.shadow.report import build_report, publish_report_snapshot
+from weatherquant.storage.retention import apply_retention
 from weatherquant.shadow.state import ShadowState
 from weatherquant.shadow.store import ShadowStore
 from weatherquant.storage.shadow import ShadowDatabase
@@ -183,6 +184,8 @@ class ShadowRunner:
         #: Decided once, after the first ingest, and held for the whole run.
         self._mode: Mode | None = None
         self._mode_reason: str | None = None
+        self._report_duration_ms: int | None = None
+        self._next_retention: datetime = datetime.min.replace(tzinfo=UTC)
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -473,6 +476,7 @@ class ShadowRunner:
 
         self._publish_report()
         self._export_decisions()
+        self._maybe_retention()
 
         stats.duration_ms = int((self.clock() - started).total_seconds() * 1000)
         self._last_cycle = stats
@@ -549,6 +553,7 @@ class ShadowRunner:
         # Advanced before the work: a report that raises must not be retried
         # on the very next tick.
         self._next_report = now + timedelta(seconds=self.shadow.shadow_report_seconds)
+        _t0 = time.perf_counter()
         try:
             report = build_report(self.db.con, now=now)
             publish_report_snapshot(
@@ -599,6 +604,7 @@ class ShadowRunner:
                 ],
                 run_id=self.run_id or "",
             )
+        self._report_duration_ms = int((time.perf_counter() - _t0) * 1000)
 
     def _export_decisions(self) -> None:
         """Append one bounded batch to the historical decision export.
@@ -734,6 +740,44 @@ class ShadowRunner:
                 ],
                 run_id=self.run_id or "",
             )
+
+    def _maybe_retention(self) -> None:
+        """Archive + delete rows older than the configured retention window.
+
+        Default is OFF (shadow_retention_days is None). The call is throttled
+        to at most once every 12h because retention is a table-scan and we
+        absolutely do not want it every tick. A failure is logged and
+        swallowed: retention is housekeeping, not the mission.
+        """
+        now = self.clock()
+        if now < self._next_retention:
+            return
+        self._next_retention = now + timedelta(hours=12)
+        if self.shadow.shadow_retention_days is None:
+            return
+        try:
+            result = apply_retention(
+                self.db.con,
+                days=self.shadow.shadow_retention_days,
+                archive_dir=self.shadow.shadow_retention_archive_dir,
+                now=now,
+            )
+            if result.ran:
+                log.info("retention ran: %s", result.as_dict())
+        except Exception as exc:
+            log.warning("retention failed: %s", exc)
+            if self.store is not None:
+                self.store.record_quality(
+                    [
+                        QualityEvent(
+                            kind="retention_failed",
+                            severity="warning",
+                            detail=f"{type(exc).__name__}: {exc}",
+                            ts_utc=now,
+                        )
+                    ],
+                    run_id=self.run_id or "",
+                )
 
     def _decision_instant(self) -> datetime:
         """The instant decisions are judged against.
@@ -1031,6 +1075,8 @@ class ShadowRunner:
             "primary_model": self.shadow.shadow_primary_model,
             "disk": {"free_percent": disk},
             "last_cycle": self._last_cycle.as_dict() if self._last_cycle else None,
+            "report_duration_ms": self._report_duration_ms,
+            "rss_mb": _rss_mb(),
             # Identity and size, so an operator can answer "which build is
             # running" and "how big is the shadow database" without opening
             # the file - this process holds the lease on it, nobody else can.
@@ -1053,6 +1099,22 @@ def _app_version() -> str:
         return version("weatherquant-next")
     except Exception:
         return "unknown"
+
+
+def _rss_mb() -> float | None:
+    """Resident set size in MB, or None if /proc is not available.
+
+    Linux-only (reads /proc/self/statm). Non-Linux platforms (macOS inside
+    tests) get None - callers must tolerate that."""
+    try:
+        with open("/proc/self/statm", "r") as fh:
+            parts = fh.read().split()
+        # rss is the second field, in pages. Page size on all current Linuxes
+        # is 4096 bytes; if that ever changes (unlikely) the number will drift
+        # but still be of the right order of magnitude.
+        return float(parts[1]) * 4096.0 / (1024.0 * 1024.0)
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def _file_size(path: str | Path) -> int:
