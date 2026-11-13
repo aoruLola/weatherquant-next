@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
+import sys
+import textwrap
+import time
 from pathlib import Path
 
 import duckdb
@@ -187,3 +193,130 @@ def test_legacy_helper_opens_strictly_read_only(tmp_path: Path) -> None:
         assert con.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
     finally:
         con.close()
+
+
+def test_migrate_checkpoints_after_applying(tmp_path: Path) -> None:
+    """migrate() folds the WAL into the main file so a crash right after cannot leave DDL stranded."""
+    directory = tmp_path / "migrations"
+    directory.mkdir()
+    (directory / "0001_foo.sql").write_text(
+        "CREATE TABLE foo (id INTEGER);\nCREATE INDEX idx_foo ON foo (id);\n", encoding="utf-8"
+    )
+
+    db_file = tmp_path / "checkpointed.duckdb"
+    con = duckdb.connect(str(db_file))
+    try:
+        # High threshold: without an explicit CHECKPOINT the DDL stays in the WAL.
+        con.execute("SET checkpoint_threshold='100GB'")
+        assert migrate(con, directory) == ["0001_foo"]
+        # Asserted while the connection is still open: closing it would checkpoint
+        # on its own and hide a missing CHECKPOINT in migrate().
+        assert _wal_is_empty(db_file), "CHECKPOINT after migrate must fold the WAL into the main file"
+    finally:
+        con.close()
+
+    con_ro = duckdb.connect(str(db_file), read_only=True)
+    try:
+        assert con_ro.execute("SELECT COUNT(*) FROM foo").fetchone()[0] == 0
+        indexes = {row[0] for row in con_ro.execute("SELECT index_name FROM duckdb_indexes()").fetchall()}
+        assert "idx_foo" in indexes
+    finally:
+        con_ro.close()
+
+    # Idempotent: an already-migrated file applies nothing and does not fail.
+    con = duckdb.connect(str(db_file))
+    try:
+        assert migrate(con, directory) == []
+    finally:
+        con.close()
+
+
+def _wal_is_empty(db_file: Path) -> bool:
+    wal = Path(f"{db_file}.wal")
+    return not wal.exists() or wal.stat().st_size == 0
+
+
+# The exact crash window: migrate() has returned but the process has not closed
+# the connection (a close would checkpoint and hide the bug). checkpoint_threshold
+# is raised so nothing else folds the WAL either.
+_MIGRATING_CHILD = textwrap.dedent(
+    """
+    import sys, time
+    from pathlib import Path
+
+    import duckdb
+
+    from weatherquant.storage.migrator import migrate
+
+    db, migrations, marker = (Path(arg) for arg in sys.argv[1:4])
+    con = duckdb.connect(str(db))
+    con.execute("SET checkpoint_threshold='100GB'")
+    applied = migrate(con, migrations)
+    marker.write_text(",".join(applied), encoding="utf-8")
+    time.sleep(600)
+    """
+)
+
+
+def _spawn_migrating_child(tmp_path: Path, db_file: Path, migrations: Path) -> tuple[subprocess.Popen, Path]:
+    script = tmp_path / "migrating_child.py"
+    script.write_text(_MIGRATING_CHILD, encoding="utf-8")
+    marker = tmp_path / "migrated.marker"
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    proc = subprocess.Popen(
+        [sys.executable, str(script), str(db_file), str(migrations), str(marker)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    return proc, marker
+
+
+def _wait_for_migration(proc: subprocess.Popen, marker: Path, timeout: float = 60.0) -> str:
+    deadline = time.monotonic() + timeout
+    while not marker.exists() and proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not marker.exists():
+        if proc.poll() is None:
+            proc.kill()
+        _, stderr = proc.communicate(timeout=30)
+        raise AssertionError(f"child never finished migrating; stderr:\n{stderr}")
+    return marker.read_text(encoding="utf-8")
+
+
+def test_migrate_survives_sigkill(tmp_path: Path) -> None:
+    """A kill -9 after migrate() leaves a database both read-only probes and engines can open.
+
+    The bulk insert and the index are what make the stranded WAL big enough to
+    matter: without the checkpoint DuckDB fails replaying it in read-only mode
+    ("Could not write file ... Bad file descriptor"), which is exactly how the
+    shadow engine's ownership probe died after the 0006 index migration.
+    """
+    directory = tmp_path / "migrations"
+    directory.mkdir()
+    (directory / "0001_bulk.sql").write_text(
+        "CREATE TABLE foo (id INTEGER, payload VARCHAR);\nINSERT INTO foo SELECT i, 'x' FROM range(200000) tbl(i);\n",
+        encoding="utf-8",
+    )
+    (directory / "0002_index.sql").write_text("CREATE INDEX idx_foo ON foo (id);\n", encoding="utf-8")
+
+    db_file = tmp_path / "killme.duckdb"
+    proc, marker = _spawn_migrating_child(tmp_path, db_file, directory)
+    assert _wait_for_migration(proc, marker) == "0001_bulk,0002_index"
+
+    proc.send_signal(signal.SIGKILL)
+    proc.communicate(timeout=30)
+
+    assert _wal_is_empty(db_file), "the migration must be checkpointed before the kill"
+
+    for read_only in (False, True):
+        con = duckdb.connect(str(db_file), read_only=read_only)
+        try:
+            versions = {row[0] for row in con.execute("SELECT version FROM schema_migrations").fetchall()}
+            assert versions == {"0001", "0002"}, f"missing migrations after SIGKILL: {versions}"
+            assert con.execute("SELECT COUNT(*) FROM foo").fetchone()[0] == 200000
+            indexes = {row[0] for row in con.execute("SELECT index_name FROM duckdb_indexes()").fetchall()}
+            assert "idx_foo" in indexes, f"index missing after SIGKILL: {indexes}"
+        finally:
+            con.close()
