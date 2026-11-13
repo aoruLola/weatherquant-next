@@ -9,6 +9,8 @@ being a convenience and starts being an exposure.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -25,6 +27,8 @@ from weatherquant.mcp.security import (
     audit_event,
 )
 from weatherquant.mcp.server import Gateway, build_server
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Building a server needs the SDK; the client and the guard do not. Skipping
 # only the two tests that touch it keeps the refusals tested even where the
@@ -426,3 +430,82 @@ def test_arguments_are_truncated_so_a_call_cannot_flood_the_log(capsys) -> None:
     captured = capsys.readouterr()
     record = captured.out + captured.err
     assert len(record) < 2000, "an unbounded argument would make the log a denial-of-service target"
+
+
+# --- WQN-50: the default listener, and the database it must never open -------
+
+
+def test_the_default_bind_is_loopback(monkeypatch) -> None:
+    """A gateway nobody configured listens on loopback, not on every interface.
+
+    The container chooses ``0.0.0.0`` explicitly in its own command line; the
+    in-process default is what protects a developer or a bare ``main()``
+    invocation from publishing an unauthenticated socket to the LAN.
+    """
+    import weatherquant.mcp.http_app as http_app
+    from weatherquant.mcp.main import DEFAULT_HOST, main
+
+    captured: dict = {}
+    monkeypatch.delenv("WQ_MCP_HOST", raising=False)
+    monkeypatch.delenv("WQ_MCP_TOKEN", raising=False)
+    monkeypatch.setenv("WQ_MCP_DASHBOARD_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("WQ_MCP_PLAINTEXT_NETWORKS", "127.0.0.0/8")
+    monkeypatch.setattr(http_app, "run_http", lambda server, **kwargs: captured.update(kwargs))
+
+    assert DEFAULT_HOST == "127.0.0.1"
+    assert main(["--transport", "streamable-http"]) == 0
+    assert captured["host"] == "127.0.0.1"
+
+
+def test_importing_the_gateway_never_opens_a_database() -> None:
+    """The gateway has no database driver in memory at all - not even read-only.
+
+    A connection opened ``read_only=True`` still holds a shared lock on the
+    production file, so the property under test is not "does not write" but
+    "never connects". A fresh interpreter makes that observable: any duckdb
+    or sqlite3 module in ``sys.modules`` after importing the entrypoint means
+    the package can reach a store it has no business reaching.
+    """
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "import weatherquant.mcp.main\n"
+        "banned = sorted(m for m in sys.modules if m.split('.')[0] in {'duckdb', 'sqlite3'})\n"
+        "print(banned)\n"
+        "raise SystemExit(1 if banned else 0)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_gateway_package_contains_no_database_code() -> None:
+    """No file in the package may name a database, a lock or an open mode.
+
+    The runtime check above proves nothing is imported; this one keeps the
+    import from being added in the first place - including the shape that
+    would sneak past a "read-only" review (``read_only=False``, an exclusive
+    transaction, a literal path to the production file).
+    """
+    root = REPO_ROOT / "src" / "weatherquant" / "mcp"
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        for forbidden in (
+            "duckdb",
+            "sqlite3",
+            ".duckdb",
+            "read_only",
+            "BEGIN EXCLUSIVE",
+            "BEGIN IMMEDIATE",
+        ):
+            if forbidden in source:
+                offenders.append(f"{path.name}: {forbidden}")
+    assert not offenders, offenders

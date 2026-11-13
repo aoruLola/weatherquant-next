@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -97,6 +98,10 @@ def test_consume_reads_the_published_export(paper_env, monkeypatch, capsys):
 
     events_dir = paper_env.parent.parent / "decisions-export"  # as the fixture configured
     (events_dir / "parts").mkdir(parents=True)
+    # Relative to now: the consume path judges signal age against the wall
+    # clock, and a fixed literal turns this test into a time bomb that starts
+    # failing on its own once the date moves past WQ_PAPER_MAX_SIGNAL_AGE.
+    decision_time = datetime.now(UTC) - timedelta(seconds=30)
     row = {
         "decision_id": "a" * 32,
         "run_id": "r" * 32,
@@ -105,7 +110,7 @@ def test_consume_reads_the_published_export(paper_env, monkeypatch, capsys):
         "direction": "buy_yes",
         "state": "ACCEPT",
         "mode": "LIVE",
-        "decision_time_utc": "2026-10-26T12:04:00+00:00",
+        "decision_time_utc": decision_time.isoformat(),
         "book_id": "b" * 64,
         "fee_rate": 0.05,
     }
