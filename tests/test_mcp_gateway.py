@@ -466,6 +466,7 @@ def test_importing_the_gateway_never_opens_a_database() -> None:
     or sqlite3 module in ``sys.modules`` after importing the entrypoint means
     the package can reach a store it has no business reaching.
     """
+    import os
     import subprocess
     import sys
 
@@ -476,12 +477,21 @@ def test_importing_the_gateway_never_opens_a_database() -> None:
         "print(banned)\n"
         "raise SystemExit(1 if banned else 0)\n"
     )
+    # pytest --cov injects COVERAGE_PROCESS_START / COV_CORE_* so the child
+    # process records coverage; coverage's tracer imports sqlite3. Strip those
+    # hooks so this assertion measures the gateway, not the test runner.
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("COVERAGE_", "COV_CORE_"))
+    }
     result = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
         cwd=REPO_ROOT,
         timeout=60,
+        env=env,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
