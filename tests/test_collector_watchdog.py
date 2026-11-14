@@ -196,14 +196,16 @@ def test_a_tick_clears_an_open_declaration() -> None:
         watchdog.stop()
 
 
-def test_probe_only_fault_blocks_once_without_a_watchdog(settings, monkeypatch):
+def test_probe_only_fault_blocks_once_without_a_watchdog(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     worker = _worker(settings, loop_stuck_seconds=0)
     _write_fault_marker(settings, 150)
-    sleeps = []
+    sleeps: list[float] = []
     monkeypatch.setattr(time, "sleep", sleeps.append)
     worker._maybe_inject_fault_block()
     worker._maybe_inject_fault_block()
+    assert worker._watchdog is None
     assert sleeps == [150]
+    assert not (settings.db_path.parent / CollectorWorker.FAULT_BLOCK_MARKER).exists()
 
 
 def test_a_blocked_loop_is_detected_and_the_final_heartbeat_names_it(
@@ -273,7 +275,12 @@ def _run_blocked_process(settings: Settings) -> None:
 def test_the_run_after_a_watchdog_kill_writes_no_duplicates(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Replay the same upstream facts over a real unclean exit and restart."""
+    """Replay the same upstream facts over a real unclean exit and restart.
+
+    This is also the close_open_gaps WAL regression: reverting it to UPDATE
+    ... RETURNING makes the restart fail while rebuilding the gap indexes on
+    DuckDB 1.5.6. The affected-row form recovers without invalidating the DB.
+    """
     monkeypatch.setattr(worker_module, "ResilientHttp", FakeHttp)
     assert _worker(settings, run_id="seed", once=True).run() == ExitCode.OK
     _write_fault_marker(settings, 10)
@@ -300,7 +307,9 @@ def test_the_run_after_a_watchdog_kill_writes_no_duplicates(
     try:
         runs = con.execute("SELECT run_id, status, stop_reason FROM collector_runs ORDER BY started_at_utc").fetchall()
         assert [(key, status) for key, status, _ in runs] == [
-            ("seed", "stopped"), ("blocked", "failed"), ("run-2", "stopped"),
+            ("seed", "stopped"),
+            ("blocked", "failed"),
+            ("run-2", "stopped"),
         ]
         assert "did not exit cleanly" in runs[1][2]
 

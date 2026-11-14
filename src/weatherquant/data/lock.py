@@ -64,6 +64,13 @@ class LockInfo:
         )
 
 
+def _load_winapi():
+    """Load the Windows API lazily; tests inject it without importing it on POSIX."""
+    import _winapi
+
+    return _winapi
+
+
 def _pid_alive(pid: int) -> bool:
     """True only if ``pid`` names a process that is genuinely running.
 
@@ -80,17 +87,17 @@ def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if os.name == "nt":
-        import _winapi
+        winapi = _load_winapi()
 
         try:
-            handle = _winapi.OpenProcess(_winapi.SYNCHRONIZE, False, pid)
+            handle = winapi.OpenProcess(winapi.SYNCHRONIZE, False, pid)
         except OSError as exc:
             # ERROR_INVALID_PARAMETER means that the PID no longer exists.
             return exc.winerror != 87
         try:
-            return _winapi.WaitForSingleObject(handle, 0) == _winapi.WAIT_TIMEOUT
+            return winapi.WaitForSingleObject(handle, 0) == winapi.WAIT_TIMEOUT
         finally:
-            _winapi.CloseHandle(handle)
+            winapi.CloseHandle(handle)
 
     try:
         os.kill(pid, 0)
