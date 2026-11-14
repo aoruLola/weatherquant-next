@@ -15,6 +15,7 @@ loaded by path, like ``test_shadow_freshness.py`` loads its tool).
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -56,9 +57,7 @@ def test_the_tally_counts_episodes_and_respects_sell_yes() -> None:
     history.add_episode(market_id="m-a", target_date="2026-10-13", direction="buy_yes")
     history.add_episode(market_id="m-b", target_date="2026-10-13", direction="sell_yes")
     history.add_episode(market_id="m-c", target_date="2026-10-14", direction="buy_yes")
-    settlements = history.settlements(
-        scenario_for=lambda ep: "verified_win" if ep["market_id"] != "m-c" else "pending"
-    )
+    settlements = history.settlements(scenario_for=lambda ep: "verified_win" if ep["market_id"] != "m-c" else "pending")
     counts = acceptance.expected_counts(history, settlements)
 
     assert counts["WIN"] == 1, "only the verified buy_yes win is scored"
@@ -76,6 +75,75 @@ def test_cli_preserves_existing_evidence(tmp_path, monkeypatch, capsys):
         acceptance.main()
 
     assert refusal.value.code == 2
-    assert "new or empty directory" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert acceptance.MARKER_FILE in error
+    assert str(tmp_path) in error
     assert list(tmp_path.iterdir()) == [report]
     assert report.read_bytes() == b"previous evidence"
+
+
+def test_cli_accepts_empty_directory(tmp_path, monkeypatch):
+    out = tmp_path / "empty"
+    out.mkdir()
+    monkeypatch.setattr(sys, "argv", ["winrate_acceptance.py", "--out", str(out)])
+
+    assert acceptance.main() == 0
+
+    assert (out / acceptance.MARKER_FILE).is_file()
+    assert (out / "case1-out" / "current.json").is_file()
+
+
+def test_cli_without_out_creates_and_prints_temporary_directory(tmp_path, monkeypatch, capsys):
+    original_mkdtemp = acceptance.tempfile.mkdtemp
+    monkeypatch.setattr(
+        acceptance.tempfile,
+        "mkdtemp",
+        lambda prefix: original_mkdtemp(prefix=prefix, dir=tmp_path),
+    )
+    monkeypatch.setattr(sys, "argv", ["winrate_acceptance.py"])
+
+    assert acceptance.main() == 0
+
+    prefix = "win-rate acceptance over "
+    printed_path = next(
+        line.removeprefix(prefix) for line in capsys.readouterr().out.splitlines() if line.startswith(prefix)
+    )
+    out = Path(printed_path)
+    assert out.parent == tmp_path
+    assert out.name.startswith("wq-winrate-acceptance-")
+    assert (out / acceptance.MARKER_FILE).is_file()
+    assert (out / "case1-out" / "current.json").is_file()
+
+
+def test_cli_reruns_marked_acceptance_directory(tmp_path, monkeypatch):
+    out = tmp_path / "acceptance"
+    out.mkdir()
+    (out / acceptance.MARKER_FILE).write_text("existing acceptance output\n", encoding="utf-8")
+    (out / "stale.txt").write_text("stale output", encoding="utf-8")
+    report = out / "evidence.json"
+    report.write_bytes(b"previous evidence")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["winrate_acceptance.py", "--out", str(out), "--report", str(report)],
+    )
+
+    assert acceptance.main() == 0
+
+    assert not (out / "stale.txt").exists()
+    assert (out / acceptance.MARKER_FILE).is_file()
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["cases"]["full"]["status"] == "pass"
+
+
+def test_cli_rejects_regular_file(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "ordinary-file"
+    out.write_bytes(b"do not delete")
+    monkeypatch.setattr(sys, "argv", ["winrate_acceptance.py", "--out", str(out)])
+
+    with pytest.raises(SystemExit) as refusal:
+        acceptance.main()
+
+    assert refusal.value.code == 2
+    assert str(out) in capsys.readouterr().err
+    assert out.read_bytes() == b"do not delete"

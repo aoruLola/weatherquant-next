@@ -21,12 +21,23 @@
 
 ## 2. 验收脚本与测试
 
-每次运行使用新的或空的输出目录。省略 `--out` 时，脚本创建独立的临时目录并打印路径。已有验收文件的目录会被保留。
+`--out` 的清理规则以标记文件 `.wq-winrate-acceptance` 为唯一删除许可：
+
+- 新目录或空目录可以使用，脚本会先写入标记，再写入本次验收输出。
+- 已存在且带标记的验收目录可以在清空后重跑；旧报告由本次输出替换。标记表示
+  整个目录都可替换，不要把它放入含有其他数据的目录。
+- 已存在且非空、没有标记的目录会被拒绝，退出码为 2，错误信息包含路径，原内容不变。
+- `--out` 指向普通文件时同样以退出码 2 拒绝，不删除或修改该文件。
+- 省略 `--out` 时，每次创建独立的临时目录，写入标记并打印路径。
 
 ```bash
 # 三案例端到端：零有效样本 / 不足阈值 / 完整样本（含两次运行的可复现性）
+# 固定目录首次运行时须为新/空目录；写入标记后，同一路径可安全重跑。
 uv run python scripts/winrate_acceptance.py --out /tmp/wq-winrate-acceptance \
     --report /tmp/wq-winrate-acceptance-evidence.json
+
+# 也可以省略 --out，让每次运行使用新的临时目录（路径会打印出来）。
+uv run python scripts/winrate_acceptance.py
 
 # 同一套案例进了单测，CI 会持续重跑
 uv run pytest tests/test_performance_winrate_acceptance.py -q
@@ -77,7 +88,8 @@ RESULT: PASSED（23/23 项）
 执行一次并留档：
 
 ```bash
-uv run python scripts/winrate_acceptance.py --out /tmp/wq-winrate-acceptance \
+# 省略 --out，每次使用独立临时目录并打印路径；报告路径另行指定。
+uv run python scripts/winrate_acceptance.py \
     --report /tmp/wq-winrate-acceptance-evidence.json   # 同一套合成案例在 NAS 上复跑
 
 # 对真实决策导出 + 真实结算索引的一次生产口径构建（只读导出目录，

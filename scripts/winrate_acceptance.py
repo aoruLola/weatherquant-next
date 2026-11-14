@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 import sys
 import tempfile
 from datetime import UTC, datetime, timedelta
@@ -47,6 +48,7 @@ T0 = datetime(2026, 10, 13, tzinfo=UTC)
 NOW = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
 
 INSUFFICIENT_REASON = "N/A — insufficient resolved independent samples"
+MARKER_FILE = ".wq-winrate-acceptance"
 
 #: Settlement scenarios cycled per (market, target_date). This table IS the
 #: ground truth: every expected count below is derived from it, never from
@@ -58,22 +60,52 @@ def scenario_settlement(scenario: str, market_id: str, target_date: str) -> dict
     """The settlement record a scenario publishes, or None for 'missing'."""
     fetched = NOW.isoformat()
     if scenario == "verified_win":
-        return {"market_id": market_id, "target_date": target_date, "settlement_status": "RESOLVED",
-                "resolved_outcome": 1.0, "verification_status": "VERIFIED", "fetched_at_utc": fetched}
+        return {
+            "market_id": market_id,
+            "target_date": target_date,
+            "settlement_status": "RESOLVED",
+            "resolved_outcome": 1.0,
+            "verification_status": "VERIFIED",
+            "fetched_at_utc": fetched,
+        }
     if scenario == "verified_loss":
-        return {"market_id": market_id, "target_date": target_date, "settlement_status": "RESOLVED",
-                "resolved_outcome": 0.0, "verification_status": "VERIFIED", "fetched_at_utc": fetched}
+        return {
+            "market_id": market_id,
+            "target_date": target_date,
+            "settlement_status": "RESOLVED",
+            "resolved_outcome": 0.0,
+            "verification_status": "VERIFIED",
+            "fetched_at_utc": fetched,
+        }
     if scenario == "pending":
-        return {"market_id": market_id, "target_date": target_date, "settlement_status": "PENDING",
-                "resolved_outcome": None, "verification_status": "UNVERIFIED", "fetched_at_utc": fetched}
+        return {
+            "market_id": market_id,
+            "target_date": target_date,
+            "settlement_status": "PENDING",
+            "resolved_outcome": None,
+            "verification_status": "UNVERIFIED",
+            "fetched_at_utc": fetched,
+        }
     if scenario == "disputed":
-        return {"market_id": market_id, "target_date": target_date, "settlement_status": "DISPUTED",
-                "resolved_outcome": None, "verification_status": "UNVERIFIED", "fetched_at_utc": fetched}
+        return {
+            "market_id": market_id,
+            "target_date": target_date,
+            "settlement_status": "DISPUTED",
+            "resolved_outcome": None,
+            "verification_status": "UNVERIFIED",
+            "fetched_at_utc": fetched,
+        }
     if scenario == "unverified":
         # Resolved on the platform, but the cross-check against observation
         # never happened - which is exactly what must NOT become a win.
-        return {"market_id": market_id, "target_date": target_date, "settlement_status": "RESOLVED",
-                "resolved_outcome": 1.0, "verification_status": "UNVERIFIED", "fetched_at_utc": fetched}
+        return {
+            "market_id": market_id,
+            "target_date": target_date,
+            "settlement_status": "RESOLVED",
+            "resolved_outcome": 1.0,
+            "verification_status": "UNVERIFIED",
+            "fetched_at_utc": fetched,
+        }
     return None
 
 
@@ -192,8 +224,12 @@ def expected_counts(history: History, settlements: list[dict]) -> dict[str, int]
         for s in settlements
     }
     tally = {
-        "WIN": 0, "LOSS": 0, "PENDING": 0,
-        "DISPUTED": 0, "UNVERIFIABLE": 0, "UNAVAILABLE": 0,
+        "WIN": 0,
+        "LOSS": 0,
+        "PENDING": 0,
+        "DISPUTED": 0,
+        "UNVERIFIABLE": 0,
+        "UNAVAILABLE": 0,
     }
     for episode in history.episodes:
         key = (episode["market_id"], episode["target_date"])
@@ -247,9 +283,7 @@ def run_engine(export: Path, out: Path, state_db: Path, settlements: list[dict])
     # The published layout is a generation directory switched in by the
     # current.json pointer - readers see one complete batch or the previous one.
     generation = json.loads((out / "current.json").read_text(encoding="utf-8"))["generation_id"]
-    payload = json.loads(
-        (out / "generations" / generation / "win-rate.json").read_text(encoding="utf-8")
-    )
+    payload = json.loads((out / "generations" / generation / "win-rate.json").read_text(encoding="utf-8"))
     return payload
 
 
@@ -272,7 +306,8 @@ def case_zero_valid_samples(root: Path, failures: list[str]) -> None:
     dates = [f"2026-10-{13 + i:02d}" for i in range(6)]
     for i in range(24):
         history.add_episode(
-            market_id=f"mz-{i}", target_date=dates[i % len(dates)],
+            market_id=f"mz-{i}",
+            target_date=dates[i % len(dates)],
             direction="sell_yes" if i % 5 == 0 else "buy_yes",
         )
     settlements = history.settlements(
@@ -346,8 +381,7 @@ def case_insufficient_samples(root: Path, failures: list[str]) -> None:
     )
     check(
         "the counts that exist are still accurate",
-        overall["counts"].get("WIN") == expected["WIN"]
-        and overall["counts"].get("LOSS") == expected["LOSS"],
+        overall["counts"].get("WIN") == expected["WIN"] and overall["counts"].get("LOSS") == expected["LOSS"],
         f"counts={overall['counts']} expected={expected}",
         failures,
     )
@@ -408,8 +442,7 @@ def case_full_samples(root: Path, failures: list[str]) -> dict:
     decisive = wins + losses
     check(
         "valid_samples counts episodes, not observations",
-        overall["valid_samples"] == decisive
-        and decisive < sum(e["n_observations"] for e in history.episodes),
+        overall["valid_samples"] == decisive and decisive < sum(e["n_observations"] for e in history.episodes),
         f"valid_samples={overall['valid_samples']} decisive={decisive} "
         f"observations={sum(e['n_observations'] for e in history.episodes)}",
         failures,
@@ -420,9 +453,12 @@ def case_full_samples(root: Path, failures: list[str]) -> dict:
         f"published={overall['win_rate']} expected={wins / decisive}",
         failures,
     )
-    decisive_dates = {e["target_date"] for e in history.episodes
-                      if scenario_map[(e["market_id"], e["target_date"])] in ("verified_win", "verified_loss")
-                      and e["direction"] != "sell_yes"}
+    decisive_dates = {
+        e["target_date"]
+        for e in history.episodes
+        if scenario_map[(e["market_id"], e["target_date"])] in ("verified_win", "verified_loss")
+        and e["direction"] != "sell_yes"
+    }
     check(
         "distinct markets and target dates are episode-level truths",
         overall["distinct_target_dates"] == len(decisive_dates),
@@ -431,8 +467,7 @@ def case_full_samples(root: Path, failures: list[str]) -> dict:
     )
     check(
         "interval is clustered by target date and says so",
-        overall["method"] == "cluster_bootstrap_by_target_date"
-        and overall["confidence_interval"] is not None,
+        overall["method"] == "cluster_bootstrap_by_target_date" and overall["confidence_interval"] is not None,
         f"method={overall['method']} ci={overall['confidence_interval']}",
         failures,
     )
@@ -440,8 +475,7 @@ def case_full_samples(root: Path, failures: list[str]) -> dict:
     wilson_low, wilson_high = _wilson(wins, decisive)
     check(
         "clustered interval is no narrower than the row-level Wilson one",
-        (high - low) >= (wilson_high - wilson_low) - 1e-9
-        and 0.0 <= low <= high <= 1.0,
+        (high - low) >= (wilson_high - wilson_low) - 1e-9 and 0.0 <= low <= high <= 1.0,
         f"clustered width={high - low:.4f} wilson width={wilson_high - wilson_low:.4f}",
         failures,
     )
@@ -450,9 +484,7 @@ def case_full_samples(root: Path, failures: list[str]) -> dict:
     by_date = payload_a["data"]["by_target_date"]
     sample_dates = sorted(decisive_dates)[:3]
     for date in sample_dates:
-        expected_for_date = expected_counts(
-            _filter_history(history, date), _filter_settlements(settlements, date)
-        )
+        expected_for_date = expected_counts(_filter_history(history, date), _filter_settlements(settlements, date))
         group = by_date.get(date)
         check(
             f"by_target_date[{date}] matches the ground truth",
@@ -509,15 +541,25 @@ def _filter_settlements(settlements: list[dict], date: str) -> list[dict]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", type=Path, help="new or empty output directory (default: a fresh temporary directory)")
-    parser.add_argument("--report", type=Path, default=None,
-                        help="write machine-readable evidence to this JSON file")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        help="new, empty, or marked acceptance output directory (default: a fresh temporary directory)",
+    )
+    parser.add_argument("--report", type=Path, default=None, help="write machine-readable evidence to this JSON file")
     args = parser.parse_args()
 
     root = args.out.resolve() if args.out else Path(tempfile.mkdtemp(prefix="wq-winrate-acceptance-"))
-    if root.exists() and (not root.is_dir() or any(root.iterdir())):
-        parser.error(f"--out must be a new or empty directory: {root}")
+    marker = root / MARKER_FILE
+    if root.exists():
+        if not root.is_dir():
+            parser.error(f"--out must be a directory, not an existing file: {root}")
+        if marker.is_file():
+            shutil.rmtree(root)
+        elif any(root.iterdir()):
+            parser.error(f"--out must be a new or empty directory, or contain {MARKER_FILE}: {root}")
     root.mkdir(parents=True, exist_ok=True)
+    marker.write_text("WQN-35 win-rate acceptance output; safe to replace on rerun.\n", encoding="utf-8")
 
     failures: list[str] = []
     print(f"win-rate acceptance over {root}")
