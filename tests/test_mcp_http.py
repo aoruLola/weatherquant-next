@@ -619,3 +619,120 @@ def test_a_non_loopback_bind_without_a_token_never_starts_serving(monkeypatch) -
 
     with pytest.raises(ValueError, match="token"):
         main(["--transport", "streamable-http", "--host", "0.0.0.0", "--port", "18799"])
+
+
+# --- WQN-50: invalid arguments and unknown tools over the real socket ---------
+#
+# The Jira acceptance lists these as negative cases in their own right: a
+# caller that invents a tool, or hands a real one a traversal string, must get
+# an explicit refusal - not a JSON-RPC traceback and not a fetch.
+
+
+def _tool_content(response: httpx.Response) -> dict:
+    payload = _rpc_json(response)
+    return _json.loads(payload["result"]["content"][0]["text"])
+
+
+def test_an_invalid_market_id_is_rejected_before_any_fetch(server_env) -> None:
+    """A traversal-shaped id is refused by the tool, with nothing fetched."""
+    upstream = server_env["upstream"]
+    before = upstream.count
+
+    response = _tool_call(
+        server_env["base"], name="get_market_detail", arguments={"market_id": "../../etc/passwd"}
+    )
+    assert response.status_code in (200, 202), response.text
+
+    content = _tool_content(response)
+    assert content["data"] is None, "an invalid id must not be answered with data"
+    assert "not a valid identifier" in content["error"], content
+    assert any("arguments rejected" in w for w in content["warnings"]), content["warnings"]
+    assert upstream.count == before, "a rejected argument reached the dashboard"
+
+
+def test_an_out_of_range_argument_is_rejected(server_env) -> None:
+    upstream = server_env["upstream"]
+    before = upstream.count
+
+    response = _tool_call(
+        server_env["base"], name="simulate_reference_capital", arguments={"capital_usdc": -1}
+    )
+    assert response.status_code in (200, 202), response.text
+
+    content = _tool_content(response)
+    assert content["data"] is None
+    assert "capital_usdc" in content["error"], content
+    assert upstream.count == before
+
+
+def test_an_argument_of_the_wrong_type_is_refused_by_the_schema(server_env) -> None:
+    """Pydantic rejects the call before the tool body runs; upstream stays quiet."""
+    upstream = server_env["upstream"]
+    before = upstream.count
+
+    response = _tool_call(server_env["base"], name="list_markets", arguments={"limit": "all"})
+    assert response.status_code in (200, 202), response.text
+
+    payload = _rpc_json(response)
+    assert payload["result"].get("isError") is True, payload
+    assert "validation error" in payload["result"]["content"][0]["text"].lower()
+    assert upstream.count == before
+
+
+def test_an_unknown_tool_is_refused_without_touching_the_dashboard(server_env) -> None:
+    """The registry is the whole surface: a name outside it does not exist."""
+    upstream = server_env["upstream"]
+    before = upstream.count
+
+    for name in ("place_order", "execute_trade", "withdraw_funds"):
+        response = _tool_call(server_env["base"], name=name, arguments={"market_id": "1"})
+        assert response.status_code in (200, 202), response.text
+        payload = _rpc_json(response)
+        assert payload["result"].get("isError") is True, f"{name}: {payload}"
+        assert "Unknown tool" in payload["result"]["content"][0]["text"], payload
+
+    assert upstream.count == before, "an unknown tool reached the dashboard"
+
+
+def _raw_post_status(port: int, authorization: bytes) -> int:
+    """Send a request over a bare socket, so the header can carry raw bytes.
+
+    ``httpx`` refuses to encode a non-ASCII header value, but a hostile client
+    is not obliged to use ``httpx``: HTTP header values are bytes on the wire.
+    """
+    body = b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+    request = b"\r\n".join(
+        [
+            b"POST /mcp HTTP/1.1",
+            f"Host: 127.0.0.1:{port}".encode(),
+            b"Content-Type: application/json",
+            b"Content-Length: " + str(len(body)).encode(),
+            b"Connection: close",
+            b"Authorization: " + authorization,
+            b"",
+            body,
+        ]
+    )
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+        sock.sendall(request)
+        head = b""
+        while b"\r\n" not in head:
+            chunk = sock.recv(1024)
+            if not chunk:
+                break
+            head += chunk
+    return int(head.split(b"\r\n", 1)[0].split()[1])
+
+
+def test_a_non_ascii_bearer_is_refused_rather_than_crashing(server_env) -> None:
+    """A malformed credential is a 401, never a 500.
+
+    ``hmac.compare_digest`` raises TypeError for non-ASCII str inputs, so the
+    token check used to turn a header of arbitrary bytes into an unhandled
+    server error. The comparison is on encoded bytes now, and the answer is
+    the same one every other bad token gets.
+    """
+    status = _raw_post_status(server_env["port"], b"Bearer \xe5\xaf\x86\xe7\xa0\x81")
+
+    assert status == 401
+    assert server_env["upstream"].count == 0
