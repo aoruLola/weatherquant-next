@@ -70,8 +70,7 @@ def test_a_shadow_shaped_source_reports_a_decision_watermark(tmp_path: Path) -> 
     """
     from weatherquant.storage import initialize_shadow
 
-    # Outside --work on purpose: the drill clears its work directory, and a
-    # source inside it would be deleted before the drill ever opened it.
+    # Keep the input copy separate from the new work directory.
     source = tmp_path / "shadow.duckdb"
     con, _applied = initialize_shadow(source)
     con.execute(
@@ -192,10 +191,7 @@ def test_a_corrupt_source_fails_the_restore_stage_itself(tmp_path: Path) -> None
     """The acceptance's fault injection, asserted at the ledger level: an
     unreadable source must fail the restore stage with its evidence - not
     surface as a pass on restore plus a vague 'drill' stage."""
-    # A real database synthesized outside any drill work dir (the drill
-    # clears its work dir at start), then a 4096-byte block overwritten at
-    # the halfway point of the file - the exact shape the acceptance
-    # injected.
+    # Synthesize a real database, then truncate a separate copy.
     drill = _load_drill()
     source = tmp_path / "plain.duckdb"
     source.parent.mkdir(parents=True, exist_ok=True)
@@ -252,3 +248,58 @@ def test_default_lifecycle_ledger_survives_successful_cleanup_and_repeated_runs(
         assert drill.main() == 0
         assert not work.exists()
     assert len(ledger.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_drill_refuses_existing_work_directory(tmp_path):
+    existing = tmp_path / "existing.duckdb"
+    existing.write_bytes(b"keep")
+    code, output, _ = _run_drill(tmp_path)
+    assert code == 2
+    assert "--work must be a new directory" in output
+    assert existing.read_bytes() == b"keep"
+
+
+def test_required_slow_io_cannot_pass_with_a_skipped_stage(tmp_path, monkeypatch):
+    drill = _load_drill()
+    ledger = tmp_path / "ledger.jsonl"
+    work = tmp_path / "work"
+    def synthesize(path):
+        path.write_bytes(b"fixture")
+        return {}
+
+    monkeypatch.setattr(drill, "synthesize_source", synthesize)
+    monkeypatch.setattr(drill, "stage_restore", lambda report, work, source: (source, {}, {}))
+    for name in ("stage_backup_cycle", "stage_clean_shutdown", "stage_wal_recovery", "stage_incomplete_files"):
+        monkeypatch.setattr(drill, name, lambda *args: None)
+
+    def skip(report, work, source):
+        report.stage("slow_io").status = "skip"
+
+    monkeypatch.setattr(drill, "stage_slow_io", skip)
+    monkeypatch.setattr(sys, "argv", ["drill", "--work", str(work), "--ledger", str(ledger), "--require-slow-io"])
+    assert drill.main() == 1
+    entry = _ledger_entry(work, ledger)
+    assert entry["verdict"] == "FAILED"
+    assert entry["stages"][0]["status"] == "skip"
+
+
+def test_chain_rejects_changed_audit_rows(tmp_path, monkeypatch):
+    import duckdb
+
+    drill = _load_drill()
+    source = tmp_path / "source.duckdb"
+    drill.synthesize_source(source, batches=0)
+    copy = drill.child_restore
+
+    def change_audit_row(src, dest):
+        copy(src, dest)
+        with duckdb.connect(str(dest)) as con:
+            con.execute("UPDATE collector_runs SET hostname='changed after copying'")
+
+    monkeypatch.setattr(drill, "child_restore", change_audit_row)
+    monkeypatch.setattr(drill, "_synthetic_prices", lambda *args: [])
+    monkeypatch.setattr(drill, "_synthetic_books", lambda *args: [])
+    report = drill.DrillReport(drill_id="audit", started_at=datetime.now(tz=UTC))
+    drill.stage_backup_cycle(report, tmp_path, source)
+    assert report.stages[0].status == "fail"
+    assert "collector_runs" in report.stages[0].detail
