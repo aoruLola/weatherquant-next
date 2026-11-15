@@ -26,7 +26,7 @@ def reports(tmp_path, monkeypatch, soak):
     collection = soak.PhaseReport("collection", duration_s=20, samples=samples)
     backup = soak.PhaseReport("backup", samples=[soak.Sample(1, 100, 110, 0, 0, "backup", 1, 1)])
     gates = {"collection_seconds": 20, "max_rss_mb": 3072, "max_slope_mb_per_min": 8, "max_psi_full": 2}
-    return collection, backup, {"verified": True, "hwm_mb": 110}, tmp_path, gates
+    return collection, backup, {"verified": True, "bytes": 1024, "hwm_mb": 110}, tmp_path, gates
 
 
 def test_clean_collection_and_verified_backup_pass(soak, reports):
@@ -137,3 +137,135 @@ def test_samples_pressure_during_backup(soak, tmp_path, monkeypatch):
     report, summary = soak.run_backup_cycle(tmp_path / "weatherquant.duckdb", tmp_path, 1, 2)
     assert summary["verified"]
     assert report.peak_psi_full() == 3
+
+
+# ---------------------------------------------------------------------------
+# End to end through main(): the exit code and the report agree, and the
+# message names the gate that was crossed. The collection/backup phases are
+# injected, so no real collection runs and no memory is stressed.
+# ---------------------------------------------------------------------------
+
+
+def _run_cli(soak, tmp_path, monkeypatch, *, collection, backup, summary, extra=()):
+    data = tmp_path / "soak"
+
+    def fake_collection(data_dir, minutes, interval):
+        (data_dir / "weatherquant.duckdb").write_bytes(b"")
+        return collection
+
+    def fake_backup_cycle(db_path, data_dir, batches, rows, *, flush_rows=500):
+        return backup, summary
+
+    monkeypatch.setattr(soak, "run_collection", fake_collection)
+    monkeypatch.setattr(soak, "run_backup_cycle", fake_backup_cycle)
+    monkeypatch.setattr(soak, "read_psi", lambda: (0.0, 0.0))
+    monkeypatch.setattr(
+        soak,
+        "read_heartbeat",
+        lambda path: {"status": "stopped", "stats": {"books_rows_inserted": 1, "price_points_inserted": 1}},
+    )
+    monkeypatch.setattr(
+        "weatherquant.data.heartbeat.evaluate_health",
+        lambda path: SimpleNamespace(status=SimpleNamespace(value="stopped"), exit_code=0),
+    )
+    monkeypatch.setattr(sys, "argv", ["soak", "--data", str(data), "--minutes", "1", *extra])
+    return soak.main(), data
+
+
+def _clean_reports(soak, *, rss=100.0, hwm=100.0):
+    samples = [
+        soak.Sample(at=i * 3.0, rss_mb=rss, hwm_mb=hwm, psi_some=0.0, psi_full=0.0, status="healthy", books=1, prices=1)
+        for i in range(20)
+    ]
+    collection = soak.PhaseReport("collection", duration_s=60.0, samples=samples)
+    backup = soak.PhaseReport("backup", samples=[soak.Sample(0, rss, hwm, 0.0, 0.0, "backup", 1, 1)])
+    return collection, backup
+
+
+def test_cli_passes_when_the_peak_equals_the_gate(soak, tmp_path, monkeypatch, capsys):
+    collection, backup = _clean_reports(soak, rss=100.0, hwm=100.0)
+    summary = {"verified": True, "bytes": 1024, "hwm_mb": 100.0}
+    code, _ = _run_cli(
+        soak,
+        tmp_path,
+        monkeypatch,
+        collection=collection,
+        backup=backup,
+        summary=summary,
+        extra=["--max-rss-mb", "100"],
+    )
+    assert code == 0
+    assert "RESULT: PASSED" in capsys.readouterr().out
+
+
+def test_cli_fails_above_the_rss_gate_and_names_it(soak, tmp_path, monkeypatch, capsys):
+    collection, backup = _clean_reports(soak, rss=101.0, hwm=101.0)
+    summary = {"verified": True, "bytes": 1024, "hwm_mb": 101.0}
+    code, _ = _run_cli(
+        soak,
+        tmp_path,
+        monkeypatch,
+        collection=collection,
+        backup=backup,
+        summary=summary,
+        extra=["--max-rss-mb", "100"],
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "RESULT: FAILED" in out
+    assert "peak RSS 101 MiB above the gate 100.0 MiB" in out
+
+
+def test_cli_fails_when_the_memory_samples_are_empty(soak, tmp_path, monkeypatch, capsys):
+    collection = soak.PhaseReport("collection", duration_s=60.0, samples=[])
+    backup = soak.PhaseReport("backup", samples=[])
+    code, _ = _run_cli(
+        soak,
+        tmp_path,
+        monkeypatch,
+        collection=collection,
+        backup=backup,
+        summary={"verified": True, "bytes": 1024, "hwm_mb": 0.0},
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "fewer than ten second-half samples" in out
+    assert "missing process RSS measurement" in out
+
+
+def test_cli_fails_when_the_backup_metrics_are_missing(soak, tmp_path, monkeypatch, capsys):
+    collection, backup = _clean_reports(soak)
+    backup.samples = []
+    code, _ = _run_cli(soak, tmp_path, monkeypatch, collection=collection, backup=backup, summary={})
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "missing process RSS measurement" in out
+    assert "backup did not verify" in out
+
+
+def test_cli_fails_when_a_verified_backup_wrote_no_bytes(soak, tmp_path, monkeypatch, capsys):
+    collection, backup = _clean_reports(soak)
+    code, _ = _run_cli(
+        soak,
+        tmp_path,
+        monkeypatch,
+        collection=collection,
+        backup=backup,
+        summary={"verified": True, "bytes": 0, "hwm_mb": 100.0},
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "wrote zero bytes" in out
+
+
+def test_cli_refuses_the_production_data_directory(soak, tmp_path, monkeypatch, capsys):
+    production = tmp_path / "data"
+    monkeypatch.setattr(soak, "PRODUCTION_DATA_DIR", production)
+    monkeypatch.delenv("WQ_DB_PATH", raising=False)
+    monkeypatch.setattr(soak, "read_psi", lambda: (0.0, 0.0))
+    monkeypatch.setattr(sys, "argv", ["soak", "--data", str(production / "soak")])
+    with pytest.raises(SystemExit) as exc:
+        soak.main()
+    assert exc.value.code == 2
+    assert "production data directory" in capsys.readouterr().err
+    assert not production.exists()

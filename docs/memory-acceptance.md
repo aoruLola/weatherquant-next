@@ -61,6 +61,10 @@
 
 ### 验收命令（两台机器上各自运行）
 
+两条脚本都只写 `--data` 指向的**新建**目录：路径已存在、或落在仓库的
+`data/`（以及 `WQ_DB_PATH` 所在目录）之下都会被直接拒绝并返回 2，因此
+默认配置下不可能指向生产库。
+
 ```bash
 # 内核级 OOM：cgroup memory.max=1GB，子进程增长直到被内核杀死，
 # 然后验证已提交前缀完整、WAL 重放、重启续写
@@ -74,6 +78,11 @@ uv run python scripts/soak_memory.py --minutes 30 --data /tmp/wq-mem-soak
 uv run pytest -q tests/test_storage_memory_budget.py tests/test_storage_memory_gate.py \
   tests/test_oom_recovery_accept.py tests/test_soak_memory_backup_gate.py
 ```
+
+**判定口径**：峰值 RSS、RSS 斜率、PSI full 三项都是"**大于**门槛才失败"
+（恰好等于门槛通过）；采样为空、第二半段样本不足 10 个、RSS 读数为 0、
+备份未通过读回校验或写入 0 字节，一律判失败而不是跳过。失败时退出码为
+1，报告逐条列出超限项（例如 `peak RSS 3200 MiB above the gate 3072 MiB`）。
 
 （本机运行输出粘贴在 PR 描述；两条脚本都是**测量后判定**，不预设结论。）
 

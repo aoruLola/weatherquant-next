@@ -59,6 +59,37 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 
+#: The repository's production data directory. A soak may never write here:
+#: the run creates a private directory and touches nothing else.
+PRODUCTION_DATA_DIR = PROJECT_ROOT / "data"
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _isolation_refusal(data_dir: Path) -> str | None:
+    """Why ``data_dir`` is not an isolated soak location, or None when it is.
+
+    Same two guards as the OOM drill: never the production data directory (or
+    the directory holding ``WQ_DB_PATH``), and never a directory that already
+    exists - a soak creates its own and must not delete someone else's.
+    """
+    configured = os.environ.get("WQ_DB_PATH")
+    guarded = {PRODUCTION_DATA_DIR.resolve()}
+    if configured:
+        guarded.add(Path(configured).expanduser().resolve().parent)
+    for root in guarded:
+        if _is_within(data_dir, root):
+            return f"--data {data_dir} is inside the production data directory {root}"
+    if data_dir.exists():
+        return f"--data {data_dir} already exists; a soak only writes to a new directory"
+    return None
+
 
 @dataclass
 class Sample:
@@ -477,6 +508,8 @@ def _report(
         )
     if not backup_summary.get("verified"):
         failures.append(f"backup did not verify: {backup_summary.get('error')}")
+    elif not backup_summary.get("bytes"):
+        failures.append("backup verified but wrote zero bytes: there is nothing to read back")
 
     backup_peak = max(backup.peak_rss(), float(backup_summary.get("hwm_mb") or 0.0))
     if backup_peak > float(gates["max_rss_mb"]):
@@ -537,7 +570,9 @@ def main() -> int:
         help="writer flush threshold for the backup-cycle phase; 500 is production cadence, raise it for fewer commits",
     )
     parser.add_argument("--keep", action="store_true")
-    parser.add_argument("--acceptance", action="store_true", help="require a 12h run in a 6 GiB, zero-swap cgroup v2 container")
+    parser.add_argument(
+        "--acceptance", action="store_true", help="require a 12h run in a 6 GiB, zero-swap cgroup v2 container"
+    )
     args = parser.parse_args()
 
     if not (args.minutes > 0 and args.interval > 0 and args.backup_batches > 0 and args.flush_rows > 0):
@@ -564,10 +599,10 @@ def main() -> int:
     except (OSError, ValueError) as exc:
         parser.error(f"host memory PSI is required: {exc}")
     data_dir = args.data.resolve()
-    try:
-        data_dir.mkdir(parents=True)
-    except FileExistsError:
-        parser.error("--data must be a new directory reserved for this soak")
+    refusal = _isolation_refusal(data_dir)
+    if refusal:
+        parser.error(refusal)
+    data_dir.mkdir(parents=True)
 
     print(f"memory soak: {args.minutes:.0f} min collection over {data_dir}")
     print(

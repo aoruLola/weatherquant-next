@@ -55,6 +55,42 @@ CGROUP_ROOT = Path("/sys/fs/cgroup")
 #: before the writer even opens the database, which would prove nothing.
 MIN_MEMORY_BYTES = 512 * 1024 * 1024
 
+#: The repository's production data directory. A drill may never write here,
+#: even when a checkout happens to have no data yet: the whole point is that a
+#: production path is impossible by construction, not merely unlikely.
+PRODUCTION_DATA_DIR = PROJECT_ROOT / "data"
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _isolation_refusal(data_dir: Path) -> str | None:
+    """Why ``data_dir`` is not an isolated drill location, or None when it is.
+
+    Two guards, both cheap and both checked before anything is created:
+
+    * the path must not be the production data directory (or inside it, or the
+      directory holding ``WQ_DB_PATH``) - a typo must not point a drill at the
+      collector's real database;
+    * the path must not already exist - a drill only ever creates its own
+      private directory, never reuses (and never deletes) someone else's.
+    """
+    configured = os.environ.get("WQ_DB_PATH")
+    guarded = {PRODUCTION_DATA_DIR.resolve()}
+    if configured:
+        guarded.add(Path(configured).expanduser().resolve().parent)
+    for root in guarded:
+        if _is_within(data_dir, root):
+            return f"--data {data_dir} is inside the production data directory {root}"
+    if data_dir.exists():
+        return f"--data {data_dir} already exists; a drill only writes to a new directory"
+    return None
+
 
 def _parse_size(text: str) -> int:
     """'1GB' / '512MB' / '268435456' -> bytes."""
@@ -111,10 +147,7 @@ def run_child(data_dir: Path, row_bytes: int, rows_per_batch: int, *, resume_onc
     # Every commit stays in the WAL, so the kill is guaranteed to leave
     # un-checkpointed commits behind and the replay check has teeth.
     con.execute("SET checkpoint_threshold='1TB'")
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS oom_batches ("
-        "batch_id INTEGER, seq INTEGER, payload VARCHAR)"
-    )
+    con.execute("CREATE TABLE IF NOT EXISTS oom_batches (batch_id INTEGER, seq INTEGER, payload VARCHAR)")
 
     start_id = int(con.execute("SELECT COALESCE(MAX(batch_id), 0) FROM oom_batches").fetchone()[0])
     print(f"child: starting at batch {start_id + 1}", flush=True)
@@ -301,10 +334,10 @@ def main() -> int:
     if args.rows_per_batch <= 0 or args.row_bytes <= 0 or args.timeout <= 0:
         parser.error("batch size, row bytes and timeout must be positive")
     data_dir = args.data.resolve()
-    try:
-        data_dir.mkdir(parents=True)
-    except FileExistsError:
-        parser.error("--data must be a new directory reserved for this drill")
+    refusal = _isolation_refusal(data_dir)
+    if refusal:
+        parser.error(refusal)
+    data_dir.mkdir(parents=True)
     failures: list[str] = []
     print(f"oom acceptance: memory.max={args.memory_max} over {data_dir}")
 
@@ -343,7 +376,11 @@ def main() -> int:
             return 1
 
         # --- recovery: reopen and verify the committed prefix --------------
-        max_id, rows, journal = _db_state(data_dir / "weatherquant.duckdb", args.rows_per_batch)
+        try:
+            max_id, rows, journal = _db_state(data_dir / "weatherquant.duckdb", args.rows_per_batch)
+        except ValueError as exc:
+            print(f"RESULT: FAILED - {exc}")
+            return 1
         journalled = len(journal)
         print(f"  recovered:     max batch={max_id}, rows={rows}, journalled={journalled}")
         if journal != list(range(1, journalled + 1)) or not 1 <= journalled <= max_id <= journalled + 1:
@@ -359,10 +396,7 @@ def main() -> int:
         con.execute("CHECKPOINT")
         con.close()
         wal_after = wal.stat().st_size if wal.exists() else 0
-        print(
-            f"  wal replay:    {wal_bytes / 1024:.0f} KiB -> {wal_after / 1024:.0f} KiB "
-            "after checkpoint"
-        )
+        print(f"  wal replay:    {wal_bytes / 1024:.0f} KiB -> {wal_after / 1024:.0f} KiB after checkpoint")
         if wal_after != 0:
             failures.append("WAL was not fully folded into the database after checkpoint")
 
@@ -372,7 +406,11 @@ def main() -> int:
         if not finished or child.returncode != 0:
             _dump_tail(child)
             failures.append(f"the budgeted restart did not finish cleanly: {note}")
-        max_after, rows_after, journal_after = _db_state(data_dir / "weatherquant.duckdb", args.rows_per_batch)
+        try:
+            max_after, rows_after, journal_after = _db_state(data_dir / "weatherquant.duckdb", args.rows_per_batch)
+        except ValueError as exc:
+            print(f"RESULT: FAILED - {exc}")
+            return 1
         gained = max_after - max_id
         print(f"  restart:       batches {max_id} -> {max_after} (+{gained}), rows={rows_after}")
         if gained != 1:
