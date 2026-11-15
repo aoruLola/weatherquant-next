@@ -73,8 +73,9 @@ class FakeHttp:
         self.calls: list[str] = []
         self.request_options: list[dict] = []
 
-    def get_json(self, url: str, *, params: Any = None, limiter: str | None = None,
-                 allow_not_found: bool = False, **options: Any) -> Any:
+    def get_json(
+        self, url: str, *, params: Any = None, limiter: str | None = None, allow_not_found: bool = False, **options: Any
+    ) -> Any:
         # `options` carries the per-call timeout/retries the sweep passes down.
         # Kept so a test can assert what the budget actually handed the client,
         # rather than only that the client was called.
@@ -128,9 +129,7 @@ def _run(settings: Settings, monkeypatch: pytest.MonkeyPatch, **kwargs: Any) -> 
     return worker.run(), worker
 
 
-def test_a_full_cycle_collects_and_shuts_down_cleanly(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_full_cycle_collects_and_shuts_down_cleanly(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     code, worker = _run(settings, monkeypatch)
     assert code == ExitCode.OK, "a clean run must exit 0"
     assert worker.run_id == "test-run-1"
@@ -146,20 +145,18 @@ def test_a_full_cycle_collects_and_shuts_down_cleanly(
 
         # The run must be recorded as stopped with a reason, not left "running".
         status, reason, stopped_at = con.execute(
-            "SELECT status, stop_reason, stopped_at_utc FROM collector_runs "
-            "WHERE run_id='test-run-1'"
+            "SELECT status, stop_reason, stopped_at_utc FROM collector_runs WHERE run_id='test-run-1'"
         ).fetchone()
         assert status == "stopped"
         assert reason, "a stopped run must record why it stopped"
         assert stopped_at is not None
 
-        # Startup covers the time until collection resumes.
+        # A first start has no prior run to measure an interruption from, so it
+        # must not invent a collection gap.
         gaps = con.execute(
             "SELECT reason, started_at_utc, ended_at_utc FROM collection_gaps ORDER BY detected_at_utc"
         ).fetchall()
-        assert gaps, "a run must record its own collection gap"
-        assert any(g[0] == "start_after_restart" for g in gaps)
-        assert all(g[2] is not None for g in gaps), "a clean shutdown must close every gap"
+        assert gaps == [], "a first run has no prior interruption to date"
     finally:
         con.close()
 
@@ -169,9 +166,7 @@ def test_a_full_cycle_collects_and_shuts_down_cleanly(
     assert any(p.name for p in raw_files)
 
 
-def test_the_final_heartbeat_reports_the_runs_achievements(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_the_final_heartbeat_reports_the_runs_achievements(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     code, _ = _run(settings, monkeypatch)
     assert code == ExitCode.OK
 
@@ -179,9 +174,7 @@ def test_the_final_heartbeat_reports_the_runs_achievements(
     assert heartbeat is not None
     assert str(heartbeat.status) == "stopped"
     # Contact bookkeeping must survive the shutdown, where http is already closed.
-    assert heartbeat.last_upstream_contact_utc is not None, (
-        "the final heartbeat must not zero the contact clock"
-    )
+    assert heartbeat.last_upstream_contact_utc is not None, "the final heartbeat must not zero the contact clock"
     assert heartbeat.stats.rest_requests_ok > 0
     assert heartbeat.stats.books_rows_inserted >= 1
     assert heartbeat.stats.archive_records >= 1
@@ -199,9 +192,7 @@ def test_health_probe_passes_after_a_clean_shutdown(settings: Settings, monkeypa
     assert verdict.status.value == "stopped"
 
 
-def test_an_existing_database_is_reopened_not_recreated(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_an_existing_database_is_reopened_not_recreated(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     """Spec: restart / upgrade / recreate must never wipe historical data."""
     code, _ = _run(settings, monkeypatch)
     assert code == ExitCode.OK
@@ -238,9 +229,7 @@ def test_an_existing_database_is_reopened_not_recreated(
         assert versions_after == versions_before, "restarting must not re-migrate"
         # Both runs are recorded, and no gap is left open.
         assert con.execute("SELECT COUNT(*) FROM collector_runs").fetchone()[0] == 2
-        open_gaps = con.execute(
-            "SELECT COUNT(*) FROM collection_gaps WHERE ended_at_utc IS NULL"
-        ).fetchone()[0]
+        open_gaps = con.execute("SELECT COUNT(*) FROM collection_gaps WHERE ended_at_utc IS NULL").fetchone()[0]
         assert open_gaps == 0, "every gap must be closed by a clean shutdown"
     finally:
         con.close()
@@ -263,9 +252,7 @@ def test_a_previously_crashed_run_has_its_gap_closed_on_next_start(
     w._con = None
 
     con = connect(settings.db_path, read_only=True)
-    open_before = con.execute(
-        "SELECT COUNT(*) FROM collection_gaps WHERE ended_at_utc IS NULL"
-    ).fetchone()[0]
+    open_before = con.execute("SELECT COUNT(*) FROM collection_gaps WHERE ended_at_utc IS NULL").fetchone()[0]
     con.close()
     assert open_before == 1
 
@@ -274,9 +261,7 @@ def test_a_previously_crashed_run_has_its_gap_closed_on_next_start(
 
     con = connect(settings.db_path, read_only=True)
     try:
-        still_open = con.execute(
-            "SELECT COUNT(*) FROM collection_gaps WHERE ended_at_utc IS NULL"
-        ).fetchone()[0]
+        still_open = con.execute("SELECT COUNT(*) FROM collection_gaps WHERE ended_at_utc IS NULL").fetchone()[0]
         assert still_open == 0, "the next start must close the crashed run's gap"
         assert con.execute("SELECT run_id, detail FROM collection_gaps").fetchall() == [
             ("crashed-run", "crashed; contact resumed in test-run-1")
@@ -290,15 +275,11 @@ def test_a_second_instance_is_refused_rather_than_double_writing(
 ) -> None:
     from weatherquant.data.lock import SingleInstanceLock
 
-    lock = SingleInstanceLock(
-        settings.db_path.parent / ".collector.lock", run_id="other", hostname="other-host"
-    )
+    lock = SingleInstanceLock(settings.db_path.parent / ".collector.lock", run_id="other", hostname="other-host")
     lock.acquire()
     try:
         monkeypatch.setattr(worker_module, "ResilientHttp", FakeHttp)
-        worker = CollectorWorker(
-            settings, run_id="test-run-1", stream_enabled=False, once=True
-        )
+        worker = CollectorWorker(settings, run_id="test-run-1", stream_enabled=False, once=True)
         code = worker.run()
         assert code == ExitCode.LOCK_HELD, "a second writer must be refused with exit 4"
         # The refusal must be visible to the health probe, not just the log.
@@ -312,9 +293,7 @@ def test_a_second_instance_is_refused_rather_than_double_writing(
         lock.release()
 
 
-def test_integrity_and_disk_checks_run_and_record_findings(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_integrity_and_disk_checks_run_and_record_findings(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     """The integrity pass must actually execute during a cycle."""
     code, worker = _run(settings, monkeypatch)
     assert code == ExitCode.OK
@@ -326,9 +305,7 @@ def test_integrity_and_disk_checks_run_and_record_findings(
         # An integrity run happens even when nothing is wrong; the absence of
         # error events is the assertion. A disk event may legitimately appear on
         # a small CI volume, so only assert that nothing *critical* was recorded.
-        critical = con.execute(
-            "SELECT COUNT(*) FROM collector_events WHERE level = 'critical'"
-        ).fetchone()[0]
+        critical = con.execute("SELECT COUNT(*) FROM collector_events WHERE level = 'critical'").fetchone()[0]
         assert critical == 0, "no critical event should appear on a healthy run"
     finally:
         con.close()
@@ -355,8 +332,7 @@ def test_book_rows_carry_full_provenance(settings: Settings, monkeypatch: pytest
     con = connect(settings.db_path, read_only=True)
     try:
         rows = con.execute(
-            "SELECT source, venue_ts_origin, venue_ts, fetched_at_utc, run_id, content_hash "
-            "FROM order_books"
+            "SELECT source, venue_ts_origin, venue_ts, fetched_at_utc, run_id, content_hash FROM order_books"
         ).fetchall()
         assert rows
         for source, origin, venue_ts, fetched_at, run_id, content_hash in rows:
@@ -374,9 +350,7 @@ def test_book_rows_carry_full_provenance(settings: Settings, monkeypatch: pytest
         con.close()
 
 
-def test_a_cycle_is_idempotent_for_unchanged_books(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_cycle_is_idempotent_for_unchanged_books(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     """Polling the same book repeatedly must dedupe, not accumulate."""
     code, _ = _run(settings, monkeypatch)
     assert code == ExitCode.OK
@@ -385,9 +359,7 @@ def test_a_cycle_is_idempotent_for_unchanged_books(
 
     con = connect(settings.db_path, read_only=True)
     try:
-        rows = con.execute(
-            "SELECT COUNT(*), COUNT(DISTINCT content_hash) FROM order_books"
-        ).fetchone()
+        rows = con.execute("SELECT COUNT(*), COUNT(DISTINCT content_hash) FROM order_books").fetchone()
         assert rows[0] == rows[1], "duplicate content hashes would mean dedup failed"
     finally:
         con.close()
@@ -447,13 +419,9 @@ def test_a_mismatch_is_recorded_as_a_collector_event(settings: Settings) -> None
     writer.open()
     try:
         worker._writer = writer
-        worker._event(
-            "warning", "ws_rest_mismatch", "test", {"x": 1}
-        )
+        worker._event("warning", "ws_rest_mismatch", "test", {"x": 1})
         writer.flush(force=True)
-        row = writer.con.execute(
-            "SELECT kind, level FROM collector_events ORDER BY event_id DESC LIMIT 1"
-        ).fetchone()
+        row = writer.con.execute("SELECT kind, level FROM collector_events ORDER BY event_id DESC LIMIT 1").fetchone()
         assert row == ("ws_rest_mismatch", "warning")
     finally:
         writer.close()
@@ -479,9 +447,9 @@ def test_mismatch_notes_are_rate_limited(settings: Settings) -> None:
         # ...but only one note lands (the very first), because the rate limiter
         # had just been armed by the default epoch.
         writer.flush(force=True)
-        notes = writer.con.execute(
-            "SELECT COUNT(*) FROM collector_events WHERE kind = 'ws_rest_mismatch'"
-        ).fetchone()[0]
+        notes = writer.con.execute("SELECT COUNT(*) FROM collector_events WHERE kind = 'ws_rest_mismatch'").fetchone()[
+            0
+        ]
         assert notes <= 1, notes
     finally:
         worker._writer = None
@@ -547,8 +515,16 @@ def _event_row() -> tuple:
     from datetime import date as _date
 
     return (
-        "evt-b", "slug", "title", _date(2026, 10, 11), "NWS", "rules",
-        datetime.now(tz=UTC), "{}", "gamma", "budget",
+        "evt-b",
+        "slug",
+        "title",
+        _date(2026, 10, 11),
+        "NWS",
+        "rules",
+        datetime.now(tz=UTC),
+        "{}",
+        "gamma",
+        "budget",
     )
 
 

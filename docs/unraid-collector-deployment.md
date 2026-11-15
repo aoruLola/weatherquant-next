@@ -703,7 +703,7 @@ B 不重复: 优雅停止后开库断言——runs≥2、恰好 1 个 run 非 st
 实际重启策略和过期心跳的探针输出。恢复场景要求有可访问的上游市场，在确认新进程写入盘口和价格后才停止容器核对数据库。
 ### 12.6 运行、缺口与备份审计
 
-正常停机的缺口从上一次停止时间算起。异常退出时，下次启动会把遗留的运行标为 `failed`。缺口取同一运行的上游心跳联系时间与已落库盘口、价点时间中较晚的一项。缺少这两类证据时使用运行起点，并在 `detail` 注明。缺口在主循环再次确认上游通信时关闭。连续离线重启期间可以一直查询到同一条未关闭记录。
+正常停机的缺口从上一次停止时间算起。异常退出时，下次启动会把遗留的运行标为 `failed`。缺口取同一运行的上游心跳联系时间与已落库盘口、价点时间中较晚的一项。缺少这两类证据时使用运行起点，并在 `detail` 注明。缺口在主循环再次确认上游通信时关闭。连续离线重启期间可以一直查询到同一条未关闭记录。**首次启动没有上一次运行可比，因此不会记录缺口**——一个全新部署不会凭空出现"采集中断"。
 
 以下 SQL 适用于已恢复到独立目录的采集数据库。第一条列出异常运行，第二条显示缺口边界及判断依据，第三条可按同一个 `attempt_id` 配对备份事件。
 
@@ -714,11 +714,17 @@ FROM collector_runs WHERE status = 'failed' ORDER BY started_at_utc;
 SELECT run_id, started_at_utc, ended_at_utc, detail
 FROM collection_gaps ORDER BY started_at_utc;
 
-SELECT ts_utc, run_id, details_json->>'attempt_id' AS attempt_id, kind, message
+SELECT ts_utc, run_id, kind,
+       details_json->>'attempt_id' AS attempt_id,
+       details_json->>'outcome'    AS outcome,
+       details_json->>'elapsed_seconds' AS elapsed_s,
+       details_json->>'bytes'      AS bytes,
+       details_json->>'error'      AS error,
+       message
 FROM collector_events WHERE kind LIKE 'backup%' ORDER BY ts_utc;
 ```
 
-`backup_interrupted` 表示上一次运行退出前没有记下备份结果。文件是否可恢复仍须校验。旧版本事件缺少 `attempt_id`，查询时保留原记录。若上一次运行遗留的旧缺口覆盖了已证实有采集的时段，更正后的行会在 `detail` 中保留原缺口 ID 和说明。已关闭的历史缺口不作重估。
+备份事件的 `details_json` 携带 `attempt_id`（配对开始/结束）、`outcome`（`started`/`ok`/`failed`/`timeout`/`interrupted`）、`elapsed_seconds`，以及成功时的 `bytes` 与失败/超时时的 `error`。写记录本身失败（盘满、约束冲突等）只会记一条错误日志，**不会终止采集**——审计失败不影响采集本身。`backup_interrupted` 表示上一次运行退出前没有记下备份结果。文件是否可恢复仍须校验。旧版本事件缺少 `attempt_id`，查询时保留原记录。若上一次运行遗留的旧缺口覆盖了已证实有采集的时段，更正后的行会在 `detail` 中保留原缺口 ID 和说明。已关闭的历史缺口不作重估。
 
 ---
 

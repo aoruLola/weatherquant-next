@@ -83,7 +83,9 @@ _PRICE_PLACEHOLDERS = ", ".join("?" for _ in range(len(_PRICE_COLUMNS.split(",")
 
 _COLLECTOR_EVENT_COLUMNS = "event_id, run_id, ts_utc, level, kind, message, details_json"
 _COLLECTOR_EVENT_PLACEHOLDERS = ", ".join("?" for _ in range(len(_COLLECTOR_EVENT_COLUMNS.split(","))))
-_INSERT_COLLECTOR_EVENT = f"INSERT INTO collector_events ({_COLLECTOR_EVENT_COLUMNS}) VALUES ({_COLLECTOR_EVENT_PLACEHOLDERS})"
+_INSERT_COLLECTOR_EVENT = (
+    f"INSERT INTO collector_events ({_COLLECTOR_EVENT_COLUMNS}) VALUES ({_COLLECTOR_EVENT_PLACEHOLDERS})"
+)
 
 # Which column defines each table's day partition for parquet export.
 _PARQUET_PARTITION_COLUMN = {
@@ -532,9 +534,9 @@ class CollectorWriter:
             ).fetchone()
         )
         tables = int(
-            con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_catalog = current_database() AND table_schema = 'main'").fetchone()[
-                0
-            ]
+            con.execute(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_catalog = current_database() AND table_schema = 'main'"
+            ).fetchone()[0]
         )
         if not has_ledger and tables > 0:
             raise RuntimeError(
@@ -630,38 +632,46 @@ class CollectorWriter:
         )
         return gap_id
 
-    def begin_restart_gap(
-        self, process_start: datetime, heartbeat_run: str | None, contact: datetime | None
-    ) -> None:
-        """Date the interruption from the previous run's last known activity."""
+    def begin_restart_gap(self, heartbeat_run: str | None, contact: datetime | None) -> None:
+        """Date the interruption from the previous run's last known activity.
+
+        The gap belongs to this run and ends when upstream contact resumes. A
+        first-ever start records nothing: there is no previous run to measure an
+        interruption from.
+        """
         prior = self.con.execute(
             "SELECT run_id, status, started_at_utc, stopped_at_utc FROM collector_runs "
-            "WHERE run_id != ? ORDER BY started_at_utc DESC LIMIT 1", [self.run_id]
+            "WHERE run_id != ? ORDER BY started_at_utc DESC LIMIT 1",
+            [self.run_id],
         ).fetchone()
+        if prior is None:
+            # A brand-new database has no interrupted collection to date. Opening
+            # a gap at process start would report a phantom outage on the very
+            # first deployment: there is no earlier run whose activity it could
+            # have started from.
+            return
         pending = self.con.execute(
             "SELECT run_id FROM collection_gaps WHERE reason='start_after_restart' AND ended_at_utc IS NULL"
         ).fetchall()
-        if pending and (not prior or (prior[0],) not in pending or prior[1] == "stopped"):
+        if pending and ((prior[0],) not in pending or prior[1] == "stopped"):
             return  # Preserve the same gap across successive offline restarts.
-        since, evidence = process_start, "initial startup"
-        if prior:
-            run, status, started, stopped = prior
-            if status == "stopped" and stopped is not None:
-                since, evidence = stopped, f"clean stop of {run}"
-            else:
-                since, evidence = started, f"start of {run}; no later observation recorded"
-                if heartbeat_run == run and contact is not None and contact >= since:
-                    since, evidence = contact, f"last upstream heartbeat of {run}"
-                # Only observations after the last known bound can narrow the
-                # gap. Use the stored rows even on files recovered by older writers.
-                observed = self.con.execute(
-                    "SELECT greatest("
-                    "(SELECT max(fetched_at_utc) FILTER (WHERE run_id=?) FROM order_books WHERE fetched_at_utc>?), "
-                    "(SELECT max(fetched_at_utc) FILTER (WHERE run_id=?) FROM price_history WHERE fetched_at_utc>?))",
-                    [run, since, run, since],
-                ).fetchone()[0]
-                if observed is not None and observed > since:
-                    since, evidence = observed, f"last persisted observation of {run}"
+        run, status, started, stopped = prior
+        if status == "stopped" and stopped is not None:
+            since, evidence = stopped, f"clean stop of {run}"
+        else:
+            since, evidence = started, f"start of {run}; no later observation recorded"
+            if heartbeat_run == run and contact is not None and contact >= since:
+                since, evidence = contact, f"last upstream heartbeat of {run}"
+            # Only observations after the last known bound can narrow the
+            # gap. Use the stored rows even on files recovered by older writers.
+            observed = self.con.execute(
+                "SELECT greatest("
+                "(SELECT max(fetched_at_utc) FILTER (WHERE run_id=?) FROM order_books WHERE fetched_at_utc>?), "
+                "(SELECT max(fetched_at_utc) FILTER (WHERE run_id=?) FROM price_history WHERE fetched_at_utc>?))",
+                [run, since, run, since],
+            ).fetchone()[0]
+            if observed is not None and observed > since:
+                since, evidence = observed, f"last persisted observation of {run}"
         if pending:
             # Older collectors opened a gap for their entire lifetime. Narrow that
             # run's open row only when there is evidence it actually collected.
@@ -716,8 +726,11 @@ class CollectorWriter:
         ).fetchall()
         for old_run, attempt in interrupted:
             self.log_event(
-                "warning", "backup_interrupted", "collector exited before recording the backup outcome",
-                {"attempt_id": attempt, "interrupted_run": old_run}, immediate=True,
+                "warning",
+                "backup_interrupted",
+                "collector exited before recording the backup outcome",
+                {"attempt_id": attempt, "interrupted_run": old_run, "outcome": "interrupted"},
+                immediate=True,
             )
         reason = "run did not exit cleanly (crash, kill, or watchdog exit)"
         rows = self.con.execute("SELECT run_id FROM collector_runs WHERE status = 'running'").fetchall()
@@ -1138,7 +1151,8 @@ class CollectorWriter:
             expected = {name: int(con.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]) for name in tables}
             versions = tuple(sorted(v for (v,) in con.execute("SELECT version FROM schema_migrations").fetchall()))
             expected_sequences = {
-                row[0] for row in con.execute(
+                row[0]
+                for row in con.execute(
                     "SELECT sequence_name FROM duckdb_sequences() WHERE database_name = current_database()"
                 ).fetchall()
             }
