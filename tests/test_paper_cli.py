@@ -98,6 +98,10 @@ def test_consume_reads_the_published_export(paper_env, monkeypatch, capsys):
 
     events_dir = paper_env.parent.parent / "decisions-export"  # as the fixture configured
     (events_dir / "parts").mkdir(parents=True)
+    # Relative to now: the consume path judges signal age against the wall
+    # clock, and a fixed literal turns this test into a time bomb that starts
+    # failing on its own once the date moves past WQ_PAPER_MAX_SIGNAL_AGE.
+    decision_time = datetime.now(UTC) - timedelta(seconds=30)
     row = {
         "decision_id": "a" * 32,
         "run_id": "r" * 32,
@@ -106,9 +110,7 @@ def test_consume_reads_the_published_export(paper_env, monkeypatch, capsys):
         "direction": "buy_yes",
         "state": "ACCEPT",
         "mode": "LIVE",
-        # Relative to now: a hardcoded timestamp goes stale and the signal is
-        # then refused by the max-age gate, not by the behaviour under test.
-        "decision_time_utc": (datetime.now(UTC) - timedelta(seconds=30)).isoformat(),
+        "decision_time_utc": decision_time.isoformat(),
         "book_id": "b" * 64,
         "fee_rate": 0.05,
     }
