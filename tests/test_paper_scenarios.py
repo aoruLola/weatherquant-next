@@ -33,7 +33,7 @@ from paper_book_helpers import book_payload, ws_line
 from paper_helpers import export_row
 from weatherquant.data.books import parse_book_payload
 from weatherquant.paper.books import ArchiveBookSource
-from weatherquant.paper.consumer import SignalConsumer
+from weatherquant.paper.consumer import CURSOR_KEY, SignalConsumer
 from weatherquant.paper.fills import FillEngine
 from weatherquant.paper.ledger import Ledger
 from weatherquant.paper.risk import RiskGate, load_risk_rules
@@ -146,10 +146,7 @@ class Harness:
         archive = self.raw_dir / "ws" / f"{decision_time.date().isoformat()}.jsonl"
         archive.parent.mkdir(parents=True, exist_ok=True)
         with archive.open("a", encoding="utf-8") as handle:
-            handle.write(
-                ws_line(book, received=decision_time - timedelta(seconds=book_lag_seconds))
-                + "\n"
-            )
+            handle.write(ws_line(book, received=decision_time - timedelta(seconds=book_lag_seconds)) + "\n")
         self._append_export(part, row)
         if duplicate:
             self._append_export(part, row)
@@ -157,7 +154,9 @@ class Harness:
 
     def _append_export(self, part: int | None, row: dict) -> None:
         if part is None:
-            parts = sorted((self.events_dir / "parts").glob("part-*.jsonl")) if (self.events_dir / "parts").exists() else []
+            parts = (
+                sorted((self.events_dir / "parts").glob("part-*.jsonl")) if (self.events_dir / "parts").exists() else []
+            )
             part = (_index_of(parts[-1]) if parts else 0) + 1
         parts_dir = self.events_dir / "parts"
         parts_dir.mkdir(parents=True, exist_ok=True)
@@ -165,9 +164,7 @@ class Harness:
             handle.write(json.dumps(row, default=str) + "\n")
 
     def publish_settlement_feed(self, rows: list[dict]) -> None:
-        self.feed_path.write_text(
-            "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
-        )
+        self.feed_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
     # -- invariants ------------------------------------------------------------
 
@@ -188,14 +185,12 @@ class Harness:
         """Everything the final ledger says, for determinism comparisons."""
         b = self.ledger.balances()
         entries = [
-            (e["kind"], round(e["amount_usdc"], 6), e["ref_id"])
-            for e in self.ledger.ledger_entries(limit=1_000_000)
+            (e["kind"], round(e["amount_usdc"], 6), e["ref_id"]) for e in self.ledger.ledger_entries(limit=1_000_000)
         ]
         signals = [
             (r[0], r[1], r[2])
             for r in self.db.execute(
-                "SELECT decision_id, outcome, COALESCE(refusal_reason, '') FROM paper_signals "
-                "ORDER BY decision_id"
+                "SELECT decision_id, outcome, COALESCE(refusal_reason, '') FROM paper_signals ORDER BY decision_id"
             ).fetchall()
         ]
         fills = [
@@ -356,7 +351,9 @@ raise RuntimeError(h.fill_engine().fill_pending().as_dict())
         result = subprocess.run(
             [sys.executable, "-c", child, str(root), boundary],
             env={**os.environ, "PYTHONPATH": os.pathsep.join(paths)},
-            capture_output=True, text=True, timeout=60,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
         assert result.returncode == 77, result.stderr
         baseline = Harness(tmp_path / "clean")
@@ -370,12 +367,31 @@ raise RuntimeError(h.fill_engine().fill_pending().as_dict())
             recovered.assert_conservation()
             recovered.assert_ledger_agrees()
             assert recovered.fill_engine().fill_pending().filled == (0 if committed else 2)
-            assert recovered.consumer().consume_once().caught_up
+            replay = recovered.consumer().consume_once()
+            assert replay.caught_up and replay.duplicates == 0
             assert recovered.fill_engine().fill_pending().caught_up
             recovered.assert_conservation()
             recovered.assert_ledger_agrees()
             assert recovered.state() == baseline.state()
-            for table, order in [("paper_ledger", "seq"), ("paper_positions", "market_id"), ("paper_fills", "decision_id")]:
+            assert (
+                recovered.store.load_state(CURSOR_KEY)
+                == baseline.store.load_state(CURSOR_KEY)
+                == {
+                    "part": 3,
+                    "lines": 1,
+                }
+            )
+            assert recovered.store.quality_counts() == baseline.store.quality_counts() == {"signal_duplicate": 1}
+            assert recovered.store.signal_counts() == baseline.store.signal_counts() == {"FILLED": 2}
+            for table, order in [
+                ("paper_ledger", "seq"),
+                ("paper_balances", "account_id"),
+                ("paper_positions", "market_id, token_id"),
+                ("paper_fills", "decision_id"),
+                ("paper_signals", "decision_id"),
+                ("paper_state", "key"),
+                ("paper_quality_events", "event_id"),
+            ]:
                 sql = f"SELECT * FROM {table} ORDER BY {order}"
                 assert recovered.db.execute(sql).fetchall() == baseline.db.execute(sql).fetchall()
         finally:
@@ -484,9 +500,16 @@ class TestMoneyScenarios:
 
         # The platform resolves YES at 1.0.
         h.publish_settlement_feed(
-            [{"market_id": "mkt-a", "revision": 1, "status": "RESOLVED",
-              "yes_payout": 1.0, "settled_at_utc": h.now().isoformat(),
-              "transaction_hash": "0x1"}]
+            [
+                {
+                    "market_id": "mkt-a",
+                    "revision": 1,
+                    "status": "RESOLVED",
+                    "yes_payout": 1.0,
+                    "settled_at_utc": h.now().isoformat(),
+                    "transaction_hash": "0x1",
+                }
+            ]
         )
         with h.db.transaction():
             for event in read_settlement_feed(h.feed_path):
@@ -498,17 +521,22 @@ class TestMoneyScenarios:
 
         # ... and later corrects the resolution to 0.0.
         h.publish_settlement_feed(
-            [{"market_id": "mkt-a", "revision": 2, "status": "RESOLVED",
-              "yes_payout": 0.0, "settled_at_utc": h.now().isoformat(),
-              "transaction_hash": "0x2"}]
+            [
+                {
+                    "market_id": "mkt-a",
+                    "revision": 2,
+                    "status": "RESOLVED",
+                    "yes_payout": 0.0,
+                    "settled_at_utc": h.now().isoformat(),
+                    "transaction_hash": "0x2",
+                }
+            ]
         )
         with h.db.transaction():
             for event in read_settlement_feed(h.feed_path):
                 h.ledger.apply_settlement(event, now=h.now())
         b = h.ledger.balances()
-        assert b["realized_pnl_usdc"] == pytest.approx(
-            -(h.capital - b["available_usdc"])
-        )
+        assert b["realized_pnl_usdc"] == pytest.approx(-(h.capital - b["available_usdc"]))
         h.assert_conservation()
         h.assert_ledger_agrees()
         kinds = [e["kind"] for e in h.ledger.ledger_entries()]
@@ -518,17 +546,15 @@ class TestMoneyScenarios:
 class TestExplainability:
     def test_every_decision_is_explainable_from_the_rows(self, h):
         """After a mixed scenario, no row is a dead end."""
-        h.publish_signal(market_id="mkt-ok")                       # fills
+        h.publish_signal(market_id="mkt-ok")  # fills
         h.publish_signal(market_id="mkt-stale", book_lag_seconds=3600.0)  # BOOK_STALE
         h.publish_signal(market_id="mkt-thin", bids=[], asks=[(0.55, 3.0)])  # capacity
-        h.publish_signal(market_id="mkt-dup", duplicate=True)      # duplicate
+        h.publish_signal(market_id="mkt-dup", duplicate=True)  # duplicate
         h.advance(30)
         h.consumer().consume_once()
         h.fill_engine().fill_pending()
 
-        rows = h.db.execute(
-            "SELECT outcome, refusal_reason, refusal_detail, decision_id FROM paper_signals"
-        ).fetchall()
+        rows = h.db.execute("SELECT outcome, refusal_reason, refusal_detail, decision_id FROM paper_signals").fetchall()
         assert rows, "the scenario consumed nothing"
         for outcome, reason, detail, decision_id in rows:
             if outcome == "FILLED":
