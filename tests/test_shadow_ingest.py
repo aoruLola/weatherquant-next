@@ -359,3 +359,83 @@ def test_invalid_sidecar_blocks_checkpoint_until_repaired(tmp_path):
     assert repaired.stats.lines_read == 1
     _commit(tailer, repaired)
     assert tailer.poll().stats.lines_read == 0
+
+
+def test_uncertified_bytes_are_not_consumed_until_the_certificate_covers_them(tmp_path):
+    """The crash window between the data fsync and the sidecar publish must look
+    like "not yet", never like a line to consume."""
+    from weatherquant.data.archive import ArchiveRecord, RawArchive, read_archive_sidecar
+
+    def event():
+        return ArchiveRecord("gamma", gamma_event(), NOW, None, "ok", "collector")
+
+    with RawArchive(tmp_path, run_id="collector") as writer:
+        writer.append(event())
+    path = tmp_path / "gamma" / f"{TARGET_DATE}.jsonl"
+    certified = read_archive_sidecar(path)
+    # A crash between the data fsync and the sidecar publish: line two is on
+    # disk, beyond the certificate.
+    with path.open("ab") as handle:
+        handle.write((archive_line(2, "gamma", gamma_event()) + "\n").encode())
+
+    tailer = _tailer(tmp_path)
+    first = tailer.poll()
+    assert first.stats.lines_read == 1
+    _commit(tailer, first)
+    assert tailer.checkpoints[str(path)].offset_bytes == certified["bytes"]
+
+    # The collector's next flush certifies everything it has written; the
+    # previously uncertified line is consumed now, and only now.
+    with RawArchive(tmp_path, run_id="collector") as writer:
+        writer.append(event())
+    path_lines = path.read_bytes().count(b"\n")
+    second = tailer.poll()
+    assert second.stats.lines_read == path_lines - first.stats.lines_read
+    _commit(tailer, second)
+    assert tailer.poll().stats.lines_read == 0
+
+
+def test_a_checksum_trail_behind_the_checkpoint_parks_with_an_error(tmp_path):
+    from weatherquant.data.archive import ArchiveRecord, RawArchive
+
+    def event():
+        return ArchiveRecord("gamma", gamma_event(), NOW, None, "ok", "collector")
+
+    with RawArchive(tmp_path, run_id="collector") as writer:
+        writer.append(event())
+    path = tmp_path / "gamma" / f"{TARGET_DATE}.jsonl"
+    receipt = path.with_suffix(".jsonl.sha256")
+    one_line_certificate = receipt.read_bytes()
+    with RawArchive(tmp_path, run_id="collector") as writer:
+        writer.append(event())
+
+    tailer = _tailer(tmp_path)
+    consumed = tailer.poll()
+    assert consumed.stats.lines_read == 2
+    _commit(tailer, consumed)
+    committed = tailer.checkpoints[str(path)].offset_bytes
+
+    # A certificate restored from before the second line: the checkpoint now
+    # sits past everything the trail certifies.
+    receipt.write_bytes(one_line_certificate)
+    parked = tailer.poll()
+    assert parked.stats.lines_read == 0
+    assert not parked.checkpoints
+    assert [q.kind for q in parked.quality] == ["archive_trail_behind_checkpoint"]
+    assert tailer.checkpoints[str(path)].offset_bytes == committed
+
+
+def test_a_checksum_trail_ahead_of_the_file_parks_with_an_error(tmp_path):
+    from weatherquant.data.archive import ArchiveRecord, RawArchive
+
+    with RawArchive(tmp_path, run_id="collector") as writer:
+        writer.append(ArchiveRecord("gamma", gamma_event(), NOW, None, "ok", "collector"))
+        writer.append(ArchiveRecord("gamma", gamma_event(), NOW, None, "ok", "collector"))
+    path = tmp_path / "gamma" / f"{TARGET_DATE}.jsonl"
+    whole = path.read_bytes()
+    path.write_bytes(whole[: whole.index(b"\n") + 5])
+
+    result = _tailer(tmp_path).poll()
+    assert result.stats.lines_read == 0
+    assert not result.checkpoints
+    assert [q.kind for q in result.quality] == ["archive_trail_ahead_of_file"]

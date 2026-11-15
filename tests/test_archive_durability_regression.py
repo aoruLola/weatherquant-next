@@ -526,3 +526,131 @@ def test_unreadable_receipt_is_preserved_and_reported(tmp_path, receipt):
         RawArchive(tmp_path, run_id="restart").recover_pending_partitions()
     assert path.read_bytes() == receipt
     assert not verify_archive_tree(tmp_path)[0]["ok"]
+
+
+def test_a_failed_sidecar_publish_does_not_certify_the_new_bytes(tmp_path, monkeypatch):
+    """Data fsync succeeded, so the bytes are durable - but until the sidecar
+    says so, no consumer may treat them as committed evidence."""
+    from weatherquant.data import archive as archive_module
+    from weatherquant.data.archive import read_archive_sidecar
+
+    root = tmp_path / "raw"
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    archive = RawArchive(root, run_id="wqn-21", flush_records=1000)
+    archive.append(_record(0))
+    assert archive.flush() == 1
+    certified = read_archive_sidecar(path)
+    archive.append(_record(1))
+    real = archive_module._write_sidecar
+
+    def fail_past_the_certified_boundary(target, state):
+        if state["bytes"] > certified["bytes"]:
+            raise OSError(28, "No space left on device")
+        real(target, state)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(archive_module, "_write_sidecar", fail_past_the_certified_boundary)
+        with pytest.raises(OSError, match="No space left"):
+            archive.flush()
+
+    # The second line is on disk, uncertified: the trail still describes only
+    # the first, and the line stays in "written but not published" territory.
+    assert read_archive_sidecar(path) == certified
+    assert path.stat().st_size > certified["bytes"]
+    assert archive.records_written == 2
+
+    # Once the publish can succeed the boundary catches up, exactly once.
+    archive.close()
+    assert read_archive_sidecar(path)["bytes"] == path.stat().st_size
+    assert [row["archive_seq"] for row in _lines(root)] == [1, 2]
+    assert _all_ok(root)
+
+
+def test_a_partition_truncated_below_its_trail_is_refused_at_startup_and_logged(tmp_path):
+    root = tmp_path / "raw"
+    with RawArchive(root, run_id="wqn-21", flush_records=1000) as archive:
+        archive.append(_record(0))
+        archive.append(_record(1))
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    receipt = path.with_suffix(".jsonl.sha256")
+    published = receipt.read_bytes()
+    whole = path.read_bytes()
+    damaged = whole[: whole.index(b"\n") + 10]
+    path.write_bytes(damaged)
+
+    with pytest.raises(ValueError, match="shorter than its published checksum trail"):
+        RawArchive(root, run_id="restart").recover_pending_partitions()
+
+    # Neither the file nor its certificate is rewritten to agree with the loss.
+    assert path.read_bytes() == damaged
+    assert receipt.read_bytes() == published
+    assert [e["event"] for e in _recovery_events(root)][-2:] == [
+        "partition_truncated",
+        "partition_recovery_failed",
+    ]
+    verdict = {r["path"]: r for r in verify_archive_tree(root)}[str(path)]
+    assert any("shorter than the checksum trail" in p for p in verdict["problems"]), verdict["problems"]
+
+
+def test_append_to_a_truncated_partition_logs_and_writes_nothing(tmp_path):
+    root = tmp_path / "raw"
+    with RawArchive(root, run_id="wqn-21", flush_records=1000) as archive:
+        archive.append(_record(0))
+        archive.append(_record(1))
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    receipt = path.with_suffix(".jsonl.sha256")
+    published = receipt.read_bytes()
+    whole = path.read_bytes()
+    damaged = whole[: whole.index(b"\n") + 1]
+    path.write_bytes(damaged)
+
+    restarted = RawArchive(root, run_id="restart", flush_records=1000)
+    restarted.append(_record(2, run_id="restart"))
+    with pytest.raises(ValueError, match="shorter than its published checksum trail"):
+        restarted.flush()
+
+    assert path.read_bytes() == damaged
+    assert receipt.read_bytes() == published
+    assert len(restarted._buffer) == 1, "the refused record must remain retryable"
+    event = _recovery_events(root)[-1]
+    assert event["event"] == "partition_truncated"
+    assert (event["file_bytes"], event["sidecar_bytes"]) == (len(damaged), len(whole))
+
+
+def test_a_quarantine_write_failure_leaves_the_fragment_and_the_batch_retryable(tmp_path, monkeypatch):
+    from weatherquant.data.archive import read_archive_sidecar
+
+    root = tmp_path / "raw"
+    with RawArchive(root, run_id="wqn-21", flush_records=1000) as archive:
+        archive.append(_record(0))
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    durable = path.read_bytes()
+    torn = b'{"crash":"half a line"'
+    with path.open("ab") as handle:
+        handle.write(torn)
+
+    restarted = RawArchive(root, run_id="restart", flush_records=1000)
+    restarted.append(_record(1, run_id="restart"))
+    real_open = os.open
+
+    def refuse_the_quarantine_copy(target, flags, *args, **kwargs):
+        if str(target).endswith(".torn"):
+            raise OSError(28, "No space left on device")
+        return real_open(target, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", refuse_the_quarantine_copy)
+        with pytest.raises(OSError, match="No space left"):
+            restarted.flush()
+
+    # The fragment survives where it was and the data file is untouched: the
+    # quarantine copy is written before the truncate precisely so this failure
+    # cannot destroy the evidence.
+    assert path.read_bytes() == durable + torn
+    assert list((root / "quarantine" / "rest").glob("*.torn")) == []
+    assert read_archive_sidecar(path)["bytes"] == len(durable)
+
+    assert restarted.flush() == 1
+    restarted.close()
+    assert [row["payload"]["n"] for row in _lines(root)] == [0, 1]
+    assert _all_ok(root)

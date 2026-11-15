@@ -8,6 +8,14 @@ complete lines*:
 * A line is consumed only once a trailing newline has been seen, so a
   half-written line is never decoded. The offset only ever advances past
   ``\\n``.
+* When the collector has published a checksum sidecar for the partition, only
+  the bytes that sidecar certifies are consumed: bytes past that boundary are
+  written but not yet durable evidence, and waiting for the next certificate
+  is what keeps a checkpoint from claiming more than the writer committed to.
+  A sidecar that falls behind the checkpoint, or claims bytes the file does
+  not have, is reported as an error and the tail parks at its last committed
+  offset. Partitions written before the sidecars existed keep the newline
+  boundary above.
 * The byte offset per file is committed **in the same transaction** as the
   effects of the lines it covers. A crash therefore replays a batch or skips
   nothing, rather than the two disagreeing.
@@ -56,6 +64,20 @@ __all__ = [
     "ReadStats",
     "TailResult",
 ]
+
+
+class _ChecksumDisagreement(Exception):
+    """The sidecar and the bytes a reader can see do not describe the same file.
+
+    Raised rather than read around: resuming from a byte the writer never
+    certified, or reading past a trail the file does not back, would both mean
+    inventing continuity. The tail parks at its last committed offset with the
+    reported event, exactly like an unreadable file.
+    """
+
+    def __init__(self, kind: str, detail: str) -> None:
+        super().__init__(detail)
+        self.kind = kind
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +273,19 @@ class ArchiveTailer:
 
             try:
                 read = self._read_complete_lines(path, offset)
+            except _ChecksumDisagreement as exc:
+                quality.append(
+                    QualityEvent(
+                        kind=exc.kind,
+                        severity="error",
+                        detail=f"{path}: {exc}; checkpoint left at byte {offset}",
+                        source=source,
+                        path=key,
+                        offset_bytes=offset,
+                        ts_utc=self.clock(),
+                    )
+                )
+                continue
             except (OSError, ValueError) as exc:
                 quality.append(
                     QualityEvent(
@@ -378,13 +413,23 @@ class ArchiveTailer:
             # Snapshot the file size before reading the boundary: legacy files
             # receive their first sidecar before the collector appends new bytes.
             limit = os.fstat(handle.fileno()).st_size
-            if offset >= limit:
-                return b"", offset, False
             sidecar = read_archive_sidecar(path)
             if sidecar is not None:
-                limit = min(limit, sidecar["bytes"])
+                if sidecar["bytes"] > limit:
+                    raise _ChecksumDisagreement(
+                        "archive_trail_ahead_of_file",
+                        f"checksum trail covers {sidecar['bytes']} bytes but the file has {limit}",
+                    )
+                if offset > sidecar["bytes"]:
+                    raise _ChecksumDisagreement(
+                        "archive_trail_behind_checkpoint",
+                        f"checkpoint is at byte {offset} but the checksum trail covers only {sidecar['bytes']}",
+                    )
+                limit = sidecar["bytes"]
+            if offset >= limit:
+                return b"", offset, False
             handle.seek(offset)
-            data = handle.read(min(self.max_bytes_per_poll, max(0, limit - offset)))
+            data = handle.read(min(self.max_bytes_per_poll, limit - offset))
         if not data:
             return b"", offset, False
         cut = data.rfind(b"\n")

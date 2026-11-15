@@ -188,6 +188,15 @@ class RawArchive:
                 size = path.stat().st_size
                 if size == state["bytes"]:
                     continue
+                if size < state["bytes"]:
+                    self._log_recovery(
+                        "partition_truncated",
+                        path=str(path),
+                        file_bytes=size,
+                        sidecar_bytes=state["bytes"],
+                        detail="data file is shorter than its published checksum trail",
+                    )
+                    raise ValueError(f"{path}: data file is shorter than its published checksum trail")
                 chain, covered, lines = _scan_file_trail(path, state)
                 fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
                 try:
@@ -379,7 +388,19 @@ class RawArchive:
             return state
         size = path.stat().st_size if path.exists() else 0
         sidecar = read_archive_sidecar(path)
-        if sidecar is not None and size == sidecar.get("bytes"):
+        if sidecar is not None and size < sidecar["bytes"]:
+            # The published trail covers bytes the file no longer has. Folding
+            # new lines onto that digest would certify continuity across a hole
+            # an operator has to see, so the append stops and says why.
+            self._log_recovery(
+                "partition_truncated",
+                path=str(path),
+                file_bytes=size,
+                sidecar_bytes=sidecar["bytes"],
+                detail="data file is shorter than its published checksum trail",
+            )
+            raise ValueError(f"{path}: data file is shorter than its published checksum trail")
+        if sidecar is not None and size == sidecar["bytes"]:
             state = dict(sidecar)
         elif size:
             chain, covered_bytes, lines = _scan_file_trail(path, sidecar)
@@ -398,8 +419,6 @@ class RawArchive:
             # Publish a zero-byte boundary before the first managed write. Any
             # recovered legacy bytes become visible after this file is fsynced.
             _write_sidecar(path, {"chain": EMPTY_CHAIN, "bytes": 0, "lines": 0})
-        elif size < sidecar["bytes"]:
-            raise ValueError(f"{path}: data file is shorter than its published checksum trail")
         self._chains[key] = state
         return state
 
