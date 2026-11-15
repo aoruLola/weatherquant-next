@@ -213,6 +213,27 @@ def test_missing_captured_evidence_refuses_even_when_archive_matches(env):
     }
 
 
+def test_tampered_captured_depth_is_refused_as_a_hash_mismatch(env):
+    """The stored levels must hash back to book_id; an edited price is not evidence."""
+    from paper_fills_support import build_engine
+
+    store, raw, _ = env
+    seed = ArchiveBookSource(raw).resolve(token_id=TOKEN, decision_time=T_DECISION)
+    tampered_asks = seed.asks_json().replace("0.55", "0.54")
+    assert tampered_asks != seed.asks_json()
+    event = parse_signal_event(export_row(
+        token_id=TOKEN, proposed_shares=100.0, book_id=seed.book_id,
+        evidence_version=1, book_bids_json=seed.bids_json(), book_asks_json=tampered_asks,
+        book_source=seed.book_source, book_source_event_id=seed.source_event_id,
+        venue_ts_utc=seed.venue_ts_utc.isoformat(),
+        collector_received_at_utc=seed.collector_received_at_utc.isoformat(),
+    ))
+    store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
+    result = build_engine(store, ArchiveBookSource(raw), clock=lambda: NOW).fill_pending()
+    assert result.by_reason == {"NOT_EXECUTABLE": 1}
+    assert not store.fill_of(event.decision_id)
+
+
 def test_timeout_after_matching_frame_never_prices_partial_scan(env, monkeypatch):
     from types import SimpleNamespace
 

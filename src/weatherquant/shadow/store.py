@@ -19,6 +19,7 @@ import hashlib
 import json
 from datetime import datetime
 
+from weatherquant.data.writer import canonical_levels_json
 from weatherquant.markets.models import Side
 from weatherquant.shadow.decision import Decision, Direction, Mode
 from weatherquant.shadow.events import BookObservation, CatalogMarket
@@ -483,15 +484,35 @@ class ShadowStore:
             )
         self.db.execute(sql, [value for row in rows for value in row])
 
-        # token_books was committed with the ingest checkpoint before evaluation.
-        # Copy the exact referenced ids in one statement, reusing its serialized
-        # levels. A second decision on the same depth adds no new row.
-        book_ids = [d.book_id for d in seen.values() if d.live_book and d.live_book.source_event_id]
-        if book_ids:
+        # Depth is content-addressed from the book the decision actually looked
+        # at. Reading it back from token_books would lose the evidence whenever
+        # a newer frame for the same token landed in the same batch: token_books
+        # keeps one row per token, so the decision's book_id is no longer there.
+        # The collector's canonical serialisation is reused, so re-hashing the
+        # stored levels reproduces book_id exactly.
+        depth_rows: dict[str, tuple[str, str, str]] = {}
+        for d in seen.values():
+            observation = d.live_book
+            if not observation or not observation.source_event_id or not d.book_id:
+                continue
+            depth_rows.setdefault(
+                d.book_id,
+                (
+                    d.book_id,
+                    canonical_levels_json(
+                        [(lv.price_usd_per_share, lv.size_shares) for lv in observation.book.bids]
+                    ),
+                    canonical_levels_json(
+                        [(lv.price_usd_per_share, lv.size_shares) for lv in observation.book.asks]
+                    ),
+                ),
+            )
+        if depth_rows:
             self.db.execute(
-                "INSERT INTO decision_book_depth SELECT book_id, bids_json, asks_json FROM token_books "
-                "WHERE book_id IN (SELECT unnest(?::VARCHAR[])) ON CONFLICT (book_id) DO NOTHING",
-                [book_ids],
+                "INSERT INTO decision_book_depth VALUES "
+                + ", ".join(["(?, ?, ?)"] * len(depth_rows))
+                + " ON CONFLICT (book_id) DO NOTHING",
+                [value for row in depth_rows.values() for value in row],
             )
 
     def save_metrics(self, *, run_id: str, payload: dict, computed_at: datetime) -> None:

@@ -219,6 +219,41 @@ def test_a_book_never_moves_backwards_in_time(shadow_db) -> None:
     assert row[0] == NOW
 
 
+def test_snapshot_depth_is_copied_from_the_decision_book_not_the_latest_token_row(shadow_db) -> None:
+    """A later frame for the same token must not erase the earlier decision's depth."""
+    from dataclasses import replace
+
+    from test_shadow_decision import _evaluate
+    from weatherquant.shadow.decision import Mode
+
+    store = ShadowStore(shadow_db)
+    decision_book = replace(
+        make_observation(bids=[(0.45, 400.0)], asks=[(0.47, 400.0)]),
+        book_id="a" * 64,
+        source_event_id="s" * 64,
+    )
+    decision = _evaluate(snapshot=decision_book, mode=Mode.LIVE)
+    assert decision.book_id == decision_book.book_id
+
+    # token_books keeps one row per token, so the newer frame replaces the
+    # earlier one there; the decision still references the earlier book.
+    newer = replace(
+        make_observation(bids=[(0.60, 100.0)], asks=[(0.62, 100.0)]),
+        book_id="b" * 64,
+        source_event_id="n" * 64,
+    )
+    store.upsert_books([newer], now=NOW)
+    with shadow_db.transaction():
+        store.save_snapshots([decision], now=NOW)
+
+    rows = shadow_db.con.execute(
+        "SELECT book_id, book_bids_json, book_asks_json FROM decision_book_depth"
+    ).fetchall()
+    assert [row[0] for row in rows] == [decision_book.book_id]
+    assert '"price_usd_per_share":0.47' in rows[0][2]
+    assert '"price_usd_per_share":0.62' not in rows[0][2]
+
+
 def test_quality_events_are_deduplicated_by_content(shadow_db) -> None:
     store = ShadowStore(shadow_db)
     event = QualityEvent(kind="archive_gap", severity="error", detail="3 day(s) missing", ts_utc=NOW)
