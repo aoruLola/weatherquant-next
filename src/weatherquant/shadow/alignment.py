@@ -127,6 +127,7 @@ class AlignmentReport:
     unknown_models: list[str] = field(default_factory=list)
     violations: list[AlignmentViolation] = field(default_factory=list)
     violation_counts: dict[str, int] = field(default_factory=dict)
+    untraceable_decisions: list[AlignmentViolation] = field(default_factory=list)
     partial_local_day_decisions: int = 0
     exposure_groups: list[ExposureGroup] = field(default_factory=list)
     forecast_sharing_markets: list[dict[str, Any]] = field(default_factory=list)
@@ -152,6 +153,8 @@ class AlignmentReport:
             "violation_count": len(self.violations),
             "violation_counts": dict(self.violation_counts),
             "violations": [v.as_dict() for v in self.violations[:_MAX_LISTED]],
+            "untraceable_decision_count": len(self.untraceable_decisions),
+            "untraceable_decisions": [v.as_dict() for v in self.untraceable_decisions[:_MAX_LISTED]],
             "partial_local_day_decisions": self.partial_local_day_decisions,
             "exposure_groups": [g.as_dict() for g in self.exposure_groups[:_MAX_LISTED]],
             "forecast_sharing_markets": self.forecast_sharing_markets[:_MAX_LISTED],
@@ -245,7 +248,16 @@ def _audit_prediction_alignment(con: Any, report: AlignmentReport) -> None:
                     )
                 )
             if prediction_rowid is None:
-                if decision_target is not None and first_target is not None:
+                if decision_target is None:
+                    report.untraceable_decisions.append(
+                        AlignmentViolation(
+                            kind="PREDICTION_UNTRACEABLE",
+                            detail="decision has no target_date; no target-day prediction can be selected",
+                            decision_id=str(decision_id),
+                        )
+                    )
+                    continue
+                if first_target is not None:
                     kind = "TARGET_DATE_MISMATCH"
                     detail = (
                         f"decision settles {decision_target.isoformat()} but there is no prediction "
