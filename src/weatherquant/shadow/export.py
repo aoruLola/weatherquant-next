@@ -114,6 +114,11 @@ EXPORT_COLUMNS = (
     "c.fee_rate",
     "c.fee_exponent",
     "d.export_seq",
+    "d.evidence_version",
+    "d.book_source_event_id",
+    "d.book_source",
+    "b.book_bids_json",
+    "b.book_asks_json",
 )
 
 #: Column offsets used to read a fetched row without naming it twice.
@@ -749,8 +754,16 @@ class DecisionExporter:
         however far its business time lies in the past - carries a fresh,
         high sequence and is always reachable above the cursor.
         """
-        columns = ", ".join(EXPORT_COLUMNS)
-        join = " LEFT JOIN market_catalog c ON c.market_id = d.market_id "
+        # Old snapshots predate fee capture. Preserve the legacy export for
+        # those rows; a captured NULL means the fee was unknown at decision time.
+        columns = ", ".join(
+            f"CASE WHEN d.evidence_version IS NOT NULL THEN d.{col[2:]} ELSE {col} END"
+            if col in ("c.fee_rate", "c.fee_exponent") else col for col in EXPORT_COLUMNS
+        )
+        join = (
+            " LEFT JOIN market_catalog c ON c.market_id = d.market_id "
+            "LEFT JOIN decision_book_depth b ON b.book_id = d.book_id AND d.book_source_event_id IS NOT NULL "
+        )
         sql = (
             f"SELECT {columns} FROM shadow_decisions d{join}"
             "WHERE d.export_seq > ? "
