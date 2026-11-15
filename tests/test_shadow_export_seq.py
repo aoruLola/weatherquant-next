@@ -49,15 +49,27 @@ def _insert(
     decision_id = f"id-{i:04d}"
     columns = COLUMNS
     params: list[object] = [
-        decision_id, "run-1", f"cycle-{i}", market, "KLGA", "buy_yes", state,
-        when, 0.6, 0.05, mode, "configured", when,
+        decision_id,
+        "run-1",
+        f"cycle-{i}",
+        market,
+        "KLGA",
+        "buy_yes",
+        state,
+        when,
+        0.6,
+        0.05,
+        mode,
+        "configured",
+        when,
     ]
     if seq is not None:
         columns += ",export_seq"
         params.append(seq)
-    db.con.execute(f"INSERT INTO shadow_decisions ({columns}) VALUES ({PLACEHOLDERS}"
-                   + (", ?" if seq is not None else "") + ")",
-                   params)
+    db.con.execute(
+        f"INSERT INTO shadow_decisions ({columns}) VALUES ({PLACEHOLDERS}" + (", ?" if seq is not None else "") + ")",
+        params,
+    )
     return decision_id
 
 
@@ -82,9 +94,7 @@ def _ids(path: Path) -> list[str]:
 def _run_to_caught_up(exporter: DecisionExporter, *, limit: int = 50):
     for _ in range(limit):
         result = exporter.run_batch()
-        if result.caught_up and not any(
-            note.startswith("transition") for note in result.notes
-        ):
+        if result.caught_up and not any(note.startswith("transition") for note in result.notes):
             return result
     raise AssertionError("the export never reached caught_up")
 
@@ -209,9 +219,7 @@ def test_rewriting_a_decision_does_not_re_export_it(db, tmp_path):
     _insert(db, i=1, when=NOW)
     ex = _exporter(db, tmp_path)
     assert ex.run_batch().rows_exported == 1
-    exported_seq = db.con.execute(
-        "SELECT export_seq FROM shadow_decisions WHERE decision_id = 'id-0001'"
-    ).fetchone()[0]
+    exported_seq = db.con.execute("SELECT export_seq FROM shadow_decisions WHERE decision_id = 'id-0001'").fetchone()[0]
 
     # The same conflict update save_decisions performs: state and edge change,
     # identity (and therefore position) does not.
@@ -228,9 +236,7 @@ def test_rewriting_a_decision_does_not_re_export_it(db, tmp_path):
     result = ex.run_batch()
 
     assert result.rows_exported == 0, "a rewritten decision was exported twice"
-    seq_now = db.con.execute(
-        "SELECT export_seq FROM shadow_decisions WHERE decision_id = 'id-0001'"
-    ).fetchone()[0]
+    seq_now = db.con.execute("SELECT export_seq FROM shadow_decisions WHERE decision_id = 'id-0001'").fetchone()[0]
     assert seq_now == exported_seq, "the upsert moved the decision's export position"
     assert ex.reconcile()["consistent"] is True
 
@@ -248,9 +254,7 @@ def test_rows_written_without_a_sequence_are_repaired_in_write_order(db, tmp_pat
 
     ids = _ids(tmp_path / "export")
     assert sorted(ids) == [f"id-{i:04d}" for i in range(4)]
-    nulls = db.con.execute(
-        "SELECT COUNT(*) FROM shadow_decisions WHERE export_seq IS NULL"
-    ).fetchone()[0]
+    nulls = db.con.execute("SELECT COUNT(*) FROM shadow_decisions WHERE export_seq IS NULL").fetchone()[0]
     assert nulls == 0
     assert ex.reconcile()["consistent"] is True
 
@@ -281,9 +285,7 @@ def test_a_lost_state_file_recovers_the_sequence_cursor_from_the_parts(db, tmp_p
     assert ex.reconcile()["consistent"] is True
 
 
-def test_recovery_after_a_crash_between_parts_publishes_the_rest_exactly_once(
-    db, tmp_path
-):
+def test_recovery_after_a_crash_between_parts_publishes_the_rest_exactly_once(db, tmp_path):
     """A part published, state still naming the previous part: the unaccounted
     tail is counted and nothing is re-exported."""
     for i in range(12):
@@ -307,6 +309,59 @@ def test_recovery_after_a_crash_between_parts_publishes_the_rest_exactly_once(
 
 
 # --- consecutive parts and reconciliation --------------------------------------
+
+
+def test_late_mix_crash_duplicate_writes_and_consecutive_parts_reconcile(db, tmp_path):
+    """One public-API acceptance run with every WQN-20 failure mode combined."""
+    for i in range(4):
+        _insert(db, i=i, when=NOW + timedelta(minutes=i))
+    ex = _exporter(db, tmp_path, batch_rows=2, max_parts_per_run=1)
+    assert ex.run_batch().rows_exported == 2
+    original_seq = db.con.execute("SELECT export_seq FROM shadow_decisions WHERE decision_id = 'id-0000'").fetchone()[0]
+
+    late_id = _insert(db, i=100, when=NOW - timedelta(hours=1), mode="REPLAY")
+    for i in range(4, 10):
+        _insert(db, i=i, when=NOW + timedelta(minutes=i))
+    assert ex.run_batch().rows_exported == 2  # part 2 is durable
+
+    # A repeated engine write keeps the original position and must not add a line.
+    db.con.execute(
+        "INSERT INTO shadow_decisions (decision_id, run_id, cycle_id, market_id, "
+        "station, direction, state, decision_time_utc, model_probability, net_edge, "
+        "mode, mode_reason, created_at_utc, export_seq) VALUES "
+        "('id-0000', 'run-1', 'cycle-0', 'm-0', 'KLGA', 'buy_yes', 'NO_TRADE', ?, "
+        "0.6, NULL, 'LIVE', 'configured', ?, nextval('seq_shadow_decision_export')) "
+        "ON CONFLICT (cycle_id, market_id, direction) DO UPDATE SET "
+        "state = excluded.state, net_edge = excluded.net_edge",
+        [NOW, NOW + timedelta(minutes=1)],
+    )
+
+    # Simulate a crash after publishing part 2 but before accounting for it,
+    # then reopen both the database and exporter before running the rest.
+    state = json.loads(ex.state_path.read_text(encoding="utf-8"))
+    state.update(next_part=2, rows_exported=2, cursor_seq=2)
+    ex.state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in ex.parts_dir.glob("part-*.jsonl")}
+    db.close()
+    db.open()
+    resumed = _exporter(db, tmp_path, batch_rows=2, max_parts_per_run=1)
+    _run_to_caught_up(resumed)
+
+    ids = _ids(tmp_path / "export")
+    expected = {f"id-{i:04d}" for i in range(10)} | {late_id}
+    assert len(ids) == len(set(ids)) == len(expected) == 11
+    assert set(ids) == expected
+    assert late_id in ids
+    assert (
+        db.con.execute("SELECT export_seq FROM shadow_decisions WHERE decision_id = 'id-0000'").fetchone()[0]
+        == original_seq
+    )
+    parts = sorted(resumed.parts_dir.glob("part-*.jsonl"))
+    assert [int(path.stem.split("-")[1]) for path in parts] == list(range(1, len(parts) + 1))
+    assert all(path.read_bytes() == before[path.name] for path in parts if path.name in before)
+    report = resumed.reconcile()
+    assert report["consistent"] is True, report
+    assert report["rows_on_disk"] == report["source_rows_at_or_below_cursor"] == 11
 
 
 def test_parts_are_consecutive_and_reconcile_is_clean_over_many_ticks(db, tmp_path):
@@ -338,7 +393,7 @@ def test_reconcile_reports_a_duplicated_line(db, tmp_path):
     ex = _exporter(db, tmp_path)
     assert ex.run_batch().rows_exported == 1
 
-    part = (tmp_path / "export" / "parts" / "part-000000001.jsonl")
+    part = tmp_path / "export" / "parts" / "part-000000001.jsonl"
     line = part.read_text(encoding="utf-8").splitlines()[0]
     part.write_text(line + "\n" + line + "\n", encoding="utf-8")
 
@@ -390,26 +445,44 @@ def test_reconcile_reports_rows_missing_from_the_parts(db, tmp_path):
     assert "source holds" in (report["first_divergence"] or "")
 
 
-def test_export_verify_cli_returns_the_source_verdict(db, tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("corruption", ["clean", "wrong-id", "missing-source-row", "duplicate-id"])
+def test_export_verify_cli_returns_the_source_verdict(db, tmp_path, monkeypatch, capsys, corruption):
     from weatherquant.shadow.cli import main
 
     monkeypatch.setenv("WQ_SHADOW_REPORT_PATH", str(tmp_path / "report.json"))
-    _insert(db, i=1, when=NOW)
+    for i in range(3):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i))
     ex = DecisionExporter(db.con, tmp_path / "decisions-export")
-    assert ex.run_batch().rows_exported == 1
+    assert ex.run_batch().rows_exported == 3
     db.close()
-    args = ["--db", str(db.path), "export-verify", "--json"]
-    assert main(args) == 0
-    clean = json.loads(capsys.readouterr().out)
-    assert clean["consistent"] and clean["parts"] == 1 and clean["watermark"]
+    part = ex.parts_dir / "part-000000001.jsonl"
+    lines = part.read_text(encoding="utf-8").splitlines()
 
-    part, = ex.parts_dir.glob("part-*.jsonl")
-    row = json.loads(part.read_text(encoding="utf-8"))
-    row["decision_id"] = "not-in-source"
-    part.write_text(json.dumps(row) + "\n", encoding="utf-8")
-    assert main(args) == 1
-    damaged = json.loads(capsys.readouterr().out)
-    assert not damaged["consistent"] and "not-in-source" in damaged["first_divergence"]
+    if corruption == "wrong-id":
+        row = json.loads(lines[0])
+        row["decision_id"] = "not-in-source"
+        lines[0] = json.dumps(row)
+    elif corruption == "missing-source-row":
+        del lines[1]
+        state = json.loads(ex.state_path.read_text(encoding="utf-8"))
+        state["rows_exported"] = 2
+        ex.state_path.write_text(json.dumps(state), encoding="utf-8")
+    elif corruption == "duplicate-id":
+        row = json.loads(lines[0])
+        row["decision_id"] = json.loads(lines[1])["decision_id"]
+        lines[0] = json.dumps(row)
+    if corruption != "clean":
+        part.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    args = ["--db", str(db.path), "export-verify", "--json"]
+    assert main(args) == (0 if corruption == "clean" else 1)
+    report = json.loads(capsys.readouterr().out)
+    assert report["consistent"] is (corruption == "clean")
+    assert report["parts"] == 1 and report["watermark"]
+    if corruption in {"wrong-id", "duplicate-id"}:
+        assert "decision_id" in report["first_divergence"]
+    elif corruption == "missing-source-row":
+        assert "source holds" in report["first_divergence"]
 
 
 # --- the one-time v1 -> v2 transition ------------------------------------------
@@ -525,9 +598,7 @@ def test_the_transition_is_bounded_and_resumable_across_restarts(tmp_path, monke
         # numbering would hand it the earliest sequence - exactly the
         # interleaving the transition exists to untangle.
         missed = _insert(database, i=77, when=NOW - timedelta(hours=3), mode="REPLAY")
-        exported = [
-            _insert(database, i=i, when=NOW + timedelta(seconds=i)) for i in range(40)
-        ]
+        exported = [_insert(database, i=i, when=NOW + timedelta(seconds=i)) for i in range(40)]
         _backfill_like_migration_0005(database)
         _write_v1_export(database, tmp_path, exported)  # 10 parts of 4 rows
 
@@ -543,9 +614,7 @@ def test_the_transition_is_bounded_and_resumable_across_restarts(tmp_path, monke
         assert state["transition"]["phase"] == "scan_parts"
         # One batch (eight parts) scanned, the deadline stopped the second.
         assert state["transition"]["next_part"] == 9
-        ids_before = database.con.execute(
-            "SELECT COUNT(*) FROM _export_transition_ids"
-        ).fetchone()[0]
+        ids_before = database.con.execute("SELECT COUNT(*) FROM _export_transition_ids").fetchone()[0]
         assert int(ids_before) == 32, "the scan table did not survive within the run"
     finally:
         database.close()
@@ -555,9 +624,7 @@ def test_the_transition_is_bounded_and_resumable_across_restarts(tmp_path, monke
     database = ShadowDatabase(tmp_path / "shadow.duckdb")
     database.open()
     try:
-        ids_after_restart = database.con.execute(
-            "SELECT COUNT(*) FROM _export_transition_ids"
-        ).fetchone()[0]
+        ids_after_restart = database.con.execute("SELECT COUNT(*) FROM _export_transition_ids").fetchone()[0]
         assert int(ids_after_restart) == 32, "the scan progress did not survive the restart"
 
         ex = DecisionExporter(database.con, tmp_path / "export", batch_rows=4)
@@ -662,6 +729,78 @@ def test_a_large_transition_completes_quickly_with_bulk_id_loading(db, tmp_path,
     assert elapsed < 5.0, f"the transition scan took {elapsed:.1f}s for {part_count} parts"
     assert ex.state()["transition"]["parts_scanned"] == part_count
     assert ex.reconcile()["consistent"] is True
+
+
+@pytest.mark.parametrize(("row_count", "trailing_empty"), [(0, True), (1, False), (20, True)])
+def test_transition_batch_boundaries_preserve_every_legacy_byte(db, tmp_path, row_count, trailing_empty):
+    """Empty, single and multi-batch tiny parts all retain their exact bytes."""
+    exported = [_insert(db, i=i, when=NOW + timedelta(seconds=i)) for i in range(row_count)]
+    if exported:
+        _backfill_like_migration_0005(db)
+        _write_v1_export(db, tmp_path, exported, rows_per_part=1)
+    else:
+        (tmp_path / "export" / "parts").mkdir(parents=True)
+        _atomic_state(
+            tmp_path / "export" / "state.json",
+            {"next_part": 1, "rows_exported": 0, "watermark": None},
+        )
+    if trailing_empty:
+        (tmp_path / "export" / "parts" / f"part-{row_count + 1:09d}.jsonl").write_bytes(b"")
+        state = json.loads((tmp_path / "export" / "state.json").read_text(encoding="utf-8"))
+        state["next_part"] = row_count + 2
+        _atomic_state(tmp_path / "export" / "state.json", state)
+
+    ex = _exporter(db, tmp_path)
+    parts = sorted(ex.parts_dir.glob("part-*.jsonl"))
+    before = {path.name: path.read_bytes() for path in parts}
+    result = ex.run_batch()
+    assert result.transition_done, result.notes
+    _run_to_caught_up(ex)
+
+    assert ex.state()["transition"]["parts_scanned"] == len(parts)
+    assert {path.name: path.read_bytes() for path in parts} == before
+    assert _ids(tmp_path / "export") == exported
+    report = ex.reconcile()
+    assert report["consistent"] is True, report
+    assert report["legacy_lines"] == row_count
+
+
+def test_empty_part_batches_resume_without_rewinding_the_scan(db, tmp_path, monkeypatch):
+    """An empty ID table can be valid progress; it is not evidence of a dropped table."""
+    exported = [_insert(db, i=1, when=NOW)]
+    _backfill_like_migration_0005(db)
+    _write_v1_export(db, tmp_path, exported, rows_per_part=1)
+    parts_dir = tmp_path / "export" / "parts"
+    (parts_dir / "part-000000001.jsonl").rename(parts_dir / "part-000000017.jsonl")
+    for index in range(1, 17):
+        (parts_dir / f"part-{index:09d}.jsonl").write_bytes(b"")
+    state = json.loads((tmp_path / "export" / "state.json").read_text(encoding="utf-8"))
+    state["next_part"] = 18
+    _atomic_state(tmp_path / "export" / "state.json", state)
+    before = {path.name: path.read_bytes() for path in parts_dir.glob("part-*.jsonl")}
+
+    ex = _exporter(db, tmp_path, max_seconds=0.001)
+    with monkeypatch.context() as patch:
+        patch.setattr("weatherquant.shadow.export.time.monotonic", itertools.count(0, 1).__next__)
+        assert not ex.run_batch().transition_done
+    assert ex.state()["transition"]["next_part"] == 9
+
+    db.close()
+    db.open()
+    resumed = _exporter(db, tmp_path, max_seconds=0.001)
+    with monkeypatch.context() as patch:
+        patch.setattr("weatherquant.shadow.export.time.monotonic", itertools.count(0, 1).__next__)
+        assert not resumed.run_batch().transition_done
+    # Parts 9..16 are also empty. Recovery must advance to 17, not mistake the
+    # empty persistent ID table for a dropped table and scan 1..8 again.
+    assert resumed.state()["transition"]["next_part"] == 17
+
+    finished = _exporter(db, tmp_path)
+    assert finished.run_batch().transition_done
+    _run_to_caught_up(finished)
+    assert _ids(tmp_path / "export") == exported
+    assert {path.name: path.read_bytes() for path in parts_dir.glob("part-*.jsonl")} == before
+    assert finished.reconcile()["consistent"] is True
 
 
 def test_a_fresh_directory_needs_no_transition_scan(db, tmp_path):
@@ -800,9 +939,7 @@ def _simulate_old_image_window(db, tmp_path: Path, rows: list[tuple[int, datetim
         cursor = (when.isoformat(), decision_id)
         if watermark is None or cursor > watermark:
             watermark = cursor
-    (export_dir / "parts" / f"part-{index:09d}.jsonl").write_text(
-        "\n".join(lines) + "\n", encoding="utf-8"
-    )
+    (export_dir / "parts" / f"part-{index:09d}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
     # The old image's _save: only the keys it knows, the v2 keys ride along.
     state.update(
         {
@@ -828,9 +965,7 @@ def test_a_rollback_window_does_not_duplicate_rows(db, tmp_path):
     ex = _exporter(db, tmp_path)
     assert ex.run_batch().rows_exported == 6  # v2 parts, every line sequenced
 
-    rollback_rows = [
-        (60 + i, NOW + timedelta(minutes=100 + i), f"m-rb-{i % 3}") for i in range(15)
-    ]
+    rollback_rows = [(60 + i, NOW + timedelta(minutes=100 + i), f"m-rb-{i % 3}") for i in range(15)]
     _simulate_old_image_window(db, tmp_path, rollback_rows)
 
     result = ex.run_batch()
@@ -844,9 +979,7 @@ def test_a_rollback_window_does_not_duplicate_rows(db, tmp_path):
     state = json.loads(ex.state_path.read_text(encoding="utf-8"))
     cursor = int(state["cursor_seq"])
     assert state["last_rollback_repair"]["rows_pinned"] == 15
-    pinned = db.con.execute(
-        "SELECT COUNT(*) FROM shadow_decisions WHERE export_seq = ?", [cursor]
-    ).fetchone()[0]
+    pinned = db.con.execute("SELECT COUNT(*) FROM shadow_decisions WHERE export_seq = ?", [cursor]).fetchone()[0]
     assert int(pinned) == 16  # the 15 pinned rows plus the row that IS the cursor
 
     report = ex.reconcile()
@@ -885,9 +1018,7 @@ def test_the_streaming_consumer_accepts_a_trailing_rollback_part(db, tmp_path):
         tmp_path,
         [(70 + i, NOW + timedelta(minutes=50 + i), f"m-rb2-{i}") for i in range(4)],
     )
-    assert any(
-        note.startswith("rollback repair") for note in ex.run_batch().notes
-    )
+    assert any(note.startswith("rollback repair") for note in ex.run_batch().notes)
     _run_to_caught_up(ex)
 
     from weatherquant.performance.state import PerformanceStateStore

@@ -91,8 +91,7 @@ def test_the_migration_opens_a_non_empty_pre_0005_database(old_db_path: Path) ->
     assert any(a.startswith("0006") for a in applied)
     try:
         row = database.con.execute(
-            "SELECT COUNT(*), COUNT(export_seq), COUNT(DISTINCT export_seq) "
-            "FROM shadow_decisions"
+            "SELECT COUNT(*), COUNT(export_seq), COUNT(DISTINCT export_seq) FROM shadow_decisions"
         ).fetchone()
         total, sequenced, distinct = int(row[0]), int(row[1]), int(row[2])
         assert total == 500
@@ -138,19 +137,11 @@ def test_the_first_nextval_after_the_backfill_is_exactly_max_plus_one(
     database = ShadowDatabase(old_db_path)
     database.open()
     try:
-        maximum = int(
-            database.con.execute(
-                "SELECT MAX(export_seq) FROM shadow_decisions"
-            ).fetchone()[0]
-        )
+        maximum = int(database.con.execute("SELECT MAX(export_seq) FROM shadow_decisions").fetchone()[0])
         assert maximum == rows
 
         for expected in (rows + 1, rows + 2):
-            got = int(
-                database.con.execute(
-                    "SELECT nextval('seq_shadow_decision_export')"
-                ).fetchone()[0]
-            )
+            got = int(database.con.execute("SELECT nextval('seq_shadow_decision_export')").fetchone()[0])
             assert got == expected, (
                 f"nextval returned {got}, expected {expected}; the sequence "
                 "advance in migration 0005 did not fully consume the backfill"
@@ -166,9 +157,7 @@ def test_the_first_nextval_after_the_backfill_is_exactly_max_plus_one(
             [NOW, NOW],
         )
         got = int(
-            database.con.execute(
-                "SELECT export_seq FROM shadow_decisions WHERE decision_id = 'id-new-1'"
-            ).fetchone()[0]
+            database.con.execute("SELECT export_seq FROM shadow_decisions WHERE decision_id = 'id-new-1'").fetchone()[0]
         )
         assert got == rows + 3
     finally:
@@ -181,16 +170,12 @@ def test_the_migration_pair_is_what_the_directory_ships() -> None:
     def statements(sql: str) -> list[str]:
         # Comments are not statements: 0005 *mentions* CREATE INDEX in its
         # explanation of the split, and that mention must not read as code.
-        without_comments = "\n".join(
-            line for line in sql.splitlines() if not line.lstrip().startswith("--")
-        )
+        without_comments = "\n".join(line for line in sql.splitlines() if not line.lstrip().startswith("--"))
         return [s.strip() for s in without_comments.split(";") if s.strip()]
 
     specs = {s.version: s.sql for s in available_migrations(SHADOW_MIGRATIONS_DIR)}
     assert any("CREATE INDEX" in s for s in statements(specs["0006"]))
-    assert not any(
-        "CREATE INDEX" in s for s in statements(specs["0005"])
-    ), (
+    assert not any("CREATE INDEX" in s for s in statements(specs["0005"])), (
         "the index moved to 0006 because creating it beside the backfill "
         "UPDATE fails on a non-empty table; putting it back in 0005 "
         "recreates the startup outage"
@@ -200,3 +185,38 @@ def test_the_migration_pair_is_what_the_directory_ships() -> None:
         "the sequence advance must be followed by another statement: a "
         "trailing SELECT is evaluated lazily and under-consumes the range"
     )
+
+
+def test_0009_is_idempotent_and_an_old_image_can_reopen_the_database(
+    old_db_path: Path, tmp_path: Path, monkeypatch
+) -> None:
+    con = connect(old_db_path)
+    _insert_rows(con, 1)
+    con.close()
+
+    database = ShadowDatabase(old_db_path)
+    applied = database.open()
+    assert any(a.startswith("0009") for a in applied)
+    spec = next(s for s in available_migrations(SHADOW_MIGRATIONS_DIR) if s.version == "0009")
+    database.con.execute(spec.sql)  # DROP INDEX IF EXISTS is safe to repeat directly.
+    database.close()
+
+    database = ShadowDatabase(old_db_path)
+    assert not any(a.startswith("0009") for a in database.open())
+    database.close()
+
+    through_0006 = tmp_path / "migrations_through_0006"
+    through_0006.mkdir()
+    for spec in available_migrations(SHADOW_MIGRATIONS_DIR):
+        if int(spec.version) <= 6:
+            shutil.copy(spec.path, through_0006 / spec.path.name)
+    monkeypatch.setattr("weatherquant.storage.shadow.SHADOW_MIGRATIONS_DIR", through_0006)
+    with ShadowDatabase(old_db_path) as old_image:
+        assert old_image.execute("SELECT COUNT(*) FROM shadow_decisions").fetchone()[0] == 1
+        indexes = {
+            row[0]
+            for row in old_image.execute(
+                "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'shadow_decisions'"
+            ).fetchall()
+        }
+        assert "idx_decisions_export_seq" not in indexes

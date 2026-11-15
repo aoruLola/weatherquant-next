@@ -34,6 +34,17 @@ REPLAY 重读历史归档时，写入时刻是现在、业务时刻是过去。�
 每个 ID 在所有分片中须恰好出现一次，并且属于已导出范围。有序号的行还须匹配该 ID 在源库中的序号。
 这样可以发现行数相同但 ID 被重复或替换的分片。完整扫描只在显式对账时执行。
 
+### 0009 与 DuckDB 版本
+
+- 本分支基于的 `origin/main` 只有 Shadow 迁移 0001–0006；新增 `0009_drop_mutable_export_seq_index.sql`
+  没有编号冲突。迁移器按版本顺序执行并记录校验和，重复 open 不会重放；直接重复执行该 SQL 也因
+  `DROP INDEX IF EXISTS` 而幂等。
+- 0009 只删除 0006 的**非唯一**索引，不删除列、序列或约束。导出仍显式使用
+  `WHERE export_seq > ? ORDER BY export_seq, decision_id`，结果不依赖索引是否存在。
+- 删除索引是为了让旧行补序号及回滚修复在 DuckDB 1.1 上也能更新该列。本仓库当前 `uv.lock`
+  锁定 **1.5.6**；本分支单独在该版本完成本轮测试，不需要合入 #44，也未改动版本锁。本轮没有切换
+  DuckDB 版本，因此不把其他版本的结果写作本轮实测证据。
+
 ## 3. 兼容已有导出：一次性过渡（不清空生产游标）
 
 旧分片没有 `export_seq`，且 v1 按业务时间选取——被它跳过的行在序列空间里与已导出行
@@ -77,11 +88,26 @@ REPLAY 重读历史归档时，写入时刻是现在、业务时刻是过去。�
 - 状态库迁移 `0003_ingest_export_seq.sql`：`performance_ingest` 增 `last_export_seq`（可空）
   与 `late_rows_seen`（默认 0），纯增量。
 
-## 5. 回滚方案（已按验收演练更正）
+## 5. 安全升级与回滚方案（已按验收演练更正）
 
-支持路径是「新 → 旧 → 新」：旧镜像在 v2 导出目录上继续用业务游标导出，把
-NULL-seq 行写进**追加在 v2 分片之后的 v1 格式分片**（旧代码会原样保留它不认识的
-`version`/`cursor_seq` 键）。新镜像重新接管时：
+### 升级步骤
+
+1. 停止 Shadow 引擎，确认没有其他进程持有数据库；在同一持久卷保留数据库和整个导出目录的备份。
+   不删除 `state.json`、不清空 `cursor_seq`，也不移动或改写任何 `parts/part-*.jsonl`。
+2. 启动包含本分支的新镜像。数据库 open 会由唯一写者按事务依次应用尚未执行的 0005、0006、0009；
+   已记录的迁移自动跳过。0009 不需要反向迁移。
+3. 让导出 tick 持续运行，直到 `state.json` 为 `version: 2` 且 `transition.phase: done`，随后达到
+   `caught_up`。大量旧分片会跨多个有界 tick 扫描，中途重启会从已保存的批次位置继续。
+4. 停止引擎后运行 `weatherquant-shadow export-verify --json`。退出码必须为 0、`consistent` 必须为
+   `true`，再恢复引擎和研究侧消费；非零时保留现场并按 `first_divergence` 排查，不要清空游标重来。
+
+### 回滚步骤
+
+支持路径是「新 → 旧 → 新」：先停止新镜像，再让旧镜像使用**同一个**数据库和导出目录，不能用旧备份
+覆盖升级后的文件。旧镜像在 v2 导出目录上继续用业务游标导出，把 NULL-seq 行写进
+**追加在 v2 分片之后的 v1 格式分片**（旧代码会原样保留它不认识的 `version`/`cursor_seq` 键）。
+旧镜像不依赖已删除的非唯一索引，也不受新增可空列和额外迁移记录影响；回滚窗口仍存在旧版迟到行
+缺陷，应尽快重新升级。新镜像重新接管时：
 
 - **`_repair_rollback_tail`**（每个导出 tick 先行）：检测"末尾无 `export_seq` 的分片"，
   把其中 id 对应的 NULL-seq 行**钉在 cursor_seq**（≤ 游标 = 已导出前缀），它们不会再被
@@ -108,12 +134,17 @@ reconcile INCONSISTENT、流式永久拒绝）。
   旧镜像运行期间已被旧版消费代码读过并留下分片 sha 记录，按
   `docs/performance-decouple-runbook.md` 重建状态库。
 
+重新升级后必须运行到 `caught_up`，再次停止引擎并执行 `export-verify --json`；只有退出码为 0
+才恢复研究侧消费。这样回滚窗口里已导出和未导出的行都经过源库对账，而不是仅依赖行数判断。
+
 ## 6. 验收证据（本机）
 
-**单元/隔离测试**：`tests/test_shadow_export_seq.py`（20 例）与
-`tests/test_shadow_export_seq_migration.py`（3 例，含旧 schema + 非空表 → 新版 open 的
-真实迁移路径、250k 行下首取 `nextval == max+1`、迁移对拆分的静态守卫）全过；
-全套 `uv run pytest -q` 1087 passed, 6 skipped；ruff 通过。
+**WQN-20 复审单元/隔离测试**：`tests/test_shadow_export_seq.py`（35 例）与
+`tests/test_shadow_export_seq_migration.py`（4 例，含旧 schema + 非空表 → 新版 open 的
+真实迁移路径、250k 行下首取 `nextval == max+1`、0009 幂等与旧迁移集重开）共 39 例全过；
+全套 `uv run pytest -q` **1521 passed, 6 skipped**；`uv run ruff check .` 通过，本次改动的四个
+Python 文件均通过 `ruff format --check`。空分片恢复用例做了反向验证：临时恢复旧的空表判据后，
+断言实际值 `next_part == 9`、预期值 `17`，测试如期失败；还原修复后通过。
 
 **双镜像演练**（旧=main@3757619，新=本分支；脚本与输出见 PR #37「本机验收证据」评论）：
 
@@ -130,7 +161,7 @@ exit code 0/1 对应一致/不一致。
 
 ## 7. 需 NAS 人工验收的部分
 
-- 生产 `shadow.duckdb` 上执行迁移 0005/0006（约 70 万行回填）与一次性过渡的实际耗时观察；
+- 生产 `shadow.duckdb` 上执行迁移 0005/0006/0009（约 70 万行回填）与一次性过渡的实际耗时观察；
 - 过渡完成的质量事件（`decision_export_transition_done`）与 `export-verify` 在真实数据上的输出；
 - 旧镜像→新镜像→旧镜像→新镜像 的回滚演练（本机已用双镜像 + kill -9 注入等价复现，见上表）。
 

@@ -273,9 +273,7 @@ class DecisionExporter:
             # A state that names parts but counts no rows is not one this
             # can trust - the two are written together - so it is treated as
             # absent and the count is rebuilt.
-            accounted = (
-                int(state.get("next_part") or 1) if state.get("rows_exported") else 1
-            )
+            accounted = int(state.get("next_part") or 1) if state.get("rows_exported") else 1
             state["next_part"] = max(accounted, _index_of(last) + 1)
             # Only the parts the state does not already cover are counted.
             #
@@ -295,9 +293,7 @@ class DecisionExporter:
             # not consulted until a part has been written.
             tail = [path for path in existing if _index_of(path) >= accounted]
             if tail:
-                state["rows_exported"] = int(
-                    state.get("rows_exported") or 0
-                ) + _count_rows(tail)
+                state["rows_exported"] = int(state.get("rows_exported") or 0) + _count_rows(tail)
         if on_disk != state:
             self._save(state)
         return state
@@ -419,21 +415,22 @@ class DecisionExporter:
         """
         started = time.monotonic()
         result = ExportResult()
-        self.con.execute(
-            f"CREATE TABLE IF NOT EXISTS {_TRANSITION_IDS_TABLE} "
-            "(decision_id VARCHAR PRIMARY KEY)"
+        table_exists = bool(
+            self.con.execute(
+                "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = ?",
+                [_TRANSITION_IDS_TABLE],
+            ).fetchone()[0]
         )
-        scanned = int(self.con.execute(
-            f"SELECT COUNT(*) FROM {_TRANSITION_IDS_TABLE}"
-        ).fetchone()[0])
+        self.con.execute(f"CREATE TABLE IF NOT EXISTS {_TRANSITION_IDS_TABLE} (decision_id VARCHAR PRIMARY KEY)")
 
         progress = state.get("transition") or {}
         phase = progress.get("phase") or "scan_parts"
         next_scan = int(progress.get("next_part") or 1)
-        if next_scan > 1 and scanned == 0:
+        if next_scan > 1 and not table_exists:
             # Progress claims a scan whose accumulated ids are gone (the
-            # table was dropped by hand). The floor must never be derived
-            # over ids that are not there, so the scan restarts instead.
+            # table was dropped by hand). Check existence before creating it:
+            # an existing table can legitimately be empty after a batch of
+            # empty parts, and must not send recovery back to part 1.
             next_scan = 1
 
         existing = sorted(self.parts_dir.glob("part-*.jsonl"))
@@ -471,9 +468,7 @@ class DecisionExporter:
                 # part is a transaction per part, and on the acceptance
                 # hardware those commits dominated the tick.
                 if did_scan_work and time.monotonic() - started >= self.max_seconds:
-                    result.notes.append(
-                        f"transition: stopped the scan at the {self.max_seconds:g}s budget"
-                    )
+                    result.notes.append(f"transition: stopped the scan at the {self.max_seconds:g}s budget")
                     break
                 # For tiny parts the setup cost of a DuckDB JSON reader per
                 # file dominates. Keep this in-memory path bounded by bytes.
@@ -499,17 +494,12 @@ class DecisionExporter:
             state["transition"] = {"phase": "scan_parts", "next_part": next_scan}
             self._save(state)
             if next_scan <= len(existing):
-                result.notes.append(
-                    f"transition: scanned {min(next_scan - 1, len(existing))}"
-                    f"/{len(existing)} part(s)"
-                )
+                result.notes.append(f"transition: scanned {min(next_scan - 1, len(existing))}/{len(existing)} part(s)")
                 result.duration_seconds = time.monotonic() - started
                 return result
             state["transition"] = {"phase": "finalize"}
             self._save(state)
-            over_budget_after_scan = (
-                did_scan_work and time.monotonic() - started >= self.max_seconds
-            )
+            over_budget_after_scan = did_scan_work and time.monotonic() - started >= self.max_seconds
 
         # -- finalize: floor, re-sequence the skipped rows, switch to v2 ----
         floor_row = self.con.execute(
@@ -524,9 +514,7 @@ class DecisionExporter:
         # selection and the loop would spin. One probe value tells us where
         # the head is; if it is too low, the difference is consumed so the
         # next nextval is floor + 1. The probe itself becomes a harmless gap.
-        probe = int(self.con.execute(
-            "SELECT nextval('seq_shadow_decision_export')"
-        ).fetchone()[0])
+        probe = int(self.con.execute("SELECT nextval('seq_shadow_decision_export')").fetchone()[0])
         if probe <= floor:
             self.con.execute(
                 "SELECT nextval('seq_shadow_decision_export') FROM range(?)",
@@ -547,8 +535,7 @@ class DecisionExporter:
             }
             self._save(state)
             result.notes.append(
-                "transition: re-sequencing deferred to the next tick by the "
-                f"{self.max_seconds:g}s budget"
+                f"transition: re-sequencing deferred to the next tick by the {self.max_seconds:g}s budget"
             )
             result.duration_seconds = time.monotonic() - started
             return result
@@ -575,9 +562,7 @@ class DecisionExporter:
                 [floor],
             )
 
-        exported_ids = int(self.con.execute(
-            f"SELECT COUNT(*) FROM {_TRANSITION_IDS_TABLE}"
-        ).fetchone()[0])
+        exported_ids = int(self.con.execute(f"SELECT COUNT(*) FROM {_TRANSITION_IDS_TABLE}").fetchone()[0])
 
         watermark = state.get("watermark")
         state["version"] = _STATE_VERSION
@@ -607,8 +592,7 @@ class DecisionExporter:
         result.transition_done = True
         result.cursor_seq = floor
         result.notes.append(
-            f"transition complete: floor_seq={floor}, "
-            f"{reassigned} skipped row(s) re-sequenced above it"
+            f"transition complete: floor_seq={floor}, {reassigned} skipped row(s) re-sequenced above it"
         )
         result.duration_seconds = time.monotonic() - started
         return result
@@ -644,9 +628,7 @@ class DecisionExporter:
 
             cursor_seq = state.get("cursor_seq")
             cursor_seq = int(cursor_seq) if cursor_seq is not None else 0
-            previous_watermark = (
-                tuple(state["watermark"]) if state.get("watermark") else None
-            )
+            previous_watermark = tuple(state["watermark"]) if state.get("watermark") else None
             rows_before = int(state.get("rows_exported") or 0)
             index = int(state.get("next_part") or 1)
 
@@ -655,9 +637,7 @@ class DecisionExporter:
             late_rows = 0
             while True:
                 if self.max_parts_per_run is not None and parts_written >= self.max_parts_per_run:
-                    result.notes.append(
-                        f"stopped after {parts_written} part(s) by max_parts_per_run"
-                    )
+                    result.notes.append(f"stopped after {parts_written} part(s) by max_parts_per_run")
                     break
                 # The budget bounds the *writing*, so it is only consulted once
                 # a part has been written. Checking it first means any slow
@@ -665,10 +645,7 @@ class DecisionExporter:
                 # the whole budget and starve the tick, which is what made a
                 # five-second budget stop a five-minute job from ever starting.
                 if parts_written and time.monotonic() - started >= self.max_seconds:
-                    result.notes.append(
-                        f"stopped after {parts_written} part(s) by the "
-                        f"{self.max_seconds:g}s budget"
-                    )
+                    result.notes.append(f"stopped after {parts_written} part(s) by the {self.max_seconds:g}s budget")
                     break
 
                 self._assign_missing_seq()
@@ -710,9 +687,7 @@ class DecisionExporter:
             result.parts_written = parts_written
             result.late_rows = late_rows
             result.cursor_seq = cursor_seq
-            result.watermark = (
-                tuple(state["watermark"]) if state.get("watermark") else None
-            )
+            result.watermark = tuple(state["watermark"]) if state.get("watermark") else None
             if result.caught_up and rows_written == 0:
                 result.notes.append("already at the watermark; nothing new to export")
         except Exception as exc:  # a side channel must not raise
@@ -746,8 +721,7 @@ class DecisionExporter:
         if not missing:
             return
         self.con.executemany(
-            "UPDATE shadow_decisions SET export_seq = "
-            "nextval('seq_shadow_decision_export') WHERE decision_id = ?",
+            "UPDATE shadow_decisions SET export_seq = nextval('seq_shadow_decision_export') WHERE decision_id = ?",
             [[row[0]] for row in missing],
         )
 
@@ -818,23 +792,20 @@ class DecisionExporter:
         }
         if int(state.get("version") or 1) < _STATE_VERSION:
             report["first_divergence"] = (
-                "state is still at v1 (business-time cursor); the one-time "
-                "transition has not completed"
+                "state is still at v1 (business-time cursor); the one-time transition has not completed"
             )
             return report
 
         try:
-            unsequenced = self.con.execute(
-                "SELECT COUNT(*) FROM shadow_decisions WHERE export_seq IS NULL"
-            ).fetchone()[0]
+            unsequenced = self.con.execute("SELECT COUNT(*) FROM shadow_decisions WHERE export_seq IS NULL").fetchone()[
+                0
+            ]
             at_or_below = self.con.execute(
                 "SELECT COUNT(*) FROM shadow_decisions WHERE export_seq <= ?",
                 [int(cursor_seq or 0)],
             ).fetchone()[0]
         except Exception as exc:
-            report["first_divergence"] = (
-                f"cannot read the source table: {type(exc).__name__}: {exc}"
-            )
+            report["first_divergence"] = f"cannot read the source table: {type(exc).__name__}: {exc}"
             return report
         report["source_rows_unsequenced"] = int(unsequenced)
         report["source_rows_at_or_below_cursor"] = int(at_or_below)
@@ -887,8 +858,7 @@ class DecisionExporter:
             report["first_divergence"] = "parts are not monotone in export_seq"
         elif rows_on_disk != int(state.get("rows_exported") or 0):
             report["first_divergence"] = (
-                f"state claims {state.get('rows_exported')} row(s) but the parts "
-                f"hold {rows_on_disk}"
+                f"state claims {state.get('rows_exported')} row(s) but the parts hold {rows_on_disk}"
             )
         elif int(at_or_below) != rows_on_disk:
             report["first_divergence"] = (
@@ -897,10 +867,7 @@ class DecisionExporter:
                 "or duplicated between the database and the export"
             )
         elif max_seq is not None and int(cursor_seq or 0) != max_seq:
-            report["first_divergence"] = (
-                f"state cursor_seq is {cursor_seq} but the newest part ends at "
-                f"{max_seq}"
-            )
+            report["first_divergence"] = f"state cursor_seq is {cursor_seq} but the newest part ends at {max_seq}"
         elif rows_on_disk:
             mismatch = self.con.execute(
                 """
@@ -944,11 +911,7 @@ def _count_late_rows(rows: list[Any], watermark: tuple[str, str] | None) -> int:
     """
     if watermark is None:
         return 0
-    return sum(
-        1
-        for row in rows
-        if _cursor_strings(row[_TIME_INDEX], row[_ID_INDEX]) <= watermark
-    )
+    return sum(1 for row in rows if _cursor_strings(row[_TIME_INDEX], row[_ID_INDEX]) <= watermark)
 
 
 def _index_of(path: Path) -> int:
@@ -1030,9 +993,7 @@ def _write_part(path: Path, rows: list[Any]) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     # delete=False plus an explicit replace: the rename is what makes the
     # publish atomic, and it needs a closed descriptor on Windows.
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=directory, suffix=".tmp", delete=False
-    ) as handle:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, suffix=".tmp", delete=False) as handle:
         for row in rows:
             handle.write(json.dumps(_row_as_dict(row), ensure_ascii=False, default=str))
             handle.write("\n")
@@ -1049,9 +1010,7 @@ def _row_as_dict(row: Any) -> dict[str, Any]:
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False
-    ) as handle:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
         handle.flush()
         os.fsync(handle.fileno())
