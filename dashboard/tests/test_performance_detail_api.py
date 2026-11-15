@@ -514,19 +514,30 @@ def test_reference_stakes_report_the_observations_each_actually_covers(tmp_path,
         assert stake["simulated_net_profit_usdc"] is None and stake["simulated_roi"] is None
 
 
-def test_reference_capital_recovers_bounds_from_an_older_published_window(tmp_path, app_for):
+@pytest.mark.parametrize("legacy_shape", ["reversed", "missing_fields"])
+def test_reference_capital_recovers_bounds_from_an_older_published_window(
+    tmp_path, app_for, legacy_shape
+):
     out = tmp_path / "performance"
     rows = _decisions(3)
     rows.append(dict(rows[0], decided_at_utc=(NOW + timedelta(minutes=1)).isoformat()))
     _publish(out, rows, detail_max_episodes=2)
     path = resolve_generation(out).directory / "opportunities.json"
     old = json.loads(path.read_text(encoding="utf-8"))
-    old["data"]["window"].update(first_seen_utc_from=NOW.isoformat(),
-                                 last_seen_utc_to=(NOW - timedelta(minutes=1)).isoformat())
+    if legacy_shape == "reversed":
+        old["data"]["window"].update(
+            first_seen_utc_from=NOW.isoformat(),
+            last_seen_utc_to=(NOW - timedelta(minutes=1)).isoformat(),
+        )
+    else:
+        old["data"]["window"].pop("first_seen_utc_from")
+        old["data"]["window"].pop("last_seen_utc_to")
     path.write_text(json.dumps(old), encoding="utf-8")
 
     with app_for() as client:
-        window = client.get("/api/v1/performance/reference-capital").json()["data"]
+        response = client.get("/api/v1/performance/reference-capital")
+        assert response.status_code == 200
+        window = response.json()["data"]
     assert window["window_start"] == (NOW - timedelta(minutes=1)).isoformat()
     assert window["window_end"] == (NOW + timedelta(minutes=1)).isoformat()
     assert window["window"]["episodes_all"] == 3

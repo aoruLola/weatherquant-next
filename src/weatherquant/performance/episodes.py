@@ -278,24 +278,27 @@ def _finite(value: object) -> float | None:
 
 
 def _timestamp(value: object) -> datetime:
-    """Accept a datetime or the ISO-8601 string a JSON export carries.
+    """Accept a datetime or ISO-8601 string and normalise it to UTC.
 
     The export the research process reads (contract section 11) serialises
     timestamps as strings, so treating ``row["decided_at_utc"]`` as already
     parsed works on a database cursor and fails on a file - which is the
     direction the data actually travels. A naive string is read as UTC
     rather than rejected, because a decision recorded without an offset was
-    recorded in the engine's own clock, which is UTC.
+    recorded in the engine's own clock, which is UTC. Explicit offsets are
+    normalised too: the streaming store round-trips through UTC, and episode
+    identity must not depend on which side of that round-trip produced it.
     """
     if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-    if isinstance(value, str):
+        parsed = value
+    elif isinstance(value, str):
         text = value.strip()
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
         parsed = datetime.fromisoformat(text)
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
-    raise TypeError(f"decided_at_utc must be a datetime or ISO-8601 string, got {type(value).__name__}")
+    else:
+        raise TypeError(f"decided_at_utc must be a datetime or ISO-8601 string, got {type(value).__name__}")
+    return parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 #: One decision, two spellings. The API and the dashboard publish the
