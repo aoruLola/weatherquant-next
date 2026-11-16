@@ -102,6 +102,10 @@ settlement_status     见 §4
 outcome               WIN | LOSS | UNVERIFIABLE | null(未结算)
 ```
 
+参考本金使用首次有效 ACCEPT 保存的价格、模型概率、深度和费率。首次费率缺失时，有盘口也会记录 `FEE_UNKNOWN`。只有首次观测明确记录零费率时，才能按零费率估算；后续观测继续计入机会次数与 Edge 统计。
+
+研究状态迁移 0005 将已消费历史标记为待重算。下一次 ingest 或 publish-only 会核验原分片的 SHA-256，再重建机会表，保留消费游标与已有结算。原分片缺失或内容不一致时，重算会中止。修复原分片后可以重试。Dashboard 的旧快照会保留原结果，重新发布后才包含修正后的费率；回滚到旧引擎需要独立的旧版派生状态库。
+
 **无有效 `net_edge_usd`（null / 非有限值）的 ACCEPT 不得开始 episode**——
 记入 `warnings`，不伪造代表值。
 
