@@ -285,3 +285,35 @@ def test_intermittent_503_is_not_hidden_by_the_last_200():
         transport=httpx.MockTransport(handler),
     )
     assert any("503" in error for error in report["failures"])
+
+
+def test_p95_includes_slowest_of_eight_requests(monkeypatch):
+    import httpx
+
+    monitor = _load_monitor()
+    clock = iter([0, 0.001] * 7 + [0, 0.5])
+    monkeypatch.setattr(monitor, "CORE_PROBES", [("summary", "/api/v1/performance/summary")])
+    monkeypatch.setattr(monitor, "perf_counter", lambda: next(clock))
+    report = monitor.probe_dashboard(
+        "http://test", token=None, probes=8, max_p95_ms=100, max_response_mb=1,
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"data": {"items": []}})),
+    )
+    assert report["probes"][0]["p95_ms"] == 500
+    assert any("above the gate" in error for error in report["failures"])
+
+
+def test_dashboard_rss_gate_records_missing_excessive_and_measured_peaks(tmp_path, monkeypatch):
+    monitor = _load_monitor()
+    monkeypatch.syspath_prepend(str(MONITOR.parent))
+    import soak_memory
+
+    performance = _publish_tree(tmp_path)
+    monkeypatch.setattr(monitor, "probe_dashboard", lambda *a, **kw: {"probes": [], "failures": []})
+    report_file = tmp_path / "report.json"
+    argv = ["--performance", str(performance), "--dashboard", "http://test", "--dashboard-pid", "1",
+            "--max-dashboard-rss-mib", "512", "--report", str(report_file)]
+    for peak, expected in [(0, 1), (513, 1), (512, 0)]:
+        monkeypatch.setattr(soak_memory, "read_rss_mb", lambda pid, value=peak: (0, value))
+        assert monitor.main(argv) == expected
+        report = json.loads(report_file.read_text())
+        assert report["dashboard_probes"]["process_rss"]["peak_mib"] == (peak or None)

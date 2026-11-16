@@ -35,15 +35,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
-import time
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-MONITOR_VERSION = "performance-monitor-1"
+MONITOR_VERSION = "performance-monitor-2"
 
 #: Files whose size must not depend on the length of the history. The
 #: opportunities pointer is here too: after contract §14 the payload lives in
@@ -62,6 +63,7 @@ CORE_PROBES = (
     ("edge", "/api/v1/performance/edge"),
     ("win-rate", "/api/v1/performance/win-rate"),
     ("opportunities page 1", "/api/v1/performance/opportunities?limit=50"),
+    ("reference capital", "/api/v1/performance/reference-capital?capital_usdc=250"),
     ("opportunities max page", "/api/v1/performance/opportunities?limit=200"),
 )
 
@@ -160,6 +162,7 @@ def probe_dashboard(
     probes: int,
     max_p95_ms: float,
     max_response_mb: float,
+    previous_cursor: str | None = None,
     transport=None,
 ) -> dict:
     """Latency, payload size and the limit clamp, against a live dashboard.
@@ -194,21 +197,25 @@ def probe_dashboard(
             payload_bytes = 0
             status = 200
             for _ in range(probes):
-                started = time.perf_counter()
+                started = perf_counter()
                 try:
                     response = client.get(path)
                 except Exception as exc:
                     samples.append(float("inf"))
                     report["failures"].append(f"{name}: request failed: {exc}")
                     break
-                samples.append((time.perf_counter() - started) * 1000)
+                samples.append((perf_counter() - started) * 1000)
                 status = response.status_code
                 if status != 200:
                     report["failures"].append(f"{name} probe answered {status}")
+                if name == "opportunities max page" and status == 200:
+                    page = response.json().get("data", {}).get("items")
+                    if not isinstance(page, list) or len(page) > 200:
+                        report["failures"].append("limit=200 did not return a bounded items list")
                 payload_bytes = max(payload_bytes, len(response.content))
             if samples and samples[-1] != float("inf"):
                 samples.sort()
-                p95 = samples[max(0, int(len(samples) * 0.95) - 1)]
+                p95 = samples[math.ceil(len(samples) * 0.95) - 1]
                 entry = {
                     "endpoint": name,
                     "status": status,
@@ -234,24 +241,56 @@ def probe_dashboard(
                         f"{name} served {payload_bytes / 1024 / 1024:.1f} MiB (gate {max_response_mb} MiB)"
                     )
 
-        # The clamp: a client asking for a million rows gets 200 at most.
-        clamped = client.get("/api/v1/performance/opportunities?limit=1000000")
-        items = 0
+        # The public route rejects oversized limits. Older servers can return a bounded page.
+        try:
+            clamped = client.get("/api/v1/performance/opportunities?limit=1000000")
+        except httpx.RequestError as exc:
+            report["failures"].append(f"limit clamp probe failed: {exc}")
+            return report
+        items = None
+        rejected_limit = False
         if clamped.status_code == 200:
             body = clamped.json()
             data = body.get("data", {})
-            items = len(data.get("items") or data.get("episodes") or [])
+            rows = data.get("items")
+            if isinstance(rows, list):
+                items = len(rows)
+        elif clamped.status_code == 422:
+            try:
+                error_body = clamped.json()
+            except ValueError:
+                error_body = None
+            detail = error_body.get("detail") if isinstance(error_body, dict) else None
+            rejected_limit = isinstance(detail, list) and any(
+                isinstance(error, dict) and error.get("loc") == ["query", "limit"]
+                and error.get("type") == "less_than_equal" and error.get("ctx", {}).get("le") == 200
+                for error in detail
+            )
         report["limit_clamp"] = {
             "requested": 1000000,
             "status": clamped.status_code,
             "served_items": items,
         }
-        if clamped.status_code != 200:
+        if rejected_limit:
+            report["limit_clamp"]["rejected_above"] = 200
+        elif clamped.status_code != 200:
             report["failures"].append(
-                f"limit clamp probe answered {clamped.status_code}; the clamp can only be verified against a 200"
+                f"limit clamp probe answered {clamped.status_code}; expected a bounded page or query validation for limit <= 200"
             )
+        elif items is None:
+            report["failures"].append("limit clamp response missing items list")
         elif items > 200:
             report["failures"].append(f"limit=1000000 served {items} items: the server-side clamp is gone")
+
+        if previous_cursor:
+            try:
+                stale = client.get("/api/v1/performance/opportunities", params={"cursor": previous_cursor})
+            except httpx.RequestError as exc:
+                report["failures"].append(f"previous generation cursor probe failed: {exc}")
+                return report
+            report["previous_cursor_status"] = stale.status_code
+            if stale.status_code != 409:
+                report["failures"].append(f"previous generation cursor answered {stale.status_code}; expected 409")
 
     return report
 
@@ -267,8 +306,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-total-mb", type=float, default=8192.0, help="generations tree size gate (default 8 GiB)")
     parser.add_argument("--max-p95-ms", type=float, default=1000.0)
     parser.add_argument("--max-response-mb", type=float, default=32.0)
+    parser.add_argument("--previous-cursor", help="cursor saved from the previous published generation")
+    parser.add_argument("--dashboard-pid", type=int, help="local Linux Dashboard worker PID for the peak RSS gate")
+    parser.add_argument("--max-dashboard-rss-mib", type=float, help="maximum Dashboard process peak RSS in MiB")
     parser.add_argument("--report", help="write the JSON report here")
     args = parser.parse_args(argv)
+
+    if (args.dashboard_pid is None) != (args.max_dashboard_rss_mib is None):
+        parser.error("--dashboard-pid and --max-dashboard-rss-mib must be used together")
+    if (args.previous_cursor or args.dashboard_pid is not None) and not args.dashboard:
+        parser.error("cursor and process measurements require --dashboard")
+    if args.max_dashboard_rss_mib is not None and not (0 < args.max_dashboard_rss_mib < math.inf):
+        parser.error("--max-dashboard-rss-mib must be positive and finite")
+    if args.probes < 1:
+        parser.error("--probes must be positive")
 
     performance_dir = Path(args.performance).resolve()
     if not performance_dir.exists():
@@ -307,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
             args.dashboard,
             token=args.dashboard_token,
             probes=args.probes,
+            previous_cursor=args.previous_cursor,
             max_p95_ms=args.max_p95_ms,
             max_response_mb=args.max_response_mb,
         )
@@ -314,7 +366,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    {probe['endpoint']:<24} {probe['bytes']:>10,} B  p95 {probe['p95_ms']:>7.1f} ms")
         if "limit_clamp" in probes:
             clamp = probes["limit_clamp"]
-            print(f"    limit clamp: asked {clamp['requested']}, served {clamp['served_items']}")
+            if "rejected_above" in clamp:
+                print(f"    limit clamp: {clamp['requested']} rejected above {clamp['rejected_above']}")
+            else:
+                print(f"    limit clamp: asked {clamp['requested']}, status {clamp['status']}, items {clamp['served_items']}")
+        if args.dashboard_pid is not None:
+            from soak_memory import read_rss_mb
+
+            _, peak = read_rss_mb(args.dashboard_pid)
+            probes["process_rss"] = {"pid": args.dashboard_pid, "peak_mib": peak or None,
+                                    "max_mib": args.max_dashboard_rss_mib}
+            if not peak:
+                probes["failures"].append(f"no peak RSS available for Dashboard PID {args.dashboard_pid}")
+            elif peak > args.max_dashboard_rss_mib:
+                probes["failures"].append(f"Dashboard peak RSS {peak:.1f} MiB exceeds {args.max_dashboard_rss_mib} MiB")
         failures.extend(probes["failures"])
 
     print("\n" + "=" * 72)
