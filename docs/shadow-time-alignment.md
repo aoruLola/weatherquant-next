@@ -28,6 +28,11 @@ timezone：目标日是站点当地民用日（`local_day_bounds_utc`），日�
 预报缺当地日小时数（`n_missing_hours`）是合法但更弱的输入：审计**计数不判违规**
 （`partial_local_day_decisions`），避免一份总在误报的审计失去可信度。
 
+审计按模型、版本、站点、事件、预报起报时刻和目标日定位预测。多个市场可引用同一条预测，
+同一事件的不同目标日则分别核对。只有其他目标日有预测时，该决策报告一次
+`TARGET_DATE_MISMATCH`。部分覆盖小时数和可发布时间均取自实际匹配的预测。
+缺少决策目标日的历史行报告 `PREDICTION_UNTRACEABLE`。
+
 ## 3. 用法
 
 ```sh
@@ -40,7 +45,7 @@ weatherquant-shadow alignment [--json]   # 引擎须停止（独占库）
 
 ## 4. 验证（本机）
 
-`tests/test_shadow_alignment.py`（17 例，全过）：干净历史一致并正确列出暴露组；
+`tests/test_shadow_alignment.py` 覆盖以下场景。干净历史一致并正确列出暴露组；
 未来 run / 未到期 issue / 无预测可追 / 日期或时刻错配 / fusion 缺同 run 源 /
 calibrated 源 run 不匹配 / 模式缺失 / 周期混模式 / LIVE 行被重放 / REPLAY 时刻晚于写入，
 各有一例点名违规；合法 REPLAY（时刻早于写入）通过；部分覆盖日只计数；
