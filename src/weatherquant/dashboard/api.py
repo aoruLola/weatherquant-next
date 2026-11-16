@@ -385,22 +385,27 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
     )
     async def r_perf_settlements(
         limit: int = Query(50, ge=1, le=perf.MAX_PAGE),
-        cursor: int = Query(0, ge=0),
+        cursor: str | None = Query(None),
         status: str | None = Query(
             None, pattern="^(PENDING|RESOLVED|DISPUTED|UNAVAILABLE|UNVERIFIABLE)$"
         ),
         market_id: str | None = Query(None, max_length=64),
     ) -> Envelope[PerformanceData]:
         now = _utcnow()
-        data, freshness = await asyncio.to_thread(
-            perf.performance_settlements,
-            perf_state,
-            now,
-            limit=limit,
-            cursor=cursor,
-            status=status,
-            market_id=market_id,
-        )
+        try:
+            data, freshness = await asyncio.to_thread(
+                perf.performance_settlements,
+                perf_state,
+                now,
+                limit=limit,
+                cursor=cursor,
+                status=status,
+                market_id=market_id,
+            )
+        except perf.CursorGenerationChanged as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _perf_env(PerformanceData, "performance/settlements", data, freshness, now, dataset)
 
     @app.get("/api/v1/performance/models", response_model=Envelope[PerformanceData], tags=["v1"])
