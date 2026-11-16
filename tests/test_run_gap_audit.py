@@ -216,7 +216,8 @@ def test_close_open_gaps_returns_the_affected_row_count(settings: Settings) -> N
         assert writer.close_open_gaps(detail="recovered") == 2
         gaps = writer.con.execute("SELECT ended_at_utc, detail FROM collection_gaps").fetchall()
         assert len(gaps) == 2
-        assert all(ended_at is not None and detail == "open" for ended_at, detail in gaps)
+        # WQN-5: closing appends the closing reason to the opening evidence.
+        assert all(ended_at is not None and detail == "open; recovered" for ended_at, detail in gaps)
         assert writer.close_open_gaps(detail="nothing to close") == 0
     finally:
         writer.close()
