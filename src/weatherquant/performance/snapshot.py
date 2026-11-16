@@ -218,18 +218,20 @@ def _settlement_index(
         target_date = item.get("target_date")
         status = str(item.get("settlement_status") or "UNAVAILABLE")
         payout = item.get("resolved_outcome")
-        answers[(market_id, str(target_date) if target_date else None)] = SettlementAnswer(
+        key = (market_id, str(target_date) if target_date else None)
+        answers[key] = SettlementAnswer(
             status=status,
             payout=float(payout) if payout in (0, 1, 0.0, 1.0) else None,
         )
-        if status == "RESOLVED" and str(item.get("verification_status")) == "VERIFIED":
-            verified.add((market_id, str(target_date) if target_date else None))
         # A raw resolutions body may be passed through untouched.
         if "data" in item and item.get("data") is not None:
             for record in parse_resolutions(item):
-                key = (market_id, str(target_date) if target_date else None)
                 status = classify(record)
                 answers[key] = SettlementAnswer(status=status, payout=record.price)
+        if status == "RESOLVED" and item.get("verification_status") == "VERIFIED":
+            verified.add(key)
+        else:
+            verified.discard(key)
     return answers, frozenset(verified)
 
 

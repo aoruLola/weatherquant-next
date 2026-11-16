@@ -491,7 +491,12 @@ def build_parser() -> argparse.ArgumentParser:
             ".json / .jsonl / .parquet file for the in-memory builder"
         ),
     )
-    p.add_argument("--settlements", help="settlement index written by backfill-settlements")
+    settlement_input = p.add_mutually_exclusive_group()
+    settlement_input.add_argument("--settlements", help="settlement index written by backfill-settlements")
+    settlement_input.add_argument(
+        "--restore-settlements-backup",
+        help="restore the complete streaming settlement layer from a retraction backup",
+    )
     p.add_argument("--out", required=True, help="directory to publish the six snapshots into")
     p.add_argument(
         "--dataset",
@@ -977,7 +982,7 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
         load_settlements,
     )
 
-    if args.confirm_empty_retraction and not args.settlements_replace:
+    if args.confirm_empty_retraction and not (args.settlements_replace or args.restore_settlements_backup):
         print(
             "--confirm-empty-retraction only means something together with "
             "--settlements-replace: on its own it confirms nothing. Refusing it "
@@ -1012,6 +1017,9 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
             return 2
 
     streaming = export.is_dir() and not args.in_memory
+    if args.restore_settlements_backup and not streaming:
+        print("settlement backup restore requires a streaming export directory", file=sys.stderr)
+        return 2
     if streaming:
         return _build_performance_streaming(settings, args, settlements)
     if args.state_db and not export.is_dir():
@@ -1079,6 +1087,7 @@ def _build_performance_streaming(settings: Settings, args: argparse.Namespace, s
             dataset=args.dataset,
             settlements=settlements,
             settlements_replace=args.settlements_replace,
+            restore_settlements_backup=args.restore_settlements_backup,
             confirm_empty_retraction=args.confirm_empty_retraction,
             settlements_source=args.settlements,
             retraction_reason=args.retraction_reason,
@@ -1100,7 +1109,7 @@ def _build_performance_streaming(settings: Settings, args: argparse.Namespace, s
     except StateMismatch as exc:
         print(f"the state store does not match this run: {exc}", file=sys.stderr)
         return 2
-    except (PerformanceStateError, ValueError, RuntimeError) as exc:
+    except (OSError, PerformanceStateError, ValueError, RuntimeError) as exc:
         print(f"could not build performance snapshots: {exc}", file=sys.stderr)
         return 2
 

@@ -60,6 +60,9 @@ from datetime import UTC, datetime, timedelta
 from operator import itemgetter
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+
+from pydantic import AwareDatetime, BaseModel, Field
 
 from weatherquant.performance.capital import (
     DEFAULT_MAX_ALLOCATION_FRACTION,
@@ -98,6 +101,7 @@ from weatherquant.performance.snapshot import (
     _envelope,
     _settlement_coverage,
     _settlement_index,
+    _settlement_provenance,
     detail_warnings,
     detail_window_descriptor,
     publish_performance,
@@ -1425,15 +1429,33 @@ def streaming_generation_id(
     return f"{now.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}-{digest[:12]}"
 
 
+class _SavedAnswer(BaseModel):
+    market_id: str = Field(min_length=1)
+    target_date: str | None
+    status: str
+    payout: float | None
+    verified: bool
+    verification_status: str | None
+    resolution_source: str | None
+    fetched_at_utc: AwareDatetime | None
+
+
+class _SettlementBackup(BaseModel):
+    rows_retracted: int
+    rows_backed_up: int | None = None  # older total-retraction backups have only rows_retracted
+    settlements: list[_SavedAnswer]
+
+
 def _write_retraction_backup(
     rows: list[dict[str, Any]],
     *,
     state_db: str | Path,
+    rows_retracted: int,
     source: str | None,
     reason: str | None,
     now: datetime,
 ) -> Path:
-    """Write out the settlement answers a total retraction is about to delete.
+    """Save the settlement layer before a replacement or state reset.
 
     Beside the state database, named for the instant, and returned so the
     caller can print the path. `reason` is recorded as ``None`` when the
@@ -1442,12 +1464,13 @@ def _write_retraction_backup(
     """
     stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
     state_path = Path(state_db)
-    path = state_path.with_name(f"{state_path.stem}.retracted-{stamp}.json")
+    path = state_path.with_name(f"{state_path.stem}.retracted-{stamp}-{uuid4().hex}.json")
     atomic_write_json(
         path,
         {
             "retracted_at_utc": now.astimezone(UTC).isoformat(),
-            "rows_retracted": len(rows),
+            "rows_retracted": rows_retracted,
+            "rows_backed_up": len(rows),
             "input_source": source,
             "reason": reason,
             "state_db": str(state_path),
@@ -1511,6 +1534,7 @@ def build_performance_streaming(
     state_db: str | Path = DEFAULT_PERFORMANCE_STATE_DB_PATH,
     settlements: Sequence[Any] = (),
     settlements_replace: bool = False,
+    restore_settlements_backup: str | Path | None = None,
     confirm_empty_retraction: bool = False,
     settlements_source: str | None = None,
     retraction_reason: str | None = None,
@@ -1561,8 +1585,28 @@ def build_performance_streaming(
     # store is opened. A rejection that had already ingested parts would have
     # advanced the watermark and recorded a generation, so the run would look
     # like it had done something - and "refused" has to mean nothing moved.
-    answers, verified = _settlement_index(settlements)
-    if settlements_replace and not answers and not confirm_empty_retraction:
+    if restore_settlements_backup is not None:
+        if settlements:
+            raise PerformanceStateError("choose a settlement index or a backup to restore")
+        saved = _SettlementBackup.model_validate_json(Path(restore_settlements_backup).read_bytes(), strict=True)
+        payload = {
+            (row.market_id, row.target_date): (
+                row.status, row.payout, row.verified, row.verification_status, row.resolution_source, row.fetched_at_utc
+            ) for row in saved.settlements
+        }
+        count = saved.rows_backed_up if saved.rows_backed_up is not None else saved.rows_retracted
+        if count != len(saved.settlements) or len(payload) != count:
+            raise PerformanceStateError("settlement backup row count or unique key count does not match")
+        settlements_replace = True
+        settlements_source = str(restore_settlements_backup)
+    else:
+        answers, verified = _settlement_index(settlements)
+        provenance = _settlement_provenance(settlements)
+        payload = {
+            key: (answer.status, answer.payout, key in verified, *provenance[key])
+            for key, answer in answers.items()
+        }
+    if settlements_replace and not payload and not confirm_empty_retraction:
         raise PerformanceStateError(
             "refusing to replace the settlement set with an empty index: that "
             "would retract every answer. An empty index is what a failed "
@@ -1575,6 +1619,16 @@ def build_performance_streaming(
         )
 
     with PerformanceStateStore(state_db, memory_limit=memory_limit, temp_directory=temp_directory) as store:
+        if settlements_replace or reset:
+            previous = store.load_settlements()
+            if previous or settlements_replace:
+                omitted = sum((row["market_id"], row["target_date"]) not in payload for row in previous)
+                backup = _write_retraction_backup(
+                    previous, state_db=state_db, rows_retracted=omitted,
+                    source=settlements_source, reason=retraction_reason, now=now,
+                )
+                if progress is not None:
+                    progress(f"retraction backup written to {backup}")
         if reset:
             store.reset()
             if progress is not None:
@@ -1598,53 +1652,11 @@ def build_performance_streaming(
         # caller asserting that this index is *complete*, which is the only way
         # to express a withdrawal - see PerformanceStateStore.replace_settlements.
         if settlements_replace:
-            if not answers:
-                # The one operation that cannot be undone from anywhere else:
-                # the export carries decisions, not settlements, and
-                # re-deriving them needs the platform. So everything about to
-                # be deleted is written out first, with the count, where the
-                # index came from and why - a retraction nobody can reverse is
-                # not a retraction, it is a loss. Written before the delete,
-                # and written even when there is nothing to delete, so the
-                # audit line exists either way.
-                backup = _write_retraction_backup(
-                    store.load_settlements(),
-                    state_db=state_db,
-                    source=settlements_source,
-                    reason=retraction_reason,
-                    now=now,
-                )
-                if progress is not None:
-                    progress(f"retraction backup written to {backup}")
-            provenance = _settlement_provenance_map(settlements)
-            removed = store.replace_settlements(
-                {
-                    key: (
-                        answer.status,
-                        answer.payout,
-                        key in verified,
-                        provenance.get(key, (None, None, None))[0],
-                        provenance.get(key, (None, None, None))[1],
-                        provenance.get(key, (None, None, None))[2],
-                    )
-                    for key, answer in answers.items()
-                }
-            )
+            with store.transaction():
+                removed = store.replace_settlements(payload)
             if progress is not None:
-                progress(f"replaced the settlement set: {len(answers)} kept, {removed} retracted")
-        elif answers:
-            provenance = _settlement_provenance_map(settlements)
-            payload = {
-                key: (
-                    answer.status,
-                    answer.payout,
-                    key in verified,
-                    provenance.get(key, (None, None, None))[0],
-                    provenance.get(key, (None, None, None))[1],
-                    provenance.get(key, (None, None, None))[2],
-                )
-                for key, answer in answers.items()
-            }
+                progress(f"replaced the settlement set: {len(payload)} kept, {removed} retracted")
+        elif payload:
             store.upsert_settlements(payload)
 
         build = build_streaming_payloads(
@@ -1705,39 +1717,3 @@ def build_performance_streaming(
         # restamp the ingest position, or an ingest stall would erase itself.
         _write_ingest_state(out_dir, build.watermark, ingest_result, now)
     return result
-
-
-def _settlement_provenance_map(
-    settlements: Sequence[Any],
-) -> dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]]:
-    """What each settlement index entry says about its own evidence.
-
-    ``(verification_status, resolution_source, fetched_at_utc)`` per
-    ``(market, target date)``. Built once rather than searched per key: the
-    index is one row per market and date, and looking each one up in the list
-    would be quadratic in the number of markets.
-    """
-    out: dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]] = {}
-    for item in settlements:
-        if not isinstance(item, Mapping):
-            continue
-        market_id = str(item.get("market_id") or "")
-        if not market_id:
-            continue
-        raw = item.get("target_date")
-        key = (market_id, str(raw) if raw else None)
-        stamp = item.get("fetched_at_utc")
-        fetched: datetime | None = None
-        if stamp is not None:
-            try:
-                fetched = _timestamp(stamp)
-            except (TypeError, ValueError):
-                fetched = None
-        verdict = item.get("verification_status")
-        source = item.get("resolution_source")
-        out[key] = (
-            str(verdict) if verdict is not None else None,
-            str(source) if source is not None else None,
-            fetched,
-        )
-    return out
