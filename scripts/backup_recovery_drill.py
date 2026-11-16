@@ -32,15 +32,17 @@ wal_recovery               SIGKILL a budgeted writer mid-write (the
 slow_io                    Re-run the restore inside a cgroup with a
                            throttled ``io.max`` - the kernel's own
                            rate limiter, the same mechanism a slow NAS
-                           array would exercise. Needs root; skipped
-                           honestly (recorded, never faked) otherwise.
+                           array would exercise. Passes only when the
+                           cgroup accounts the restore's writes; needs
+                           root and is skipped honestly (recorded,
+                           never faked) otherwise.
 incomplete_files           Plant ``.incomplete-*`` files in a backups
                            directory and require that backup discovery
                            never offers one as a restore candidate.
 =========================  ==============================================
 
 Every run appends one JSON line to the ledger (``--ledger``, default
-``<work>/recovery-drills.jsonl``): stages with statuses and durations, the
+``<work-name>-recovery-drills.jsonl beside the work directory``): stages with statuses and durations, the
 recovery-point facts, and an overall verdict. That ledger is the DuckDB/WAL
 lifecycle record WQN-22 asks for.
 
@@ -48,7 +50,7 @@ Usage::
 
     uv run python scripts/backup_recovery_drill.py --work /tmp/wq-drill
     uv run python scripts/backup_recovery_drill.py --work /tmp/wq-drill \\
-        --source /path/to/copy-of-production.duckdb --ledger /mnt/user/.../drills.jsonl
+        --source /path/to/copy-of-production.duckdb --source-is-copy --ledger /mnt/user/.../drills.jsonl
 
 ``--source`` must be a COPY of a production file; the drill never opens a
 live database (the writer holds its lease), and restoring anything back into
@@ -63,7 +65,7 @@ import hashlib
 import json
 import os
 import shutil
-import signal
+import socket
 import subprocess
 import sys
 import time
@@ -73,7 +75,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DRILL_VERSION = "recovery-drill-1"
+DRILL_VERSION = "recovery-drill-3"
+CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 #: Rows per synthetic flush batch and how many batches the synthesized source
 #: gets. Small on purpose: the drill is about correctness under restore, not
@@ -88,6 +91,9 @@ class Stage:
     status: str = "pass"  # pass | fail | skip | not_applicable
     duration_ms: float = 0.0
     detail: str = ""
+    #: Structured measurements behind the status, so an auditor reads numbers
+    #: rather than parsing prose. Empty when the stage measured nothing.
+    evidence: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -95,6 +101,7 @@ class Stage:
             "status": self.status,
             "duration_ms": round(self.duration_ms, 1),
             "detail": self.detail,
+            "evidence": self.evidence,
         }
 
 
@@ -102,6 +109,7 @@ class Stage:
 class DrillReport:
     drill_id: str
     started_at: datetime
+    strict: bool = False
     stages: list[Stage] = field(default_factory=list)
     recovery_point: dict = field(default_factory=dict)
     source: dict = field(default_factory=dict)
@@ -123,6 +131,7 @@ class DrillReport:
         return {
             "drill_id": self.drill_id,
             "tool_version": DRILL_VERSION,
+            "strict": self.strict,
             "started_at_utc": self.started_at.isoformat(),
             "ended_at_utc": self.ended_at.isoformat(),
             "source": self.source,
@@ -148,10 +157,27 @@ def _sha256_file(path: Path) -> str:
 def _table_names(con) -> list[str]:
     rows = con.execute(
         "SELECT table_name FROM information_schema.tables "
-        "WHERE table_schema='main' AND table_name != 'schema_migrations' "
+        "WHERE table_catalog=current_database() AND table_schema='main' AND table_type='BASE TABLE' "
         "ORDER BY table_name"
     ).fetchall()
     return [r[0] for r in rows]
+
+
+def _table_columns(con, table: str) -> str:
+    """Ordered column signature: name, type and nullability.
+
+    Row counts and content hashes compare data, not shape: two empty tables
+    with different columns have identical counts and digests, so a restore
+    that dropped a column from an empty table would otherwise pass. The
+    signature is textual so a failure can name the table without decoding.
+    """
+    rows = con.execute(
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+        "WHERE table_catalog=current_database() AND table_schema='main' AND table_name=? "
+        "ORDER BY ordinal_position",
+        [table],
+    ).fetchall()
+    return "|".join(f"{name} {data_type} {nullable}" for name, data_type, nullable in rows)
 
 
 def _table_digest(con, table: str) -> tuple[int, int]:
@@ -201,11 +227,11 @@ def _decision_watermark(con) -> dict:
     return {"source": None, "value": None, "name": "none"}
 
 
-def _recovery_point(db_path: Path) -> dict:
+def _recovery_point(db_path: Path, *, read_only: bool = True) -> dict:
     """Everything the drill means by 'this backup is recoverable to here'."""
     import duckdb
 
-    con = duckdb.connect(str(db_path), read_only=True)
+    con = duckdb.connect(str(db_path), read_only=read_only)
     # Pin the session to UTC, as every project connection does: an unpinned
     # session renders TIMESTAMPTZ in the host's zone, and a watermark whose
     # text moves between machines is a worse audit fact than a stable one.
@@ -214,7 +240,7 @@ def _recovery_point(db_path: Path) -> dict:
         tables: dict[str, dict] = {}
         for table in _table_names(con):
             count, digest = _table_digest(con, table)
-            tables[table] = {"rows": count, "digest": digest}
+            tables[table] = {"rows": count, "digest": digest, "columns": _table_columns(con, table)}
         # The schema version is part of the recovery point: a restored copy on
         # an older migration ledger than its source would open fine and still
         # not be the database that was backed up.
@@ -241,6 +267,8 @@ def _recovery_points_agree(source: dict, restored: dict) -> list[str]:
         if got is None:
             failures.append(f"table {table} missing after restore")
             continue
+        if got.get("columns") != facts.get("columns"):
+            failures.append(f"table {table}: column signature differs")
         if got["rows"] != facts["rows"]:
             failures.append(f"table {table}: rows {got['rows']} != {facts['rows']}")
         if got["digest"] != facts["digest"]:
@@ -306,7 +334,7 @@ def synthesize_source(db_path: Path, *, batches: int = SYNTH_BATCHES) -> dict:
         app_version="recovery-drill",
         git_sha=None,
         image_tag="drill",
-        hostname=os.uname().nodename,
+        hostname=socket.gethostname(),
         pid=os.getpid(),
     )
     base = datetime.now(tz=UTC)
@@ -400,17 +428,27 @@ def stage_restore(report: DrillReport, work: Path, source: Path) -> tuple[Path, 
         except Exception as exc:
             stage.status = "fail"
             stage.detail = f"the recovery point could not be read: {type(exc).__name__}: {exc}"
+            stage.evidence = {"error": f"{type(exc).__name__}: {exc}"}
             raise
         failures = _recovery_points_agree(source_point, restored_point)
         if failures:
             stage.status = "fail"
             stage.detail = "; ".join(failures)
+            stage.evidence = {"differences": failures}
             raise RuntimeError(stage.detail)
+        verify_s = time.monotonic() - verify_started
         stage.detail = (
-            f"copy {copy_s:.1f}s, verify {time.monotonic() - verify_started:.1f}s, "
+            f"copy {copy_s:.1f}s, verify {verify_s:.1f}s, "
             f"{len(source_point['tables'])} tables, "
             f"watermark={source_point['watermark']['value']}"
         )
+        stage.evidence = {
+            "tables": len(source_point["tables"]),
+            "schema_version": source_point["schema_version"],
+            "duckdb_version": source_point["duckdb_version"],
+            "copy_seconds": round(copy_s, 3),
+            "verify_seconds": round(verify_s, 3),
+        }
         report.recovery_point = source_point
         return dest, source_point, restored_point
     finally:
@@ -466,7 +504,7 @@ def stage_backup_cycle(report: DrillReport, work: Path, restored: Path) -> None:
             app_version="recovery-drill",
             git_sha=None,
             image_tag="drill",
-            hostname=os.uname().nodename,
+            hostname=socket.gethostname(),
             pid=os.getpid(),
         )
         base = datetime.now(tz=UTC)
@@ -478,6 +516,9 @@ def stage_backup_cycle(report: DrillReport, work: Path, restored: Path) -> None:
                 for row in _synthetic_prices(100 + batch, 500, run_id, base):
                     writer.stage_price(row)
                 writer.flush(force=True)
+            # This isolated writer is quiescent. Record its audit rows before
+            # close() logs the shutdown that is outside the backup snapshot.
+            expected_point = _recovery_point(db_path, read_only=False)
             backup_report = writer.backup(work / "backups")
             writer.close(status="stopped", reason="recovery-drill cycle")
         except BaseException:
@@ -501,18 +542,13 @@ def stage_backup_cycle(report: DrillReport, work: Path, restored: Path) -> None:
             shutil.rmtree(chain_dest.parent)
         child_restore(published, chain_dest)
         chained_point = _recovery_point(chain_dest)
-        # The chain starts from the *restored* copy, which already carries the
-        # cycle's extra rows - so the chain's recovery point is compared to a
-        # fresh reading of the restored copy, not to the original source.
-        expected_point = _recovery_point(restored)
-        # `collector_runs`/`collector_events` legitimately move AFTER a backup
-        # snapshot: close() records the run's exit status and stats into them.
-        # A backup cannot contain a graceful shutdown that had not happened
-        # yet, so these two are excluded from the chain comparison by name.
-        excluded = {"collector_runs", "collector_events"}
-        for point in (expected_point, chained_point):
-            point["tables"] = {t: facts for t, facts in point["tables"].items() if t not in excluded}
         failures = _recovery_points_agree(expected_point, chained_point)
+        stage.evidence = {
+            "backup": published.name,
+            "backup_bytes": backup_report.bytes_written or 0,
+            "tables": len(expected_point["tables"]),
+            "differences": failures,
+        }
         if failures:
             stage.status = "fail"
             stage.detail = "; ".join(failures)
@@ -520,8 +556,7 @@ def stage_backup_cycle(report: DrillReport, work: Path, restored: Path) -> None:
         stage.status = "pass"
         stage.detail = (
             f"backup verified={backup_report.ok} bytes={backup_report.bytes_written or 0}; "
-            f"chain restore verified ({len(expected_point['tables'])} tables; "
-            f"{', '.join(sorted(excluded))} excluded - they advance at close)"
+            f"chain restore verified against the pre-backup snapshot ({len(expected_point['tables'])} tables)"
         )
     except Exception as exc:
         stage.status = "fail"
@@ -566,6 +601,7 @@ def stage_clean_shutdown(report: DrillReport, work: Path, restored: Path) -> Non
         writer.close(status="stopped", reason="recovery-drill clean shutdown")
         wal_after = wal.stat().st_size if wal.exists() else 0
         stage.duration_ms = (time.monotonic() - started) * 1000.0
+        stage.evidence = {"wal_bytes_during": wal_during, "wal_bytes_after": wal_after}
         if wal_during > 0 and wal_after == 0:
             stage.detail = f"wal {wal_during} bytes folded away by graceful close"
         elif wal_during == 0:
@@ -588,8 +624,15 @@ def stage_wal_recovery(report: DrillReport, work: Path, restored: Path) -> None:
     if journal.exists():
         journal.unlink()
     child_restore(restored, db_path)
+    executable = sys.executable
+    child_env = os.environ.copy()
+    if os.name == "nt":
+        # Target the DB writer, not the venv launcher that starts it.
+        executable = sys._base_executable
+        child_env["__PYVENV_LAUNCHER__"] = sys.executable
     proc = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "--child-wal", str(db_path)],
+        [executable, str(Path(__file__).resolve()), "--child-wal", str(db_path)],
+        env=child_env,
         cwd=PROJECT_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -598,7 +641,7 @@ def stage_wal_recovery(report: DrillReport, work: Path, restored: Path) -> None:
     try:
         deadline = time.monotonic() + 90.0
         while time.monotonic() < deadline:
-            if journal.exists() and sum(1 for _ in journal.open()) >= 6:
+            if journal.exists() and len(journal.read_text().splitlines()) >= 6:
                 break
             if proc.poll() is not None:
                 tail = ""
@@ -606,7 +649,9 @@ def stage_wal_recovery(report: DrillReport, work: Path, restored: Path) -> None:
                     tail = "".join(proc.stdout.readlines()[-8:])
                 raise RuntimeError(f"wal child exited before committing enough batches: {tail}")
             time.sleep(0.2)
-        proc.send_signal(signal.SIGKILL)
+        else:
+            raise RuntimeError("WAL writer did not commit six journalled batches before the deadline")
+        proc.kill()
         proc.wait(timeout=30)
 
         journalled = sum(1 for line in journal.read_text().splitlines() if line.strip())
@@ -623,6 +668,13 @@ def stage_wal_recovery(report: DrillReport, work: Path, restored: Path) -> None:
             con.close()
         wal_after = wal.stat().st_size if wal.exists() else 0
         stage.duration_ms = (time.monotonic() - started) * 1000.0
+        stage.evidence = {
+            "journalled_batches": journalled,
+            "max_batch": int(max_batch),
+            "rows": int(rows),
+            "wal_bytes_at_kill": wal_bytes,
+            "wal_bytes_after_checkpoint": wal_after,
+        }
 
         failures = []
         if rows != max_batch * 1000:
@@ -660,25 +712,70 @@ def _device_of(path: Path) -> str | None:
     return f"{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
 
 
+def _slow_io_capability_problem() -> str | None:
+    """Why ``io.max`` cannot be exercised on this host, or None when it can.
+
+    Kept separate from the stage so the reason is a testable fact rather than
+    an early ``return`` hidden in a try block.
+    """
+    if sys.platform != "linux":
+        return "requires Linux cgroup v2 and root for io.max"
+    if os.geteuid() != 0:
+        return "requires Linux cgroup v2 and root for io.max"
+    controllers = CGROUP_ROOT / "cgroup.controllers"
+    if not controllers.exists() or "io" not in controllers.read_text().split():
+        return "io controller not available on this kernel"
+    return None
+
+
+def _measured_writes(io_stat: str, device: str) -> int:
+    """Write bytes the cgroup's ``io.stat`` attributes to ``device``, else 0.
+
+    Zero means the throttle was never observed against this device - on a
+    layered filesystem the limited device may account none of the copy's
+    writes. That is *not* a measured slow restore and must not become a pass.
+    """
+    for line in io_stat.splitlines():
+        fields = line.split()
+        if not fields or fields[0] != device:
+            continue
+        counters = dict(item.split("=", 1) for item in fields[1:] if "=" in item)
+        return int(counters.get("wbytes", 0))
+    return 0
+
+
+def _throttled_restore(cgroup: Path, source: Path, dest: Path) -> None:
+    """Copy in a child that joins ``cgroup`` before writing anything."""
+    env = os.environ.copy()
+    env["WQ_RECOVERY_CGROUP"] = str(cgroup)
+    subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--child-restore", str(source), str(dest), "--throttled"],
+        cwd=PROJECT_ROOT,
+        env=env,
+        check=True,
+        timeout=900,
+    )
+
+
 def stage_slow_io(report: DrillReport, work: Path, source: Path) -> None:
     """Re-restore under a kernel-enforced io.max, on a copy, timed.
 
     The io controller is the kernel's own rate limiter - the same mechanism
     that makes a busy NAS array slow, applied here to prove the restore path
     degrades in duration and not in correctness. Root is required; anything
-    else is recorded as a skip, never silently passed.
+    else is recorded as a skip, never silently passed. A pass additionally
+    requires the cgroup to report the bytes the throttled restore wrote:
+    without that number there is no measured slow path.
     """
     stage = report.stage("slow_io")
     started = time.monotonic()
-    cgroup = Path("/sys/fs/cgroup/wq-recovery-drill")
+    cgroup = CGROUP_ROOT / f"wq-recovery-drill-{os.getpid()}"
+    created = False
     try:
-        if os.geteuid() != 0:
+        problem = _slow_io_capability_problem()
+        if problem is not None:
             stage.status = "skip"
-            stage.detail = "requires root to create a cgroup with io.max"
-            return
-        if "io" not in Path("/sys/fs/cgroup/cgroup.controllers").read_text().split():
-            stage.status = "skip"
-            stage.detail = "io controller not available on this kernel"
+            stage.detail = problem
             return
         device = _device_of(work)
         if device is None:
@@ -686,8 +783,8 @@ def stage_slow_io(report: DrillReport, work: Path, source: Path) -> None:
             stage.detail = "could not resolve the work directory's device"
             return
 
-        shutil.rmtree(cgroup, ignore_errors=True)
-        cgroup.mkdir(parents=True)
+        cgroup.mkdir()
+        created = True
         # 4 MiB/s both ways: slow enough to feel, fast enough for the drill
         # to finish in minutes even against a 100 MB source.
         (cgroup / "io.max").write_text(f"{device} rbps=4194304 wbps=4194304")
@@ -695,41 +792,41 @@ def stage_slow_io(report: DrillReport, work: Path, source: Path) -> None:
         dest = work / "restored-slow" / "weatherquant.duckdb"
         if dest.parent.exists():
             shutil.rmtree(dest.parent)
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "--child-restore",
-                str(source),
-                str(dest),
-            ],
-            cwd=PROJECT_ROOT,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        (cgroup / "cgroup.procs").write_text(str(proc.pid))
-        proc.wait(timeout=900)
+        restore_started = time.monotonic()
+        _throttled_restore(cgroup, source, dest)
+        restore_s = time.monotonic() - restore_started
+
+        written = _measured_writes((cgroup / "io.stat").read_text(), device)
+        if written <= 0:
+            raise RuntimeError(f"no restore writes accounted to the limited device {device}")
+        stage.evidence = {
+            "device": device,
+            "measured_write_bytes": written,
+            "restore_seconds": round(restore_s, 3),
+        }
 
         verify_started = time.monotonic()
         expected = _recovery_point(source)
         got = _recovery_point(dest)
         failures = _recovery_points_agree(expected, got)
-        stage.duration_ms = (time.monotonic() - started) * 1000.0
         if failures:
+            stage.evidence["differences"] = failures
             stage.status = "fail"
             stage.detail = "; ".join(failures)
         else:
             stage.detail = (
-                f"restore under 4MiB/s io.max completed in {stage.duration_ms / 1000:.1f}s, "
+                f"restore under 4MiB/s io.max on {device} wrote {written} bytes in {restore_s:.1f}s, "
                 f"recovery point verified ({len(expected['tables'])} tables, "
                 f"verify {time.monotonic() - verify_started:.1f}s)"
             )
     except Exception as exc:
         stage.status = "fail"
         stage.detail = str(exc)
-        stage.duration_ms = (time.monotonic() - started) * 1000.0
     finally:
-        shutil.rmtree(cgroup, ignore_errors=True)
+        stage.duration_ms = (time.monotonic() - started) * 1000.0
+        if created:
+            with contextlib.suppress(OSError):
+                cgroup.rmdir()
 
 
 def stage_incomplete_files(report: DrillReport, work: Path, restored: Path) -> None:
@@ -809,7 +906,7 @@ def append_ledger(ledger: Path, entry: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--work", type=Path, help="scratch directory (never a production path)")
+    parser.add_argument("--work", type=Path, help="new directory for this drill")
     parser.add_argument(
         "--source", type=Path, default=None, help="a COPY of a database to drill against; default: synthesize one"
     )
@@ -827,11 +924,20 @@ def main() -> int:
         help="JSONL lifecycle ledger to append to (default sibling <work-name>-recovery-drills.jsonl)",
     )
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument(
+        "--require-slow-io", action="store_true", help="fail acceptance when kernel I/O throttling cannot run"
+    )
+    parser.add_argument("--throttled", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--child-restore", type=Path, nargs=2, metavar=("SRC", "DEST"), help=argparse.SUPPRESS)
     parser.add_argument("--child-wal", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.child_restore is not None:
+        if args.throttled:
+            # Join the parent's cgroup before the first write, so every chunk
+            # this copy fsyncs is charged to the throttled device.
+            cgroup = Path(os.environ["WQ_RECOVERY_CGROUP"])
+            (cgroup / "cgroup.procs").write_text(str(os.getpid()))
         child_restore(args.child_restore[0], args.child_restore[1])
         return 0
     if args.child_wal is not None:
@@ -844,13 +950,17 @@ def main() -> int:
     ledger = args.ledger.resolve() if args.ledger else work.parent / (work.name + "-recovery-drills.jsonl")
     if ledger.is_relative_to(work):
         parser.error("--ledger must be outside --work so cleanup preserves the lifecycle history")
-    if work.exists():
-        shutil.rmtree(work)
-    work.mkdir(parents=True)
+    if args.source is not None and not args.source_is_copy:
+        parser.error("--source needs --source-is-copy for an existing isolated copy")
+    try:
+        work.mkdir(parents=True)
+    except FileExistsError:
+        parser.error("--work must be a new directory reserved for this drill")
 
     report = DrillReport(
         drill_id=f"{datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}",
         started_at=datetime.now(tz=UTC),
+        strict=args.require_slow_io,
     )
     print(f"recovery drill {report.drill_id} over {work}")
 
@@ -860,15 +970,6 @@ def main() -> int:
             source = args.source.resolve()
             if not source.exists():
                 raise FileNotFoundError(f"source not found: {source}")
-            if not source.is_relative_to(work) and not args.source_is_copy:
-                print(
-                    "refusing: --source outside --work needs --source-is-copy. The drill "
-                    "reads its source byte-for-byte, and a byte-copy of a database a "
-                    "writer still has open is a torn file - the guard is what keeps a "
-                    "live production file from becoming a 'recovery' source.",
-                    file=sys.stderr,
-                )
-                return 2
             report.source = {"origin": str(source), "synthesized": False}
         else:
             started = time.monotonic()
@@ -901,14 +1002,19 @@ def main() -> int:
             existing.detail = str(exc)
         else:
             failed_stage = next(s for s in report.stages if s.status == "fail")
-            failed_stage.detail = (
-                (f"{failed_stage.detail}; unhandled: {type(exc).__name__}: {exc}")
-                if "unhandled" not in failed_stage.detail
-                else failed_stage.detail
-            )
+            # A stage that already recorded this exception (restore does) must
+            # not have the same message pasted on twice: the detail is the
+            # operator's difference report, not a traceback.
+            if "unhandled" not in failed_stage.detail and str(exc) not in failed_stage.detail:
+                failed_stage.detail = f"{failed_stage.detail}; unhandled: {type(exc).__name__}: {exc}"
 
     failures = [s for s in report.stages if s.status == "fail"]
-    report.verdict = "FAILED" if failures else "PASSED"
+    slow_io_stage = next((s for s in report.stages if s.name == "slow_io"), None)
+    # Strict acceptance: a skipped (or absent) slow_io stage is not evidence
+    # that the restore survives a slow device, so it fails the drill even
+    # though nothing failed. Non-strict runs keep the skip visible instead.
+    required_slow_io_unmet = args.require_slow_io and (slow_io_stage is None or slow_io_stage.status != "pass")
+    report.verdict = "FAILED" if failures or required_slow_io_unmet else "PASSED"
 
     print("\n" + "=" * 72)
     print("RECOVERY DRILL REPORT")
@@ -929,7 +1035,10 @@ def main() -> int:
     entry = report.as_dict()
     append_ledger(ledger, entry)
     print("\n" + "=" * 72)
-    if failures:
+    if report.verdict == "FAILED":
+        if required_slow_io_unmet and (slow_io_stage is None or slow_io_stage.status != "fail"):
+            status = slow_io_stage.status if slow_io_stage is not None else "missing"
+            print(f"required slow_io stage did not pass (status: {status})")
         print("RESULT: FAILED")
         return 1
     print("RESULT: PASSED")

@@ -30,7 +30,7 @@ collapsing them would make a slow shadow look like a fast collector.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -405,7 +405,7 @@ class ArchiveTailer:
         for raw in data.split(b"\n"):
             if not raw:
                 continue
-            line = raw.decode("utf-8", errors="replace")
+            line = raw.removesuffix(b"\r").decode("utf-8", errors="replace")
             stats.lines_read += 1
 
             try:
@@ -500,7 +500,7 @@ class ArchiveTailer:
             for observation in observations:
                 if not observation.complete:
                     stats.books_incomplete += 1
-                book_updates.append(observation)
+                book_updates.append(replace(observation, source_event_id=envelope.raw_sha256))
             if not observations and not unattached:
                 raise ValueError("book frame produced no snapshot and no explanation")
             return

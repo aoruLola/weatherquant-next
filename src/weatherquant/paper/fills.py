@@ -219,7 +219,7 @@ class FillEngine:
                     key = outcome.reason or "UNKNOWN"
                     result.by_reason[key] = result.by_reason.get(key, 0) + 1
         except Exception as exc:  # a side channel must not raise
-            result.notes.append(f"fill pass failed: {type(exc).__name__}: {exc}")
+            return FillResult(attempted=result.attempted, notes=[f"fill pass failed: {type(exc).__name__}: {exc}"])
         return result
 
     def _settle(self, fill: PaperFill, now: datetime) -> tuple[bool, tuple[str, str] | None]:
@@ -298,7 +298,10 @@ class FillEngine:
             outcome.reason, outcome.detail = verdict.reason, verdict.detail
             return outcome
 
-        evidence = self.books.resolve(token_id=event.token_id, decision_time=event.decision_time_utc)
+        if event.evidence_version is not None:
+            evidence = BookEvidence.from_signal(event)
+        else:
+            evidence = self.books.resolve(token_id=event.token_id, decision_time=event.decision_time_utc)
         gate = self._gate_book(event, evidence)
         if gate is not None:
             outcome.reason, outcome.detail = gate
