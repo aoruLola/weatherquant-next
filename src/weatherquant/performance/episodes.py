@@ -43,6 +43,7 @@ __all__ = [
     "build_episodes",
     "episode_from_mapping",
     "episode_from_open",
+    "observation_bounds",
     "summarize",
 ]
 
@@ -345,6 +346,16 @@ def row_from_mapping(row: dict) -> _DecisionRow:
         station=_normalise(row.get("station")),
         bracket_label=_normalise(row.get("bracket_label")),
         market_question=_normalise(row.get("market_question")),
+    )
+
+
+def observation_bounds(episodes: Sequence[Episode]) -> tuple[str | None, str | None]:
+    """Earliest and latest observations covered by these episodes, in UTC."""
+    if not episodes:
+        return None, None
+    return (
+        min(e.first_seen_utc for e in episodes).astimezone(UTC).isoformat(),
+        max(e.last_seen_utc for e in episodes).astimezone(UTC).isoformat(),
     )
 
 
