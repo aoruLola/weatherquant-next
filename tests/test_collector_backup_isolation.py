@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -228,10 +228,17 @@ def test_an_off_thread_backup_is_verified_and_restorable(writer: CollectorWriter
     restored.write_bytes(report.destination.read_bytes())
     w2 = CollectorWriter(restored, run_id="run-restore")
     w2.open()
-    w2.log_event("info", "restore", "post-restore event")
-    w2.flush(force=True)
-    assert w2.integrity_check().ok
-    w2.close()
+    try:
+        w2.log_event("info", "restore", "post-restore event")
+        w2.stage_event(_event())
+        w2.stage_market(_market())
+        w2.stage_book(_book())
+        w2.stage_book(_book(best_bid=0.47))
+        w2.flush(force=True)
+        assert w2.con.execute("SELECT COUNT(*) FROM order_books").fetchone()[0] == 2
+        assert w2.integrity_check().ok
+    finally:
+        w2.close()
 
 
 # ---------------------------------------------------------------------------
@@ -516,18 +523,32 @@ def _heartbeat_state(settings: Settings) -> tuple[datetime, int]:
     return heartbeat.updated_at_utc, heartbeat.stats.rest_requests_ok
 
 
-def test_the_loop_keeps_collecting_while_a_backup_copies(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
-    """WQN-1 acceptance: with the copy deliberately stalled, heartbeats and
-    polls continue; once released, the published backup is complete."""
+@pytest.mark.parametrize("stall", ["copy", "destination"])
+def test_the_loop_keeps_collecting_while_a_backup_copies(settings: Settings, monkeypatch: pytest.MonkeyPatch, stall) -> None:
+    """Heartbeats and polls continue during slow copy or backup mount access."""
     backup_started = threading.Event()
     release = threading.Event()
-    real_start = CollectorWriter.start_backup
 
-    def stalled_start(self: CollectorWriter, dest_dir: Any, **kwargs: Any) -> Any:
+    def wait_for_release():
         backup_started.set()
-        return real_start(self, dest_dir, **kwargs, before_copy=lambda: release.wait(30))
+        assert release.wait(30)
 
-    monkeypatch.setattr(CollectorWriter, "start_backup", stalled_start)
+    if stall == "copy":
+        real_start = CollectorWriter.start_backup
+
+        def stalled_start(self, dest_dir, **kwargs):
+            return real_start(self, dest_dir, **kwargs, before_copy=wait_for_release)
+
+        monkeypatch.setattr(CollectorWriter, "start_backup", stalled_start)
+    else:
+        real_mkdir = Path.mkdir
+
+        def stalled_mkdir(path, *args, **kwargs):
+            if path == settings.db_path.parent / "backups":
+                wait_for_release()
+            return real_mkdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", stalled_mkdir)
 
     # Seed one committed set of rows so "what the backup must contain" is
     # deterministic: rows committed before the worker starts are in *every*
@@ -634,7 +655,7 @@ def test_a_failed_backup_is_recorded_and_retried_the_same_day(
     assert _events(settings.db_path, "backup_started"), "the retry must run the same day"
     assert _events(settings.db_path, "backup"), "the retry must publish a verified backup"
     assert len(attempts) >= 2
-    assert (settings.db_path.parent / "backups").glob("weatherquant-*.duckdb")
+    assert list((settings.db_path.parent / "backups").glob("weatherquant-*.duckdb"))
 
 
 def test_a_hung_backup_times_out_and_the_day_is_not_retry_burned(
@@ -692,3 +713,56 @@ def test_backup_fsync_uses_a_writable_binary_handle(tmp_path):
     target.write_bytes(b"durable bytes\n")
     fsync_file(target)
     assert target.read_bytes() == b"durable bytes\n"
+
+@pytest.mark.parametrize("operation", ["fsync_file", "fsync_directory"])
+def test_timeout_during_fsync_discards_backup(writer, settings, tmp_path, monkeypatch, operation):
+    from weatherquant.data import writer as writer_module
+
+    stalled = threading.Event()
+    release = threading.Event()
+
+    def slow_fsync(path):
+        stalled.set()
+        assert release.wait(10)
+
+    monkeypatch.setattr(writer_module, operation, slow_fsync)
+    worker = CollectorWorker(settings, backup_timeout_seconds=0)
+    worker._writer = writer
+    worker._advance_daily_backup(TODAY)
+    job = worker._backup_job
+    try:
+        assert stalled.wait(5)
+        worker._advance_daily_backup(TODAY)
+        assert job.abandoned
+        assert worker._backup_attempts_today == 1
+        worker._advance_daily_backup(TODAY + timedelta(days=1))
+        assert worker._backup_job is job
+    finally:
+        release.set()
+        job.join(10)
+    assert not job.poll().ok
+    assert not job.final.exists()
+    assert not job.tmp.exists()
+    worker._advance_daily_backup(TODAY + timedelta(days=1))
+    assert worker._backup_job is None
+
+
+def test_failed_directory_sync_retries_four_times_without_publishing(writer, settings, monkeypatch):
+    from weatherquant.data import writer as writer_module
+
+    def fail(path):
+        raise OSError("injected directory fsync failure")
+
+    monkeypatch.setattr(writer_module, "fsync_directory", fail)
+    worker = CollectorWorker(settings, backup_retry_seconds=0)
+    worker._writer = writer
+    for attempt in range(1, worker.BACKUP_MAX_ATTEMPTS_PER_DAY + 1):
+        worker._advance_daily_backup(TODAY)
+        job = worker._backup_job
+        assert job is not None and job.join(10)
+        worker._advance_daily_backup(TODAY)
+        assert worker._backup_attempts_today == attempt
+        assert "directory fsync failure" in worker._last_backup_error
+        assert not job.final.exists()
+    worker._advance_daily_backup(TODAY)
+    assert worker._backup_job is None
