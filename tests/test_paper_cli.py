@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -50,10 +50,22 @@ def test_init_opens_the_account_when_enabled(paper_env, monkeypatch, capsys):
 
 
 def test_reinit_with_same_capital_is_a_noop(paper_env, monkeypatch, capsys):
+    from weatherquant.paper.ledger import Ledger
+    from weatherquant.paper.store import PaperStore
+
     monkeypatch.setenv("WQ_PAPER_ENABLED", "true")
     main(["init"])
     assert main(["init"]) == 0
-    assert "already open" in capsys.readouterr().out
+    assert main(["init"]) == 0
+    assert capsys.readouterr().out.count("already open") == 2
+    with PaperDatabase(paper_env) as db:
+        ledger = Ledger(PaperStore(db))
+        # A repeated init neither funds the account twice nor appends a
+        # second opening: the balance stays at the capital and the ledger
+        # still holds exactly one OPEN row that reconciles.
+        assert ledger.balances()["available_usdc"] == 100.0
+        assert [entry["kind"] for entry in ledger.ledger_entries()] == ["OPEN"]
+        assert ledger.verify()["consistent"] is True
 
 
 def test_reinit_with_different_capital_fails(paper_env, monkeypatch):
@@ -98,6 +110,10 @@ def test_consume_reads_the_published_export(paper_env, monkeypatch, capsys):
 
     events_dir = paper_env.parent.parent / "decisions-export"  # as the fixture configured
     (events_dir / "parts").mkdir(parents=True)
+    # Relative to now: the consume path judges signal age against the wall
+    # clock, and a fixed literal turns this test into a time bomb that starts
+    # failing on its own once the date moves past WQ_PAPER_MAX_SIGNAL_AGE.
+    decision_time = datetime.now(UTC) - timedelta(seconds=30)
     row = {
         "decision_id": "a" * 32,
         "run_id": "r" * 32,
@@ -106,7 +122,7 @@ def test_consume_reads_the_published_export(paper_env, monkeypatch, capsys):
         "direction": "buy_yes",
         "state": "ACCEPT",
         "mode": "LIVE",
-        "decision_time_utc": datetime.now(UTC).isoformat(),
+        "decision_time_utc": decision_time.isoformat(),
         "book_id": "b" * 64,
         "fee_rate": 0.05,
     }
@@ -126,3 +142,99 @@ def test_consume_reads_the_published_export(paper_env, monkeypatch, capsys):
     assert main(["status"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["signals"] == {"ACCEPTED": 1}
+
+
+def test_interrupted_init_rolls_back_and_can_be_retried(paper_env, monkeypatch):
+    from weatherquant.paper.ledger import Ledger
+    from weatherquant.paper.store import PaperStore
+
+    monkeypatch.setenv("WQ_PAPER_ENABLED", "true")
+    original = Ledger._insert_entry
+
+    def interrupted(self, *, kind, **kwargs):
+        if kind == "OPEN":
+            raise RuntimeError("injected failure writing the first ledger entry")
+        return original(self, kind=kind, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(Ledger, "_insert_entry", interrupted)
+        with pytest.raises(RuntimeError, match="injected failure"):
+            main(["init"])
+
+    # No half-opened account survives: the balances and the account row were
+    # committed by the same transaction the failed OPEN aborted.
+    with PaperDatabase(paper_env) as db:
+        for table in ("paper_accounts", "paper_balances", "paper_ledger"):
+            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+
+    assert main(["init"]) == 0
+    assert main(["init"]) == 0
+    with PaperDatabase(paper_env) as db:
+        ledger = Ledger(PaperStore(db))
+        assert db.execute("SELECT available_usdc FROM paper_balances").fetchall() == [(100.0,)]
+        assert db.execute("SELECT kind, amount_usdc FROM paper_ledger").fetchall() == [("OPEN", 100.0)]
+        assert ledger.verify()["consistent"] is True
+
+
+@pytest.mark.parametrize("with_fills", [False, True])
+def test_reinit_restores_only_the_missing_legacy_open(paper_env, monkeypatch, with_fills):
+    from paper_fills_support import make_fill
+    from weatherquant.paper.ledger import Ledger
+    from weatherquant.paper.store import PaperStore
+
+    monkeypatch.setenv("WQ_PAPER_ENABLED", "true")
+    assert main(["init"]) == 0
+    with PaperDatabase(paper_env) as db:
+        store = PaperStore(db)
+        ledger = Ledger(store)
+        account = store.account()
+        # The pre-WQN-42 engine wrote the funded balances first and the OPEN
+        # entry second; a crash between them left a funded account whose
+        # ledger never opened.
+        db.execute("DELETE FROM paper_ledger WHERE kind = 'OPEN'")
+        if with_fills:
+            with db.transaction():
+                ledger.apply_buy(
+                    make_fill(decision_id="before-repair-1", market_id="mkt-1", shares=40.0, price=0.5),
+                    now=account["created_at_utc"],
+                )
+                ledger.apply_buy(
+                    make_fill(decision_id="before-repair-2", market_id="mkt-2", shares=40.0, price=0.5),
+                    now=account["created_at_utc"],
+                )
+                ledger.apply_sell(
+                    make_fill(
+                        decision_id="before-repair-3",
+                        market_id="mkt-1",
+                        direction="sell_yes",
+                        side="sell",
+                        shares=20.0,
+                        price=0.6,
+                    ),
+                    now=account["created_at_utc"],
+                )
+        before = ledger.balances(), ledger.positions(), ledger.ledger_entries()
+        assert [entry["kind"] for entry in before[2]] == (
+            ["BUY_SETTLE", "BUY_SETTLE", "SELL_SETTLE"] if with_fills else []
+        )
+
+    assert main(["init"]) == 0
+    assert main(["init"]) == 0
+    with PaperDatabase(paper_env) as db:
+        ledger = Ledger(PaperStore(db))
+        opening, *movements = ledger.ledger_entries()
+        # One OPEN, restored from the account's immutable record - the
+        # original timestamp and capital, not the retry's clock or the
+        # current cash - and ordered ahead of every surviving fill.
+        assert opening["kind"] == "OPEN"
+        assert opening["ref_id"] == ACCOUNT_ID
+        assert opening["amount_usdc"] == opening["balance_after_usdc"] == account["initial_capital_usdc"]
+        assert opening["ts_utc"] == account["created_at_utc"]
+        assert [entry["kind"] for entry in movements] == (
+            ["BUY_SETTLE", "BUY_SETTLE", "SELL_SETTLE"] if with_fills else []
+        )
+        assert db.execute("SELECT COUNT(*) FROM paper_ledger WHERE kind = 'OPEN'").fetchone() == (1,)
+        # Nothing already traded moved: same cash, same shares, same cash
+        # entries, in the same order.
+        assert (ledger.balances(), ledger.positions(), movements) == before
+        assert ledger.verify()["consistent"] is True

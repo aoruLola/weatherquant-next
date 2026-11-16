@@ -7,14 +7,18 @@ cursor and its effects together.
 
 from __future__ import annotations
 
+import json
+import shutil
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from paper_helpers import export_row
 from weatherquant.data.lock import LockError, SingleInstanceLock
+from weatherquant.paper.consumer import CURSOR_KEY, SignalConsumer
 from weatherquant.paper.events import parse_signal_event
 from weatherquant.paper.store import ACCOUNT_ID, PaperStore
+from weatherquant.storage import paper as paper_storage
 from weatherquant.storage.paper import PaperDatabase
 
 NOW = datetime(2026, 10, 26, 12, 0, 0, tzinfo=UTC)
@@ -61,6 +65,87 @@ class TestMigrations:
             assert set(applied) == {"0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009"}
         with PaperDatabase(path) as again:
             assert again.applied_migrations() == applied
+
+    def test_legacy_upgrade_preserves_rows_order_and_future_consumption(self, tmp_path, monkeypatch):
+        old_migrations = tmp_path / "old-migrations"
+        old_migrations.mkdir()
+        for migration in paper_storage.PAPER_MIGRATIONS_DIR.glob("*.sql"):
+            if migration.name[:4] <= "0007":
+                shutil.copyfile(migration, old_migrations / migration.name)
+
+        path = tmp_path / "paper.duckdb"
+        events_dir = tmp_path / "decisions-export"
+
+        def publish(part: int, rows: list[dict]) -> None:
+            parts = events_dir / "parts"
+            parts.mkdir(parents=True, exist_ok=True)
+            with (parts / f"part-{part:09d}.jsonl").open("a", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row) + "\n")
+
+        first = export_row()
+        earlier = export_row(
+            decision_id="e" * 32,
+            market_id="mkt-0",
+            decision_time_utc=(NOW - timedelta(seconds=1)).isoformat(),
+        )
+        publish(1, [first, earlier])
+        with monkeypatch.context() as patch:
+            patch.setattr(paper_storage, "PAPER_MIGRATIONS_DIR", old_migrations)
+            with PaperDatabase(path) as legacy:
+                legacy_store = PaperStore(legacy)
+                result = SignalConsumer(
+                    legacy_store,
+                    events_dir=events_dir,
+                    max_signal_age_seconds=600.0,
+                    clock=lambda: NOW,
+                ).consume_once()
+                assert (result.accepted, result.duplicates) == (2, 0)
+                assert legacy_store.load_state(CURSOR_KEY) == {"part": 1, "lines": 2}
+                indexes = {
+                    row[0]
+                    for row in legacy.execute(
+                        "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'paper_signals'"
+                    ).fetchall()
+                }
+                assert "idx_paper_signals_outcome" in indexes
+                rows_before = legacy.execute("SELECT * FROM paper_signals ORDER BY decision_id").fetchall()
+                pending_before = legacy_store.signals_with_outcome("ACCEPTED")
+                assert [row["decision_id"] for row in pending_before] == ["e" * 32, "d" * 32]
+
+        publish(2, [export_row(decision_id="f" * 32, market_id="mkt-2")])
+        with PaperDatabase(path) as upgraded:
+            upgraded_store = PaperStore(upgraded)
+            assert "0008" in upgraded.applied_migrations()
+            indexes = {
+                row[0]
+                for row in upgraded.execute(
+                    "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'paper_signals'"
+                ).fetchall()
+            }
+            assert "idx_paper_signals_outcome" not in indexes
+            assert "idx_paper_signals_market" in indexes
+            assert upgraded.execute("SELECT * FROM paper_signals ORDER BY decision_id").fetchall() == rows_before
+            assert upgraded_store.signals_with_outcome("ACCEPTED") == pending_before
+
+            migration_sql = (paper_storage.PAPER_MIGRATIONS_DIR / "0008_drop_mutable_signal_index.sql").read_text(
+                encoding="utf-8"
+            )
+            upgraded.execute(migration_sql)
+            upgraded.execute(migration_sql)
+            assert upgraded.execute("SELECT * FROM paper_signals ORDER BY decision_id").fetchall() == rows_before
+
+            result = SignalConsumer(
+                upgraded_store,
+                events_dir=events_dir,
+                max_signal_age_seconds=600.0,
+                clock=lambda: NOW,
+            ).consume_once()
+            assert (result.signals_recorded, result.accepted, result.duplicates) == (1, 1, 0)
+            assert result.cursor.as_dict() == {"part": 2, "lines": 1}
+            assert upgraded_store.load_state(CURSOR_KEY) == {"part": 2, "lines": 1}
+            upgraded_store.set_signal_outcome(first["decision_id"], outcome="FILLED")
+            assert upgraded_store.signal(first["decision_id"])["outcome"] == "FILLED"
 
     def test_foreign_databases_are_refused_by_name(self, tmp_path):
         cases = [
@@ -186,9 +271,7 @@ class TestSingleInstance:
         first = SingleInstanceLock(lock_path, run_id="a", hostname="h", stale_after_seconds=60.0)
         first.acquire()
         try:
-            second = SingleInstanceLock(
-                lock_path, run_id="b", hostname="h", stale_after_seconds=60.0
-            )
+            second = SingleInstanceLock(lock_path, run_id="b", hostname="h", stale_after_seconds=60.0)
             with pytest.raises(LockError):
                 second.acquire()
         finally:
@@ -203,9 +286,7 @@ class TestRunBookkeeping:
     def test_run_lifecycle(self, db):
         run_id = db.start_run("paper", {"k": "v"})
         db.finish_run(run_id, status="stopped", stats={"cycles": 3}, reason="done")
-        row = db.execute(
-            "SELECT status, stop_reason, stats_json FROM paper_runs WHERE run_id = ?", [run_id]
-        ).fetchone()
+        row = db.execute("SELECT status, stop_reason, stats_json FROM paper_runs WHERE run_id = ?", [run_id]).fetchone()
         assert row[0] == "stopped"
         assert row[1] == "done"
         assert "cycles" in row[2]
@@ -266,3 +347,43 @@ def test_legacy_ledger_sequence_upgrade(tmp_path, history):
 
     with PaperDatabase(db_path) as db:
         assert db.execute("SELECT ref_id, seq, balance_after_usdc FROM paper_ledger ORDER BY seq").fetchall() == expected
+
+
+def test_legacy_database_upgrade_keeps_the_opening_entry_readable(tmp_path):
+    """A pre-0006 database written by the old engine upgrades in place."""
+    from shutil import copy2
+
+    from weatherquant.paper.api import ledger_payload
+    from weatherquant.paper.ledger import ledger_entry_id
+    from weatherquant.storage.db import connect
+    from weatherquant.storage.migrator import migrate
+    from weatherquant.storage.paper import PAPER_MIGRATIONS_DIR
+
+    old = tmp_path / "migrations"
+    old.mkdir()
+    for sql in sorted(PAPER_MIGRATIONS_DIR.glob("*.sql")):
+        if sql.name[:4] <= "0005":
+            copy2(sql, old)
+    db_path = tmp_path / "legacy.duckdb"
+    entry_id = ledger_entry_id(kind="OPEN", ref_id=ACCOUNT_ID)
+    with connect(db_path) as con:
+        migrate(con, old)
+        # Exactly what the old engine wrote: no seq column existed yet.
+        con.execute(
+            "INSERT INTO paper_ledger VALUES (?, ?, 'OPEN', 'USDC', 100.0, 100.0, 'account', ?, ?)",
+            [entry_id, NOW, ACCOUNT_ID, json.dumps({"initial_capital_usdc": 100.0})],
+        )
+
+    with PaperDatabase(db_path) as db:
+        # Opening the file again is the upgrade; it must not rewrite the row.
+        assert "0009" in db.applied_migrations()
+        payload = ledger_payload(db.con, now=NOW, query={"limit": 1})
+        (entry,) = payload["data"]["entries"]
+        assert (entry["kind"], entry["seq"], entry["balance_after_usdc"]) == ("OPEN", 1, 100.0)
+        assert entry["amount_usdc"] == 100.0
+        assert payload["data"]["has_more"] is False
+
+    with PaperDatabase(db_path) as again:
+        # Re-running the upgrade (a second open) changes nothing.
+        rows = again.execute("SELECT ref_id, seq, amount_usdc, balance_after_usdc FROM paper_ledger").fetchall()
+        assert rows == [(ACCOUNT_ID, 1, 100.0, 100.0)]
