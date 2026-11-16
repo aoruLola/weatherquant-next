@@ -98,9 +98,10 @@ def test_consume_reads_the_published_export(paper_env, monkeypatch, capsys):
 
     events_dir = paper_env.parent.parent / "decisions-export"  # as the fixture configured
     (events_dir / "parts").mkdir(parents=True)
-    # Use a decision time relative to now so the 600s freshness gate does not
-    # reject the signal merely because the test was run after 2026-10-26.
-    decision_time = datetime.now(tz=UTC) - timedelta(seconds=60)
+    # Relative to now: the consume path judges signal age against the wall
+    # clock, and a fixed literal turns this test into a time bomb that starts
+    # failing on its own once the date moves past WQ_PAPER_MAX_SIGNAL_AGE.
+    decision_time = datetime.now(UTC) - timedelta(seconds=30)
     row = {
         "decision_id": "a" * 32,
         "run_id": "r" * 32,

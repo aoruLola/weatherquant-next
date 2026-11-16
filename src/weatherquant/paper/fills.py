@@ -298,7 +298,10 @@ class FillEngine:
             outcome.reason, outcome.detail = verdict.reason, verdict.detail
             return outcome
 
-        evidence = self.books.resolve(token_id=event.token_id, decision_time=event.decision_time_utc)
+        if event.evidence_version is not None:
+            evidence = BookEvidence.from_signal(event)
+        else:
+            evidence = self.books.resolve(token_id=event.token_id, decision_time=event.decision_time_utc)
         gate = self._gate_book(event, evidence)
         if gate is not None:
             outcome.reason, outcome.detail = gate
