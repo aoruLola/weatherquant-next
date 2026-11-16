@@ -384,7 +384,7 @@ def test_only_verified_markets_are_marked_verified() -> None:
         markets,
         get_json=platform.get,
         dataset="live",
-        verified=[{"market_id": "m-1", "target_date": "2026-10-14"}],
+        verified=[dict(markets[0], resolved_outcome=1.0)],
         now=NOW,
     )
     assert rows[0]["verification_status"] == "VERIFIED"
@@ -395,6 +395,21 @@ def test_only_verified_markets_are_marked_verified() -> None:
     assert unverified[0]["verification_status"] == "UNVERIFIED", (
         "a resolution the system has not cross-checked must not be scored"
     )
+
+
+@pytest.mark.parametrize(("price", "evidence", "expected"), [
+    ("0", {"condition_id": "0xaaa", "resolved_outcome": 0.0}, "VERIFIED"),
+    ("0", {"condition_id": "0xaaa", "resolved_outcome": 1.0}, "UNVERIFIED"),
+    ("1", {"condition_id": "0xbbb", "resolved_outcome": 1.0}, "UNVERIFIED"),
+    ("1", {}, "UNVERIFIED"),
+    (None, {"condition_id": "0xaaa", "resolved_outcome": 1.0}, "PENDING"),
+])
+def test_backfill_verifies_only_the_observed_condition_and_payout(price, evidence, expected):
+    market = {"market_id": "m-1", "target_date": "2026-10-14", "condition_id": "0xaaa"}
+    proof = {"market_id": "m-1", "target_date": "2026-10-14", **evidence}
+    row, = backfill_settlements([market], get_json=_FakePlatform({"0xaaa": price}).get,
+                                dataset="fixture", verified=[proof], now=NOW)
+    assert row["verification_status"] == expected
 
 
 def test_the_chain_reference_is_kept() -> None:

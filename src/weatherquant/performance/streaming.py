@@ -100,13 +100,12 @@ from weatherquant.performance.snapshot import (
     SettlementRecord,
     _envelope,
     _settlement_coverage,
-    _settlement_index,
-    _settlement_provenance,
     detail_warnings,
     detail_window_descriptor,
     publish_performance,
     settlement_freshness,
     settlement_payload,
+    settlement_records_from_index,
 )
 from weatherquant.performance.state import (
     DEFAULT_MEMORY_LIMIT,
@@ -426,12 +425,15 @@ def _ensure_chronological_episodes(store: PerformanceStateStore) -> None:
             [[str(p.path) for p in parts]],
         )
         with store.transaction():
-            store.execute("DELETE FROM performance_episodes")
+            # DuckDB 1.1 loses same-key replacements after DELETE in this transaction.
+            # Every upsert stamps ingested_at_utc. Prune only rows the re-fold did not visit.
+            store.execute("UPDATE performance_episodes SET ingested_at_utc = '-infinity'")
             while page := reader.fetchmany(5000):
                 for (raw,) in page:
                     folder.add(row_from_mapping(json.loads(raw)))
             store.upsert_closed_episodes(closed)
             store.upsert_open_episodes(folder.open_by_key.values())
+            store.execute("DELETE FROM performance_episodes WHERE ingested_at_utc = '-infinity'")
             state.row_seq = folder.state.row_seq
             state.last_instant = folder.state.last_instant
             state.prev_instant = folder.state.prev_instant
@@ -1048,10 +1050,11 @@ def build_streaming_payloads(
     )
 
     build_watermark = state.last_end_cursor
+    start, end = store.fetchone("SELECT min(first_seen_utc), max(last_seen_utc) FROM performance_episodes")
     lifetime_window = {
         "episodes_all": episode_count,
-        "first_seen_utc_from": _iso(store.fetchone("SELECT min(first_seen_utc) FROM performance_episodes")[0]),
-        "last_seen_utc_to": _iso(store.fetchone("SELECT max(first_seen_utc) FROM performance_episodes")[0]),
+        "first_seen_utc_from": _iso(start),
+        "last_seen_utc_to": _iso(end),
     }
 
     scope = ["observation_all_accepts", "opportunity_episodes", "database_lifetime"]
@@ -1301,9 +1304,9 @@ def _detail_window(
     since = now - timedelta(days=days)
     in_window = store.count_episodes_since(since)
     window_episodes = min(in_window, max_episodes)
-    first = store.fetchone(
-        "SELECT min(first_seen_utc), max(first_seen_utc) FROM "
-        "(SELECT first_seen_utc FROM performance_episodes WHERE first_seen_utc >= ? "
+    start, end = store.fetchone(
+        "SELECT min(first_seen_utc), max(last_seen_utc) FROM "
+        "(SELECT first_seen_utc, last_seen_utc FROM performance_episodes WHERE first_seen_utc >= ? "
         "ORDER BY first_seen_utc DESC, episode_id DESC LIMIT ?) AS w",
         [since, max_episodes],
     )
@@ -1312,8 +1315,8 @@ def _detail_window(
         all_episodes=store.count_episodes(),
         max_episodes=max_episodes,
         days=days,
-        first_seen_utc=_iso(first[1]) if first and first[1] else None,
-        last_seen_utc=_iso(first[0]) if first and first[0] else None,
+        first_seen_utc=_iso(start),
+        last_seen_utc=_iso(end),
     )
     return since, descriptor
 
@@ -1600,11 +1603,16 @@ def build_performance_streaming(
         settlements_replace = True
         settlements_source = str(restore_settlements_backup)
     else:
-        answers, verified = _settlement_index(settlements)
-        provenance = _settlement_provenance(settlements)
         payload = {
-            key: (answer.status, answer.payout, key in verified, *provenance[key])
-            for key, answer in answers.items()
+            (record.market_id, record.target_date): (
+                record.status,
+                record.payout,
+                record.verified,
+                record.verification_status,
+                record.resolution_source,
+                record.fetched_at_utc,
+            )
+            for record in settlement_records_from_index(settlements)
         }
     if settlements_replace and not payload and not confirm_empty_retraction:
         raise PerformanceStateError(

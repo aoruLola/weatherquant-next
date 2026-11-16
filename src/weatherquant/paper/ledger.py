@@ -122,13 +122,19 @@ class Ledger:
         write wins, exactly like the account row itself.
         """
         if self.balances() is not None:
-            return False
-        self.db.execute(
-            "INSERT INTO paper_balances (account_id, available_usdc, occupied_usdc, "
-            "realized_pnl_usdc, updated_at_utc) VALUES (?, ?, 0.0, 0.0, ?) "
-            "ON CONFLICT (account_id) DO NOTHING",
-            [ACCOUNT_ID, float(initial_capital_usdc), now],
-        )
+            if self._entry_exists(ledger_entry_id(kind="OPEN", ref_id=ACCOUNT_ID)):
+                return False
+            # Before atomic init, a crash could leave funded balances without OPEN.
+            # Restore only the missing entry from the immutable account record.
+            account = self.store.account()
+            initial_capital_usdc = account["initial_capital_usdc"]
+            now = account["created_at_utc"]
+        else:
+            self.db.execute(
+                "INSERT INTO paper_balances (account_id, available_usdc, occupied_usdc, "
+                "realized_pnl_usdc, updated_at_utc) VALUES (?, ?, 0.0, 0.0, ?)",
+                [ACCOUNT_ID, float(initial_capital_usdc), now],
+            )
         self._insert_entry(
             kind="OPEN",
             ts_utc=now,
@@ -547,41 +553,30 @@ class Ledger:
                 "detail": "already recorded; the natural key absorbed the redelivery",
             }
 
-        if not event.is_payout:
-            # A dispute that reopens an already-settled market breaks the
-            # applied payout's finality: the final answer is unknown, and
-            # keeping OR reversing the payout would both fabricate realised
-            # profit. A human decides; the balances stay untouched.
-            applied = self._applied_settlement(market_id)
-            if applied is not None and event.status == "DISPUTED":
-                self._flag_review(
-                    event,
-                    reason=(
-                        f"market re-disputed after a payout was applied at revision "
-                        f"{applied['revision']}; whether that payout stands is a "
-                        "human decision"
-                    ),
-                )
-                return {
-                    "action": "REVIEW_REQUIRED",
-                    "market_id": market_id,
-                    "revision": event.revision,
-                    "detail": "dispute after settlement; flagged for manual review",
-                }
-            return {
-                "action": "RECORDED",
-                "market_id": market_id,
-                "revision": event.revision,
-                "detail": f"status {event.status}; unsettled positions never book realised P&L",
-            }
-
-        applied = self._applied_settlement(market_id)
-        if applied is not None and event.revision <= applied["revision"]:
+        latest = self.db.execute(
+            "SELECT MAX(revision) FROM paper_settlements WHERE market_id = ?", [market_id]
+        ).fetchone()[0]
+        if event.revision < latest:
             return {
                 "action": "NOOP",
                 "market_id": market_id,
                 "revision": event.revision,
-                "detail": f"superseded by applied revision {applied['revision']}",
+                "detail": f"superseded by recorded revision {latest}",
+            }
+
+        applied = self._applied_settlement(market_id)
+        if not event.is_payout:
+            detail = (
+                "resolution lacks VERIFIED evidence" if event.status == "RESOLVED" else f"status {event.status}"
+            )
+            if applied is not None:
+                detail = f"{detail} after payout at revision {applied['revision']}; manual review required"
+                self._flag_review(event, reason=detail)
+            return {
+                "action": "REVIEW_REQUIRED" if applied is not None else "RECORDED",
+                "market_id": market_id,
+                "revision": event.revision,
+                "detail": detail,
             }
 
         payout = float(event.yes_payout)  # guaranteed by is_payout
@@ -830,7 +825,11 @@ class Ledger:
         # only this counter can. Ordering the ledger by (ts, entry_id) once
         # shuffled such a batch and broke the running-balance audit chain.
         # (A wasted sequence on a conflicting insert is a gap, not a problem.)
-        seq = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM paper_ledger").fetchone()[0]
+        if kind == "OPEN":
+            # A recovered opening precedes any fills recorded before init was retried.
+            seq = self.db.execute("SELECT COALESCE(MIN(seq) - 1, 1) FROM paper_ledger").fetchone()[0]
+        else:
+            seq = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM paper_ledger").fetchone()[0]
         self.db.execute(
             "INSERT INTO paper_ledger (entry_id, seq, ts_utc, kind, currency, amount_usdc, "
             "balance_after_usdc, ref_type, ref_id, detail_json) "

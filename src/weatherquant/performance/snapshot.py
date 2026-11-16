@@ -31,11 +31,12 @@ from weatherquant.performance.capital import lifetime_portfolio_payload, simulat
 from weatherquant.performance.edge import daily_edge, edge_by_bin, grouped_edge, observation_edge
 from weatherquant.performance.episodes import (
     Episode,
-    _timestamp,
     build_episodes,
+    observation_bounds,
     summarize,
 )
 from weatherquant.performance.settlement import classify, parse_resolutions
+from weatherquant.performance.settlement_queue import latest_settlement_rows, settlement_fetch_time
 from weatherquant.performance.winrate import (
     SettlementAnswer,
     assign_outcomes,
@@ -133,13 +134,14 @@ def detail_window(
     recent = [episode for episode in episodes if episode.first_seen_utc >= cutoff]
     recent.sort(key=lambda e: (e.first_seen_utc, e.episode_id), reverse=True)
     window = recent[:max_episodes]
+    start, end = observation_bounds(window)
     descriptor = detail_window_descriptor(
         window_episodes=len(window),
         all_episodes=len(episodes),
         max_episodes=max_episodes,
         days=days,
-        first_seen_utc=window[0].first_seen_utc.isoformat() if window else None,
-        last_seen_utc=window[-1].first_seen_utc.isoformat() if window else None,
+        first_seen_utc=start,
+        last_seen_utc=end,
     )
     return window, descriptor
 
@@ -198,43 +200,6 @@ def _envelope(
     return payload
 
 
-def _settlement_index(
-    payloads: Iterable[Any],
-) -> tuple[dict[tuple[str, str | None], SettlementAnswer], frozenset[tuple[str, str | None]]]:
-    """Fold raw resolution bodies into ``(market, date) -> answer``.
-
-    Accepts either a parsed mapping or a raw ``/v2/resolutions`` body, so a
-    backfill can hand over exactly what the platform returned without
-    re-encoding it first.
-    """
-    answers: dict[tuple[str, str | None], SettlementAnswer] = {}
-    verified: set[tuple[str, str | None]] = set()
-    for item in payloads:
-        if not isinstance(item, Mapping):
-            continue
-        market_id = str(item.get("market_id") or "")
-        if not market_id:
-            continue
-        target_date = item.get("target_date")
-        status = str(item.get("settlement_status") or "UNAVAILABLE")
-        payout = item.get("resolved_outcome")
-        key = (market_id, str(target_date) if target_date else None)
-        answers[key] = SettlementAnswer(
-            status=status,
-            payout=float(payout) if payout in (0, 1, 0.0, 1.0) else None,
-        )
-        # A raw resolutions body may be passed through untouched.
-        if "data" in item and item.get("data") is not None:
-            for record in parse_resolutions(item):
-                status = classify(record)
-                answers[key] = SettlementAnswer(status=status, payout=record.price)
-        if status == "RESOLVED" and item.get("verification_status") == "VERIFIED":
-            verified.add(key)
-        else:
-            verified.discard(key)
-    return answers, frozenset(verified)
-
-
 @dataclass(frozen=True, slots=True)
 class SettlementRecord:
     """One settlement answer with the evidence that produced it.
@@ -259,52 +224,24 @@ class SettlementRecord:
 
 def settlement_records_from_index(payloads: Iterable[Any]) -> list[SettlementRecord]:
     """The published records for a settlement index, in a stable order."""
-    answers, verified = _settlement_index(payloads)
-    provenance = _settlement_provenance(payloads)
-    records = [
-        SettlementRecord(
-            market_id=market_id,
-            target_date=target_date,
-            status=answer.status,
-            payout=answer.payout,
-            verified=(market_id, target_date) in verified,
-            verification_status=provenance.get((market_id, target_date), (None, None, None))[0],
-            resolution_source=provenance.get((market_id, target_date), (None, None, None))[1],
-            fetched_at_utc=provenance.get((market_id, target_date), (None, None, None))[2],
-        )
-        for (market_id, target_date), answer in answers.items()
-    ]
-    return sorted(records, key=lambda r: (r.market_id, r.target_date or ""))
-
-
-def _settlement_provenance(
-    payloads: Iterable[Any],
-) -> dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]]:
-    """``(verification_status, resolution_source, fetched_at)`` per answer."""
-    out: dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]] = {}
-    for item in payloads:
-        if not isinstance(item, Mapping):
-            continue
-        market_id = str(item.get("market_id") or "")
-        if not market_id:
-            continue
-        raw = item.get("target_date")
-        key = (market_id, str(raw) if raw else None)
-        stamp = item.get("fetched_at_utc")
-        fetched: datetime | None = None
-        if stamp is not None:
-            try:
-                fetched = _timestamp(stamp)
-            except (TypeError, ValueError):
-                fetched = None
+    records = []
+    for (market_id, target_date), item in latest_settlement_rows(payloads).items():
+        status = str(item.get("settlement_status") or "UNAVAILABLE")
+        claimed = item.get("resolved_outcome")
+        payout = float(claimed) if type(claimed) in (int, float) and claimed in (0, 1) else None
+        if "data" in item:
+            for raw in parse_resolutions(item):
+                status, payout = classify(raw), raw.price
         verdict = item.get("verification_status")
         source = item.get("resolution_source")
-        out[key] = (
-            str(verdict) if verdict is not None else None,
-            str(source) if source is not None else None,
-            fetched,
-        )
-    return out
+        records.append(SettlementRecord(
+            market_id=market_id, target_date=target_date, status=status, payout=payout,
+            verified=status == "RESOLVED" and payout is not None and payout == claimed and verdict == "VERIFIED",
+            verification_status=str(verdict) if verdict is not None else None,
+            resolution_source=str(source) if source is not None else None,
+            fetched_at_utc=settlement_fetch_time(item),
+        ))
+    return sorted(records, key=lambda r: (r.market_id, r.target_date or ""))
 
 
 def _settlement_coverage(
@@ -429,8 +366,9 @@ def build_performance(
     else:
         episode_counters = {"episodes_built": len(episodes)}
 
-    answers, verified = _settlement_index(settlements)
     settlement_records = settlement_records_from_index(settlements)
+    answers = {(r.market_id, r.target_date): SettlementAnswer(status=r.status, payout=r.payout) for r in settlement_records}
+    verified = {(r.market_id, r.target_date) for r in settlement_records if r.verified}
     scored = assign_outcomes(episodes, answers=answers, verified=verified)
 
     edge_summary = observation_edge(decisions)
@@ -448,6 +386,7 @@ def build_performance(
 
     scope = ["observation_all_accepts", "opportunity_episodes", "database_lifetime"]
 
+    start, end = observation_bounds(episodes)
     summary = {
         "observation_edge_sum": edge_summary["overall"]["sum"],
         "unique_opportunity_edge_sum": episode_summary["unique_opportunity_edge_sum"],
@@ -468,16 +407,8 @@ def build_performance(
                 all_episodes=len(episodes),
                 max_episodes=len(episodes),
                 days=0,
-                first_seen_utc=(
-                    min((e.first_seen_utc for e in episodes), default=None).isoformat()
-                    if episodes
-                    else None
-                ),
-                last_seen_utc=(
-                    max((e.first_seen_utc for e in episodes), default=None).isoformat()
-                    if episodes
-                    else None
-                ),
+                first_seen_utc=start,
+                last_seen_utc=end,
             ),
             settlement_coverage=_settlement_coverage(settlement_records, rate),
         ),

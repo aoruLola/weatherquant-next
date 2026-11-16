@@ -281,22 +281,23 @@ def test_a_second_process_is_refused_rather_than_corrupting_the_store(tmp_path) 
     import sys
 
     rows = _dataset(seed=91, rows=200)
-    _write_parts(tmp_path, rows, 2)
     state_db = tmp_path / "state.duckdb"
+    _ingest(tmp_path, rows, parts=2, state_db=state_db)
+    probe = [
+        sys.executable, "-c",
+        "import duckdb, sys; print('opening', flush=True); con = duckdb.connect(sys.argv[1]); "
+        "print('opened', flush=True); "
+        "print(con.execute('SELECT SUM(rows) FROM performance_parts').fetchone()[0])",
+        str(state_db),
+    ]
     with PerformanceStateStore(state_db):
-        attempt = subprocess.run(
-            [sys.executable, "-c", f"import duckdb; duckdb.connect({str(state_db)!r})"],
-            capture_output=True,
-            text=True,
-        )
-    assert attempt.returncode != 0
-    message = (attempt.stderr or attempt.stdout).lower()
-    # The wording is platform-specific - DuckDB says "Conflicting lock is held"
-    # on Linux and "File is already open in" on Windows - so asserting one of
-    # them makes this test pass or fail on the operating system rather than on
-    # the behaviour. What has to hold is that the second process is refused,
-    # and refused for *this* reason rather than an unrelated one.
-    assert "lock" in message or "already open" in message, message
+        attempt = subprocess.run(probe, capture_output=True)
+        assert attempt.returncode != 0
+        assert attempt.stdout.splitlines() == [b"opening"], attempt.stderr
+    # The identical process can open the same file and see its committed rows
+    # once the owner releases it, regardless of the OS language.
+    released = subprocess.run(probe, check=True, capture_output=True)
+    assert released.stdout.splitlines() == [b"opening", b"opened", str(len(rows)).encode()]
 
 
 # ---------------------------------------------------------------------------
@@ -797,13 +798,7 @@ def test_the_empty_retraction_refusal_reaches_the_command(tmp_path, capsys) -> N
 
 
 def test_an_existing_state_database_keeps_working(tmp_path) -> None:
-    """Migration regression: a store built before this change still opens.
-
-    No migration was added for the retraction guard - it is CLI and control
-    flow, not schema - so the check that matters is that an existing database
-    is not disturbed: the migration set is unchanged, reopening re-applies
-    nothing, and the settlement rows survive.
-    """
+    """Reopening a migrated database preserves its settlement rows."""
     from weatherquant.performance.state import PERFORMANCE_MIGRATIONS_DIR
     from weatherquant.storage.migrator import applied_migrations, available_migrations
 
@@ -821,11 +816,7 @@ def test_an_existing_state_database_keeps_working(tmp_path) -> None:
 
     versions = [spec.version for spec in available_migrations(PERFORMANCE_MIGRATIONS_DIR)]
     assert versions == sorted(versions, key=int), versions
-    assert versions == ["0001", "0002", "0003", "0004"], (
-        "0003 adds the ingest columns for the write-sequence cursor (WQN-20); "
-        "any other new one here means an existing state database has to be "
-        "upgraded before it can be read, which is a decision to make openly"
-    )
+    assert versions == ["0001", "0002", "0003", "0004", "0005"]
 
     # Reopen: migrations are idempotent and nothing is lost.
     with PerformanceStateStore(state_db) as store:
@@ -1359,6 +1350,37 @@ def test_partial_retraction_and_restore_use_the_normal_command(tmp_path):
     assert restored["summary.json"]["data"]["reference_capital"] == before["summary.json"]["data"]["reference_capital"]
 
 
+def test_restore_keeps_unverified_answers_unverified(tmp_path):
+    """A restore puts back the verdict that was saved, not a fresh conclusion.
+
+    The win rate is gated on RESOLVED + observation-verified (WQN-32/33), so a
+    restore that silently promoted UNVERIFIED rows would inflate the
+    denominator without a single observation being checked.
+    """
+    rows = _dataset(seed=211, rows=200)
+    index = _settlements(rows, verified=False)
+    out = tmp_path / "out"
+    state = tmp_path / "state.duckdb"
+    options = dict(export=_write_parts(tmp_path, rows, 2), out_dir=out,
+                   state_db=state, dataset="fixture", now=NOW)
+    build_performance_streaming(**options, settlements=index)
+    before = _read_generation(out)
+    assert before["settlements.json"]["data"]["verified"] == []
+    assert all(row["verification_status"] == "UNVERIFIED" for row in before["settlements.json"]["data"]["answers"])
+
+    build_performance_streaming(**options, settlements=index[:1], settlements_replace=True)
+    backup, = tmp_path.glob("*.retracted-*.json")
+    build_performance_streaming(**options, restore_settlements_backup=backup)
+
+    restored = _read_generation(out)
+    answers = restored["settlements.json"]["data"]["answers"]
+    assert len(answers) == len(index)
+    assert all(row["verification_status"] == "UNVERIFIED" for row in answers)
+    assert restored["settlements.json"]["data"]["verified"] == []
+    assert restored["win-rate.json"]["data"]["overall"] == before["win-rate.json"]["data"]["overall"]
+    assert restored["summary.json"]["data"]["reference_capital"] == before["summary.json"]["data"]["reference_capital"]
+
+
 def test_last_settlement_revision_also_owns_its_verification(tmp_path):
     rows = _dataset(seed=211, rows=200)
     index = _settlements(rows)
@@ -1408,7 +1430,7 @@ def test_failed_settlement_upsert_rolls_back_omissions(tmp_path, monkeypatch):
     with PerformanceStateStore(state) as store:
         previous = store.load_settlements()
 
-    def fail(self, answers):
+    def fail(self, answers, **kwargs):
         raise RuntimeError("replacement write failed")
 
     monkeypatch.setattr(PerformanceStateStore, "upsert_settlements", fail)
