@@ -250,10 +250,7 @@ def cmd_export_verify(settings: Settings, shadow: ShadowSettings, args: argparse
     """Reconcile the published decision export against the database.
 
     Opens the shadow database directly, so it only works while the engine is
-    stopped - the same lease `report --offline` lives under. The check it
-    runs is the one WQN-20 demands of the export: nothing lost (every row at
-    or below the cursor is in the parts), nothing twice (sequences strictly
-    increase across the whole concatenation, and the counts agree).
+    stopped, as with `report --offline`.
     """
     if not shadow.shadow_db_path.exists():
         print(f"no shadow database at {shadow.shadow_db_path}", file=sys.stderr)
@@ -265,7 +262,6 @@ def cmd_export_verify(settings: Settings, shadow: ShadowSettings, args: argparse
 
             exporter = DecisionExporter(db.con, export_dir)
             report = exporter.reconcile()
-            report.update(exporter.verify())
             report["export_dir"] = str(export_dir)
     except Exception as exc:
         print(

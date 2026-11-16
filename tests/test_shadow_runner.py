@@ -950,3 +950,104 @@ def test_a_dead_feed_never_produces_a_live_accept(tmp_path, models_dir, monkeypa
     assert dec["by_mode"].get("LIVE", {}).get("accepted", 0) == 0
     # Whatever it did conclude about history is labelled and warned about.
     assert any("REPLAY, not LIVE" in w for w in report["warnings"])
+
+
+def test_live_export_keeps_decision_time_depth_and_fees_after_catalog_changes(make_runner, archive, tmp_path):
+    import hashlib
+
+    from weatherquant.paper.books import BookEvidence
+    from weatherquant.paper.events import parse_signal_event
+    from weatherquant.shadow.export import DecisionExporter, read_export
+
+    runner, _ = _run_one_cycle(make_runner)
+    con = runner.db.con
+    expected = {}
+    for raw in (archive / "rest" / f"{TARGET_DATE}.jsonl").read_bytes().splitlines():
+        if raw:
+            payload = json.loads(raw)["payload"]
+            expected[payload["asset_id"]] = (hashlib.sha256(raw).hexdigest(), payload)
+    old_fees = dict(con.execute("SELECT market_id, fee_rate FROM market_catalog").fetchall())
+    assert all(rate is not None and rate != 0.99 for rate in old_fees.values())
+    assert con.execute("SELECT COUNT(*) FROM decision_book_depth").fetchone() == (4,)
+    con.execute("UPDATE market_catalog SET fee_rate=0.99")
+    con.execute("UPDATE token_books SET bids_json='[]', asks_json='[]'")
+    root = tmp_path / "audit-export"
+    exporter = DecisionExporter(con, root)
+    assert exporter.run_batch().rows_exported == 8
+    rows = list(read_export(root))
+    assert {row["direction"] for row in rows} == {"buy_yes", "sell_yes"}
+    assert len({row["decision_id"] for row in rows}) == len(rows)
+    for row in rows:
+        event = parse_signal_event(row)
+        evidence = BookEvidence.from_signal(event)
+        assert evidence.book_id == event.book_id
+        source_digest, payload = expected[event.token_id]
+        assert evidence.source_event_id == source_digest
+        assert row["fee_rate"] == old_fees[event.market_id]
+        assert [(lv.price_usd_per_share, lv.size_shares) for lv in evidence.book.bids] == sorted(
+            ((float(lv["price"]), float(lv["size"])) for lv in payload["bids"]), reverse=True)
+        assert [(lv.price_usd_per_share, lv.size_shares) for lv in evidence.book.asks] == sorted(
+            (float(lv["price"]), float(lv["size"])) for lv in payload["asks"])
+
+
+def test_paper_fills_a_live_decision_from_its_own_exported_book(make_runner, archive, tmp_path):
+    """Decision -> export -> fill: the price is the decision-time book, not a
+    newer book the archive can resolve at the same instant."""
+    import hashlib
+
+    from paper_fills_support import build_engine, open_ledger_if_needed
+    from weatherquant.paper.books import ArchiveBookSource
+    from weatherquant.paper.events import parse_signal_event
+    from weatherquant.paper.store import PaperStore
+    from weatherquant.shadow.export import DecisionExporter, read_export
+    from weatherquant.storage.paper import PaperDatabase
+
+    runner, _ = _run_one_cycle(make_runner)
+    root = tmp_path / "paper-export"
+    assert DecisionExporter(runner.db.con, root).run_batch().rows_exported == 8
+    row = next(
+        r for r in read_export(root) if r["direction"] == "buy_yes" and r["token_id"] == "tok-0-yes"
+    )
+    event = parse_signal_event(row)
+    decision_time = event.decision_time_utc
+    path = archive / "rest" / f"{TARGET_DATE}.jsonl"
+    original_line = next(
+        line
+        for line in path.read_bytes().splitlines()
+        if json.loads(line)["payload"].get("asset_id") == "tok-0-yes"
+    )
+
+    # A newer frame is archived after the decision was recorded. It is
+    # received before the decision instant, so the archive now resolves it -
+    # but the fill must still use the book the decision actually saw.
+    late = book_payload(
+        token_id="tok-0-yes",
+        bids=[(0.58, 500.0)],
+        asks=[(0.60, 500.0)],
+        venue_ts_ms=VENUE_TS_MS + 500,
+    )
+    late_line = archive_line(
+        3, "rest", late, received=decision_time - timedelta(milliseconds=500)
+    )
+    write_lines(archive, "rest", TARGET_DATE, [late_line])
+    archived = ArchiveBookSource(archive).resolve(token_id="tok-0-yes", decision_time=decision_time)
+    assert archived.book.asks[0].price_usd_per_share == 0.60
+
+    with PaperDatabase(tmp_path / "paper.duckdb") as db:
+        store = PaperStore(db)
+        store.ensure_account(initial_capital_usdc=100.0, now=decision_time)
+        open_ledger_if_needed(store, now=decision_time)
+        store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=decision_time)
+        result = build_engine(
+            store, ArchiveBookSource(archive), clock=lambda: decision_time
+        ).fill_pending()
+
+        assert result.filled == 1
+        fill = store.fill_of(event.decision_id)
+        assert fill["avg_price_usd_per_share"] == pytest.approx(0.47)
+        stored_book_id = db.execute(
+            "SELECT book_id FROM paper_fills WHERE decision_id = ?", [event.decision_id]
+        ).fetchone()[0]
+        assert stored_book_id == event.book_id
+        assert fill["book_source_event_id"] == hashlib.sha256(original_line).hexdigest()
+        assert fill["book_source_event_id"] != hashlib.sha256(late_line.encode("utf-8")).hexdigest()
