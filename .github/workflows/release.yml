@@ -1,9 +1,9 @@
 # Release: test, build, verify, publish.
 #
-# Ordering is the safety property. Every gate runs before anything is pushed:
+# Release tags move only after the registry artifact passes verification:
 #
 #   pytest + ruff  ->  docker build  ->  container start + health check
-#                  ->  push SHA tag  ->  move `stable`
+#                  ->  push digest  ->  verify worker  ->  publish tags
 #
 # `stable` is only ever moved by this workflow, on a run where every gate
 # passed. Development pushes never touch it, so the NAS - which tracks
@@ -39,8 +39,18 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify the release commit is on main
+        id: source
+        run: |
+          git merge-base --is-ancestor HEAD origin/main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
@@ -67,6 +77,7 @@ jobs:
           push: false
           load: true
           tags: weatherquant-next:release-candidate
+          build-args: GIT_SHA=${{ steps.source.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -143,6 +154,8 @@ jobs:
     environment: release
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -154,43 +167,31 @@ jobs:
       - name: Lowercase the image name
         run: echo "IMAGE=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
 
-      - name: Extract metadata
-        id: meta
-        run: |
-          set -euo pipefail
-          sha="${GITHUB_SHA}"
-          tag="${GITHUB_REF_NAME}"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "sha_tag=sha-${sha}" >> "$GITHUB_OUTPUT"
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push (immutable SHA tag)
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          push: true
+          build-args: GIT_SHA=${{ needs.verify.outputs.sha }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           provenance: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE }}:sha-${{ steps.meta.outputs.sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Move stable (only after the SHA tag exists)
+      - name: Verify the published worker and promote its digest
+        env:
+          SOURCE_SHA: ${{ needs.verify.outputs.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create \
-            -t "$REGISTRY/$IMAGE:stable" \
-            "$REGISTRY/$IMAGE:sha-${{ steps.meta.outputs.sha }}"
-          echo "stable -> sha-${{ steps.meta.outputs.sha }}"
-
-      - name: Provenance summary
-        run: |
-          echo "Published:" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`$REGISTRY/$IMAGE:sha-${{ steps.meta.outputs.sha }}\` (immutable)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`$REGISTRY/$IMAGE:${{ steps.meta.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`$REGISTRY/$IMAGE:stable\` (moved from previous)" >> "$GITHUB_STEP_SUMMARY"
+          repo="$REGISTRY/$IMAGE"
+          ref="$repo@$DIGEST"
+          docker pull "$ref"
+          bash scripts/verify_worker_image.sh "$ref" "$SOURCE_SHA"
+          docker buildx imagetools create -t "$repo:sha-$SOURCE_SHA" -t "$repo:$GITHUB_REF_NAME" "$ref"
+          docker buildx imagetools create -t "$repo:stable" "$ref"
+          echo "Collector $SOURCE_SHA ($GITHUB_REF_NAME, stable) verified at $ref" >> "$GITHUB_STEP_SUMMARY"
