@@ -219,7 +219,7 @@ def lifetime_portfolio_payload(
     ]
     payload["statistical_window"] = {
         "first_seen_utc_from": window.get("first_seen_utc_from"),
-        "last_seen_utc_to": window.get("first_seen_utc_to"),
+        "last_seen_utc_to": window.get("last_seen_utc_to"),
         "episodes": window.get("episodes_all"),
         "episodes_simulated": window.get("episodes_all"),
     }

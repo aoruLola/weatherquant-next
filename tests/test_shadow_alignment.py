@@ -10,11 +10,13 @@ mixed mode, untraceable fusion input - is named and attached to its row.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from weatherquant.shadow import cli as shadow_cli
 from weatherquant.shadow.alignment import audit_alignment
 from weatherquant.storage.shadow import ShadowDatabase
 
@@ -87,6 +89,7 @@ def _prediction(
     db,
     *,
     model: str = "fusion",
+    version: str = "v1",
     event: str = "e-1",
     target: date = TARGET,
     run_time: datetime = RUN,
@@ -97,10 +100,11 @@ def _prediction(
 ) -> None:
     db.con.execute(
         f"INSERT INTO model_predictions ({PREDICTION_COLUMNS}) VALUES "
-        "(?, 'v1', 'KLGA', ?, ?, ?, '{}', 48.0, 24, ?, ?, "
+        "(?, ?, 'KLGA', ?, ?, ?, '{}', 48.0, 24, ?, ?, "
         "datetime '2020-01-01', ?, 'estimated', ?, ?, 'cal-v1', 'sha', ?)",
         [
             model,
+            version,
             target,
             event,
             run_time,
@@ -116,6 +120,13 @@ def _prediction(
 
 def _kinds(report) -> set[str]:
     return {v.kind for v in report.violations}
+
+
+def _run_alignment_json(db, capsys):
+    path = db.path
+    db.close()
+    exit_code = shadow_cli.main(["--db", str(path), "alignment", "--json"])
+    return exit_code, json.loads(capsys.readouterr().out)
 
 
 # --- the clean history ---------------------------------------------------------
@@ -157,6 +168,21 @@ def test_one_forecast_run_shared_across_markets_is_listed_not_refused(db):
     assert sharing[0]["markets"] == 3
 
 
+def test_live_and_replay_decisions_stay_separate_when_sharing_a_prediction(db):
+    _prediction(db, model="gfs_raw")
+    _decision(db, i=1, model="gfs_raw", market="m-live", mode="LIVE")
+    _decision(db, i=2, model="gfs_raw", market="m-replay", mode="REPLAY")
+
+    report = audit_alignment(db.con, now=NOW)
+
+    assert report.consistent
+    assert report.checked_decisions == 2
+    assert report.checked_predictions == 1
+    assert report.per_mode["LIVE"]["decisions"] == 1
+    assert report.per_mode["REPLAY"]["decisions"] == 1
+    assert report.forecast_sharing_markets[0]["markets"] == 2
+
+
 # --- no future forecast was read -----------------------------------------------
 
 
@@ -171,12 +197,93 @@ def test_a_run_initialised_after_the_decision_is_a_violation(db):
 
 
 def test_an_issue_that_was_not_publishable_yet_is_a_violation(db):
-    _prediction(db, publishable=NOW + timedelta(hours=1))
-    _decision(db, i=1)
+    _prediction(db, model="gfs_raw", publishable=NOW + timedelta(hours=1))
+    did = _decision(db, i=1, model="gfs_raw")
 
     report = audit_alignment(db.con, now=NOW)
 
-    assert "FORECAST_NOT_PUBLISHABLE" in _kinds(report)
+    assert [(v.kind, v.decision_id) for v in report.violations] == [("FORECAST_NOT_PUBLISHABLE", did)]
+    assert "not knowable yet" in report.violations[0].detail
+
+
+def test_cross_date_reuse_checks_only_the_prediction_for_each_decision(db):
+    tomorrow = TARGET + timedelta(days=1)
+    _prediction(db, model="gfs_raw")
+    _prediction(db, model="gfs_raw", target=tomorrow, publishable=NOW + timedelta(hours=1), n_missing=1)
+    _decision(db, i=1, model="gfs_raw")
+    late = _decision(db, i=2, model="gfs_raw", target=tomorrow, mode="REPLAY")
+
+    report = audit_alignment(db.con, now=NOW)
+
+    assert report.checked_decisions == report.checked_predictions == 2
+    assert report.partial_local_day_decisions == 1
+    assert report.per_mode["LIVE"]["decisions"] == report.per_mode["REPLAY"]["decisions"] == 1
+    assert [(v.kind, v.decision_id) for v in report.violations] == [("FORECAST_NOT_PUBLISHABLE", late)]
+
+
+def test_wrong_dates_do_not_supply_forecast_evidence(db):
+    for offset in (1, 2):
+        _prediction(db, model="gfs_raw", target=TARGET + timedelta(days=offset),
+                    publishable=NOW + timedelta(days=1), n_missing=1)
+    did = _decision(db, i=1, model="gfs_raw")
+
+    report = audit_alignment(db.con, now=NOW)
+
+    assert report.checked_decisions == 1
+    assert report.checked_predictions == report.partial_local_day_decisions == 0
+    assert [(v.kind, v.decision_id) for v in report.violations] == [("TARGET_DATE_MISMATCH", did)]
+
+
+def test_target_date_is_the_station_local_day_not_the_utc_decision_date(db):
+    # 02:30 UTC on October 22 is still October 21 at KLGA. The stored market
+    # target date is authoritative; the audit must not replace it with the
+    # UTC calendar date of the decision timestamp.
+    local_target = date(2026, 10, 21)
+    when = datetime(2026, 10, 22, 2, 30, tzinfo=UTC)
+    _prediction(db, model="gfs_raw", target=local_target, when=when)
+    _decision(db, i=1, model="gfs_raw", target=local_target, when=when)
+
+    report = audit_alignment(db.con, now=NOW)
+
+    assert report.consistent
+    assert report.checked_decisions == report.checked_predictions == 1
+
+
+def test_distinct_events_with_the_same_model_date_and_run_count_separately(db):
+    for i, event in enumerate(("e-1", "e-2")):
+        _prediction(db, model="gfs_raw", event=event)
+        _decision(db, i=i, model="gfs_raw", event=event)
+
+    report = audit_alignment(db.con, now=NOW)
+
+    assert report.consistent
+    assert report.checked_decisions == report.checked_predictions == 2
+
+
+def test_model_version_is_part_of_the_prediction_key(db):
+    _prediction(db, model="gfs_raw")
+    _prediction(db, model="gfs_raw", version="v2", publishable=NOW + timedelta(hours=1))
+    _decision(db, i=1, model="gfs_raw")
+
+    report = audit_alignment(db.con, now=NOW)
+
+    assert report.consistent
+    assert report.checked_decisions == report.checked_predictions == 1
+
+
+def test_missing_decision_date_cannot_be_inferred_from_other_predictions(db):
+    _prediction(db, model="gfs_raw")
+    did = _decision(db, i=1, model="gfs_raw")
+    db.con.execute("UPDATE shadow_decisions SET target_date = NULL WHERE decision_id = ?", [did])
+
+    report = audit_alignment(db.con, now=NOW)
+
+    assert report.consistent
+    assert report.checked_decisions == 1
+    assert report.checked_predictions == 0
+    assert report.violations == []
+    assert [(v.kind, v.decision_id) for v in report.untraceable_decisions] == [("PREDICTION_UNTRACEABLE", did)]
+    assert report.as_dict()["untraceable_decision_count"] == 1
 
 
 def test_a_decision_citing_an_unrecorded_prediction_is_untraceable(db):
@@ -399,3 +506,52 @@ def test_replay_can_reuse_a_prediction_first_evaluated_in_a_later_cycle(db):
     _prediction(db, model="ecmwf_raw", when=NOW + timedelta(hours=1))
     _decision(db, i=1, model="ecmwf_raw", when=NOW, mode="REPLAY", created=NOW + timedelta(hours=2))
     assert audit_alignment(db.con, now=NOW).consistent
+
+
+# --- CLI JSON and exit status ---------------------------------------------------
+
+
+def test_alignment_cli_json_returns_zero_for_a_consistent_history(db, capsys):
+    _prediction(db, model="gfs_raw")
+    _decision(db, i=1, model="gfs_raw")
+
+    exit_code, payload = _run_alignment_json(db, capsys)
+
+    assert exit_code == 0
+    assert payload["consistent"] is True
+    assert payload["checked_decisions"] == payload["checked_predictions"] == 1
+    assert payload["violation_count"] == 0
+    assert payload["untraceable_decision_count"] == 0
+
+
+def test_alignment_cli_json_lists_missing_target_dates_without_failing(db, capsys):
+    did = _decision(db, i=1, model="gfs_raw")
+    db.con.execute("UPDATE shadow_decisions SET target_date = NULL WHERE decision_id = ?", [did])
+
+    exit_code, payload = _run_alignment_json(db, capsys)
+
+    assert exit_code == 0
+    assert payload["consistent"] is True
+    assert payload["checked_decisions"] == 1
+    assert payload["violation_count"] == 0
+    assert payload["untraceable_decision_count"] == 1
+    assert len(payload["untraceable_decisions"]) == 1
+    finding = payload["untraceable_decisions"][0]
+    assert finding["kind"] == "PREDICTION_UNTRACEABLE"
+    assert finding["decision_id"] == did
+    assert "target_date" in finding["detail"]
+
+
+def test_alignment_cli_json_returns_one_and_names_the_offending_decision(db, capsys):
+    _prediction(db, model="gfs_raw", publishable=NOW + timedelta(hours=1))
+    did = _decision(db, i=1, model="gfs_raw")
+
+    exit_code, payload = _run_alignment_json(db, capsys)
+
+    assert exit_code == 1
+    assert payload["consistent"] is False
+    assert payload["violation_count"] == 1
+    assert payload["violation_counts"] == {"FORECAST_NOT_PUBLISHABLE": 1}
+    assert [(v["kind"], v["decision_id"]) for v in payload["violations"]] == [
+        ("FORECAST_NOT_PUBLISHABLE", did)
+    ]
