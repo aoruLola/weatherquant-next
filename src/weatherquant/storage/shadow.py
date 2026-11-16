@@ -55,6 +55,11 @@ _FOREIGN_MARKERS = {
 def initialize_shadow(path: str | Path = DEFAULT_SHADOW_DB_PATH) -> tuple[Any, list[str]]:
     con = connect(path)
     applied = migrate(con, SHADOW_MIGRATIONS_DIR)
+    if applied:
+        # Persist the schema before appending decisions. On DuckDB 1.1.0,
+        # checkpointing the rebuilt reasons table together with the first
+        # live batch can crash the process during checkpoint or close.
+        con.execute("CHECKPOINT")
     return con, applied
 
 
