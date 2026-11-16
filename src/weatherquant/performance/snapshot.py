@@ -33,6 +33,7 @@ from weatherquant.performance.episodes import (
     Episode,
     _timestamp,
     build_episodes,
+    observation_bounds,
     summarize,
 )
 from weatherquant.performance.settlement import classify, parse_resolutions
@@ -133,13 +134,14 @@ def detail_window(
     recent = [episode for episode in episodes if episode.first_seen_utc >= cutoff]
     recent.sort(key=lambda e: (e.first_seen_utc, e.episode_id), reverse=True)
     window = recent[:max_episodes]
+    start, end = observation_bounds(window)
     descriptor = detail_window_descriptor(
         window_episodes=len(window),
         all_episodes=len(episodes),
         max_episodes=max_episodes,
         days=days,
-        first_seen_utc=window[0].first_seen_utc.isoformat() if window else None,
-        last_seen_utc=window[-1].first_seen_utc.isoformat() if window else None,
+        first_seen_utc=start,
+        last_seen_utc=end,
     )
     return window, descriptor
 
@@ -446,6 +448,7 @@ def build_performance(
 
     scope = ["observation_all_accepts", "opportunity_episodes", "database_lifetime"]
 
+    start, end = observation_bounds(episodes)
     summary = {
         "observation_edge_sum": edge_summary["overall"]["sum"],
         "unique_opportunity_edge_sum": episode_summary["unique_opportunity_edge_sum"],
@@ -466,16 +469,8 @@ def build_performance(
                 all_episodes=len(episodes),
                 max_episodes=len(episodes),
                 days=0,
-                first_seen_utc=(
-                    min((e.first_seen_utc for e in episodes), default=None).isoformat()
-                    if episodes
-                    else None
-                ),
-                last_seen_utc=(
-                    max((e.first_seen_utc for e in episodes), default=None).isoformat()
-                    if episodes
-                    else None
-                ),
+                first_seen_utc=start,
+                last_seen_utc=end,
             ),
             settlement_coverage=_settlement_coverage(settlement_records, rate),
         ),
