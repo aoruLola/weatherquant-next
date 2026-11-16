@@ -622,6 +622,7 @@ class PerformanceStateStore:
         rows: Sequence[Sequence[Any]],
         *,
         replace: bool = False,
+        where: str = "",
     ) -> None:
         """Write a batch through a DataFrame, not through ``executemany``.
 
@@ -641,7 +642,7 @@ class PerformanceStateStore:
         column_list = ", ".join(columns)
         self.con.register(staging, frame)
         try:
-            self.con.execute(f"{verb} INTO {table} ({column_list}) SELECT {column_list} FROM {staging}")
+            self.con.execute(f"{verb} INTO {table} ({column_list}) SELECT {column_list} FROM {staging} AS incoming {where}")
         finally:
             self.con.unregister(staging)
 
@@ -879,6 +880,8 @@ class PerformanceStateStore:
             tuple[str, str | None],
             tuple[str, float | None, bool, str | None, str | None, datetime | None],
         ],
+        *,
+        authoritative: bool = False,
     ) -> None:
         """``(market, date) -> (status, payout, verified, verdict, source, fetched_at)``.
 
@@ -917,7 +920,16 @@ class PerformanceStateStore:
                 fetched_at,
             ) in answers.items()
         ]
-        self._insert_rows("performance_settlements", _SETTLEMENT_COLUMNS, _SETTLEMENT_SPECS, rows, replace=True)
+        # Ordinary incremental imports cannot undo a newer fetch. An explicit
+        # full replacement keeps the operator-supplied set exactly as given.
+        where = "" if authoritative else """
+            WHERE NOT EXISTS (
+                SELECT 1 FROM performance_settlements stored
+                WHERE stored.key_hash = incoming.key_hash AND stored.fetched_at_utc IS NOT NULL
+                AND (incoming.fetched_at_utc IS NULL OR stored.fetched_at_utc > incoming.fetched_at_utc)
+            )"""
+        self._insert_rows("performance_settlements", _SETTLEMENT_COLUMNS, _SETTLEMENT_SPECS, rows,
+                          replace=True, where=where)
 
     def replace_settlements(
         self,
@@ -943,7 +955,7 @@ class PerformanceStateStore:
                 f"DELETE FROM performance_settlements WHERE key_hash IN ({', '.join(['?'] * len(removed))})",
                 removed,
             )
-        self.upsert_settlements(answers)
+        self.upsert_settlements(answers, authoritative=True)
         return len(removed)
 
     def load_settlements(self) -> list[dict[str, Any]]:

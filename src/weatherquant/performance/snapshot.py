@@ -31,11 +31,11 @@ from weatherquant.performance.capital import lifetime_portfolio_payload, simulat
 from weatherquant.performance.edge import daily_edge, edge_by_bin, grouped_edge, observation_edge
 from weatherquant.performance.episodes import (
     Episode,
-    _timestamp,
     build_episodes,
     summarize,
 )
 from weatherquant.performance.settlement import classify, parse_resolutions
+from weatherquant.performance.settlement_queue import latest_settlement_rows, settlement_fetch_time
 from weatherquant.performance.winrate import (
     SettlementAnswer,
     assign_outcomes,
@@ -198,41 +198,6 @@ def _envelope(
     return payload
 
 
-def _settlement_index(
-    payloads: Iterable[Any],
-) -> tuple[dict[tuple[str, str | None], SettlementAnswer], frozenset[tuple[str, str | None]]]:
-    """Fold raw resolution bodies into ``(market, date) -> answer``.
-
-    Accepts either a parsed mapping or a raw ``/v2/resolutions`` body, so a
-    backfill can hand over exactly what the platform returned without
-    re-encoding it first.
-    """
-    answers: dict[tuple[str, str | None], SettlementAnswer] = {}
-    verified: set[tuple[str, str | None]] = set()
-    for item in payloads:
-        if not isinstance(item, Mapping):
-            continue
-        market_id = str(item.get("market_id") or "")
-        if not market_id:
-            continue
-        target_date = item.get("target_date")
-        status = str(item.get("settlement_status") or "UNAVAILABLE")
-        payout = item.get("resolved_outcome")
-        answers[(market_id, str(target_date) if target_date else None)] = SettlementAnswer(
-            status=status,
-            payout=float(payout) if payout in (0, 1, 0.0, 1.0) else None,
-        )
-        if status == "RESOLVED" and str(item.get("verification_status")) == "VERIFIED":
-            verified.add((market_id, str(target_date) if target_date else None))
-        # A raw resolutions body may be passed through untouched.
-        if "data" in item and item.get("data") is not None:
-            for record in parse_resolutions(item):
-                key = (market_id, str(target_date) if target_date else None)
-                status = classify(record)
-                answers[key] = SettlementAnswer(status=status, payout=record.price)
-    return answers, frozenset(verified)
-
-
 @dataclass(frozen=True, slots=True)
 class SettlementRecord:
     """One settlement answer with the evidence that produced it.
@@ -257,52 +222,24 @@ class SettlementRecord:
 
 def settlement_records_from_index(payloads: Iterable[Any]) -> list[SettlementRecord]:
     """The published records for a settlement index, in a stable order."""
-    answers, verified = _settlement_index(payloads)
-    provenance = _settlement_provenance(payloads)
-    records = [
-        SettlementRecord(
-            market_id=market_id,
-            target_date=target_date,
-            status=answer.status,
-            payout=answer.payout,
-            verified=(market_id, target_date) in verified,
-            verification_status=provenance.get((market_id, target_date), (None, None, None))[0],
-            resolution_source=provenance.get((market_id, target_date), (None, None, None))[1],
-            fetched_at_utc=provenance.get((market_id, target_date), (None, None, None))[2],
-        )
-        for (market_id, target_date), answer in answers.items()
-    ]
-    return sorted(records, key=lambda r: (r.market_id, r.target_date or ""))
-
-
-def _settlement_provenance(
-    payloads: Iterable[Any],
-) -> dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]]:
-    """``(verification_status, resolution_source, fetched_at)`` per answer."""
-    out: dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]] = {}
-    for item in payloads:
-        if not isinstance(item, Mapping):
-            continue
-        market_id = str(item.get("market_id") or "")
-        if not market_id:
-            continue
-        raw = item.get("target_date")
-        key = (market_id, str(raw) if raw else None)
-        stamp = item.get("fetched_at_utc")
-        fetched: datetime | None = None
-        if stamp is not None:
-            try:
-                fetched = _timestamp(stamp)
-            except (TypeError, ValueError):
-                fetched = None
+    records = []
+    for (market_id, target_date), item in latest_settlement_rows(payloads).items():
+        status = str(item.get("settlement_status") or "UNAVAILABLE")
+        claimed = item.get("resolved_outcome")
+        payout = float(claimed) if type(claimed) in (int, float) and claimed in (0, 1) else None
+        if "data" in item:
+            for raw in parse_resolutions(item):
+                status, payout = classify(raw), raw.price
         verdict = item.get("verification_status")
         source = item.get("resolution_source")
-        out[key] = (
-            str(verdict) if verdict is not None else None,
-            str(source) if source is not None else None,
-            fetched,
-        )
-    return out
+        records.append(SettlementRecord(
+            market_id=market_id, target_date=target_date, status=status, payout=payout,
+            verified=status == "RESOLVED" and payout is not None and payout == claimed and verdict == "VERIFIED",
+            verification_status=str(verdict) if verdict is not None else None,
+            resolution_source=str(source) if source is not None else None,
+            fetched_at_utc=settlement_fetch_time(item),
+        ))
+    return sorted(records, key=lambda r: (r.market_id, r.target_date or ""))
 
 
 def _settlement_coverage(
@@ -427,8 +364,9 @@ def build_performance(
     else:
         episode_counters = {"episodes_built": len(episodes)}
 
-    answers, verified = _settlement_index(settlements)
     settlement_records = settlement_records_from_index(settlements)
+    answers = {(r.market_id, r.target_date): SettlementAnswer(status=r.status, payout=r.payout) for r in settlement_records}
+    verified = {(r.market_id, r.target_date) for r in settlement_records if r.verified}
     scored = assign_outcomes(episodes, answers=answers, verified=verified)
 
     edge_summary = observation_edge(decisions)

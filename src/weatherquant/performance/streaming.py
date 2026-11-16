@@ -97,12 +97,12 @@ from weatherquant.performance.snapshot import (
     SettlementRecord,
     _envelope,
     _settlement_coverage,
-    _settlement_index,
     detail_warnings,
     detail_window_descriptor,
     publish_performance,
     settlement_freshness,
     settlement_payload,
+    settlement_records_from_index,
 )
 from weatherquant.performance.state import (
     DEFAULT_MEMORY_LIMIT,
@@ -1561,8 +1561,12 @@ def build_performance_streaming(
     # store is opened. A rejection that had already ingested parts would have
     # advanced the watermark and recorded a generation, so the run would look
     # like it had done something - and "refused" has to mean nothing moved.
-    answers, verified = _settlement_index(settlements)
-    if settlements_replace and not answers and not confirm_empty_retraction:
+    payload = {
+        (r.market_id, r.target_date): (r.status, r.payout, r.verified, r.verification_status,
+                                      r.resolution_source, r.fetched_at_utc)
+        for r in settlement_records_from_index(settlements)
+    }
+    if settlements_replace and not payload and not confirm_empty_retraction:
         raise PerformanceStateError(
             "refusing to replace the settlement set with an empty index: that "
             "would retract every answer. An empty index is what a failed "
@@ -1598,7 +1602,7 @@ def build_performance_streaming(
         # caller asserting that this index is *complete*, which is the only way
         # to express a withdrawal - see PerformanceStateStore.replace_settlements.
         if settlements_replace:
-            if not answers:
+            if not payload:
                 # The one operation that cannot be undone from anywhere else:
                 # the export carries decisions, not settlements, and
                 # re-deriving them needs the platform. So everything about to
@@ -1616,35 +1620,10 @@ def build_performance_streaming(
                 )
                 if progress is not None:
                     progress(f"retraction backup written to {backup}")
-            provenance = _settlement_provenance_map(settlements)
-            removed = store.replace_settlements(
-                {
-                    key: (
-                        answer.status,
-                        answer.payout,
-                        key in verified,
-                        provenance.get(key, (None, None, None))[0],
-                        provenance.get(key, (None, None, None))[1],
-                        provenance.get(key, (None, None, None))[2],
-                    )
-                    for key, answer in answers.items()
-                }
-            )
+            removed = store.replace_settlements(payload)
             if progress is not None:
-                progress(f"replaced the settlement set: {len(answers)} kept, {removed} retracted")
-        elif answers:
-            provenance = _settlement_provenance_map(settlements)
-            payload = {
-                key: (
-                    answer.status,
-                    answer.payout,
-                    key in verified,
-                    provenance.get(key, (None, None, None))[0],
-                    provenance.get(key, (None, None, None))[1],
-                    provenance.get(key, (None, None, None))[2],
-                )
-                for key, answer in answers.items()
-            }
+                progress(f"replaced the settlement set: {len(payload)} kept, {removed} retracted")
+        elif payload:
             store.upsert_settlements(payload)
 
         build = build_streaming_payloads(
@@ -1705,39 +1684,3 @@ def build_performance_streaming(
         # restamp the ingest position, or an ingest stall would erase itself.
         _write_ingest_state(out_dir, build.watermark, ingest_result, now)
     return result
-
-
-def _settlement_provenance_map(
-    settlements: Sequence[Any],
-) -> dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]]:
-    """What each settlement index entry says about its own evidence.
-
-    ``(verification_status, resolution_source, fetched_at_utc)`` per
-    ``(market, target date)``. Built once rather than searched per key: the
-    index is one row per market and date, and looking each one up in the list
-    would be quadratic in the number of markets.
-    """
-    out: dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]] = {}
-    for item in settlements:
-        if not isinstance(item, Mapping):
-            continue
-        market_id = str(item.get("market_id") or "")
-        if not market_id:
-            continue
-        raw = item.get("target_date")
-        key = (market_id, str(raw) if raw else None)
-        stamp = item.get("fetched_at_utc")
-        fetched: datetime | None = None
-        if stamp is not None:
-            try:
-                fetched = _timestamp(stamp)
-            except (TypeError, ValueError):
-                fetched = None
-        verdict = item.get("verification_status")
-        source = item.get("resolution_source")
-        out[key] = (
-            str(verdict) if verdict is not None else None,
-            str(source) if source is not None else None,
-            fetched,
-        )
-    return out

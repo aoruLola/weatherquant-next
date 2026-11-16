@@ -161,16 +161,16 @@ def backfill_settlements(
     rate limits and httpx User-Agent apply - the platform refuses Python's
     default agent, so the client must be httpx.
 
-    ``verified`` is the set of ``(market_id, target_date)`` pairs that
-    passed an observation cross-check. Everything else stays UNVERIFIABLE
-    even when the platform has resolved it: a resolution the system has not
-    confirmed is not one it may score.
+    Verification binds the market, date and condition to the exact observed
+    payout. An old market/date-only file cannot attest to a revised payout.
     """
     _require_dataset(dataset)
     now = now or datetime.now(tz=UTC)
     verified_keys = {
-        (str(v.get("market_id")), str(v.get("target_date")) if v.get("target_date") else None)
+        (str(v["market_id"]), str(v["target_date"]), str(v["condition_id"]).lower(), v["resolved_outcome"])
         for v in verified
+        if v.get("market_id") and v.get("target_date") and v.get("condition_id")
+        and type(v.get("resolved_outcome")) in (int, float) and v["resolved_outcome"] in (0, 1)
     }
 
     rows: list[dict[str, Any]] = []
@@ -184,10 +184,10 @@ def backfill_settlements(
 
         status, record = fetch_resolution(get_json, condition_id=condition)
         resolved = record.price if status == SettlementStatus.RESOLVED else None
-        key = (market_id, target_date)
-        verification = "VERIFIED" if key in verified_keys else (
-            "UNVERIFIED" if status == SettlementStatus.RESOLVED else "PENDING"
-        )
+        verification = "PENDING"
+        if status == SettlementStatus.RESOLVED:
+            key = (market_id, target_date, condition.lower(), resolved)
+            verification = "VERIFIED" if key in verified_keys else "UNVERIFIED"
         rows.append(
             {
                 "market_id": market_id,
