@@ -4,7 +4,7 @@ The vocabulary is :mod:`weatherquant.performance.settlement`'s - the same
 five states, parsed from Polymarket's own resolutions endpoint by the
 research side. The paper engine consumes the *published record* of that
 answer (a JSONL feed keyed by market and revision) and applies exactly one
-rule: only ``RESOLVED`` with a payout of 0 or 1 moves anything.
+rule: only an explicitly verified ``RESOLVED`` payout of 0 or 1 moves anything.
 
 Three properties the acceptance criteria name, and how they live here:
 
@@ -19,10 +19,9 @@ applied automatically - a clawback that would drive cash negative - the
 settlement row is flagged ``review_required`` and the balances stay
 untouched: fabricating the fix would be worse than asking a human.
 
-**A dispute reopens nothing.** A DISPUTED record arriving after a payout
-was applied marks manual review - the final answer is unknown, and
-guessing it (either keeping or reversing the payout) would fabricate
-realised profit either way.
+**Withdrawn verification requires review.** A newer record that no longer
+authorises an applied payout is flagged for manual review. Older revisions
+remain in the audit history and cannot change the current decision.
 """
 
 from __future__ import annotations
@@ -84,7 +83,7 @@ class SettlementEvent:
     @property
     def is_payout(self) -> bool:
         """Whether this record, by itself, authorises a ledger movement."""
-        return self.status == "RESOLVED" and self.yes_payout in RESOLVED_PAYOUTS
+        return self.status == "RESOLVED" and self.evidence.get("verification_status") == "VERIFIED"
 
     def evidence_json(self) -> str:
         return json.dumps(self.evidence, sort_keys=True, default=str)
@@ -164,7 +163,7 @@ def parse_settlement_record(row: Any) -> SettlementEvent:
         settled_at_utc=settled_at,
         evidence={
             k: row[k]
-            for k in ("condition_id", "question_id", "transaction_hash", "source", "retrieved_at_utc")
+            for k in ("condition_id", "question_id", "transaction_hash", "source", "retrieved_at_utc", "verification_status")
             if row.get(k) is not None
         },
         raw=dict(row),
