@@ -11,7 +11,7 @@ cannot produce an answer the snapshot would have contradicted.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -196,6 +196,46 @@ def test_settlements_are_paginated_too(published) -> None:
 
 
 # --- reference capital --------------------------------------------------------
+
+
+@pytest.mark.parametrize("builder", ["materialized", "streaming"])
+def test_both_reference_stakes_use_only_the_opening_fee(tmp_path, settings_for, builder) -> None:
+    import json
+
+    from weatherquant.performance.streaming import build_performance_streaming
+
+    root = _empty_tree(tmp_path)
+    out = settings_for(root).performance_snapshots_dir
+    # Two observations of one opportunity, then a new opportunity in the same market.
+    rows = [
+        dict(_decision(0), decision_id=f"d{i}", decided_at_utc=(NOW + timedelta(minutes=minute)).isoformat(),
+             decision_time_utc=(NOW + timedelta(minutes=minute)).isoformat(),
+             fee_rate=fee)
+        for i, (minute, fee) in enumerate([(0, None), (1, 0.0), (30, 0.0)])
+    ]
+    options = dict(dataset="fixture", now=NOW + timedelta(hours=1), book_for=lambda _: _book())
+    if builder == "materialized":
+        publish_performance(build_performance(decisions=rows, settlements=[], **options), out)
+    else:
+        parts = tmp_path / "export" / "parts"
+        parts.mkdir(parents=True)
+        for i, row in enumerate(rows, 1):
+            (parts / f"part-{i:09d}.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+        build_performance_streaming(export=parts.parent, out_dir=out, state_db=tmp_path / "state.duckdb", **options)
+
+    with _client_for(root, settings_for) as client:
+        summary = client.get("/api/v1/performance/summary").json()["data"]["data"]
+        window = client.get("/api/v1/performance/reference-capital").json()["data"]
+    assert summary["opportunity_episodes"] == 2
+    lifetime = summary["reference_capital"]
+    assert (lifetime["scope"], window["scope"]) == ("lifetime", "window")
+    for stake in (lifetime, window):
+        assert stake["initial_capital_usdc"] == 100
+        assert stake["not_executable_reason_counts"] == {"FEE_UNKNOWN": 1}
+        assert stake["executable_count"] == 1
+        assert 0 < stake["allocated_total_usdc"] <= 10
+        assert stake["simulated_net_profit_usdc"] is None
+    assert lifetime["allocated_total_usdc"] == window["allocated_total_usdc"]
 
 
 def test_reference_capital_requires_a_positive_stake(published) -> None:

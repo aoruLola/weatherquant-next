@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
+from weatherquant.data.books import book_from_levels_json
 from weatherquant.shadow.events import BookObservation, CatalogMarket, market_of_token_table
 
 __all__ = ["MarketGroup", "ShadowState"]
@@ -123,11 +124,12 @@ class ShadowState:
                 quality,
                 _defects,
                 _updated,
+                source_event_id,
             ) = row
             self.books[token_id] = BookObservation(
                 token_id=token_id,
                 market_id=market_id,
-                book=_book_from_json(
+                book=book_from_levels_json(
                     market_id=market_id,
                     token_id=token_id,
                     bids_json=bids_json,
@@ -142,6 +144,7 @@ class ShadowState:
                 collector_received_at_utc=collector_received,
                 shadow_received_at_utc=shadow_received,
                 quality=quality,
+                source_event_id=source_event_id,
             )
 
     def apply_markets(self, batches) -> int:
@@ -189,30 +192,6 @@ class ShadowState:
 
     def book_for(self, token_id: str) -> BookObservation | None:
         return self.books.get(token_id)
-
-
-def _book_from_json(*, market_id, token_id, bids_json, asks_json, venue_ts, collector_received):
-    import json
-
-    from weatherquant.markets.models import BookLevel, OrderBook
-
-    def levels(raw: str) -> tuple:
-        return tuple(
-            BookLevel(
-                price_usd_per_share=float(item["price_usd_per_share"]),
-                size_shares=float(item["size_shares"]),
-            )
-            for item in json.loads(raw)
-        )
-
-    return OrderBook(
-        market_id=market_id,
-        token_id=token_id,
-        bids=levels(bids_json),
-        asks=levels(asks_json),
-        venue_ts=venue_ts,
-        fetched_at_utc=collector_received,
-    )
 
 
 def _ts(observation: BookObservation) -> object:

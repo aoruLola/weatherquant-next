@@ -138,17 +138,10 @@ def _cmd_init(settings: PaperSettings) -> int:
         return 4
     try:
         store = PaperStore(db)
-        created = store.ensure_account(
-            initial_capital_usdc=settings.initial_capital_usdc,
-            now=datetime.now(tz=UTC),
-        )
-        # The ledger opens with the account: the OPEN entry and the balances
-        # row are the first two facts every later figure is derived from.
-        ledger = Ledger(store)
-        ledger.open_account(
-            initial_capital_usdc=settings.initial_capital_usdc,
-            now=datetime.now(tz=UTC),
-        )
+        now = datetime.now(tz=UTC)
+        with db.transaction():
+            created = store.ensure_account(initial_capital_usdc=settings.initial_capital_usdc, now=now)
+            Ledger(store).open_account(initial_capital_usdc=settings.initial_capital_usdc, now=now)
         run_id = db.start_run(
             "paper-init",
             {
