@@ -154,7 +154,13 @@ class RequestGuard:
             return
         if presented is None or presented == "":
             raise AuthError("missing bearer token")
-        if not hmac.compare_digest(presented, self._token):
+        # Compare bytes, not str: ``hmac.compare_digest`` raises TypeError on
+        # any non-ASCII str, and a header can carry arbitrary bytes. Comparing
+        # the decoded text directly turned a malformed credential into a 500
+        # server error instead of the 401 every other bad token gets.
+        if not hmac.compare_digest(
+            presented.encode("utf-8"), self._token.encode("utf-8")
+        ):
             raise AuthError("incorrect bearer token")
 
     def acquire(self, client_key: str) -> None:

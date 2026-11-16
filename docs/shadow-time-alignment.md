@@ -28,24 +28,35 @@ timezone：目标日是站点当地民用日（`local_day_bounds_utc`），日�
 预报缺当地日小时数（`n_missing_hours`）是合法但更弱的输入：审计**计数不判违规**
 （`partial_local_day_decisions`），避免一份总在误报的审计失去可信度。
 
+审计按模型、版本、站点、事件、预报起报时刻和目标日定位预测。多个市场可引用同一条预测，
+同一事件的不同目标日则分别核对。只有其他目标日有预测时，该决策报告一次
+`TARGET_DATE_MISMATCH`。部分覆盖小时数和可发布时间均取自实际匹配的预测。
+缺少决策目标日的历史行单列为 `untraceable_decisions`（条目类型为
+`PREDICTION_UNTRACEABLE`），计入 `checked_decisions` 和 `untraceable_decision_count`，
+但不计入违规；目标日完整却找不到预测的决策仍是 `PREDICTION_UNTRACEABLE` 违规。
+
 ## 3. 用法
 
 ```sh
 weatherquant-shadow alignment [--json]   # 引擎须停止（独占库）
 ```
 
-输出：检查规模、分模式计数、暴露组/共享 run 清单（可追溯性）、违规明细（前 100 条，
-计数完整）。exit 0 = 全部不变量成立；1 = 有违规。也可从 Python 调
-`weatherquant.shadow.alignment.audit_alignment(con)`（runner 内部/测试用）。
+输出：检查规模、分模式计数、暴露组/共享 run 清单、缺目标日的无法追溯决策（可追溯性）、
+违规明细（前 100 条，计数完整）。exit 0 = 没有违规（可以存在单列的无法追溯历史行）；
+1 = 有违规。JSON 中 `consistent`、`violation_count` 和 `untraceable_decision_count`
+分别表达这三种状态。也可从 Python 调 `weatherquant.shadow.alignment.audit_alignment(con)`
+（runner 内部/测试用）。
 
 ## 4. 验证（本机）
 
-`tests/test_shadow_alignment.py`（17 例，全过）：干净历史一致并正确列出暴露组；
+`tests/test_shadow_alignment.py` 覆盖以下场景。干净历史一致并正确列出暴露组；
 未来 run / 未到期 issue / 无预测可追 / 日期或时刻错配 / fusion 缺同 run 源 /
 calibrated 源 run 不匹配 / 模式缺失 / 周期混模式 / LIVE 行被重放 / REPLAY 时刻晚于写入，
 各有一例点名违规；合法 REPLAY（时刻早于写入）通过；部分覆盖日只计数；
-单 run 多市场列出不拒绝；**运行期闸门**拒绝为目标日之外日期的预报
-（`shadow/decision.py` 新增检查）。全套 `uv run pytest -q`：1097 passed, 6 skipped。
+单 run 多市场列出不拒绝；跨目标日不重复计数；其他目标日的发布时间不误报；
+不同事件和模型版本不合并；缺目标日历史行单列且 CLI 退出 0；真实未发布预报仍点名决策并退出 1；
+LIVE/REPLAY 分别计数；**运行期闸门**拒绝为目标日之外日期的预报
+（`shadow/decision.py` 新增检查）。
 
 ## 5. 尚未验证（需 NAS 人工验收）
 

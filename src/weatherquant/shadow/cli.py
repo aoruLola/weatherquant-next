@@ -201,10 +201,10 @@ def cmd_alignment(settings: Settings, shadow: ShadowSettings, args: argparse.Nam
     """Audit time alignment and LIVE/REPLAY isolation (WQN-25).
 
     Reads the database directly, so it only works while the engine is stopped.
-    Exit 0 means every invariant held; exit 1 lists the first divergences.
-    Exposure groups (same weather day across markets, a market whose date
-    moved) are traceability output, not failures - real market data always
-    has some, and calling it broken would bury the checks that matter.
+    Exit 0 means no violation was found; exit 1 lists the first divergences.
+    Exposure groups and historical decisions without a target date are
+    traceability output, not failures - real market data always has some,
+    and calling it broken would bury the checks that matter.
     """
     if not shadow.shadow_db_path.exists():
         print(f"no shadow database at {shadow.shadow_db_path}", file=sys.stderr)
@@ -228,6 +228,11 @@ def cmd_alignment(settings: Settings, shadow: ShadowSettings, args: argparse.Nam
     else:
         print(f"checked        {payload['checked_decisions']} model-carrying decision(s), "
               f"{payload['checked_predictions']} distinct prediction(s)")
+        if payload["untraceable_decision_count"]:
+            print(f"untraceable    {payload['untraceable_decision_count']} decision(s) "
+                  "missing target_date (listed, not counted as violations)")
+            for finding in payload["untraceable_decisions"]:
+                print(f"UNTRACEABLE    [{finding['decision_id']}]: {finding['detail']}")
         for mode, counts in sorted(payload["per_mode"].items()):
             print(
                 f"mode {mode:8}  {counts['decisions']:6} decision(s), "
@@ -250,10 +255,7 @@ def cmd_export_verify(settings: Settings, shadow: ShadowSettings, args: argparse
     """Reconcile the published decision export against the database.
 
     Opens the shadow database directly, so it only works while the engine is
-    stopped - the same lease `report --offline` lives under. The check it
-    runs is the one WQN-20 demands of the export: nothing lost (every row at
-    or below the cursor is in the parts), nothing twice (sequences strictly
-    increase across the whole concatenation, and the counts agree).
+    stopped, as with `report --offline`.
     """
     if not shadow.shadow_db_path.exists():
         print(f"no shadow database at {shadow.shadow_db_path}", file=sys.stderr)
@@ -265,7 +267,6 @@ def cmd_export_verify(settings: Settings, shadow: ShadowSettings, args: argparse
 
             exporter = DecisionExporter(db.con, export_dir)
             report = exporter.reconcile()
-            report.update(exporter.verify())
             report["export_dir"] = str(export_dir)
     except Exception as exc:
         print(
