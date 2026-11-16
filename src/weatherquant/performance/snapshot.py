@@ -35,6 +35,7 @@ from weatherquant.performance.episodes import (
     build_episodes,
     summarize,
 )
+from weatherquant.performance.generation_lock import generation_lock
 from weatherquant.performance.settlement import classify, parse_resolutions
 from weatherquant.performance.winrate import (
     SettlementAnswer,
@@ -685,55 +686,57 @@ def publish_performance(
     target = Path(directory)
     now = datetime.now(tz=UTC)
     gid = generation_id or new_generation_id(now=now, payloads=payloads)
-    generation_dir = target / "generations" / gid
-    generation_dir.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True)
+    with generation_lock(target):
+        generation_dir = target / "generations" / gid
+        generation_dir.mkdir(parents=True, exist_ok=True)
 
-    written: list[Path] = []
-    files_meta: dict[str, Any] = {}
-    for filename in SNAPSHOT_FILES:
-        if filename not in payloads:
-            continue
-        payload = dict(payloads[filename])
-        payload["generation_id"] = gid
-        path = generation_dir / filename
-        atomic_write_json_streaming(path, payload, root=generation_dir)
-        written.append(path)
-        files_meta[filename] = {"bytes": path.stat().st_size}
+        written: list[Path] = []
+        files_meta: dict[str, Any] = {}
+        for filename in SNAPSHOT_FILES:
+            if filename not in payloads:
+                continue
+            payload = dict(payloads[filename])
+            payload["generation_id"] = gid
+            path = generation_dir / filename
+            atomic_write_json_streaming(path, payload, root=generation_dir)
+            written.append(path)
+            files_meta[filename] = {"bytes": path.stat().st_size}
 
-    missing = [name for name in SNAPSHOT_FILES if name not in files_meta]
-    if missing:
-        raise RuntimeError(
-            f"generation {gid} is incomplete: missing {missing}; "
-            "the previous generation stays current"
-        )
+        missing = [name for name in SNAPSHOT_FILES if name not in files_meta]
+        if missing:
+            raise RuntimeError(
+                f"generation {gid} is incomplete: missing {missing}; "
+                "the previous generation stays current"
+            )
 
-    manifest = {
-        "generation_id": gid,
-        "published_at_utc": now.astimezone(UTC).isoformat(),
-        "generated_at_utc": now.astimezone(UTC).isoformat(),
-        "dataset": next(
-            (p.get("dataset") for p in payloads.values() if p.get("dataset")), None
-        ),
-        "source": next(
-            (p.get("source") for p in payloads.values() if p.get("source")), None
-        ),
-        "watermark": watermark,
-        "coverage": dict(coverage or {}),
-        "files": files_meta,
-        "performance_schema_version": PERFORMANCE_SCHEMA_VERSION,
-    }
-    if extra_manifest:
-        # Additive only. ``algorithm_version``, ``input_source`` and
-        # ``input_range`` describe *how* this batch was produced; a reader that
-        # predates them ignores them, and one that does not can tell two
-        # differently-built generations apart without diffing the payloads.
-        manifest.update(dict(extra_manifest))
-    atomic_write_json(generation_dir / "manifest.json", manifest)
+        manifest = {
+            "generation_id": gid,
+            "published_at_utc": now.astimezone(UTC).isoformat(),
+            "generated_at_utc": now.astimezone(UTC).isoformat(),
+            "dataset": next(
+                (p.get("dataset") for p in payloads.values() if p.get("dataset")), None
+            ),
+            "source": next(
+                (p.get("source") for p in payloads.values() if p.get("source")), None
+            ),
+            "watermark": watermark,
+            "coverage": dict(coverage or {}),
+            "files": files_meta,
+            "performance_schema_version": PERFORMANCE_SCHEMA_VERSION,
+        }
+        if extra_manifest:
+            # Additive only. ``algorithm_version``, ``input_source`` and
+            # ``input_range`` describe *how* this batch was produced; a reader that
+            # predates them ignores them, and one that does not can tell two
+            # differently-built generations apart without diffing the payloads.
+            manifest.update(dict(extra_manifest))
+        atomic_write_json(generation_dir / "manifest.json", manifest)
 
-    # One rename publishes the batch. Before this line the previous
-    # generation is still the current one; after it, this one is.
-    atomic_write_json(target / CURRENT_POINTER, {"generation_id": gid})
-    return written
+        # One rename publishes the batch. Before this line the previous
+        # generation is still the current one; after it, this one is.
+        atomic_write_json(target / CURRENT_POINTER, {"generation_id": gid})
+        return written
 
 
 @dataclass(frozen=True, slots=True)
