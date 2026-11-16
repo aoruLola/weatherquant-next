@@ -93,6 +93,98 @@ test('the fixture banner is impossible to miss', async ({ page }) => {
   await expect(banner).toContainText('FIXTURE')
 })
 
+test('Paper page keeps simulation labels and quote-dependent N/A states', async ({ page }) => {
+  const envelope = (api: string, data: Record<string, unknown>) => ({
+    schema_version: 1,
+    api,
+    generated_at_utc: new Date().toISOString(),
+    dataset: 'fixture',
+    freshness: { state: 'fresh', age_seconds: 1 },
+    data,
+  })
+  await page.route('**/api/v1/paper/summary', async (route) => {
+    await route.fulfill({
+      json: envelope('paper/summary', {
+        status: 'ok',
+        mode: 'PAPER',
+        initial_capital_usdc: 100,
+        available_usdc: 60,
+        occupied_usdc: 40,
+        cost_equity_usdc: 100,
+        equity_usdc: null,
+        realized_pnl_usdc: 0,
+        unrealized_pnl_usdc: null,
+        roi: null,
+        max_drawdown: 0,
+        drawdown_basis: 'ledger_cost',
+        equity_curve: {
+          basis: 'ledger_cost',
+          points: [
+            { t: '2026-11-17T01:00:00Z', v: 100, seq: 1 },
+            { t: '2026-11-17T02:00:00Z', v: 100, seq: 2 },
+          ],
+        },
+        positions: [
+          {
+            market_id: 'market-e2e',
+            token_id: 'token-e2e',
+            shares: 40,
+            avg_cost_usd_per_share: 1,
+            cost_basis_usdc: 40,
+            mark_usd_per_share: null,
+            market_value_usdc: null,
+            unrealized_pnl_usdc: null,
+            mark_status: 'MARK_UNAVAILABLE',
+          },
+        ],
+        marks_status: 'unavailable',
+        marks_reason: 'no fresh quote',
+        rejection_summary: [{ reason: 'NOT_EXECUTABLE', count: 1 }],
+        rejections: [],
+        ledger_consistent: true,
+        conservation_ok: true,
+        fill_count: 1,
+      }),
+    })
+  })
+  await page.route(/\/api\/v1\/paper\/fills/, async (route) => {
+    await route.fulfill({
+      json: envelope('paper/fills', {
+        status: 'ok',
+        mode: 'PAPER',
+        fills: [
+          {
+            decision_id: 'e2e-fill',
+            market_id: 'market-e2e',
+            token_id: 'token-e2e',
+            direction: 'buy_yes',
+            side: 'BUY',
+            requested_shares: 10,
+            filled_shares: 10,
+            avg_price_usd_per_share: 0.55,
+            fill_cost_usd: 5.5,
+            fees_usd: 0.01,
+            complete: true,
+            filled_at_utc: '2026-11-17T02:00:00Z',
+          },
+        ],
+        limit: 20,
+        next_cursor: null,
+        has_more: false,
+      }),
+    })
+  })
+
+  await page.goto('/paper')
+  await expect(page.getByTestId('paper-mode-badge')).toContainText('模拟 / PAPER')
+  await expect(page.getByTestId('paper-disclaimer')).toContainText('不代表真实交易或真实收益')
+  await expect(page.getByTestId('paper-initial')).toContainText('100.00 USDC')
+  await expect(page.getByTestId('paper-equity')).toContainText('N/A')
+  await expect(page.getByTestId('paper-position-mark')).toContainText('N/A')
+  await expect(page.getByTestId('paper-position-pnl')).toContainText('N/A')
+  await expect(page.getByTestId('paper-fill-e2e-fill')).toBeVisible()
+})
+
 test('deep links resolve directly (SPA fallback)', async ({ page }) => {
   await page.goto('/decisions')
   await expect(page).toHaveURL(/\/decisions$/)
