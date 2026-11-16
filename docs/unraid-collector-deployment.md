@@ -13,6 +13,16 @@ WeatherQuant Next 采集器 · Compose Manager Plus · GHCR
 > | GitHub Actions `release.yml` | ✅ **`v0.1.1` 已执行并发布成功**（run `38063764541`：verify + publish 双绿） |
 > | **Unraid 上的真实部署** | ❌ **未部署 —— 我没有 NAS 访问权限** |
 >
+> **WQN-2 当前分支状态（2026-11-15）**
+>
+> | 阶段 | 状态 |
+> |---|---|
+> | 代码已合并 | PR #27 已合入 `main`；PR #40 及本次补强仅在当前分支验收，本地提交不等于已合入 `main`。 |
+> | 镜像已发布 | 现有 GHCR Release 记录不证明其包含本次修复；包含本次修复的新镜像尚未发布。 |
+> | 生产已部署 | **未执行**。本次未访问 NAS、生产数据或生产容器。 |
+> | 生产已验收 | **未执行**。NAS 上的 `restart=unless-stopped`、退出码 4 后自动重启及独立健康探针仍待实测记录。 |
+> | 本机验收 | Linux 单元测试与 spawn/WAL 恢复测试已执行；容器验收脚本仅做语法检查，未启动 Docker。 |
+>
 > 下面标 `[待NAS验证]` 的步骤是给你执行的，不是我做过的。§11 会把"我验证了什么"
 > 和"你需要验证什么"分开列清楚。
 
@@ -701,6 +711,17 @@ B 不重复: 优雅停止后开库断言——runs≥2、恰好 1 个 run 非 st
 当前版本重启后会把上次运行记为 `failed`，并在 `stop_reason` 记录异常退出，详见 §12.6。
 复验脚本默认从当前工作区构建镜像，也支持通过 `IMAGE` 指定本地待验收镜像。它会记录镜像 ID、
 实际重启策略和过期心跳的探针输出。恢复场景要求有可访问的上游市场，在确认新进程写入盘口和价格后才停止容器核对数据库。
+
+#### 2026-11-15 当前分支 Linux 复验（非 Docker / 非 NAS）
+
+- 本机 DuckDB 为 **1.5.6**。新增计数测试实际写入两条 open gap，首次关闭返回 `2`、两条均写入结束时间，再次关闭返回 `0`。
+- `uv run pytest tests/test_collector_watchdog.py -q` 连续运行 **5 次**，每次均为 **8 passed**；pytest 耗时为 **6.73–7.02s**，未见间歇性失败或超时。
+- 临时把 `close_open_gaps` 回退为 `UPDATE ... RETURNING` 后，spawn + WAL 恢复测试稳定复现 `Failed to delete all rows from index`，重启退出码为 1；恢复 affected-row 实现后上述 5 次复验全部通过。普通两条 gap 的计数测试不能单独暴露该 WAL 问题。
+- 临时恢复旧的 probe-only 故障注入分支后，`test_probe_only_fault_blocks_once_without_a_watchdog` 因未执行睡眠而失败（`[] != [150]`）；恢复修复后通过，且故障标记只消费一次。
+- Windows 分支通过注入的 `_winapi` 测试已退出但句柄可打开、错误 87、错误 5 和 `WAIT_TIMEOUT` 四种情况；Linux 测试不会导入真实 `_winapi`，实际 Windows 隔离环境证据仍以 PR 记录为准。
+- 全量 `uv run pytest -q` 完成到 100%，结果为 **1511 passed, 6 skipped**；`uv run ruff check .` 无告警。
+- `bash -n scripts/wqn2_container_recovery_test.sh` 通过；本机没有 `shellcheck`。本次未启动 Docker，以上记录不构成 NAS 重启策略或容器健康探针的生产验收。
+
 ### 12.6 运行、缺口与备份审计
 
 正常停机的缺口从上一次停止时间算起。异常退出时，下次启动会把遗留的运行标为 `failed`。缺口取同一运行的上游心跳联系时间与已落库盘口、价点时间中较晚的一项。缺少这两类证据时使用运行起点，并在 `detail` 注明。缺口在主循环再次确认上游通信时关闭。连续离线重启期间可以一直查询到同一条未关闭记录。**首次启动没有上一次运行可比，因此不会记录缺口**——一个全新部署不会凭空出现"采集中断"。

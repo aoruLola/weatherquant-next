@@ -241,6 +241,60 @@ def test_an_off_thread_backup_is_verified_and_restorable(writer: CollectorWriter
         w2.close()
 
 
+def test_a_backup_write_failure_leaves_the_live_database_intact(
+    writer: CollectorWriter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write error while copying (disk full, lost mount) must not publish a
+    partial copy, must not touch the live database, and must be reported."""
+    def raise_during_copy(self, con, alias, tmp):
+        raise OSError("injected ENOSPC while writing the backup copy")
+
+    monkeypatch.setattr(CollectorWriter, "_copy_backup", raise_during_copy)
+
+    # Snapshot the live database before the failed attempt.
+    before = {
+        table: writer.con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        for table in writer._backup_tables()
+    }
+
+    job = writer.start_backup(tmp_path / "backups")
+    job.join(60.0)
+    report = job.poll()
+    assert report is not None and not report.ok
+    assert "ENOSPC" in (report.error or "")
+    # Nothing partial or final is left behind in the backups directory.
+    assert not list((tmp_path / "backups").glob("*"))
+    # The live database is byte-for-byte the same set of rows.
+    after = {
+        table: writer.con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        for table in writer._backup_tables()
+    }
+    assert after == before
+
+
+def test_verification_rejects_a_backup_missing_a_table(
+    writer: CollectorWriter, tmp_path: Path
+) -> None:
+    """A restored copy that lost a user table is not a valid backup."""
+    import duckdb
+
+    job = writer.start_backup(tmp_path / "backups")
+    job.join(60.0)
+    report = job.poll()
+    assert report is not None and report.ok
+
+    # Corrupt the published copy: drop a user table the snapshot expected.
+    path = report.destination
+    probe = duckdb.connect(str(path))
+    probe.execute("DROP TABLE order_books")
+    probe.close()
+
+    # Re-running verification against the expected snapshot must reject it.
+    bad = writer._verify_backup(path, report.expected_counts, report.schema_versions, set())
+    assert not bad.ok
+    assert bad.error is not None
+
+
 # ---------------------------------------------------------------------------
 # WQN-1 acceptance regression: integrity checks must stay off the backup's
 # critical path (the acceptance harness stalled the loop ~20s and failed the

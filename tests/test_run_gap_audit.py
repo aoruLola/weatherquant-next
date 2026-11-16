@@ -197,6 +197,31 @@ def test_the_gap_covers_the_whole_outage_stall_death_and_restart(
         con.close()
 
 
+def test_close_open_gaps_returns_the_affected_row_count(settings: Settings) -> None:
+    """DuckDB 1.5.6 returns affected rows for UPDATE without RETURNING.
+
+    The plain two-row path also accepts the old RETURNING form. The separate
+    spawn-based watchdog recovery test is the WAL regression: with RETURNING
+    it fails on DuckDB 1.5.6 while rebuilding the gap table's indexes.
+    """
+    writer = CollectorWriter(settings.db_path, run_id="gap-count")
+    writer.open()
+    try:
+        for _ in range(2):
+            writer.record_gap(
+                reason="start_after_restart",
+                started_at_utc=datetime.now(tz=UTC),
+                detail="open",
+            )
+        assert writer.close_open_gaps(detail="recovered") == 2
+        gaps = writer.con.execute("SELECT ended_at_utc, detail FROM collection_gaps").fetchall()
+        assert len(gaps) == 2
+        assert all(ended_at is not None and detail == "open" for ended_at, detail in gaps)
+        assert writer.close_open_gaps(detail="nothing to close") == 0
+    finally:
+        writer.close()
+
+
 # ---------------------------------------------------------------------------
 # 3. the backup lifecycle is on the event trail
 # ---------------------------------------------------------------------------
