@@ -105,3 +105,17 @@ uv run python scripts/prune_performance_generations.py --performance ... --dry-r
 - 本机 soak 用 fixture 数据集标签；生产 publish 的 `WQ_DATASET=live`
   由部署环境变量决定，**不是脚本默认**；
 - 24h/SSH/WebUI 项只能在 NAS 上观察，本机无法模拟，未验证即不标完成。
+
+### WQN-29 发布与回滚演练
+
+发布器、执行 pin 和执行 prune 的进程须使用支持同一把锁的版本，并挂载同一份可写的 performance 目录。清单和预览只读。写入方占用目录中的 `.generation.lock` 时，另一个维护命令返回 75。锁随进程退出而释放，锁文件保留在原位。现有调度器的 pipeline 锁继续用于协调研究任务。
+
+清理预览列出每个候选目录、完整性和字节数。工具按发布清单核对世代 ID、六个文件的体积和分片大小。当有删除候选但缺少完整 Legacy 回滚点时，实际清理会失败。生产清理仍需对本次预览另行授权。
+
+以下回归从历史提交读取旧发布器和旧 Dashboard。它在临时目录中生成 Legacy 快照，发布新版快照，再切回 Legacy。断言覆盖旧 Dashboard 的摘要、机会分页和参考本金重算。运行环境需有 Dashboard 测试依赖，Git 对象库需包含 `e6698dfd39930bf1dd219410ae911b1cf496a982`。
+
+```sh
+uv run --group dashboard pytest -q dashboard/tests/test_legacy_rollback_drill.py
+```
+
+NAS 验收另需生产挂载上的锁争用结果、已部署镜像标识和实际候选清单。
