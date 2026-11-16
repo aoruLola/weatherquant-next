@@ -8,7 +8,7 @@ stop that look identical until you ask why.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -268,6 +268,27 @@ def test_a_zulu_suffix_is_read_as_utc() -> None:
     episodes, _ = build_episodes(rows)
 
     assert episodes[0].first_seen_utc.tzinfo is not None
+
+
+def test_an_explicit_offset_is_normalised_before_episode_identity() -> None:
+    utc_rows = [_row(minutes=0), _row(minutes=10)]
+    offset_rows = [
+        {
+            **row,
+            "decided_at_utc": row["decided_at_utc"]
+            .astimezone(timezone(timedelta(hours=8)))
+            .isoformat(),
+        }
+        for row in utc_rows
+    ]
+
+    utc_episodes, _ = build_episodes(utc_rows)
+    offset_episodes, _ = build_episodes(offset_rows)
+
+    assert [episode.as_dict() for episode in offset_episodes] == [
+        episode.as_dict() for episode in utc_episodes
+    ]
+    assert offset_episodes[0].first_seen_utc.isoformat().endswith("+00:00")
 
 
 def test_a_timestamp_that_is_not_a_time_is_refused() -> None:
