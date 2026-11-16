@@ -102,7 +102,7 @@ weatherquant-research backfill-settlements \
 | `--markets` | **必填**。市场清单 JSON 路径 |
 | `--out` | **必填**。结算索引输出路径 |
 | `--dataset` | **必填**，`live` 或 `fixture`。**没有默认值**——一次未标注的运行会被拒绝 |
-| `--verified` | 可选。已通过观测交叉核对的 `{market_id, target_date}` 列表；不提供时全部记为 `UNVERIFIED` |
+| `--verified` | 可选。`verify-market --out` 生成的核验清单，含市场、目标日、condition_id 和 resolved_outcome。旧版仅含市场和日期的清单需重新生成。官方赔付更改后，要重新核验才能计入 WIN/LOSS |
 | `--timeout` | 可选，默认 20s |
 
 结算判定只采信 **`data-api.polymarket.com/v2/resolutions`**（契约 §4.1 实测），
