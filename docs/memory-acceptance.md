@@ -56,8 +56,8 @@
 | 溢写目录在连接时创建、路径错误启动即报错 | 同上 | 同上 |
 | **SIGKILL 后零丢失**：硬杀等价于容器 OOM 杀；flush 事务原子；WAL 重放；checkpoint 折叠 WAL | 子进程硬杀测试 | 同上 |
 | 备份在 512MB 预算下完成并通过读回校验 | 子进程备份测试 | 同上 |
-| **内核级 OOM 杀 + 恢复 + 重启续写**（cgroup v2，与 Docker `mem_limit` 同一机制） | `scripts/oom_recovery_accept.py` | 本文档 §5 的运行记录 |
-| 30 分钟真实采集：RSS 有界、无泄漏斜率、PSI 无停顿、备份周期通过 | `scripts/soak_memory.py` | PR 描述与 §5 |
+| **内核级 OOM 杀 + 恢复 + 重启续写**（cgroup v2，与 Docker `mem_limit` 同一机制） | `scripts/oom_recovery_accept.py` | §3 的历史运行记录 |
+| 30 分钟采集与备份阶段的 RSS 和 PSI 记录 | `scripts/soak_memory.py` | §3 的历史运行记录 |
 
 ### 验收命令（两台机器上各自运行）
 
@@ -66,12 +66,13 @@
 # 然后验证已提交前缀完整、WAL 重放、重启续写
 sudo -E uv run python scripts/oom_recovery_accept.py --memory-max 1GB --data /tmp/wq-oom-accept
 
-# 内存 soak：真实采集 30 分钟（NAS 上建议 --minutes 720 做 12 小时版本）
+# 内存 soak：短时验证运行 30 分钟；正式容器验收使用 §4.4 的命令
 # + 备份周期，全程采样 RSS / PSI
 uv run python scripts/soak_memory.py --minutes 30 --data /tmp/wq-mem-soak
 
 # 单测
-uv run pytest tests/test_storage_memory_budget.py tests/test_storage_memory_gate.py -q
+uv run pytest -q tests/test_storage_memory_budget.py tests/test_storage_memory_gate.py \
+  tests/test_oom_recovery_accept.py tests/test_soak_memory_backup_gate.py
 ```
 
 （本机运行输出粘贴在 PR 描述；两条脚本都是**测量后判定**，不预设结论。）
@@ -90,7 +91,7 @@ restart:     batches 36 -> 39 (+3), rows=780000           # 重启续写，行�
 峰值恰好 1024 MiB = cgroup 上限：内核在闸口处击杀，与 Docker `mem_limit`
 同一机制（Docker 的内存限制就是 cgroup v2 `memory.max`）。
 
-**30 分钟内存 soak（真实采集 + 备份周期）——RESULT: PASSED**
+**30 分钟内存 soak 历史记录**
 
 ```
 collection     1803s，360 样本：peak RSS 304.8 MiB；斜率 −0.6 MiB/min（无泄漏）；
@@ -100,10 +101,7 @@ backup-cycle   200k 盘口 + 200k 价点按生产 500 行/flush 节奏写入：
 final health   stopped (exit 0)
 ```
 
-> 如实记录：backup-cycle 阶段的 PSI 读数（some/full 峰值 86.7/68.4%）被
-> **同期并行的 OOM 验收**污染（同一台机上 cgroup 回收风暴），不构成采集器
-> 的账——采集期的 PSI 才是"采集器不饿死宿主"的门，峰值为 0.54/0.36%。
-> NAS 上的 12h soak 应独占机器运行。
+备份阶段 PSI some/full 峰值为 86.7% / 68.4%，超过 full avg10 的 2% 门限。同期同机运行了 OOM 演练，无法单独归因。按现行规则，这次运行未通过，需要在独占测试时段重测。
 
 ---
 
@@ -115,9 +113,10 @@ final health   stopped (exit 0)
 ### 4.1 镜像发布后（部署前）
 
 ```bash
-# 镜像里的 db.py 与本分支一致（md5 对比）
-docker run --rm ghcr.io/aorulola/weatherquant-next:stable \
-  md5sum /app/.venv/lib/python3.12/site-packages/weatherquant/storage/db.py
+# IMAGE_REF 使用待验收镜像的仓库名和 sha256 摘要。发布源码和镜像内文件的 SHA256 应一致。
+git show "${RELEASE_SHA:?}:src/weatherquant/storage/db.py" | sha256sum
+docker run --rm --entrypoint python "${IMAGE_REF:?}" -c \
+  'import hashlib, pathlib, weatherquant.storage.db as db; print(hashlib.sha256(pathlib.Path(db.__file__).read_bytes()).hexdigest())'
 ```
 
 ### 4.2 部署（Compose Manager Plus Apply 后）
@@ -135,42 +134,30 @@ docker exec weatherquant-collector ls -la /data/duckdb-spill
 # 期望：目录存在（首次连接即创建）
 ```
 
-### 4.3 容器级 OOM 演练（一次性，验证"被杀后完好"）
+### 4.3 隔离环境的内核 OOM 演练
+
+在支持 cgroup v2 的 Linux 测试机上使用新的临时数据库。脚本将写入进程和恢复进程置于同一个独立限额组。保留退出码、内核 OOM 计数、恢复前后的 WAL 大小和续写批次。演练与 12 小时观测分时执行。
 
 ```bash
-# 把运行中容器的上限临时压到 512MB，制造真实容器 OOM
-docker update --memory 512m --memory-swap 512m weatherquant-collector
-# 等待被杀（docker events 里看 OOM），然后恢复：
-docker update --memory 6g --memory-swap 6g weatherquant-collector
-docker start weatherquant-collector
-# 重启后：
-#   - healthcheck 回到 healthy
-#   - 数据库完好：backups/ 上一份备份仍可读
-#   - collection_gaps 记录了这次中断并随后关闭
-docker logs weatherquant-collector 2>&1 | grep -i "gap\|replay\|lock"
+evidence=$(mktemp -d)
+sudo -E uv run python scripts/oom_recovery_accept.py --memory-max 1GB --data "$evidence/oom"
 ```
 
-### 4.4 12 小时 soak（验收的核心一条）
+### 4.4 12 小时采集与备份
+
+使用已核对摘要的镜像、新建数据卷和当前验收脚本。数据卷需要位于有足够可用空间的磁盘上。容器使用独立 cgroup 命名空间，脚本启动时读取内核限额和 PSI。保留终端输出、镜像摘要及卷名以便核查。
 
 ```bash
-# 在 NAS 上（或任何能跑本仓库的常驻机器）：
-uv run python scripts/soak_memory.py --minutes 720 --data /mnt/user/appdata/soak-mem --keep
-# 判定：RESULT: PASSED，且峰值 RSS < 3072 MiB、斜率 < 8 MiB/min、PSI full avg10 < 2.0%
+volume=$(docker volume create)
+echo "$IMAGE_REF $volume"
+docker run --rm --cgroupns private --memory 6g --memory-swap 6g \
+  -v "$volume:/data" -v "$PWD/scripts/soak_memory.py:/opt/acceptance/scripts/soak_memory.py:ro" \
+  -e WQ_DUCKDB_MEMORY_LIMIT=3GB -e WQ_DUCKDB_THREADS=4 -e WQ_DUCKDB_TEMP_DIR=/data/duckdb-spill \
+  --entrypoint python "${IMAGE_REF:?}" /opt/acceptance/scripts/soak_memory.py \
+  --data /data/soak --minutes 720 --acceptance --keep
 ```
 
-退而求其次（不引入新进程、直接观察生产容器）：
-
-```bash
-for i in $(seq 1 4320); do
-  ts=$(date -u +%FT%TZ)
-  rss=$(docker stats --no-stream --format '{{.MemUsage}}' weatherquant-collector)
-  psi=$(grep some /proc/pressure/memory | head -1)
-  echo "$ts rss=$rss psi=$psi" >> /var/log/wq-mem-soak.log
-  sleep 10
-done
-# 12 小时后检查：RSS 无持续上升斜率；PSI full avg10 峰值 < 2%；
-# 期间 backups/ 恰好新增 1 份当日备份且无 .incomplete- 残留
-```
+采集须满 12 小时，有盘口、价点和正常退出记录。采集与备份阶段的 RSS 高水位均不得超过 3072 MiB，PSI full avg10 不得超过 2%。采集后半段 RSS 斜率不得超过 8 MiB/min，备份须通过独立读回校验。另按下节核对生产定时备份。
 
 ### 4.5 备份周期观察（12h soak 期间顺带完成）
 
@@ -195,7 +182,7 @@ cat /proc/pressure/memory
 
 | 状态 | 内容 | 当前 | 判定证据 |
 |---|---|---|---|
-| 代码合并 | 引擎预算（PR #14）+ 容器上限与验收工具（本 PR） | 🟡 评审中 | CI 全绿 + 本文档 §3 |
+| 代码合并 | 引擎预算（PR #14）+ 容器上限与验收工具（本 PR） | PR #14 已合并，验收脚本修订另行验证 | 合并记录及对应版本的测试输出 |
 | 镜像发布 | `release.yml` 打 tag → `:stable` 前进 | ⚪ 未做 | GHCR sha-<commit> tag |
 | 生产部署 | NAS compose Apply（新 env + mem_limit 生效） | ⚪ 未做 | §4.2 的 inspect 输出 |
 | 验收完成 | OOM 演练 + 12h soak + 备份周期 + PSI | ⚪ 未做 | §4.3–4.6 的输出留档 |
