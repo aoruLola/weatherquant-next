@@ -84,7 +84,7 @@ __all__ = [
 #: Bumped whenever the *fold* changes in a way that invalidates stored
 #: aggregates. The store refuses to be extended across a change: the numbers
 #: would be a mixture of two algorithms, which is worse than a rebuild.
-PERFORMANCE_ALGORITHM_VERSION = "performance-streaming-2"
+PERFORMANCE_ALGORITHM_VERSION = "performance-streaming-3"
 
 PERFORMANCE_MIGRATIONS_DIR = Path(__file__).parent.parent / "storage" / "migrations_performance"
 
