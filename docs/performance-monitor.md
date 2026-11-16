@@ -50,7 +50,7 @@ uv run python scripts/prune_performance_generations.py --performance ... --dry-r
 
 测试先从另一份已发布快照取得游标，再切换到百万行快照。旧游标返回 409，合法分页最多返回 200 条，超限请求返回指向 `limit` 的 422。
 
-在 NAS 上测量时，在发布前保存机会分页响应中的 `data.next_cursor`。正常发布下一代快照后，给上述监控命令加上 `--previous-cursor "$PREVIOUS_CURSOR"`。测量 RSS 时，同时指定 `--dashboard-pid "$DASHBOARD_PID" --max-dashboard-rss-mib 512`。PID 应是实际服务该端点的单个工作进程，监控器需能读取同一 PID 命名空间的 Linux `/proc`。报告记录进程生命周期的峰值 RSS，无法读取时检查失败。仅检查快照文件的报告不包含 HTTP 或内存测量。
+在 NAS 上测量时，在发布前保存机会分页响应中的 `data.next_cursor`。正常发布下一代快照后，给上述监控命令加上 `--previous-cursor "$PREVIOUS_CURSOR"`。测量 RSS 时，同时指定 `--dashboard-pid "$DASHBOARD_PID" --max-dashboard-rss-mib 512`。PID 应是实际服务该端点的单个工作进程，监控器需能读取同一 PID 命名空间的 Linux `/proc`。报告记录进程生命周期的峰值 RSS，无法读取时检查失败；非 Linux 主机上该测量会被跳过并在报告中记录 `skipped`，不判为失败。仅检查快照文件的报告不包含 HTTP 或内存测量。
 
 有可清理世代时，`--apply` 要求 `current.json` 指向清单中的世代。删除失败会返回非零状态，回收量只计入成功移除的目录。
 

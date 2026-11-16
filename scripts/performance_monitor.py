@@ -58,6 +58,26 @@ ALWAYS_SMALL = (
     "opportunities.json",
 )
 
+
+def nearest_rank_p95(samples: list[float]) -> float:
+    """95th percentile by nearest rank: the ceil(0.95 * n)-th smallest sample."""
+    return samples[math.ceil(len(samples) * 0.95) - 1]
+
+
+def _linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def process_peak_mib(pid: int) -> tuple[float, str | None]:
+    """Peak RSS of a PID on Linux; elsewhere the measurement is skipped."""
+    if not _linux():
+        return 0.0, f"process RSS is only measured on Linux (host is {sys.platform})"
+    from soak_memory import read_rss_mb
+
+    _, peak = read_rss_mb(pid)
+    return peak, None
+
+
 CORE_PROBES = (
     ("summary", "/api/v1/performance/summary"),
     ("edge", "/api/v1/performance/edge"),
@@ -215,7 +235,7 @@ def probe_dashboard(
                 payload_bytes = max(payload_bytes, len(response.content))
             if samples and samples[-1] != float("inf"):
                 samples.sort()
-                p95 = samples[math.ceil(len(samples) * 0.95) - 1]
+                p95 = nearest_rank_p95(samples)
                 entry = {
                     "endpoint": name,
                     "status": status,
@@ -371,12 +391,13 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"    limit clamp: asked {clamp['requested']}, status {clamp['status']}, items {clamp['served_items']}")
         if args.dashboard_pid is not None:
-            from soak_memory import read_rss_mb
-
-            _, peak = read_rss_mb(args.dashboard_pid)
+            peak, skipped = process_peak_mib(args.dashboard_pid)
             probes["process_rss"] = {"pid": args.dashboard_pid, "peak_mib": peak or None,
-                                    "max_mib": args.max_dashboard_rss_mib}
-            if not peak:
+                                     "max_mib": args.max_dashboard_rss_mib}
+            if skipped:
+                probes["process_rss"]["skipped"] = skipped
+                print(f"    dashboard RSS: skipped ({skipped})")
+            elif not peak:
                 probes["failures"].append(f"no peak RSS available for Dashboard PID {args.dashboard_pid}")
             elif peak > args.max_dashboard_rss_mib:
                 probes["failures"].append(f"Dashboard peak RSS {peak:.1f} MiB exceeds {args.max_dashboard_rss_mib} MiB")

@@ -16,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MONITOR = REPO_ROOT / "scripts" / "performance_monitor.py"
 
@@ -300,6 +302,54 @@ def test_p95_includes_slowest_of_eight_requests(monkeypatch):
     )
     assert report["probes"][0]["p95_ms"] == 500
     assert any("above the gate" in error for error in report["failures"])
+
+
+@pytest.mark.parametrize(
+    ("size", "index"),
+    [(1, 0), (2, 1), (3, 2), (19, 18), (20, 18), (21, 19)],
+)
+def test_nearest_rank_p95_picks_the_ceiling_rank(size, index):
+    monitor = _load_monitor()
+    samples = [float(n) for n in range(size)]
+    assert monitor.nearest_rank_p95(samples) == samples[index]
+
+
+def test_previous_generation_cursor_409_passes():
+    import httpx
+
+    monitor = _load_monitor()
+
+    def handler(request):
+        if request.url.params.get("limit") == "1000000":
+            return httpx.Response(422, json={"detail": [
+                {"loc": ["query", "limit"], "type": "less_than_equal", "ctx": {"le": 200}},
+            ]})
+        if request.url.params.get("cursor") == "old-generation":
+            return httpx.Response(409, json={"detail": "cursor from a previous generation"})
+        return httpx.Response(200, json={"data": {"items": [{"i": 0}]}})
+
+    report = monitor.probe_dashboard(
+        "http://dashboard.test", token=None, probes=1, max_p95_ms=1000, max_response_mb=32,
+        previous_cursor="old-generation", transport=httpx.MockTransport(handler),
+    )
+    assert report["failures"] == [], report["failures"]
+    assert report["previous_cursor_status"] == 409
+    assert report["limit_clamp"]["rejected_above"] == 200
+
+
+def test_process_rss_is_skipped_outside_linux(tmp_path, monkeypatch):
+    monitor = _load_monitor()
+    performance = _publish_tree(tmp_path)
+    monkeypatch.setattr(monitor, "probe_dashboard", lambda *a, **kw: {"probes": [], "failures": []})
+    monkeypatch.setattr(monitor, "_linux", lambda: False)
+    report_file = tmp_path / "report.json"
+    argv = ["--performance", str(performance), "--dashboard", "http://test", "--dashboard-pid", "1",
+            "--max-dashboard-rss-mib", "512", "--report", str(report_file)]
+    assert monitor.main(argv) == 0
+    report = json.loads(report_file.read_text())
+    process = report["dashboard_probes"]["process_rss"]
+    assert process["peak_mib"] is None
+    assert "only measured on Linux" in process["skipped"]
 
 
 def test_dashboard_rss_gate_records_missing_excessive_and_measured_peaks(tmp_path, monkeypatch):
