@@ -635,15 +635,16 @@ class CollectorWriter:
 
     def close_open_gaps(self, *, detail: str) -> int:
         """Close gaps a previous unclean shutdown left open."""
-        cur = self.con.execute(
+        # Use DuckDB's affected-row count. UPDATE ... RETURNING can fail on
+        # the gap table's indexes immediately after watchdog/WAL recovery.
+        count = self.con.execute(
             "UPDATE collection_gaps SET ended_at_utc = ?, detail = COALESCE(detail, ?) "
-            "WHERE ended_at_utc IS NULL RETURNING gap_id",
+            "WHERE ended_at_utc IS NULL",
             [datetime.now(tz=UTC), detail],
-        )
-        rows = cur.fetchall()
-        if rows:
-            log.info("closed %d gap(s) left open by a previous run", len(rows))
-        return len(rows)
+        ).fetchone()[0]
+        if count:
+            log.info("closed %d gap(s) left open by a previous run", count)
+        return count
 
     def mark_abandoned_runs_failed(self) -> list[str]:
         """Fail every run still marked ``running`` - none of them is us.

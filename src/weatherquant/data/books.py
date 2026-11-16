@@ -24,6 +24,7 @@ every latency and staleness figure downstream meaningless.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from dataclasses import dataclass
@@ -37,7 +38,7 @@ from weatherquant.markets.models import BookLevel, OrderBook
 
 log = logging.getLogger(__name__)
 
-__all__ = ["CLOB_BASE", "BookSnapshot", "fetch_book", "parse_book_payload"]
+__all__ = ["CLOB_BASE", "BookSnapshot", "book_from_levels_json", "fetch_book", "parse_book_payload"]
 
 CLOB_BASE = "https://clob.polymarket.com"
 
@@ -56,6 +57,31 @@ class BookSnapshot:
     @property
     def content_hash(self) -> str:
         return self.row[0]
+
+
+def book_from_levels_json(
+    *, market_id: str, token_id: str, bids_json: str, asks_json: str,
+    venue_ts: datetime | None, collector_received: datetime,
+) -> OrderBook:
+    """Rehydrate the canonical levels persisted by the collector and Shadow."""
+
+    def levels(raw: str) -> tuple[BookLevel, ...]:
+        return tuple(
+            BookLevel(
+                price_usd_per_share=float(item["price_usd_per_share"]),
+                size_shares=float(item["size_shares"]),
+            )
+            for item in json.loads(raw)
+        )
+
+    return OrderBook(
+        market_id=market_id,
+        token_id=token_id,
+        bids=levels(bids_json),
+        asks=levels(asks_json),
+        venue_ts=venue_ts,
+        fetched_at_utc=collector_received,
+    )
 
 
 def _sorted_levels(payload: Any, *, descending: bool) -> list[tuple[float, float]]:

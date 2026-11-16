@@ -125,8 +125,7 @@ def test_a_killed_run_is_marked_failed_by_the_next_start(settings: Settings, mon
         rows = {
             r[0]: r
             for r in con.execute(
-                "SELECT run_id, status, stop_reason, stopped_at_utc, started_at_utc "
-                "FROM collector_runs"
+                "SELECT run_id, status, stop_reason, stopped_at_utc, started_at_utc FROM collector_runs"
             ).fetchall()
         }
         dead = rows["dead-run"]
@@ -139,9 +138,7 @@ def test_a_killed_run_is_marked_failed_by_the_next_start(settings: Settings, mon
         assert fresh[3] is not None
 
         # The audit event is on the trail too.
-        marked = con.execute(
-            "SELECT level, message FROM collector_events WHERE kind = 'restart'"
-        ).fetchall()
+        marked = con.execute("SELECT level, message FROM collector_events WHERE kind = 'restart'").fetchall()
         assert any("abandoned run(s) as failed" in m for _, m in marked), marked
     finally:
         con.close()
@@ -181,8 +178,7 @@ def test_the_gap_covers_the_whole_outage_stall_death_and_restart(
     con = duckdb.connect(str(settings.db_path), read_only=True)
     try:
         gaps = con.execute(
-            "SELECT run_id, reason, started_at_utc, ended_at_utc FROM collection_gaps "
-            "ORDER BY started_at_utc"
+            "SELECT run_id, reason, started_at_utc, ended_at_utc FROM collection_gaps ORDER BY started_at_utc"
         ).fetchall()
         assert gaps, "every run must record its own collection gap"
         assert all(g[3] is not None for g in gaps), f"gap left open: {gaps}"
@@ -196,6 +192,31 @@ def test_the_gap_covers_the_whole_outage_stall_death_and_restart(
         assert dead_gap[3] <= restarted_at + timedelta(seconds=1), dead_gap
     finally:
         con.close()
+
+
+def test_close_open_gaps_returns_the_affected_row_count(settings: Settings) -> None:
+    """DuckDB 1.5.6 returns affected rows for UPDATE without RETURNING.
+
+    The plain two-row path also accepts the old RETURNING form. The separate
+    spawn-based watchdog recovery test is the WAL regression: with RETURNING
+    it fails on DuckDB 1.5.6 while rebuilding the gap table's indexes.
+    """
+    writer = CollectorWriter(settings.db_path, run_id="gap-count")
+    writer.open()
+    try:
+        for _ in range(2):
+            writer.record_gap(
+                reason="start_after_restart",
+                started_at_utc=datetime.now(tz=UTC),
+                detail="open",
+            )
+        assert writer.close_open_gaps(detail="recovered") == 2
+        gaps = writer.con.execute("SELECT ended_at_utc, detail FROM collection_gaps").fetchall()
+        assert len(gaps) == 2
+        assert all(ended_at is not None and detail == "open" for ended_at, detail in gaps)
+        assert writer.close_open_gaps(detail="nothing to close") == 0
+    finally:
+        writer.close()
 
 
 # ---------------------------------------------------------------------------
@@ -231,8 +252,7 @@ def test_a_backup_attempt_leaves_start_and_outcome_on_the_trail(
                 con = duckdb.connect(str(settings.db_path))
                 try:
                     found = con.execute(
-                        "SELECT level, kind FROM collector_events WHERE kind LIKE 'backup%' "
-                        "ORDER BY ts_utc"
+                        "SELECT level, kind FROM collector_events WHERE kind LIKE 'backup%' ORDER BY ts_utc"
                     ).fetchall()
                 finally:
                     con.close()
@@ -251,9 +271,7 @@ def test_a_backup_attempt_leaves_start_and_outcome_on_the_trail(
     try:
         # The run's own exit is normal - the backup failure is an event, not
         # a crash, which is what makes the trail trustworthy to audit.
-        status = con.execute(
-            "SELECT status FROM collector_runs WHERE run_id = 'backup-audit'"
-        ).fetchone()[0]
+        status = con.execute("SELECT status FROM collector_runs WHERE run_id = 'backup-audit'").fetchone()[0]
         assert status == "stopped"
     finally:
         con.close()
