@@ -1,11 +1,17 @@
 import json
 from datetime import UTC, datetime, timedelta
 
+import duckdb
 import pytest
 
 from weatherquant.performance.episodes import EndReason, build_episodes, episode_from_open
-from weatherquant.performance.state import PERFORMANCE_ALGORITHM_VERSION, PerformanceStateStore
+from weatherquant.performance.state import (
+    PERFORMANCE_ALGORITHM_VERSION,
+    PERFORMANCE_MIGRATIONS_DIR,
+    PerformanceStateStore,
+)
 from weatherquant.performance.streaming import ingest_export
+from weatherquant.storage.migrator import MigrationError, applied_migrations, available_migrations, migrate
 
 
 def _write_part(root, index, rows):
@@ -103,6 +109,120 @@ def test_existing_state_is_repaired_after_the_chronological_migration(tmp_path):
         _assert_chronological(store, rows)
         assert store.load_state().algorithm_version == PERFORMANCE_ALGORITHM_VERSION
         assert store.load_state().rows_consumed == 3
+
+
+def test_streaming_and_materialized_keep_opening_evidence_across_parts(tmp_path):
+    first, later = _rows()[:2]
+    first.update(
+        market_price=None,
+        model_probability=None,
+        available_depth_usd=None,
+        fee_rate=None,
+        net_edge=0.1,
+    )
+    later.update(
+        market_price=0.95,
+        model_probability=0.99,
+        available_depth_usd=500.0,
+        fee_rate=0.0,
+        net_edge=0.3,
+    )
+    rows = [first, later]
+    expected, _ = build_episodes(rows)
+    export = tmp_path / "export"
+    db = tmp_path / "state.duckdb"
+
+    _write_part(export, 1, rows[:1])
+    with PerformanceStateStore(db) as store:
+        ingest_export(store, export)
+    _write_part(export, 2, rows[1:])
+    with PerformanceStateStore(db) as store:
+        ingest_export(store, export)
+        actual = [
+            episode_from_open(item.open_ep, end_reason=item.end_reason or EndReason.END_OF_DATA).as_dict()
+            for item in store.iter_episodes()
+        ]
+
+    assert actual == [episode.as_dict() for episode in expected]
+    (episode,) = actual
+    assert episode["first_market_price"] is None
+    assert episode["first_model_probability"] is None
+    assert episode["first_available_depth_usd"] is None
+    assert episode["fee_rate"] is None
+    assert episode["observation_count"] == 2
+    assert episode["last_edge"] == pytest.approx(0.3)
+    assert episode["mean_edge"] == pytest.approx(0.2)
+    assert episode["max_edge"] == pytest.approx(0.3)
+
+
+def test_entry_evidence_migration_rolls_back_and_retries_on_existing_state(tmp_path):
+    rows = _rows()[:2]
+    export = tmp_path / "export"
+    _write_part(export, 1, rows)
+    db = tmp_path / "state.duckdb"
+    with PerformanceStateStore(db) as store:
+        ingest_export(store, export)
+        store.upsert_settlements(
+            {
+                ("m", "2026-10-26"): (
+                    "RESOLVED",
+                    1.0,
+                    True,
+                    "VERIFIED",
+                    "fixture",
+                    datetime(2026, 10, 27, tzinfo=UTC),
+                )
+            }
+        )
+        parts = store.recorded_parts()
+        settlements = store.load_settlements()
+        state = store.load_state()
+        cursor = (state.last_part_index, state.last_end_cursor, state.last_export_seq, state.rows_consumed)
+        episodes = store.fetchall("SELECT episode_id, fee_rate FROM performance_episodes ORDER BY episode_id")
+        store.execute("UPDATE performance_ingest SET algorithm_version='performance-streaming-2'")
+        store.execute("DELETE FROM schema_migrations WHERE version='0005'")
+
+    specifications = available_migrations(PERFORMANCE_MIGRATIONS_DIR)
+    interrupted = tmp_path / "interrupted-migrations"
+    interrupted.mkdir()
+    for spec in specifications:
+        sql = spec.sql
+        if spec.version == "0005":
+            sql += "\nSELECT * FROM missing_entry_evidence_migration_table;\n"
+        (interrupted / spec.path.name).write_text(sql, encoding="utf-8")
+
+    con = duckdb.connect(db)
+    try:
+        with pytest.raises(MigrationError, match="0005_episode_entry_evidence"):
+            migrate(con, interrupted)
+        assert con.execute("SELECT algorithm_version FROM performance_ingest").fetchone() == (
+            "performance-streaming-2",
+        )
+        assert con.execute("SELECT required FROM performance_episode_rebuild").fetchone() == (False,)
+        assert "0005" not in applied_migrations(con)
+        assert con.execute("SELECT episode_id, fee_rate FROM performance_episodes ORDER BY episode_id").fetchall() == episodes
+    finally:
+        con.close()
+
+    store = PerformanceStateStore(db)
+    try:
+        assert store.open() == ["0005_episode_entry_evidence"]
+        assert store.load_state().algorithm_version == PERFORMANCE_ALGORITHM_VERSION
+        assert store.fetchone("SELECT required FROM performance_episode_rebuild") == (True,)
+        state = store.load_state()
+        assert (state.last_part_index, state.last_end_cursor, state.last_export_seq, state.rows_consumed) == cursor
+        assert store.recorded_parts() == parts
+        assert store.load_settlements() == settlements
+        assert store.fetchall("SELECT episode_id, fee_rate FROM performance_episodes ORDER BY episode_id") == episodes
+    finally:
+        store.close()
+
+    store = PerformanceStateStore(db)
+    try:
+        assert store.open() == []
+    finally:
+        store.close()
+
 
 def test_publish_only_repairs_existing_entry_evidence_without_reconsuming_parts(tmp_path, monkeypatch):
     from test_performance_streaming import _two_sided_book
