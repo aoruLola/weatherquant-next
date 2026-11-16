@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from weatherquant.shadow.export import DecisionExporter, read_export
+from weatherquant.shadow.export import DecisionExporter, export_watermark, read_export
 from weatherquant.storage.shadow import ShadowDatabase
 
 NOW = datetime(2026, 10, 14, 8, 0, tzinfo=UTC)
@@ -1031,3 +1031,130 @@ def test_the_streaming_consumer_accepts_a_trailing_rollback_part(db, tmp_path):
     assert result.rows_consumed == 9
     assert state is not None
     assert state.last_export_seq is not None  # the v2 rows still bind it
+
+
+@pytest.mark.parametrize(
+    ("missing", "lose_state"),
+    [(1, False), (1, True), (2, False), (2, True), (3, False)],
+)
+def test_broken_part_sequence_blocks_recovery_until_restored(db, tmp_path, missing, lose_state):
+    for i in range(1, 4):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i), seq=i)
+    exporter = _exporter(db, tmp_path, batch_rows=1)
+    assert exporter.run_batch().rows_exported == 3
+
+    part = exporter.parts_dir / f"part-{missing:09d}.jsonl"
+    parked = part.rename(tmp_path / part.name)
+    if lose_state:
+        exporter.state_path.unlink()
+    state_before = None if lose_state else exporter.state_path.read_bytes()
+    _insert(db, i=4, when=NOW + timedelta(seconds=4), seq=4)
+
+    result = exporter.run_batch()
+    assert result.rows_exported == result.parts_written == 0
+    assert not result.caught_up
+    assert part.name in " ".join(result.notes)
+    for report in (exporter.verify(), exporter.reconcile()):
+        assert report["consistent"] is False
+        assert part.name in report["first_divergence"]
+    assert (exporter.state_path.read_bytes() if exporter.state_path.exists() else None) == state_before
+    if missing < 3:
+        with pytest.raises(ValueError, match=part.name):
+            export_watermark(exporter.directory)
+        with pytest.raises(ValueError, match=part.name):
+            read_export(exporter.directory)
+
+    parked.rename(part)
+    _run_to_caught_up(exporter)
+    expected_ids = [f"id-{i:04d}" for i in range(1, 5)]
+    assert _ids(exporter.directory) == expected_ids
+    report = exporter.reconcile()
+    assert report["consistent"]
+    assert report["source_rows_total"] == 4
+    assert report["source_rows_pending"] == 0
+
+    state_after_recovery = exporter.state_path.read_bytes()
+    again = exporter.run_batch()
+    assert again.caught_up
+    assert again.rows_exported == again.parts_written == 0
+    assert _ids(exporter.directory) == expected_ids
+    assert exporter.state_path.read_bytes() == state_after_recovery
+
+
+def test_reconcile_distinguishes_a_valid_prefix_from_catching_up(db, tmp_path):
+    _insert(db, i=1, when=NOW, seq=1)
+    exporter = _exporter(db, tmp_path)
+    assert exporter.run_batch().rows_exported == 1
+    _insert(db, i=2, when=NOW - timedelta(days=1), mode="REPLAY", seq=2)
+    _insert(db, i=3, when=NOW + timedelta(seconds=1))
+
+    report = exporter.reconcile()
+    assert report["consistent"]
+    assert report["source_rows_total"] == 3
+    assert report["rows_on_disk"] == report["source_rows_at_or_below_cursor"] == 1
+    assert report["source_rows_unsequenced"] == 1
+    assert report["source_rows_pending"] == 2
+
+
+def test_reconcile_reports_no_backlog_for_empty_and_fully_exported_sources(db, tmp_path):
+    exporter = _exporter(db, tmp_path)
+    assert exporter.run_batch().caught_up
+
+    empty = exporter.reconcile()
+    assert empty["consistent"]
+    assert empty["source_rows_total"] == 0
+    assert empty["source_rows_pending"] == 0
+    assert empty["source_rows_unsequenced"] == 0
+
+    for i in range(1, 3):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i), seq=i)
+    _run_to_caught_up(exporter)
+
+    complete = exporter.reconcile()
+    assert complete["consistent"]
+    assert complete["source_rows_total"] == 2
+    assert complete["source_rows_pending"] == 0
+    assert complete["source_rows_at_or_below_cursor"] == complete["rows_on_disk"] == 2
+
+
+def test_export_verify_cli_reports_backlog_and_a_missing_part(
+    db, tmp_path, monkeypatch, capsys
+):
+    from weatherquant.shadow.cli import main
+
+    report_path = tmp_path / "reports" / "report.json"
+    monkeypatch.setenv("WQ_SHADOW_REPORT_PATH", str(report_path))
+    exporter = DecisionExporter(
+        db.con,
+        report_path.parent / "decisions-export",
+        batch_rows=1,
+        max_parts_per_run=5,
+    )
+    for i in range(1, 4):
+        _insert(db, i=i, when=NOW + timedelta(seconds=i), seq=i)
+    assert exporter.run_batch().rows_exported == 3
+    _insert(db, i=4, when=NOW + timedelta(seconds=4))
+    db.close()  # export-verify requires the engine's writer to be stopped
+
+    command = ["--db", str(db.path), "export-verify", "--json"]
+    assert main(command) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["consistent"] is True
+    assert payload["source_rows_total"] == 4
+    assert payload["source_rows_pending"] == 1
+    assert payload["source_rows_unsequenced"] == 1
+    assert payload["export_dir"] == str(exporter.directory)
+
+    missing = exporter.parts_dir / "part-000000002.jsonl"
+    parked = missing.rename(tmp_path / missing.name)
+    assert main(command) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["consistent"] is False
+    assert missing.name in payload["first_divergence"]
+
+    parked.rename(missing)
+    assert main(command) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["consistent"] is True
+    assert payload["source_rows_total"] == 4
+    assert payload["source_rows_pending"] == 1
