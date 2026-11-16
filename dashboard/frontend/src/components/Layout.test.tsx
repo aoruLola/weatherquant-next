@@ -24,6 +24,7 @@ describe('Layout', () => {
     expect(screen.getByTestId('nav-markets')).toBeInTheDocument()
     expect(screen.getByTestId('nav-forecasts')).toBeInTheDocument()
     expect(screen.getByTestId('nav-decisions')).toBeInTheDocument()
+    expect(screen.getByTestId('nav-paper')).toBeInTheDocument()
     expect(screen.getByTestId('nav-system')).toBeInTheDocument()
     await waitFor(() => expect(screen.getByTestId('api-status')).toBeInTheDocument())
   })

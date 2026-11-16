@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from weatherquant.dashboard import API_SCHEMA_VERSION
 from weatherquant.dashboard import builders as builders
+from weatherquant.dashboard import paper as paper
 from weatherquant.dashboard import performance as perf
 from weatherquant.dashboard.archive import ArchiveTail
 from weatherquant.dashboard.config import DashboardSettings
@@ -39,10 +40,12 @@ from weatherquant.dashboard.contracts import (
     Envelope,
     ForecastsData,
     Freshness,
+    FreshnessState,
     HealthzData,
     MarketDetailData,
     MarketsData,
     OverviewData,
+    PaperData,
     PerformanceData,
     ShadowHealthData,
     ShadowReportData,
@@ -68,6 +71,10 @@ def create_app(settings: DashboardSettings | None = None) -> FastAPI:
         archive=ArchiveTail(settings),
         trends=TrendBuffer(max_samples=settings.trend_history_samples),
     )
+    paper_client = paper.PaperClient(
+        settings.paper_api_base_url,
+        timeout_seconds=settings.paper_api_timeout_seconds,
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -78,6 +85,7 @@ def create_app(settings: DashboardSettings | None = None) -> FastAPI:
             sampler.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sampler
+            await paper_client.aclose()
 
     app = FastAPI(
         title="WeatherQuant Dashboard",
@@ -91,6 +99,7 @@ def create_app(settings: DashboardSettings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.wq_state = state
+    app.state.paper_client = paper_client
 
     _install_rate_limit(app, settings)
     _install_api_routes(app, state, settings)
@@ -307,6 +316,61 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
         now = _utcnow()
         data, freshness = await asyncio.to_thread(builders.system, state, now)
         return _env(SystemData, "system", data, freshness, now, dataset)
+
+    # -- Paper Trading ------------------------------------------------------
+    # A deliberately narrow HTTP proxy: only these two dashboard routes exist,
+    # and the client itself accepts only a whitelist of GET resources. No
+    # database path or write method is part of this integration.
+
+    @app.get("/api/v1/paper/summary", response_model=Envelope[PaperData], tags=["paper"])
+    async def r_paper_summary() -> Envelope[PaperData]:
+        now = _utcnow()
+        market_data, market_freshness = await asyncio.to_thread(
+            builders.markets, state, now, limit=500
+        )
+        marks = paper.current_marks(market_data.items)
+        marks_reason = (
+            market_data.reason
+            or market_freshness.reason
+            or "one or more open positions has no fresh best bid"
+        )
+        try:
+            data = await paper.build_summary(
+                app.state.paper_client,
+                marks,
+                marks_reason=marks_reason,
+            )
+            freshness = Freshness(state=FreshnessState.FRESH)
+        except paper.PaperUnavailable as exc:
+            data = paper.unavailable_summary(str(exc))
+            freshness = Freshness(state=FreshnessState.UNAVAILABLE, reason=str(exc))
+        return _env(PaperData, "paper/summary", data, freshness, now, dataset)
+
+    @app.get("/api/v1/paper/fills", response_model=Envelope[PaperData], tags=["paper"])
+    async def r_paper_fills(
+        limit: int = Query(20, ge=1, le=500),
+        cursor: str | None = Query(None, max_length=200),
+    ) -> Envelope[PaperData]:
+        now = _utcnow()
+        params: dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            page = await app.state.paper_client.get("fills", params=params)
+            data = {**page, "status": "ok", "mode": "PAPER"}
+            freshness = Freshness(state=FreshnessState.FRESH)
+        except paper.PaperUnavailable as exc:
+            data = {
+                "status": "unavailable",
+                "mode": "PAPER",
+                "reason": str(exc),
+                "fills": [],
+                "limit": limit,
+                "next_cursor": None,
+                "has_more": False,
+            }
+            freshness = Freshness(state=FreshnessState.UNAVAILABLE, reason=str(exc))
+        return _env(PaperData, "paper/fills", data, freshness, now, dataset)
 
     # -- performance -------------------------------------------------------
     # All seven read snapshots the research process already computed. None
