@@ -489,14 +489,16 @@ def performance_settlements(
     now: datetime,
     *,
     limit: int = 50,
-    cursor: int = 0,
+    cursor: str | int | None = None,
     status: str | None = None,
     market_id: str | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """One page of the settlement answers.
 
     Bounded by construction - one row per market and target date, not per
-    decision - so this stays an offset cursor rather than a keyset one.
+    decision - so this stays an offset cursor. The cursor is still stamped
+    with the published generation id, so a republish between two pages is
+    refused (409) rather than silently served as a mix of two batches.
     """
     payload, freshness = state.snapshot("performance-settlements", "settlements.json", now)
     if payload.data == {} and payload.kind:
@@ -507,27 +509,32 @@ def performance_settlements(
         }, freshness
 
     limit = max(1, min(int(limit), MAX_PAGE))
-    cursor = max(0, int(cursor))
+    offset = _decode_cursor(cursor, payload.generation_id)
     rows = list(payload.data.get("answers") or [])
     if status:
         rows = [row for row in rows if str(row.get("status") or "") == status]
     if market_id:
         rows = [row for row in rows if str(row.get("market_id") or "") == market_id]
 
-    window = rows[cursor : cursor + limit]
+    window = rows[offset : offset + limit]
     envelope = payload.model_dump()
     envelope.pop("data", None)
     envelope["items"] = window
     envelope["total"] = len(rows)
-    envelope["next_cursor"] = (cursor + limit) if cursor + limit < len(rows) else None
-    envelope["prev_cursor"] = max(0, cursor - limit) if cursor > 0 else None
+    next_offset = offset + len(window)
+    envelope["next_cursor"] = (
+        _encode_cursor(payload.generation_id, next_offset) if next_offset < len(rows) else None
+    )
+    envelope["prev_cursor"] = (
+        _encode_cursor(payload.generation_id, max(0, offset - limit)) if offset > 0 else None
+    )
     envelope["data"] = {
         "collection": "answers",
         "returned": len(window),
         "total": len(rows),
-        "offset": cursor,
+        "offset": offset,
         "limit": limit,
-        "cursor": cursor,
+        "cursor": cursor if cursor not in (None, "") else None,
         "filters": {k: v for k, v in (("status", status), ("market_id", market_id)) if v},
         "freshness": payload.data.get("freshness"),
         "statistical_scope": payload.data.get("statistical_scope") or ["resolved_verified_only"],
