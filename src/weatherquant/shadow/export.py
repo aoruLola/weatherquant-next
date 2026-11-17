@@ -318,59 +318,6 @@ class DecisionExporter:
     def state(self) -> dict[str, Any]:
         return self._load()
 
-    # -- manifest repair / reconciliation ----------------------------------
-
-    def _reconcile_manifest(self, state: dict[str, Any]) -> int:
-        """Back-fill sidecars for the trailing run of parts that missed them.
-
-        A crash between ``_write_part`` and ``_write_part_manifest`` leaves
-        the most recently written part(s) on disk without a manifest.  The
-        next tick repairs exactly that window: the contiguous tail of parts
-        above the highest manifested index.  Older parts are left alone on
-        purpose - a directory that predates provenance has no manifests at
-        all, and silently attesting it would erase the
-        ``LEGACY_UNATTESTED`` distinction the verifier exists to report.
-
-        Returns the number of manifests written.  Never raises: a missing
-        manifest that we cannot repair becomes a note on the caller's
-        ``ExportResult`` (written above in ``run_batch``), not an engine
-        crash.
-        """
-        try:
-            existing = sorted(self.parts_dir.glob("part-*.jsonl"))
-            if not existing:
-                return 0
-            manifest_idx = {_index_of(p) for p in self.parts_dir.glob("part-*.manifest.json")}
-            if not manifest_idx:
-                # Nothing has ever been attested: the whole directory is
-                # legacy.  Do not retroactively attest it.
-                return 0
-            last_manifested = max(manifest_idx)
-            repaired = 0
-            for part in existing:
-                idx = _index_of(part)
-                if idx <= last_manifested:
-                    continue
-                prev_path = self._manifest_path(idx - 1)
-                prev_bytes: bytes | None = None
-                if prev_path.exists():
-                    try:
-                        prev_bytes = prev_path.read_bytes()
-                    except OSError:
-                        prev_bytes = None
-                manifest = _build_part_manifest(
-                    part,
-                    prev_manifest_bytes=prev_bytes,
-                    publisher_run_id=self._publisher_run_id,
-                    signing_key=self._signing_key,
-                )
-                _write_part_manifest(self._manifest_path(idx), manifest)
-                repaired += 1
-            return repaired
-        except Exception as exc:
-            state.setdefault("_manifest_repair_failed", str(exc))
-            return 0
-
     # -- the one-time v1 -> v2 transition -----------------------------------
 
     def _transition_pending(self, state: dict[str, Any]) -> bool:
@@ -693,14 +640,6 @@ class DecisionExporter:
                     return step
                 result.transition_done = True
 
-            # Before writing new parts, repair any previous half-writes: a
-            # part file that already exists but has no manifest.  This keeps
-            # the hash chain continuous after a crash between ``_write_part``
-            # and ``_write_part_manifest``.
-            repaired = self._reconcile_manifest(state)
-            if repaired:
-                result.notes.append(f"repaired {repaired} missing manifest(s) from prior runs")
-
             cursor_seq = state.get("cursor_seq")
             cursor_seq = int(cursor_seq) if cursor_seq is not None else 0
             previous_watermark = tuple(state["watermark"]) if state.get("watermark") else None
@@ -730,20 +669,32 @@ class DecisionExporter:
                     break
 
                 part_path = self._part_path(index)
-                _write_part(part_path, rows)
-                # Only once both part and manifest are durably on disk do we
-                # advance state.  A crash between the two leaves us a part
-                # file with no manifest, which the next ``run_batch`` will
-                # pick up via ``_reconcile_manifest`` before proceeding.
-                prev_manifest = self._manifest_path(index - 1)
-                prev_manifest_bytes = prev_manifest.read_bytes() if prev_manifest.exists() else None
-                manifest = _build_part_manifest(
-                    part_path,
-                    prev_manifest_bytes=prev_manifest_bytes,
-                    publisher_run_id=self._publisher_run_id,
-                    signing_key=self._signing_key,
-                )
-                _write_part_manifest(self._manifest_path(index), manifest)
+                # The manifest is written *before* the part is published, from
+                # the staged bytes this process just wrote. A published part
+                # therefore always already has its manifest, and nothing on
+                # disk is ever attested after the fact: signing whatever part
+                # happened to lack a manifest would let anyone who can write
+                # this directory get an injected or replaced part signed.
+                # A crash after the manifest but before the publish leaves an
+                # orphan manifest (UNKNOWN_PART) and no part; state has not
+                # moved, so the next tick rewrites both for this index.
+                staged = _stage_part(part_path, rows)
+                try:
+                    prev_manifest = self._manifest_path(index - 1)
+                    prev_manifest_bytes = prev_manifest.read_bytes() if prev_manifest.exists() else None
+                    manifest = _build_part_manifest(
+                        staged,
+                        index=index,
+                        prev_manifest_bytes=prev_manifest_bytes,
+                        publisher_run_id=self._publisher_run_id,
+                        signing_key=self._signing_key,
+                    )
+                    _write_part_manifest(self._manifest_path(index), manifest)
+                    staged.replace(part_path)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        staged.unlink()
+                    raise
 
                 cursor_seq = int(rows[-1][_SEQ_INDEX])
                 rows_written += len(rows)
@@ -778,7 +729,7 @@ class DecisionExporter:
             result.late_rows = late_rows
             result.cursor_seq = cursor_seq
             result.watermark = tuple(state["watermark"]) if state.get("watermark") else None
-            if result.caught_up and rows_written == 0 and not repaired:
+            if result.caught_up and rows_written == 0:
                 result.notes.append("already at the watermark; nothing new to export")
         except Exception as exc:  # a side channel must not raise
             # The engine keeps deciding. The caller turns this into an
@@ -1122,8 +1073,12 @@ def _count_rows(paths: list[Path]) -> int:
     return total
 
 
-def _write_part(path: Path, rows: list[Any]) -> Path:
-    """Write one immutable part, durably, before anyone may depend on it."""
+def _stage_part(path: Path, rows: list[Any]) -> Path:
+    """Write one part's bytes durably to a temp file beside ``path``.
+
+    Not yet published: nothing reads ``*.tmp``. The caller renames it onto
+    ``path`` (see :func:`_write_part`), after writing its manifest.
+    """
     directory = path.parent
     directory.mkdir(parents=True, exist_ok=True)
     # delete=False plus an explicit replace: the rename is what makes the
@@ -1135,16 +1090,21 @@ def _write_part(path: Path, rows: list[Any]) -> Path:
         handle.flush()
         os.fsync(handle.fileno())
         temporary = handle.name
-    Path(temporary).replace(path)
+    return Path(temporary)
+
+
+def _write_part(path: Path, rows: list[Any]) -> Path:
+    """Write one immutable part, durably, before anyone may depend on it."""
+    _stage_part(path, rows).replace(path)
     return path
 
 
 # ---------------------------------------------------------------------------
 # Provenance sidecar manifest helpers (WQN-26).
 #
-# These are module-level helpers so they can be called from both the
-# exporter (while writing a part) and from the manifest repair path
-# (``DecisionExporter._reconcile_manifest``).
+# Module-level helpers used by the exporter while publishing a part, and by
+# tests. There is deliberately no repair path that attests parts already on
+# disk: see the comment in ``DecisionExporter.run_batch``.
 # ---------------------------------------------------------------------------
 
 
@@ -1222,12 +1182,17 @@ def _hmac_sign_manifest(key: str, payload: dict[str, Any]) -> str:
 def _build_part_manifest(
     part_path: Path,
     *,
+    index: int | None = None,
     prev_manifest_bytes: bytes | None,
     publisher_run_id: str,
     signing_key: str | None,
 ) -> dict[str, Any]:
-    """Construct the manifest payload for ``part_path``."""
-    index = _index_of(part_path)
+    """Construct the manifest payload for the bytes at ``part_path``.
+
+    ``index`` names the part when ``part_path`` is the staged temp file.
+    """
+    if index is None:
+        index = _index_of(part_path)
     row_count, first_seq, last_seq, first_ts, last_ts = _scan_part_for_manifest(part_path)
     manifest: dict[str, Any] = {
         "schema_version": 1,

@@ -14,6 +14,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from weatherquant.shadow.export import (
     _build_part_manifest,
     _write_part_manifest,
@@ -384,40 +386,137 @@ def test_stray_tmp_file_detected(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. Exporter auto-repairs missing manifests (DecisionExporter integration).
+# 7. The exporter only attests parts it is publishing itself.
+#
+# The manifest is written before the part is published, so a published
+# part always already has its manifest and nothing ever has to be
+# "repaired". Signing whatever trailing part happens to lack a manifest
+# would let anyone who can write the export directory (but does not hold
+# the key) get an injected or replaced part signed by the real exporter.
 # ---------------------------------------------------------------------------
 
-def test_exporter_repairs_missing_manifest_after_crash(tmp_path: Path) -> None:
-    """Run batch once, delete the manifest, run again — manifest should be back."""
+_DECISION_COLUMNS = (
+    "decision_id,run_id,cycle_id,market_id,station,direction,state,"
+    "decision_time_utc,model_probability,net_edge,mode,created_at_utc"
+)
+
+
+def _insert_decision(db: Any, i: int) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    when = datetime(2026, 11, 17, 8, 0, tzinfo=UTC) + timedelta(minutes=i)
+    db.con.execute(
+        f"INSERT INTO shadow_decisions ({_DECISION_COLUMNS}) VALUES ({','.join(['?'] * 12)})",
+        [f"id-{i:04d}", "run-1", f"cycle-{i}", "m-0", "KLGA", "buy_yes", "ACCEPT", when, 0.6, 0.05, "LIVE", when],
+    )
+
+
+@pytest.fixture
+def shadow_db(tmp_path: Path):
+    from weatherquant.storage.shadow import ShadowDatabase
+
+    database = ShadowDatabase(tmp_path / "shadow.duckdb")
+    database.open()
+    yield database
+    database.close()
+
+
+def _real_exporter(db: Any, tmp_path: Path, **kwargs: Any) -> Any:
     from weatherquant.shadow.export import DecisionExporter
 
-    export_dir = tmp_path / "decisions-export"
-    parts = export_dir / "parts"
-    parts.mkdir(parents=True, exist_ok=True)
+    options: dict[str, Any] = {"batch_rows": 2, "max_seconds": 30.0, "max_parts_per_run": 10, "signing_key": "k"}
+    options.update(kwargs)
+    return DecisionExporter(db.con, tmp_path / "export", **options)
 
-    # We don't want to open the real shadow DB — build a tiny fake exporter
-    # path that uses a stub.  Easier: directly write part 1, delete manifest 1,
-    # then call the repair path.
-    _write_tiny_part(parts, 1, _make_rows(1, 3))
-    _write_tiny_part(parts, 2, _make_rows(4, 2))
-    # Only attest part 1.
-    _attest(parts, signing_key=None, start_index=1, end_index=1)
-    # Simulate missing manifest for part 2.
-    assert (parts / "part-000000002.jsonl").exists()
-    assert not (parts / "part-000000002.manifest.json").exists()
 
-    # A minimal exporter instance (no real con needed for the repair path).
-    exporter = object.__new__(DecisionExporter)
-    exporter.directory = export_dir
-    exporter._signing_key = None
-    exporter._publisher_run_id = "test"
+def test_exporter_run_produces_a_signed_chain_that_verifies(shadow_db: Any, tmp_path: Path) -> None:
+    for i in range(5):
+        _insert_decision(shadow_db, i)
+    result = _real_exporter(shadow_db, tmp_path).run_batch()
+    assert not any("failed" in note for note in result.notes), result.notes
+    assert result.parts_written == 3
+    parts = tmp_path / "export" / "parts"
+    report = verify_export_provenance(parts, signing_key="k")
+    assert report.verdict == VERDICT_PASS, report.as_dict()
+    assert report.verified_ok == 3
+    assert not list(parts.glob("*.tmp"))
 
-    repaired = exporter._reconcile_manifest({"rows_exported": 5, "next_part": 3})
-    assert repaired == 1
+
+def test_exporter_never_signs_an_injected_tail_part(shadow_db: Any, tmp_path: Path) -> None:
+    for i in range(2):
+        _insert_decision(shadow_db, i)
+    assert _real_exporter(shadow_db, tmp_path).run_batch().parts_written >= 1
+    parts = tmp_path / "export" / "parts"
+    assert (parts / "part-000000001.manifest.json").exists()
+
+    # Someone without the key drops a part of their own after the last one.
+    forged = {"decision_id": "forged", "export_seq": 2, "decision_time_utc": "2026-11-17T09:00:00+00:00"}
+    (parts / "part-000000002.jsonl").write_text(json.dumps(forged) + "\n", encoding="utf-8")
+
+    for i in range(2, 4):
+        _insert_decision(shadow_db, i)
+    _real_exporter(shadow_db, tmp_path).run_batch()
+
+    report = verify_export_provenance(parts, signing_key="k")
+    assert report.verdict == VERDICT_FAIL, report.as_dict()
+    statuses = {res.index: res.status for res in report.errors}
+    assert statuses.get(2) == VERIFY_MISSING_MANIFEST, report.as_dict()
+
+
+def test_exporter_never_re_signs_a_replaced_part_whose_manifest_was_deleted(
+    shadow_db: Any, tmp_path: Path
+) -> None:
+    for i in range(4):
+        _insert_decision(shadow_db, i)
+    assert _real_exporter(shadow_db, tmp_path).run_batch().parts_written >= 1
+    parts = tmp_path / "export" / "parts"
     assert (parts / "part-000000002.manifest.json").exists()
 
-    report = verify_export_provenance(parts)
-    assert report.verdict == VERDICT_PASS
+    # Replace the newest part and delete its manifest.
+    part2 = parts / "part-000000002.jsonl"
+    part2.write_text(part2.read_text(encoding="utf-8").replace("0.6", "0.9"), encoding="utf-8")
+    (parts / "part-000000002.manifest.json").unlink()
+
+    _insert_decision(shadow_db, 4)
+    _real_exporter(shadow_db, tmp_path).run_batch()
+
+    report = verify_export_provenance(parts, signing_key="k")
+    assert report.verdict == VERDICT_FAIL, report.as_dict()
+    statuses = {res.index: res.status for res in report.errors}
+    assert statuses.get(2) == VERIFY_MISSING_MANIFEST, report.as_dict()
+
+
+def test_crash_between_manifest_and_publish_recovers_on_the_next_tick(
+    shadow_db: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    import weatherquant.shadow.export as export_module
+    from weatherquant.shadow.export import read_export
+
+    for i in range(2):
+        _insert_decision(shadow_db, i)
+    real_write = export_module._write_part_manifest
+
+    def write_then_crash(path: Path, manifest: dict[str, Any]) -> Path:
+        real_write(path, manifest)
+        raise RuntimeError("simulated crash after the manifest, before the publish")
+
+    monkeypatch.setattr(export_module, "_write_part_manifest", write_then_crash)
+    first = _real_exporter(shadow_db, tmp_path).run_batch()
+    assert any("simulated crash" in note for note in first.notes), first.notes
+    parts = tmp_path / "export" / "parts"
+    assert not (parts / "part-000000001.jsonl").exists()
+    assert (parts / "part-000000001.manifest.json").exists()
+    assert not list(parts.glob("*.tmp"))
+    assert verify_export_provenance(parts, signing_key="k").verdict == VERDICT_FAIL
+
+    monkeypatch.setattr(export_module, "_write_part_manifest", real_write)
+    _insert_decision(shadow_db, 2)
+    _real_exporter(shadow_db, tmp_path).run_batch()
+
+    report = verify_export_provenance(parts, signing_key="k")
+    assert report.verdict == VERDICT_PASS, report.as_dict()
+    ids = [row["decision_id"] for row in read_export(tmp_path / "export")]
+    assert ids == ["id-0000", "id-0001", "id-0002"]
 
 
 # ---------------------------------------------------------------------------

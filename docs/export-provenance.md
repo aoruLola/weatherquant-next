@@ -69,19 +69,22 @@ hmac_sha256:              "<64 hex or null>"  # 可选，见下
 ## 发布原子性
 
 ```
-① _write_part()            → part-XXXXXXXXX.jsonl   (temp + fsync + rename, 沿用现有逻辑)
-② build_manifest(part, prev_manifest_path)
+① _stage_part()            → 临时文件 *.tmp（写完整字节 + fsync；尚未发布，消费者不读 *.tmp）
+② build_manifest(临时文件字节, prev_manifest)
 ③ _write_part_manifest()   → part-XXXXXXXXX.manifest.json (temp + fsync + rename)
-④ 只有 ① 和 ③ 都成功，run_batch() 才推进 state.json
+④ rename 临时文件 → part-XXXXXXXXX.jsonl（发布）
+⑤ 只有 ①–④ 都成功，run_batch() 才推进 state.json
 ```
 
-这样外部看到的可能"过渡态"只有三种，且每一种 verifier 都能识别：
+manifest 先于 part 发布，所以**任何已发布的 part 在发布那一刻就已有 manifest**；
+导出器从不为磁盘上已有的 part 事后补签。崩溃时外部可能看到的状态：
 
 | 外部看到 | 判定 |
 |---|---|
 | part 在，manifest 在 | 正常 OK（或 LEGACY_UNATTESTED 首段） |
-| part 在，manifest 不在（从第 N 片开始连续缺） | 前一片之后残留半写 → 第 N 片起 `MISSING_MANIFEST`，首段（1..N-1）视情况为 LEGACY |
-| 目录里存在 *.tmp | `STRAY_TMP_FILE` |
+| manifest 在，part 不在（③ 之后、④ 之前崩溃） | `UNKNOWN_PART`；state 未推进，下一次 tick 对同一 index 重写 manifest 与 part，恢复为 OK |
+| 目录里存在 *.tmp（① 之后被 kill） | `STRAY_TMP_FILE`（与改动前的分片临时文件行为相同，需人工清理） |
+| part 在，manifest 不在（第一份 manifest 之后） | `MISSING_MANIFEST`：不是本导出器发布的（手工拷贝/注入/老代码回滚），**不会被自动补签** |
 
 **关键不变量**：一旦某分片有 manifest，它之后所有分片都必须有 manifest，并且哈希链连续；
 否则视为"半写 / 未被发布者认证"。
@@ -99,12 +102,13 @@ hmac_sha256:              "<64 hex or null>"  # 可选，见下
 - 一旦某个 part index 有 manifest，它之后所有连续 part 若没有 manifest → `MISSING_MANIFEST`。
 - 若 legacy 之后**插入**一个新 part 但不带 manifest（老代码回滚，或手工拷贝）→ 同样报 `MISSING_MANIFEST`。
 
-### 崩溃后的自动补写
+### 不做自动补写（安全原因）
 
-`run_batch()` 在写新分片之前会调用 `_reconcile_manifest()`：只补写**最高已签名分片之后**的连续尾部
-（`_write_part` 成功但 `_write_part_manifest` 未完成的那一段），保证哈希链重新连续。
-它**不会**为纯 legacy 目录（一份 manifest 都没有）补写 manifest——那会把"从未被认证"伪装成"已认证"，
-抹掉 verifier 本来要报告的 `LEGACY_UNATTESTED` 事实。
+导出器**不会**为缺 manifest 的已存在分片补写 manifest。早期草案在 `run_batch()` 里补签
+「最高已签名分片之后」的尾部分片，但补签的对象只是磁盘上的文件：任何能写导出目录、却没有密钥的人
+都可以放入一个新的尾部分片，或替换最新分片并删掉它的 manifest，然后等下一次 tick 让导出器用真密钥
+签上——这正是 HMAC 要防的伪造。改为「先写 manifest、再发布 part」之后，正常流程与崩溃恢复都不需要补签：
+缺 manifest 的分片一律保持 `MISSING_MANIFEST`，需要人工核查。
 
 ### Consumer 侧
 
