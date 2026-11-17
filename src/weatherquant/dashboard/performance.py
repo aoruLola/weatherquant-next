@@ -173,7 +173,11 @@ class PerformanceState:
         # manifest's publish time is the fallback for a generation that has no
         # payload-level timestamp.
         published_at = payload.generated_at_utc or parse_utc(manifest.get("published_at_utc"))
-        consumed_at = payload.as_of_utc or parse_utc(_watermark_time(manifest))
+        # The consumed watermark is business time, like the export and ingest
+        # watermarks it is compared with. The payload's as_of_utc is the build's
+        # wall clock, so it is only the fallback for a generation published
+        # before the manifest recorded its watermark (see _watermark_time).
+        consumed_at = parse_utc(_watermark_time(manifest)) or payload.as_of_utc
         # The snapshot declares the cadence it is republished on; the Dashboard
         # only adds its grace. One meaning for `stale_after_seconds` on both
         # sides, rather than the manifest saying 300 and the reader saying 1500.

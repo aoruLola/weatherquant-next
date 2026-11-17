@@ -42,12 +42,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from weatherquant.dashboard.contracts import FreshnessState
+from weatherquant.dashboard.contracts import FreshnessState, LayerStatus
 
 __all__ = [
     "ExportState",
     "IngestState",
+    "LayerReading",
+    "LayerReport",
     "PerformanceLayers",
+    "build_layer_report",
     "evaluate_layers",
     "read_export_state",
     "read_ingest_state",
@@ -145,9 +148,7 @@ def read_ingest_state(directory: str | Path | None) -> IngestState:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return IngestState.unreadable(
-            "no ingest has recorded its position yet (ingest-state.json is absent)"
-        )
+        return IngestState.unreadable("no ingest has recorded its position yet (ingest-state.json is absent)")
     except (OSError, ValueError) as exc:
         return IngestState.unreadable(f"the ingest state could not be read: {exc}")
     if not isinstance(raw, dict):
@@ -246,11 +247,7 @@ def evaluate_layers(
         if export_state.readable and ingest_state.readable
         else None
     )
-    publication_lag = (
-        _diff(ingest_state.watermark_time, snapshot_consumed_time)
-        if ingest_state.readable
-        else None
-    )
+    publication_lag = _diff(ingest_state.watermark_time, snapshot_consumed_time) if ingest_state.readable else None
     snapshot_age = _lag(now, published_at_utc)
 
     layers = PerformanceLayers(
@@ -278,8 +275,7 @@ def evaluate_layers(
         return _verdict(
             layers,
             "ingestion",
-            f"ingest is {ingestion_lag:.0f}s behind the shadow export "
-            f"(limit {ingest_stale_after_seconds:.0f}s)",
+            f"ingest is {ingestion_lag:.0f}s behind the shadow export (limit {ingest_stale_after_seconds:.0f}s)",
         )
 
     if publication_lag is not None and publication_lag > publication_stale_after_seconds:
@@ -296,8 +292,7 @@ def evaluate_layers(
         return _verdict(
             layers,
             "publish_interval",
-            f"the snapshot is {snapshot_age:.0f}s old, beyond the "
-            f"{publish_interval_seconds:.0f}s publish interval",
+            f"the snapshot is {snapshot_age:.0f}s old, beyond the {publish_interval_seconds:.0f}s publish interval",
         )
 
     # An unreadable export or ingest state is not a freshness verdict on the
@@ -316,6 +311,218 @@ def evaluate_layers(
         )
 
     return layers
+
+
+#: The source labels used in the API response. Logical names only - a response
+#: can be pasted into an issue without leaking the NAS layout.
+EXPORT_SOURCE = "shadow export state.json · watermark[0]"
+INGEST_SOURCE = "performance ingest-state.json · watermark[0]"
+
+
+@dataclass(frozen=True, slots=True)
+class LayerReading:
+    """One layer, with the exact value the verdict was computed from."""
+
+    name: str
+    source: str
+    watermark_time: datetime | None = None
+    age_seconds: float | None = None
+    lag_seconds: float | None = None
+    threshold_seconds: float | None = None
+    status: LayerStatus = LayerStatus.UNKNOWN
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LayerReport:
+    """The four layer readings plus the first layer that crossed its limit."""
+
+    generation_id: str | None
+    layers: tuple[LayerReading, ...]
+    thresholds: dict[str, float]
+    lagging_layer: str | None = None
+    lagging_basis: str | None = None
+
+
+def build_layer_report(
+    *,
+    now: datetime,
+    export_state: ExportState,
+    ingest_state: IngestState,
+    snapshot_consumed_time: datetime | None,
+    published_at_utc: datetime | None,
+    publish_interval_seconds: float,
+    export_stale_after_seconds: float,
+    ingest_stale_after_seconds: float,
+    publication_stale_after_seconds: float,
+    generation_id: str | None = None,
+    consumed_source: str = "generation manifest.json · watermark[0]",
+    published_source: str = "generation manifest.json · published_at_utc",
+) -> LayerReport:
+    """Build the four layer readings the read-only API returns.
+
+    The judgements reuse the same arithmetic as :func:`evaluate_layers` - each
+    lag is measured against the live position of the layer upstream of it -
+    and add what an operator needs to verify the verdict: the watermark the
+    number came from, that source's name, the age, and the threshold applied.
+
+    ``LAGGING`` is used for a downstream layer that is inside its own limit but
+    cannot advance because an upstream layer is stale. A healthy 20-minute
+    publish cadence therefore produces ``OK``, not a false ``STALE``.
+    """
+    export_lag = _lag(now, export_state.watermark_time)
+    ingestion_lag = (
+        _diff(export_state.watermark_time, ingest_state.watermark_time)
+        if export_state.readable and ingest_state.readable
+        else None
+    )
+    publication_lag = _diff(ingest_state.watermark_time, snapshot_consumed_time) if ingest_state.readable else None
+    snapshot_age = _lag(now, published_at_utc)
+
+    export_status, export_reason = _self_status(
+        lag=export_lag,
+        threshold=export_stale_after_seconds,
+        missing_reason=export_state.reason or "the shadow export state carries no usable watermark",
+        label="the shadow export watermark",
+    )
+    export_layer = LayerReading(
+        name="export",
+        source=EXPORT_SOURCE,
+        watermark_time=export_state.watermark_time,
+        age_seconds=export_lag,
+        lag_seconds=export_lag,
+        threshold_seconds=export_stale_after_seconds,
+        status=export_status,
+        reason=export_reason,
+    )
+
+    ingest_missing = None
+    if not ingest_state.readable:
+        ingest_missing = ingest_state.reason or "no ingest position has been recorded"
+    elif not export_state.readable:
+        ingest_missing = (
+            "cannot compare ingest with the live export: "
+            f"{export_state.reason or 'the export watermark is unavailable'}"
+        )
+    consume_status, consume_reason = _relative_status(
+        lag=ingestion_lag,
+        threshold=ingest_stale_after_seconds,
+        missing_reason=ingest_missing,
+        upstream=export_layer,
+        label="ingest",
+        upstream_label="shadow export",
+    )
+    consume_layer = LayerReading(
+        name="performance_consume",
+        source=INGEST_SOURCE,
+        watermark_time=ingest_state.watermark_time,
+        age_seconds=_lag(now, ingest_state.watermark_time),
+        lag_seconds=ingestion_lag,
+        threshold_seconds=ingest_stale_after_seconds,
+        status=consume_status,
+        reason=consume_reason,
+    )
+
+    publish_missing = None
+    if snapshot_consumed_time is None:
+        publish_missing = "the current snapshot records no consumed watermark"
+    elif not ingest_state.readable:
+        publish_missing = (
+            "cannot compare the published snapshot with ingest: "
+            f"{ingest_state.reason or 'the ingest watermark is unavailable'}"
+        )
+    publish_status, publish_reason = _relative_status(
+        lag=publication_lag,
+        threshold=publication_stale_after_seconds,
+        missing_reason=publish_missing,
+        upstream=consume_layer,
+        label="publish",
+        upstream_label="ingest",
+    )
+    publish_layer = LayerReading(
+        name="publish",
+        source=consumed_source,
+        watermark_time=snapshot_consumed_time,
+        age_seconds=_lag(now, snapshot_consumed_time),
+        lag_seconds=publication_lag,
+        threshold_seconds=publication_stale_after_seconds,
+        status=publish_status,
+        reason=publish_reason,
+    )
+
+    snapshot_status, snapshot_reason = _relative_status(
+        lag=snapshot_age,
+        threshold=publish_interval_seconds,
+        missing_reason=(None if published_at_utc is not None else "the published generation records no publish time"),
+        upstream=publish_layer,
+        label="snapshot",
+        upstream_label="publish",
+    )
+    snapshot_layer = LayerReading(
+        name="snapshot",
+        source=published_source,
+        watermark_time=published_at_utc,
+        age_seconds=snapshot_age,
+        lag_seconds=snapshot_age,
+        threshold_seconds=publish_interval_seconds,
+        status=snapshot_status,
+        reason=snapshot_reason,
+    )
+
+    layers = (export_layer, consume_layer, publish_layer, snapshot_layer)
+    # Most upstream first: a stopped export explains every lag below it, and
+    # naming the upstream layer is the actionable finding.
+    lagging = next((layer for layer in layers if layer.status is LayerStatus.STALE), None)
+    return LayerReport(
+        generation_id=generation_id,
+        layers=layers,
+        thresholds={
+            "export_stale_after_seconds": export_stale_after_seconds,
+            "performance_consume_stale_after_seconds": ingest_stale_after_seconds,
+            "publish_stale_after_seconds": publication_stale_after_seconds,
+            "snapshot_stale_after_seconds": publish_interval_seconds,
+        },
+        lagging_layer=lagging.name if lagging else None,
+        lagging_basis=(f"{lagging.name}: {lagging.reason}" if lagging is not None and lagging.reason else None),
+    )
+
+
+def _self_status(
+    *,
+    lag: float | None,
+    threshold: float,
+    missing_reason: str,
+    label: str,
+) -> tuple[LayerStatus, str | None]:
+    if lag is None:
+        return LayerStatus.UNKNOWN, missing_reason
+    if lag > threshold:
+        return LayerStatus.STALE, f"{label} is {lag:.0f}s old (limit {threshold:.0f}s)"
+    return LayerStatus.OK, None
+
+
+def _relative_status(
+    *,
+    lag: float | None,
+    threshold: float,
+    missing_reason: str | None,
+    upstream: LayerReading,
+    label: str,
+    upstream_label: str,
+) -> tuple[LayerStatus, str | None]:
+    if missing_reason is not None or lag is None:
+        return LayerStatus.UNKNOWN, missing_reason or f"{label} has no comparable watermark"
+    if lag > threshold:
+        return (
+            LayerStatus.STALE,
+            f"{label} is {lag:.0f}s behind {upstream_label} (limit {threshold:.0f}s)",
+        )
+    if upstream.status in {LayerStatus.STALE, LayerStatus.LAGGING}:
+        return (
+            LayerStatus.LAGGING,
+            f"{label} is within its limit but {upstream_label} is not advancing ({upstream.status.value})",
+        )
+    return LayerStatus.OK, None
 
 
 def _unknown_reason(export_state: ExportState, ingest_state: IngestState) -> str | None:
