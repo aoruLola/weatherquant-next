@@ -49,7 +49,11 @@ CREATE TABLE shadow_decisions (
     model_name VARCHAR, model_version VARCHAR, model_probability DOUBLE,
     market_price DOUBLE, best_bid DOUBLE, best_ask DOUBLE, net_edge DOUBLE,
     snapshot_age_ms BIGINT, forecast_age_hours DOUBLE,
-    available_depth_usd DOUBLE, thresholds_version VARCHAR, run_id VARCHAR
+    available_depth_usd DOUBLE, thresholds_version VARCHAR, run_id VARCHAR,
+    forecast_run_time_utc TIMESTAMPTZ, snapshot_id VARCHAR, book_id VARCHAR,
+    venue_ts_utc TIMESTAMPTZ, collector_received_at_utc TIMESTAMPTZ,
+    shadow_received_at_utc TIMESTAMPTZ, spread DOUBLE, mode_reason VARCHAR,
+    evidence_version INTEGER, book_source VARCHAR, book_source_event_id VARCHAR
 );
 CREATE TABLE rejection_reasons (
     decision_id VARCHAR, ordinal INTEGER, reason VARCHAR, is_primary BOOLEAN
@@ -57,7 +61,8 @@ CREATE TABLE rejection_reasons (
 CREATE TABLE model_predictions (
     model_name VARCHAR, model_version VARCHAR, target_date DATE,
     event_id VARCHAR, probabilities_json VARCHAR, predicted_max_f DOUBLE,
-    forecast_run_time_utc TIMESTAMPTZ, training_cutoff_utc TIMESTAMPTZ,
+    forecast_run_time_utc TIMESTAMPTZ, forecast_publishable_at_utc TIMESTAMPTZ,
+    forecast_publishable_basis VARCHAR, training_cutoff_utc TIMESTAMPTZ,
     forecast_received_at_utc TIMESTAMPTZ, station VARCHAR
 );
 """
@@ -87,11 +92,11 @@ def shadow_con(tmp_path: Path):
         ],
     )
     con.executemany(
-        "INSERT INTO shadow_decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO shadow_decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [
-            ("d1", now - timedelta(seconds=30), "m-81", "81°F", target, "buy_yes", "ACCEPT", "LIVE", None, "calibrated", "v1", 0.41, 0.65, 0.62, 0.65, 0.03, 400, 3.5, 48.0, "v3", "run-1"),
-            ("d2", now - timedelta(seconds=60), "m-81", "81°F", target, "buy_yes", "REJECT", "LIVE", "EDGE_BELOW_THRESHOLD", "calibrated", "v1", 0.41, 0.65, 0.62, 0.65, -0.04, 400, 3.5, 48.0, "v3", "run-1"),
-            ("d3", now - timedelta(seconds=90), "m-80", "80°F or below", target, "sell_yes", "NO_TRADE", "LIVE", "NO_LIQUIDITY", "calibrated", "v1", 0.7, 0.13, 0.10, 0.13, 0.0, 400, 3.5, 4.0, "v3", "run-1"),
+            ("d1", now - timedelta(seconds=30), "m-81", "81°F", target, "buy_yes", "ACCEPT", "LIVE", None, "calibrated", "v1", 0.41, 0.65, 0.62, 0.65, 0.03, 400, 3.5, 48.0, "v3", "run-1", now - timedelta(hours=6), "snap-d1", "book-d1", now - timedelta(seconds=31), now - timedelta(seconds=30), now - timedelta(seconds=29), 0.03, "configured", 1, "rest", "book-event-d1"),
+            ("d2", now - timedelta(seconds=60), "m-81", "81°F", target, "buy_yes", "REJECT", "LIVE", "EDGE_BELOW_THRESHOLD", "calibrated", "v1", 0.41, 0.65, 0.62, 0.65, -0.04, 400, 3.5, 48.0, "v3", "run-1", now - timedelta(hours=6), "snap-d2", "book-d2", now - timedelta(seconds=61), now - timedelta(seconds=60), now - timedelta(seconds=59), 0.03, "configured", 1, "rest", "book-event-d2"),
+            ("d3", now - timedelta(seconds=90), "m-80", "80°F or below", target, "sell_yes", "NO_TRADE", "LIVE", "NO_LIQUIDITY", "calibrated", "v1", 0.7, 0.13, 0.10, 0.13, 0.0, 400, 3.5, 4.0, "v3", "run-1", now - timedelta(hours=6), "snap-d3", "book-d3", now - timedelta(seconds=91), now - timedelta(seconds=90), now - timedelta(seconds=89), 0.03, "configured", 1, "ws", "book-event-d3"),
         ],
     )
     con.executemany(
@@ -102,10 +107,10 @@ def shadow_con(tmp_path: Path):
     # 0001_shadow_schema.sql - a fixture that invents columns the real
     # database does not have is how a query passes here and fails in production.
     con.executemany(
-        "INSERT INTO model_predictions VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO model_predictions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         [
-            ("calibrated", "v1", target, "event-1", json.dumps({"81°F": 0.41, "80°F or below": 0.59}), 81.2, now - timedelta(hours=6), datetime(2026, 9, 1, tzinfo=UTC), now - timedelta(hours=6), "KLGA"),
-            ("gfs_raw", "v1", target, "event-1", json.dumps({"81°F": 0.38, "80°F or below": 0.62}), 80.9, now - timedelta(hours=6), datetime(2026, 9, 1, tzinfo=UTC), now - timedelta(hours=6), "KLGA"),
+            ("calibrated", "v1", target, "event-1", json.dumps({"81°F": 0.41, "80°F or below": 0.59}), 81.2, now - timedelta(hours=6), now - timedelta(hours=6), "forecast_run_time_utc", datetime(2026, 9, 1, tzinfo=UTC), now - timedelta(hours=6), "KLGA"),
+            ("gfs_raw", "v1", target, "event-1", json.dumps({"81°F": 0.38, "80°F or below": 0.62}), 80.9, now - timedelta(hours=6), now - timedelta(hours=6), "forecast_run_time_utc", datetime(2026, 9, 1, tzinfo=UTC), now - timedelta(hours=6), "KLGA"),
         ],
     )
     yield con

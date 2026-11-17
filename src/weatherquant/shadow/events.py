@@ -31,7 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -173,6 +173,12 @@ class CatalogMarket:
     accepting_orders: bool
     raw_sha256: str
     source_run_id: str
+    rules_text: str | None = None
+    resolution_source: str | None = None
+    start_time_utc: datetime | None = None
+    end_time_utc: datetime | None = None
+    schedule_source: str | None = None
+    schedule_reason: str | None = None
 
     @property
     def tradeable(self) -> bool:
@@ -198,6 +204,41 @@ def _opt_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _schedule_time(
+    market: dict[str, Any], event: dict[str, Any], keys: tuple[str, ...]
+) -> tuple[datetime | None, str | None, str | None]:
+    """Read one trading-schedule timestamp without inventing a timezone.
+
+    Gamma sends ``startDate``/``endDate`` as full timestamps ending in ``Z``
+    and ``startDateIso``/``endDateIso`` as bare civil dates. A date-only or
+    otherwise naive value says nothing about the instant, so it is skipped and
+    the next field (then the event) is tried. "No timezone" is reported only
+    when no timezone-aware value exists anywhere.
+    """
+    naive: list[str] = []
+    invalid: list[str] = []
+    for owner_name, owner in (("market", market), ("event", event)):
+        for key in keys:
+            raw = owner.get(key)
+            if raw is None or raw == "":
+                continue
+            source = f"gamma:{owner_name}.{key}"
+            try:
+                parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except ValueError:
+                invalid.append(source)
+                continue
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                naive.append(source)
+                continue
+            return parsed.astimezone(UTC), source, None
+    if naive:
+        return None, naive[0], f"{', '.join(naive)} has no timezone; trading time is unknown"
+    if invalid:
+        return None, invalid[0], f"{', '.join(invalid)} is not a valid ISO timestamp"
+    return None, None, f"gamma market/event has no {'/'.join(keys)}"
 
 
 def parse_gamma(
@@ -263,7 +304,19 @@ def parse_gamma(
             problems.append(f"{market_id}: no YES token id")
 
         fee_schedule = market.get("feeSchedule") or {}
-        market_rules = str(market.get("description") or rules)
+        market_rules = str(market.get("description") or rules) or None
+        market_resolution = str(market.get("resolutionSource") or resolution) or None
+        # Gamma's plain startDate/endDate carry a time and offset; the *Iso
+        # fields are bare dates, so they are only a fallback (and a bare date
+        # is skipped rather than read as midnight in some assumed zone).
+        start_time, start_source, start_reason = _schedule_time(
+            market, payload, ("startDate", "startDateIso")
+        )
+        end_time, end_source, end_reason = _schedule_time(
+            market, payload, ("endDate", "endDateIso")
+        )
+        schedule_sources = [source for source in (start_source, end_source) if source]
+        schedule_reasons = [reason for reason in (start_reason, end_reason) if reason]
         markets.append(
             CatalogMarket(
                 market_id=market_id,
@@ -286,6 +339,12 @@ def parse_gamma(
                 accepting_orders=bool(market.get("acceptingOrders")),
                 raw_sha256=digest,
                 source_run_id=run_id,
+                rules_text=market_rules,
+                resolution_source=market_resolution,
+                start_time_utc=start_time,
+                end_time_utc=end_time,
+                schedule_source=", ".join(schedule_sources) or None,
+                schedule_reason="; ".join(schedule_reasons) or None,
             )
         )
     return markets, problems

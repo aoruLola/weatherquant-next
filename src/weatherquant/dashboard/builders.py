@@ -349,6 +349,64 @@ def _target_day_ended(target_date: date | None, now: datetime) -> bool:
     return now >= end
 
 
+def _parse_aware(value: Any) -> datetime | None:
+    """Parse a trading timestamp; unlike source timestamps, naive means unknown."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _open_now(
+    start: datetime | None,
+    end: datetime | None,
+    now: datetime,
+    *,
+    tradeable: bool | None,
+    schedule_source: str | None,
+    schedule_reason: str | None,
+) -> tuple[bool | None, str | None, str | None]:
+    """Whether the venue is accepting orders right now.
+
+    Decided by the venue's own flags (``active`` and ``acceptingOrders`` and
+    not ``closed``), not by the Gamma schedule: weather markets keep accepting
+    orders and trading after their published ``endDate`` until the venue
+    closes them, so ``[start, end)`` would call a live book closed. The
+    schedule stays informational and is mentioned in the reason. Unknown
+    flags stay unknown.
+    """
+    del schedule_reason  # informational only; it never decides the answer
+    if tradeable is None:
+        return None, None, "venue order-acceptance flags are unavailable"
+    source = "venue flags (active, acceptingOrders, closed)"
+    if not tradeable:
+        return False, source, "venue flags do not currently allow order acceptance"
+    if end is not None and now >= end:
+        where = schedule_source or "market schedule"
+        return True, source, f"past the scheduled end ({where}); the venue still accepts orders"
+    if start is not None and now < start:
+        where = schedule_source or "market schedule"
+        return True, source, f"before the scheduled start ({where}); the venue already accepts orders"
+    return True, source, None
+
+
+def _rules_reason(rules_text: str | None, resolution_source: str | None) -> str | None:
+    missing = [
+        name
+        for name, value in (("rules_text", rules_text), ("resolution_source", resolution_source))
+        if not value
+    ]
+    return f"Gamma metadata missing: {', '.join(missing)}" if missing else None
+
+
 def _summary_from_catalog(
     market,
     book: BookQuote | None,
@@ -357,11 +415,37 @@ def _summary_from_catalog(
     model_reason: str,
 ) -> MarketSummary:
     target = market.target_date if isinstance(market.target_date, date) else None
+    start = getattr(market, "start_time_utc", None)
+    end = getattr(market, "end_time_utc", None)
+    schedule_source = getattr(market, "schedule_source", None)
+    schedule_reason = getattr(market, "schedule_reason", None)
+    open_now, open_source, open_reason = _open_now(
+        start,
+        end,
+        now,
+        tradeable=market.tradeable,
+        schedule_source=schedule_source,
+        schedule_reason=schedule_reason,
+    )
+    rules_text = getattr(market, "rules_text", None)
+    resolution_source = getattr(market, "resolution_source", None)
     return MarketSummary(
         market_id=market.market_id,
         event_id=market.event_id,
         question=market.question,
         target_date=target,
+        target_date_reason=None if target else "Gamma event target date is missing or unparseable",
+        rules_text=rules_text,
+        resolution_source=resolution_source,
+        rules_source="archive-tail:gamma" if rules_text or resolution_source else None,
+        rules_reason=_rules_reason(rules_text, resolution_source),
+        start_time_utc=start,
+        end_time_utc=end,
+        schedule_source=schedule_source,
+        schedule_reason=schedule_reason,
+        open_now=open_now,
+        open_now_source=open_source,
+        open_now_reason=open_reason,
         target_day_ended=_target_day_ended(target, now),
         bracket_label=market.bracket_label,
         bracket_low=market.bracket.low if market.bracket else None,
@@ -382,7 +466,12 @@ def _summary_from_catalog(
     )
 
 
-def _producer_markets(payload: dict[str, Any], now: datetime, book_stale_seconds: float) -> list[MarketSummary]:
+def _producer_markets(
+    payload: dict[str, Any],
+    now: datetime,
+    book_stale_seconds: float,
+    archive: ArchiveResult | None = None,
+) -> list[MarketSummary]:
     """Adapt a published market-snapshot.json (contract §3) to summaries."""
     items: list[MarketSummary] = []
     raw_items = payload.get("data", {}).get("markets", []) if isinstance(payload.get("data"), dict) else []
@@ -415,12 +504,63 @@ def _producer_markets(payload: dict[str, Any], now: datetime, book_stale_seconds
             )
         model_prob = _num(entry.get("model_probability"))
         target = _parse_date(entry.get("target_date"))
+        market_id = str(entry.get("market_id") or "")
+        catalog = archive.catalog.get(market_id) if archive is not None else None
+
+        rules_text = entry.get("rules_text") or getattr(catalog, "rules_text", None)
+        resolution_source = entry.get("resolution_source") or getattr(
+            catalog, "resolution_source", None
+        )
+        rules_sources = []
+        if entry.get("rules_text") or entry.get("resolution_source"):
+            rules_sources.append("market-snapshot")
+        if catalog is not None and (
+            getattr(catalog, "rules_text", None) or getattr(catalog, "resolution_source", None)
+        ):
+            rules_sources.append("archive-tail:gamma")
+
+        raw_start, raw_end = entry.get("start_time_utc"), entry.get("end_time_utc")
+        start = _parse_aware(raw_start) if raw_start else getattr(catalog, "start_time_utc", None)
+        end = _parse_aware(raw_end) if raw_end else getattr(catalog, "end_time_utc", None)
+        schedule_source = entry.get("schedule_source") or getattr(catalog, "schedule_source", None)
+        schedule_reason = (
+            None
+            if start is not None and end is not None
+            else getattr(catalog, "schedule_reason", None) or entry.get("schedule_reason")
+        )
+        invalid_raw_schedule = (bool(raw_start) and start is None) or (bool(raw_end) and end is None)
+        if invalid_raw_schedule:
+            schedule_reason = "market-snapshot start/end must be timezone-aware ISO timestamps"
+        open_now, open_source, open_reason = _open_now(
+            start,
+            end,
+            now,
+            tradeable=(
+                bool(entry["tradeable"]) if entry.get("tradeable") is not None else None
+            ),
+            schedule_source=schedule_source,
+            schedule_reason=schedule_reason,
+        )
         items.append(
             MarketSummary(
-                market_id=str(entry.get("market_id") or ""),
+                market_id=market_id,
                 event_id=entry.get("event_id"),
                 question=str(entry.get("question") or ""),
                 target_date=target,
+                target_date_reason=(
+                    None if target else entry.get("target_date_reason") or "market-snapshot has no valid target_date"
+                ),
+                rules_text=rules_text,
+                resolution_source=resolution_source,
+                rules_source=" + ".join(rules_sources) or None,
+                rules_reason=_rules_reason(rules_text, resolution_source),
+                start_time_utc=start,
+                end_time_utc=end,
+                schedule_source=schedule_source,
+                schedule_reason=schedule_reason,
+                open_now=open_now,
+                open_now_source=open_source,
+                open_now_reason=open_reason,
                 target_day_ended=_target_day_ended(target, now),
                 bracket_label=str(entry.get("bracket_label") or ""),
                 bracket_low=_num(entry.get("bracket_low")),
@@ -438,7 +578,11 @@ def _producer_markets(payload: dict[str, Any], now: datetime, book_stale_seconds
                 if isinstance(entry.get("last_decision"), dict)
                 else None,
                 model_source="market-snapshot",
-                model_reason=None,
+                model_reason=(
+                    None
+                    if model_prob is not None
+                    else entry.get("model_reason") or "market-snapshot has no model_probability for this market"
+                ),
                 updated_at_utc=_parse_any(entry.get("updated_at_utc")),
             )
         )
@@ -459,10 +603,15 @@ def markets(
 ) -> tuple[MarketsData, Freshness]:
     producer = state.sources.named_snapshot("market-snapshot", "market-snapshot.json", now)
     if producer.payload is not None:
-        items = _producer_markets(producer.payload, now, state.settings.book_stale_seconds)
+        # DuckDB's market_catalog has no rules/schedule columns. Supplement the
+        # producer row by market_id from the bounded Gamma tail; never replace
+        # its decision-time model/book evidence with a newer archive book.
+        archive = state.archive.read(now)
+        items = _producer_markets(
+            producer.payload, now, state.settings.book_stale_seconds, archive
+        )
         source, source_status = "market-snapshot", producer.freshness.state
         reason = producer.freshness.reason
-        archive: ArchiveResult | None = None
     else:
         archive = state.archive.read(now)
         source, source_status = "archive-tail", archive.freshness.state
@@ -663,14 +812,38 @@ def forecasts(state: DashboardState, now: datetime) -> tuple[ForecastsData, Fres
                     for b in entry.get("buckets", [])
                     if isinstance(b, dict)
                 ]
+                issued = _parse_any(
+                    entry.get("forecast_issued_at_utc") or entry.get("forecast_run_time_utc")
+                )
+                publishable = _parse_any(entry.get("forecast_publishable_at_utc"))
+                publishable_basis = entry.get("forecast_publishable_basis")
+                received = _parse_any(entry.get("forecast_received_at_utc"))
+                version = entry.get("version")
+                target = _parse_date(entry.get("target_date"))
                 distributions.append(
                     ForecastDistribution(
                         model=str(entry.get("model") or ""),
-                        version=entry.get("version"),
-                        target_date=_parse_date(entry.get("target_date")),
-                        forecast_run_time_utc=_parse_any(entry.get("forecast_run_time_utc")),
+                        version=version,
+                        version_reason=None if version else "model_predictions.model_version is missing",
+                        target_date=target,
+                        target_date_reason=None if target else "model_predictions.target_date is missing or invalid",
+                        forecast_run_time_utc=issued,
+                        forecast_issued_at_utc=issued,
+                        forecast_issued_reason=(
+                            None if issued else "model_predictions.forecast_run_time_utc is missing or invalid"
+                        ),
+                        forecast_publishable_at_utc=publishable,
+                        forecast_publishable_basis=publishable_basis,
+                        forecast_publishable_reason=(
+                            None
+                            if publishable and publishable_basis
+                            else "forecast publishable time/basis is unavailable in model_predictions"
+                        ),
                         training_cutoff_utc=_parse_any(entry.get("training_cutoff_utc")),
-                        forecast_received_at_utc=_parse_any(entry.get("forecast_received_at_utc")),
+                        forecast_received_at_utc=received,
+                        forecast_received_reason=(
+                            None if received else "model_predictions.forecast_received_at_utc is missing or invalid"
+                        ),
                         predicted_max_f=_num(entry.get("predicted_max_f")),
                         station=entry.get("station"),
                         buckets=buckets,
@@ -813,7 +986,7 @@ def decisions(
 
 
 def _row_from_entry(entry: dict[str, Any]) -> DecisionRow:
-    return DecisionRow(
+    row = DecisionRow(
         decision_id=str(entry.get("decision_id") or ""),
         decided_at_utc=_parse_any(entry.get("decided_at_utc")),
         market_id=str(entry.get("market_id") or ""),
@@ -837,7 +1010,44 @@ def _row_from_entry(entry: dict[str, Any]) -> DecisionRow:
         available_depth_usd=_num(entry.get("available_depth_usd")),
         thresholds_version=entry.get("thresholds_version"),
         run_id=entry.get("run_id"),
+        forecast_run_time_utc=_parse_any(entry.get("forecast_run_time_utc")),
+        snapshot_id=entry.get("snapshot_id"),
+        book_id=entry.get("book_id"),
+        book_venue_ts_utc=_parse_any(entry.get("book_venue_ts_utc")),
+        book_collector_received_at_utc=_parse_any(entry.get("book_collector_received_at_utc")),
+        book_shadow_received_at_utc=_parse_any(entry.get("book_shadow_received_at_utc")),
+        spread=_num(entry.get("spread")),
+        mode_reason=entry.get("mode_reason"),
+        evidence_version=_int(entry.get("evidence_version")),
+        book_source=entry.get("book_source"),
+        book_source_event_id=entry.get("book_source_event_id"),
+        evidence_source="shadow_decisions",
     )
+    missing = [
+        field
+        for field in (
+            "mode",
+            "model_name",
+            "model_version",
+            "model_probability",
+            "forecast_run_time_utc",
+            "best_bid",
+            "best_ask",
+            "net_edge_usd",
+            "book_source",
+            "book_venue_ts_utc",
+            "book_collector_received_at_utc",
+            "book_shadow_received_at_utc",
+        )
+        if getattr(row, field) is None
+    ]
+    row.evidence_reason = (
+        f"shadow_decisions has no stored value for: {', '.join(missing)}; "
+        "later token_books are not substituted"
+        if missing
+        else None
+    )
+    return row
 
 
 def _filter_rows(
