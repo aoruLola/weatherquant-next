@@ -1510,15 +1510,23 @@ def _consumed_time(
     summary: dict[str, Any] | None,
     manifest: dict[str, Any],
 ) -> tuple[datetime | None, str]:
-    if isinstance(summary, dict):
-        consumed = parse_utc(summary.get("as_of_utc"))
-        if consumed is not None:
-            return consumed, "published snapshot summary.json · as_of_utc"
+    """The business-time watermark the published generation consumed.
+
+    The manifest's ``watermark[0]`` is that watermark, on the same clock as the
+    export and ingest watermarks it is compared with. A payload's
+    ``as_of_utc`` is stamped with the build's wall clock, so it is only a
+    fallback for generations published before the manifest recorded one -
+    preferring it would hide however far the consumed data trailed the build.
+    """
     watermark = manifest.get("watermark")
     if isinstance(watermark, (list, tuple)) and watermark:
         consumed = parse_utc(watermark[0])
         if consumed is not None:
             return consumed, "generation manifest.json · watermark[0]"
+    if isinstance(summary, dict):
+        consumed = parse_utc(summary.get("as_of_utc"))
+        if consumed is not None:
+            return consumed, "published snapshot summary.json · as_of_utc (build time; no manifest watermark)"
     return None, "no snapshot or manifest watermark"
 
 

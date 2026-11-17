@@ -319,7 +319,7 @@ def test_publish_and_snapshot_come_from_one_generation(tmp_path: Path):
     assert "generation" in data["generation_source"]
 
 
-def test_publish_watermark_falls_back_to_the_manifest_and_says_so(tmp_path: Path):
+def test_publish_watermark_reads_the_manifest_and_says_so(tmp_path: Path):
     now = datetime.now(tz=UTC)
     performance = tmp_path / "performance"
     published = _publish_generation(
@@ -345,6 +345,74 @@ def test_publish_watermark_falls_back_to_the_manifest_and_says_so(tmp_path: Path
     assert datetime.fromisoformat(layers["publish"]["watermark_utc"]) == datetime.fromisoformat(
         published["consumed_at"]
     )
+
+
+def test_publish_layer_uses_the_consumed_watermark_not_the_build_clock(tmp_path: Path):
+    """The real producer stamps summary.json ``as_of_utc`` with the build's
+    wall clock, while manifest ``watermark[0]`` is the business time it
+    consumed. Here the build ran 60s ago but had only consumed data up to
+    3000s ago (a backlog); ingest has since reached 10s ago. Publish is
+    really 2990s behind ingest - judging it by the build clock (50s) would
+    report a stalled publish as OK.
+    """
+    now = datetime.now(tz=UTC)
+    performance = tmp_path / "performance"
+    published = _publish_generation(
+        performance,
+        now=now,
+        published_ago=60,
+        consumed_ago=60,
+        watermark_ago=3000,
+    )
+    _write_export(tmp_path / "shadow", now=now, ago=10)
+    _write_ingest(performance, now=now, ago=10)
+
+    with _client(tmp_path) as client:
+        body = _layers(client)
+        perf = client.get("/api/v1/performance/summary").json()
+
+    data = body["data"]
+    layers = _by_name(data)
+    publish = layers["publish"]
+    assert publish["source"] == "generation manifest.json · watermark[0]"
+    consumed = datetime.fromisoformat(publish["watermark_utc"])
+    assert abs((consumed - (now - timedelta(seconds=3000))).total_seconds()) < 1
+    assert publish["lag_seconds"] == pytest.approx(2990, abs=2)
+    assert publish["status"] == "STALE"
+    assert data["lagging_layer"] == "publish"
+    assert published["consumed_at"] != publish["watermark_utc"]
+
+    # The Performance endpoints' envelope must agree with the health page.
+    freshness = perf["freshness"]
+    assert freshness["publication_lag_seconds"] == pytest.approx(2990, abs=2)
+    assert freshness["lagging_layer"] == "publication"
+    assert freshness["state"] == "stale"
+
+
+def test_publish_layer_falls_back_to_summary_as_of_when_manifest_has_no_watermark(tmp_path: Path):
+    now = datetime.now(tz=UTC)
+    performance = tmp_path / "performance"
+    published = _publish_generation(
+        performance,
+        now=now,
+        published_ago=60,
+        consumed_ago=120,
+    )
+    generation = resolve_generation(performance)
+    assert generation.directory is not None
+    manifest_path = generation.directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["watermark"] = None
+    write_json(manifest_path, manifest)
+    _write_export(tmp_path / "shadow", now=now, ago=30)
+    _write_ingest(performance, now=now, ago=30)
+
+    with _client(tmp_path) as client:
+        body = _layers(client)
+
+    publish = _by_name(body["data"])["publish"]
+    assert publish["source"].startswith("published snapshot summary.json · as_of_utc")
+    assert datetime.fromisoformat(publish["watermark_utc"]) == datetime.fromisoformat(published["consumed_at"])
 
 
 def test_broken_generation_pointer_does_not_fall_back_to_flat_files(tmp_path: Path):

@@ -217,7 +217,7 @@ export function layeredHealthFixture(
       {
         name: 'publish',
         watermark_utc: iso(2400),
-        source: 'published snapshot summary.json · as_of_utc',
+        source: 'generation manifest.json · watermark[0]',
         age_seconds: 2400,
         lag_seconds: 2400,
         threshold_seconds: 1500,

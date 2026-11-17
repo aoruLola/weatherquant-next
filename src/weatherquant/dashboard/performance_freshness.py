@@ -356,7 +356,7 @@ def build_layer_report(
     ingest_stale_after_seconds: float,
     publication_stale_after_seconds: float,
     generation_id: str | None = None,
-    consumed_source: str = "published snapshot summary.json · as_of_utc",
+    consumed_source: str = "generation manifest.json · watermark[0]",
     published_source: str = "generation manifest.json · published_at_utc",
 ) -> LayerReport:
     """Build the four layer readings the read-only API returns.
