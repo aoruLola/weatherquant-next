@@ -24,9 +24,10 @@ import type { MarketSummary, MarketsData } from '../types'
 const DEFAULT_STATUS = 'tradeable'
 
 /**
- * Current open state comes from the server's timezone-aware schedule check.
- * `open_now === null` means the inputs were insufficient: show UNKNOWN rather
- * than inheriting the venue's `tradeable` flag as if it were a clock.
+ * Current open state comes from the server, which follows the venue's own
+ * order-acceptance flags (weather markets keep trading after Gamma's endDate);
+ * the schedule is shown as information only. `open_now === null` means the
+ * flags were unavailable: show UNKNOWN rather than guessing.
  */
 function openState(market: MarketSummary): {
   value: string
@@ -37,7 +38,7 @@ function openState(market: MarketSummary): {
     return {
       value: 'live',
       label: 'OPEN',
-      title: `依据 ${market.open_now_source ?? 'market schedule'}；开始时刻含、结束时刻不含`,
+      title: `依据 ${market.open_now_source ?? '交易所下单标志'}${market.open_now_reason ? `；${market.open_now_reason}` : ''}`,
     }
   }
   if (market.open_now === false) {
@@ -52,7 +53,7 @@ function openState(market: MarketSummary): {
     label: 'UNKNOWN',
     title:
       market.open_now_reason ??
-      '缺少带时区的真实起止时间，无法判断当前是否开放（不会默认开放）',
+      '缺少交易所下单标志，无法判断当前是否开放（不会默认开放）',
   }
 }
 

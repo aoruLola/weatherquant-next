@@ -41,11 +41,11 @@ describe('Markets', () => {
     expect(first).toHaveTextContent('OPEN')
   })
 
-  it('shows UNKNOWN rather than OPEN when the schedule is unavailable', async () => {
+  it('shows UNKNOWN rather than OPEN when the venue flags are unavailable', async () => {
     const unknown = marketFixture({
       open_now: null,
       open_now_source: null,
-      open_now_reason: 'timezone-aware market start and end times are required',
+      open_now_reason: 'venue order-acceptance flags are unavailable',
       start_time_utc: null,
       end_time_utc: null,
       target_date: null,
@@ -103,14 +103,14 @@ describe('Markets', () => {
     expect(screen.getByTestId('markets-empty')).toHaveTextContent('collector raw archive not found')
   })
 
-  it('closes a market whose schedule has ended, even if a New York day label remains', async () => {
+  it('closes a market the venue stopped accepting orders for, even if a New York day label remains', async () => {
     mockFetch({
       '/api/v1/markets': envelopeOf(
         marketsFixture([
           marketFixture({
             target_day_ended: true,
             open_now: false,
-            open_now_reason: 'current time is at/after the market end (end is exclusive)',
+            open_now_reason: 'venue flags do not currently allow order acceptance',
           }),
         ]),
       ),

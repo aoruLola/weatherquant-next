@@ -370,24 +370,31 @@ def _open_now(
     end: datetime | None,
     now: datetime,
     *,
-    tradeable: bool,
+    tradeable: bool | None,
     schedule_source: str | None,
     schedule_reason: str | None,
 ) -> tuple[bool | None, str | None, str | None]:
-    """Venue schedule uses [start, end); flags alone never prove it is open."""
-    if schedule_reason:
-        return None, None, schedule_reason
-    if start is None or end is None:
-        return None, None, "timezone-aware market start and end times are required"
-    if start >= end:
-        return None, None, "market start time must be earlier than its end time"
-    source = f"{schedule_source or 'market schedule'} + venue flags"
-    if now < start:
-        return False, source, "current time is before the market start (start is inclusive)"
-    if now >= end:
-        return False, source, "current time is at/after the market end (end is exclusive)"
+    """Whether the venue is accepting orders right now.
+
+    Decided by the venue's own flags (``active`` and ``acceptingOrders`` and
+    not ``closed``), not by the Gamma schedule: weather markets keep accepting
+    orders and trading after their published ``endDate`` until the venue
+    closes them, so ``[start, end)`` would call a live book closed. The
+    schedule stays informational and is mentioned in the reason. Unknown
+    flags stay unknown.
+    """
+    del schedule_reason  # informational only; it never decides the answer
+    if tradeable is None:
+        return None, None, "venue order-acceptance flags are unavailable"
+    source = "venue flags (active, acceptingOrders, closed)"
     if not tradeable:
         return False, source, "venue flags do not currently allow order acceptance"
+    if end is not None and now >= end:
+        where = schedule_source or "market schedule"
+        return True, source, f"past the scheduled end ({where}); the venue still accepts orders"
+    if start is not None and now < start:
+        where = schedule_source or "market schedule"
+        return True, source, f"before the scheduled start ({where}); the venue already accepts orders"
     return True, source, None
 
 
@@ -528,7 +535,9 @@ def _producer_markets(
             start,
             end,
             now,
-            tradeable=bool(entry.get("tradeable", False)),
+            tradeable=(
+                bool(entry["tradeable"]) if entry.get("tradeable") is not None else None
+            ),
             schedule_source=schedule_source,
             schedule_reason=schedule_reason,
         )

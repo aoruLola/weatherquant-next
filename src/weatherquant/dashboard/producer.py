@@ -288,7 +288,7 @@ def build_markets_snapshot(
                 "schedule_reason": "market_catalog does not store Gamma trading start/end; API may supplement archive-tail metadata",
                 "open_now": None,
                 "open_now_source": None,
-                "open_now_reason": "timezone-aware trading start/end are unavailable in market_catalog",
+                "open_now_reason": "computed by the dashboard API from the venue order-acceptance flags",
                 "bracket_label": str(bracket_label or ""),
                 "bracket_low": None,
                 "bracket_high": None,

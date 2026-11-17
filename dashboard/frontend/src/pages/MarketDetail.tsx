@@ -93,7 +93,7 @@ export default function MarketDetail() {
               label={openLabel}
               title={
                 market.open_now_reason ??
-                `依据 ${market.open_now_source ?? 'market schedule'}；开始时刻含、结束时刻不含`
+                `依据 ${market.open_now_source ?? '交易所下单标志'}`
               }
             />
           )

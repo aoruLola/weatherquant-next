@@ -209,7 +209,16 @@ def _opt_float(value: Any) -> float | None:
 def _schedule_time(
     market: dict[str, Any], event: dict[str, Any], keys: tuple[str, ...]
 ) -> tuple[datetime | None, str | None, str | None]:
-    """Read one trading-schedule timestamp without inventing a timezone."""
+    """Read one trading-schedule timestamp without inventing a timezone.
+
+    Gamma sends ``startDate``/``endDate`` as full timestamps ending in ``Z``
+    and ``startDateIso``/``endDateIso`` as bare civil dates. A date-only or
+    otherwise naive value says nothing about the instant, so it is skipped and
+    the next field (then the event) is tried. "No timezone" is reported only
+    when no timezone-aware value exists anywhere.
+    """
+    naive: list[str] = []
+    invalid: list[str] = []
     for owner_name, owner in (("market", market), ("event", event)):
         for key in keys:
             raw = owner.get(key)
@@ -219,10 +228,16 @@ def _schedule_time(
             try:
                 parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
             except ValueError:
-                return None, source, f"{source} is not a valid ISO timestamp"
+                invalid.append(source)
+                continue
             if parsed.tzinfo is None or parsed.utcoffset() is None:
-                return None, source, f"{source} has no timezone; trading time is unknown"
+                naive.append(source)
+                continue
             return parsed.astimezone(UTC), source, None
+    if naive:
+        return None, naive[0], f"{', '.join(naive)} has no timezone; trading time is unknown"
+    if invalid:
+        return None, invalid[0], f"{', '.join(invalid)} is not a valid ISO timestamp"
     return None, None, f"gamma market/event has no {'/'.join(keys)}"
 
 
@@ -291,13 +306,14 @@ def parse_gamma(
         fee_schedule = market.get("feeSchedule") or {}
         market_rules = str(market.get("description") or rules) or None
         market_resolution = str(market.get("resolutionSource") or resolution) or None
-        # The *Iso fields carry a time and offset; the plain ones are often
-        # date-only, so they are the fallback rather than the first choice.
+        # Gamma's plain startDate/endDate carry a time and offset; the *Iso
+        # fields are bare dates, so they are only a fallback (and a bare date
+        # is skipped rather than read as midnight in some assumed zone).
         start_time, start_source, start_reason = _schedule_time(
-            market, payload, ("startDateIso", "startDate")
+            market, payload, ("startDate", "startDateIso")
         )
         end_time, end_source, end_reason = _schedule_time(
-            market, payload, ("endDateIso", "endDate")
+            market, payload, ("endDate", "endDateIso")
         )
         schedule_sources = [source for source in (start_source, end_source) if source]
         schedule_reasons = [reason for reason in (start_reason, end_reason) if reason]
