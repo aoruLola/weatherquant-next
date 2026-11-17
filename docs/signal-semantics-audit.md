@@ -62,7 +62,7 @@ Direction.SELL_YES -> Side.SELL  -> 走 bids（bid 侧）
 
 ### 2.2 Paper：只平/减已有 YES 库存，绝不裸空，绝不映射 BUY NO
 
-Paper 的入口分三层，SELL YES 在每一层的含义都是「卖出已有 YES」：
+Paper 侧 SELL YES 依次经过以下五道环节，每一步的含义都是「卖出已有 YES」：
 
 1. **消费闸门** [`paper/consumer.py`](../src/weatherquant/paper/consumer.py)：
    只允许 `LIVE + ACCEPT` 进入账户；其余记录 `NOT_LIVE` / `NOT_ACCEPT` /
