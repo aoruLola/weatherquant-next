@@ -9,6 +9,7 @@ Nothing here writes to the collector's database or to the legacy database.
     weatherquant-research crosscheck
     weatherquant-research rules [--event-id ID] [--source NAME]
     weatherquant-research fit-models --cutoff YYYY-MM-DD [--pin]
+    weatherquant-research models oos-compare [--json]
     weatherquant-research report [--json]
 """
 
@@ -225,6 +226,63 @@ def cmd_fit_models(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_model_oos_compare(settings: Settings, args: argparse.Namespace) -> int:
+    """Compare models without opening a writable database connection."""
+
+    from weatherquant.models.oos_compare import MODEL_NAMES, run_oos_comparison
+    from weatherquant.storage.db import connect
+
+    if args.reference not in MODEL_NAMES:
+        print(f"unknown reference model {args.reference!r}; known: {list(MODEL_NAMES)}", file=sys.stderr)
+        return 2
+    path = settings.research_db_path
+    if not path.exists():
+        print(f"research database not found: {path}", file=sys.stderr)
+        return 2
+
+    con = connect(path, read_only=True)
+    try:
+        report = run_oos_comparison(
+            con,
+            observation_rule=args.observation_rule,
+            min_train_dates=args.min_train_dates,
+            min_samples_per_bucket=args.min_samples_per_bucket,
+            bootstrap_samples=args.bootstrap_samples,
+            seed=args.seed,
+            reference_model=args.reference,
+        )
+    except (ValueError, RuntimeError) as exc:
+        print(f"model OOS comparison failed: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        con.close()
+
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+        return 0
+
+    print("Four-model chronological out-of-sample comparison")
+    print("Cutoff: start of target New York day; calibration: strictly earlier folds only")
+    print("Ranking uses Brier/Log Loss and paired date-bootstrap CIs (never theoretical Edge).")
+
+    def interval(name: str, metric: str) -> str:
+        value = report["models"][name]["metrics"][metric]
+        ci = value["ci95"]
+        bounds = "n/a" if ci is None else f"{ci[0]:.4f}, {ci[1]:.4f}"
+        return f"{value['value']:.4f} [{bounds}]"
+
+    print("\nmodel        dates  events  Brier [95% CI]              Log Loss [95% CI]")
+    for item in report["ranking"]:
+        name = item["model"]
+        counts = report["models"][name]
+        print(
+            f"{name:12} {counts['n_dates']:5d} {counts['n_events']:7d}  "
+            f"{interval(name, 'brier'):28} {interval(name, 'log_loss')}"
+        )
+    print("\nBreakdowns by month and observed-temperature tercile are available with --json.")
+    return 0
+
+
 def cmd_report(settings: Settings, args: argparse.Namespace) -> int:
     with _db(settings) as db:
         db.open()
@@ -390,6 +448,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--observation-rule", default="max of all readings")
     p.add_argument("--pin", action="store_true", help="write manifest.json so the shadow loads these")
+
+    models_parser = sub.add_parser("models", help="read-only model evaluation")
+    models_sub = models_parser.add_subparsers(dest="models_command", required=True)
+    p = models_sub.add_parser("oos-compare", help="compare four models on chronological out-of-sample rows")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--observation-rule", default="max of all readings")
+    p.add_argument("--min-train-dates", type=int, default=5)
+    p.add_argument("--min-samples-per-bucket", type=int, default=3)
+    p.add_argument("--bootstrap-samples", type=int, default=1000)
+    p.add_argument("--seed", type=int, default=36)
+    p.add_argument("--reference", default="ecmwf_raw", help="reference for paired metric differences")
 
     p = sub.add_parser("report", help="data-quality report")
     p.add_argument("--json", action="store_true")
@@ -1154,6 +1223,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if getattr(args, "db", None):
         settings = settings.model_copy(update={"research_db_path": Path(args.db)})
+
+    if args.command == "models":
+        if args.models_command == "oos-compare":
+            return cmd_model_oos_compare(settings, args)
+        raise AssertionError(f"unhandled models command: {args.models_command}")
 
     handlers = {
         "init": cmd_init,
