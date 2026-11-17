@@ -42,10 +42,14 @@ large table finishes over many cycles rather than blocking one.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
 import json
 import os
+import socket
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -200,6 +204,7 @@ class DecisionExporter:
         batch_rows: int = 20_000,
         max_seconds: float = 5.0,
         max_parts_per_run: int | None = None,
+        signing_key: str | None = None,
     ) -> None:
         if batch_rows <= 0:
             raise ValueError(f"batch_rows must be > 0, got {batch_rows!r}")
@@ -210,6 +215,11 @@ class DecisionExporter:
         self.batch_rows = batch_rows
         self.max_seconds = max_seconds
         self.max_parts_per_run = max_parts_per_run
+        # Prefer an explicit argument; fall back to the env var (never log it).
+        self._signing_key = signing_key if signing_key is not None else os.environ.get("WQ_EXPORT_SIGNING_KEY")
+        self._publisher_run_id = (
+            f"host={socket.gethostname()}:pid={os.getpid()}:run={uuid.uuid4().hex[:8]}"
+        )
         self._cursor: tuple[str, str] | None = None
 
     # -- state -------------------------------------------------------------
@@ -224,6 +234,9 @@ class DecisionExporter:
 
     def _part_path(self, index: int) -> Path:
         return self.parts_dir / f"part-{index:09d}.jsonl"
+
+    def _manifest_path(self, index: int) -> Path:
+        return self.parts_dir / f"part-{index:09d}.manifest.json"
 
     def _load(self) -> dict[str, Any]:
         """Read state, then reconcile it against the parts that actually exist.
@@ -655,7 +668,34 @@ class DecisionExporter:
                     result.caught_up = True
                     break
 
-                _write_part(self._part_path(index), rows)
+                part_path = self._part_path(index)
+                # The manifest is written *before* the part is published, from
+                # the staged bytes this process just wrote. A published part
+                # therefore always already has its manifest, and nothing on
+                # disk is ever attested after the fact: signing whatever part
+                # happened to lack a manifest would let anyone who can write
+                # this directory get an injected or replaced part signed.
+                # A crash after the manifest but before the publish leaves an
+                # orphan manifest (UNKNOWN_PART) and no part; state has not
+                # moved, so the next tick rewrites both for this index.
+                staged = _stage_part(part_path, rows)
+                try:
+                    prev_manifest = self._manifest_path(index - 1)
+                    prev_manifest_bytes = prev_manifest.read_bytes() if prev_manifest.exists() else None
+                    manifest = _build_part_manifest(
+                        staged,
+                        index=index,
+                        prev_manifest_bytes=prev_manifest_bytes,
+                        publisher_run_id=self._publisher_run_id,
+                        signing_key=self._signing_key,
+                    )
+                    _write_part_manifest(self._manifest_path(index), manifest)
+                    staged.replace(part_path)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        staged.unlink()
+                    raise
+
                 cursor_seq = int(rows[-1][_SEQ_INDEX])
                 rows_written += len(rows)
                 late_rows += _count_late_rows(rows, previous_watermark)
@@ -932,8 +972,18 @@ def _count_late_rows(rows: list[Any], watermark: tuple[str, str] | None) -> int:
 
 
 def _index_of(path: Path) -> int:
+    """Extract the part index from either a part or manifest file name.
+
+    Handles both ``part-000000005.jsonl`` and ``part-000000005.manifest.json``.
+    Returns 0 on names that do not match the naming contract; callers already
+    pre-filter by ``glob("part-*.jsonl")`` / ``glob("part-*.manifest.json")``,
+    so 0 means something else is on disk and we should ignore it.
+    """
+    stem = path.stem  # drops one suffix; for .manifest.json we want the numeric base
+    if stem.endswith(".manifest"):
+        stem = stem[: -len(".manifest")]
     try:
-        return int(path.stem.split("-")[1])
+        return int(stem.split("-")[1])
     except (IndexError, ValueError):
         return 0
 
@@ -1023,8 +1073,12 @@ def _count_rows(paths: list[Path]) -> int:
     return total
 
 
-def _write_part(path: Path, rows: list[Any]) -> Path:
-    """Write one immutable part, durably, before anyone may depend on it."""
+def _stage_part(path: Path, rows: list[Any]) -> Path:
+    """Write one part's bytes durably to a temp file beside ``path``.
+
+    Not yet published: nothing reads ``*.tmp``. The caller renames it onto
+    ``path`` (see :func:`_write_part`), after writing its manifest.
+    """
     directory = path.parent
     directory.mkdir(parents=True, exist_ok=True)
     # delete=False plus an explicit replace: the rename is what makes the
@@ -1036,7 +1090,135 @@ def _write_part(path: Path, rows: list[Any]) -> Path:
         handle.flush()
         os.fsync(handle.fileno())
         temporary = handle.name
-    Path(temporary).replace(path)
+    return Path(temporary)
+
+
+def _write_part(path: Path, rows: list[Any]) -> Path:
+    """Write one immutable part, durably, before anyone may depend on it."""
+    _stage_part(path, rows).replace(path)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Provenance sidecar manifest helpers (WQN-26).
+#
+# Module-level helpers used by the exporter while publishing a part, and by
+# tests. There is deliberately no repair path that attests parts already on
+# disk: see the comment in ``DecisionExporter.run_batch``.
+# ---------------------------------------------------------------------------
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65_536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _scan_part_for_manifest(
+    part_path: Path,
+) -> tuple[int, int | None, int | None, str | None, str | None]:
+    """Row count and seq/time range of the part, for the manifest."""
+    row_count = 0
+    first_seq: int | None = None
+    last_seq: int | None = None
+    first_ts: str | None = None
+    last_ts: str | None = None
+    with part_path.open("rb") as raw:
+        text = raw.read().decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        row_count += 1
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        seq = obj.get("export_seq")
+        if seq is not None:
+            try:
+                seq_int = int(seq)
+            except (TypeError, ValueError):
+                seq_int = None
+            if seq_int is not None:
+                if first_seq is None:
+                    first_seq = seq_int
+                last_seq = seq_int
+        ts = obj.get("decision_time_utc")
+        if isinstance(ts, str):
+            if first_ts is None:
+                first_ts = ts
+            last_ts = ts
+    return row_count, first_seq, last_seq, first_ts, last_ts
+
+
+def _canonical_json_for_signing(payload: dict[str, Any]) -> bytes:
+    """Deterministic JSON used as HMAC input.  Sort keys + compact separators."""
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+
+
+def _hmac_sign_manifest(key: str, payload: dict[str, Any]) -> str:
+    signing_payload = {k: v for k, v in payload.items() if k != "hmac_sha256"}
+    return hmac.new(
+        key.encode("utf-8"),
+        _canonical_json_for_signing(signing_payload),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _build_part_manifest(
+    part_path: Path,
+    *,
+    index: int | None = None,
+    prev_manifest_bytes: bytes | None,
+    publisher_run_id: str,
+    signing_key: str | None,
+) -> dict[str, Any]:
+    """Construct the manifest payload for the bytes at ``part_path``.
+
+    ``index`` names the part when ``part_path`` is the staged temp file.
+    """
+    if index is None:
+        index = _index_of(part_path)
+    row_count, first_seq, last_seq, first_ts, last_ts = _scan_part_for_manifest(part_path)
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "part_file": f"part-{index:09d}.jsonl",
+        "index": index,
+        "part_sha256": _sha256_file(part_path),
+        "row_count": row_count,
+        "first_export_seq": first_seq,
+        "last_export_seq": last_seq,
+        "first_decision_time_utc": first_ts,
+        "last_decision_time_utc": last_ts,
+        "prev_manifest_sha256": (
+            _sha256_bytes(prev_manifest_bytes) if prev_manifest_bytes is not None else None
+        ),
+        "publisher_run_id": publisher_run_id,
+        "created_at_utc": datetime.now(tz=UTC).isoformat(),
+        "hmac_sha256": None,
+    }
+    if signing_key:
+        manifest["hmac_sha256"] = _hmac_sign_manifest(signing_key, manifest)
+    return manifest
+
+
+def _write_part_manifest(path: Path, manifest: dict[str, Any]) -> Path:
+    """Write the sidecar manifest durably, in the same directory as the part."""
+    _atomic_write_json(path, manifest)
     return path
 
 
