@@ -304,6 +304,46 @@ def cmd_status(settings: Settings, shadow: ShadowSettings, args: argparse.Namesp
     return verdict.exit_code
 
 
+def cmd_export_provenance(settings: Settings, shadow: ShadowSettings, args: argparse.Namespace) -> int:
+    """Verify export provenance sidecars (WQN-26).
+
+    Read-only: does not open the shadow database, does not require the
+    engine lease.  Exits 0 on PASS, 1 on FAIL, 2 on argument errors.
+    """
+    from weatherquant.shadow.provenance import verify_export_provenance
+
+    parts_dir = getattr(args, "parts_dir", None)
+    if parts_dir is None:
+        parts_dir = shadow.shadow_report_path.parent / "decisions-export" / "parts"
+    else:
+        parts_dir = Path(parts_dir)
+
+    # Prefer an explicit key; otherwise the verifier falls back to
+    # WQ_EXPORT_SIGNING_KEY.  The key is never printed.
+    report = verify_export_provenance(parts_dir, signing_key=getattr(args, "signing_key", None))
+
+    if getattr(args, "json", False):
+        print(json.dumps(report.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(f"parts_dir      : {report.parts_dir}")
+        print(f"parts checked  : {report.parts_checked}")
+        print(f"manifests found: {report.manifests_found}")
+        print(f"verified ok    : {report.verified_ok}")
+        print(f"legacy         : {report.legacy_unattested}")
+        print(f"key configured : {'yes' if report.signing_key_configured else 'no'}")
+        for res in report.errors:
+            print(
+                f"  FAIL   part-{res.index:09d}.jsonl  "
+                f"[{res.status}] {res.detail}"
+            )
+        for stray in report.strays:
+            print(f"  STRAY  {stray.path}  [{stray.status}] {stray.detail}")
+        print()
+        print(report.verdict)
+
+    return 0 if report.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="weatherquant-shadow",
@@ -345,6 +385,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser(
+        "export-provenance",
+        help="verify per-part manifest sidecars and hash chain (read-only; no DB required)",
+    )
+    p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--parts-dir",
+        help="parts directory path (default: <report>/decisions-export/parts)",
+    )
+    p.add_argument(
+        "--signing-key",
+        help="explicit HMAC signing key to validate the manifest signature "
+        "(default: WQ_EXPORT_SIGNING_KEY env var, if any). Never echoed back.",
+    )
+
     p = sub.add_parser("status", help="health summary; exit code matches the probe")
     p.add_argument("--json", action="store_true")
     return parser
@@ -371,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         "report": cmd_report,
         "alignment": cmd_alignment,
         "export-verify": cmd_export_verify,
+        "export-provenance": cmd_export_provenance,
         "status": cmd_status,
     }
     return handlers[args.command](settings, shadow, args)

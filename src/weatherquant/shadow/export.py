@@ -42,10 +42,14 @@ large table finishes over many cycles rather than blocking one.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
 import json
 import os
+import socket
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -200,6 +204,7 @@ class DecisionExporter:
         batch_rows: int = 20_000,
         max_seconds: float = 5.0,
         max_parts_per_run: int | None = None,
+        signing_key: str | None = None,
     ) -> None:
         if batch_rows <= 0:
             raise ValueError(f"batch_rows must be > 0, got {batch_rows!r}")
@@ -210,6 +215,11 @@ class DecisionExporter:
         self.batch_rows = batch_rows
         self.max_seconds = max_seconds
         self.max_parts_per_run = max_parts_per_run
+        # Prefer an explicit argument; fall back to the env var (never log it).
+        self._signing_key = signing_key if signing_key is not None else os.environ.get("WQ_EXPORT_SIGNING_KEY")
+        self._publisher_run_id = (
+            f"host={socket.gethostname()}:pid={os.getpid()}:run={uuid.uuid4().hex[:8]}"
+        )
         self._cursor: tuple[str, str] | None = None
 
     # -- state -------------------------------------------------------------
@@ -224,6 +234,9 @@ class DecisionExporter:
 
     def _part_path(self, index: int) -> Path:
         return self.parts_dir / f"part-{index:09d}.jsonl"
+
+    def _manifest_path(self, index: int) -> Path:
+        return self.parts_dir / f"part-{index:09d}.manifest.json"
 
     def _load(self) -> dict[str, Any]:
         """Read state, then reconcile it against the parts that actually exist.
@@ -304,6 +317,59 @@ class DecisionExporter:
 
     def state(self) -> dict[str, Any]:
         return self._load()
+
+    # -- manifest repair / reconciliation ----------------------------------
+
+    def _reconcile_manifest(self, state: dict[str, Any]) -> int:
+        """Back-fill sidecars for the trailing run of parts that missed them.
+
+        A crash between ``_write_part`` and ``_write_part_manifest`` leaves
+        the most recently written part(s) on disk without a manifest.  The
+        next tick repairs exactly that window: the contiguous tail of parts
+        above the highest manifested index.  Older parts are left alone on
+        purpose - a directory that predates provenance has no manifests at
+        all, and silently attesting it would erase the
+        ``LEGACY_UNATTESTED`` distinction the verifier exists to report.
+
+        Returns the number of manifests written.  Never raises: a missing
+        manifest that we cannot repair becomes a note on the caller's
+        ``ExportResult`` (written above in ``run_batch``), not an engine
+        crash.
+        """
+        try:
+            existing = sorted(self.parts_dir.glob("part-*.jsonl"))
+            if not existing:
+                return 0
+            manifest_idx = {_index_of(p) for p in self.parts_dir.glob("part-*.manifest.json")}
+            if not manifest_idx:
+                # Nothing has ever been attested: the whole directory is
+                # legacy.  Do not retroactively attest it.
+                return 0
+            last_manifested = max(manifest_idx)
+            repaired = 0
+            for part in existing:
+                idx = _index_of(part)
+                if idx <= last_manifested:
+                    continue
+                prev_path = self._manifest_path(idx - 1)
+                prev_bytes: bytes | None = None
+                if prev_path.exists():
+                    try:
+                        prev_bytes = prev_path.read_bytes()
+                    except OSError:
+                        prev_bytes = None
+                manifest = _build_part_manifest(
+                    part,
+                    prev_manifest_bytes=prev_bytes,
+                    publisher_run_id=self._publisher_run_id,
+                    signing_key=self._signing_key,
+                )
+                _write_part_manifest(self._manifest_path(idx), manifest)
+                repaired += 1
+            return repaired
+        except Exception as exc:
+            state.setdefault("_manifest_repair_failed", str(exc))
+            return 0
 
     # -- the one-time v1 -> v2 transition -----------------------------------
 
@@ -627,6 +693,14 @@ class DecisionExporter:
                     return step
                 result.transition_done = True
 
+            # Before writing new parts, repair any previous half-writes: a
+            # part file that already exists but has no manifest.  This keeps
+            # the hash chain continuous after a crash between ``_write_part``
+            # and ``_write_part_manifest``.
+            repaired = self._reconcile_manifest(state)
+            if repaired:
+                result.notes.append(f"repaired {repaired} missing manifest(s) from prior runs")
+
             cursor_seq = state.get("cursor_seq")
             cursor_seq = int(cursor_seq) if cursor_seq is not None else 0
             previous_watermark = tuple(state["watermark"]) if state.get("watermark") else None
@@ -655,7 +729,22 @@ class DecisionExporter:
                     result.caught_up = True
                     break
 
-                _write_part(self._part_path(index), rows)
+                part_path = self._part_path(index)
+                _write_part(part_path, rows)
+                # Only once both part and manifest are durably on disk do we
+                # advance state.  A crash between the two leaves us a part
+                # file with no manifest, which the next ``run_batch`` will
+                # pick up via ``_reconcile_manifest`` before proceeding.
+                prev_manifest = self._manifest_path(index - 1)
+                prev_manifest_bytes = prev_manifest.read_bytes() if prev_manifest.exists() else None
+                manifest = _build_part_manifest(
+                    part_path,
+                    prev_manifest_bytes=prev_manifest_bytes,
+                    publisher_run_id=self._publisher_run_id,
+                    signing_key=self._signing_key,
+                )
+                _write_part_manifest(self._manifest_path(index), manifest)
+
                 cursor_seq = int(rows[-1][_SEQ_INDEX])
                 rows_written += len(rows)
                 late_rows += _count_late_rows(rows, previous_watermark)
@@ -689,7 +778,7 @@ class DecisionExporter:
             result.late_rows = late_rows
             result.cursor_seq = cursor_seq
             result.watermark = tuple(state["watermark"]) if state.get("watermark") else None
-            if result.caught_up and rows_written == 0:
+            if result.caught_up and rows_written == 0 and not repaired:
                 result.notes.append("already at the watermark; nothing new to export")
         except Exception as exc:  # a side channel must not raise
             # The engine keeps deciding. The caller turns this into an
@@ -932,8 +1021,18 @@ def _count_late_rows(rows: list[Any], watermark: tuple[str, str] | None) -> int:
 
 
 def _index_of(path: Path) -> int:
+    """Extract the part index from either a part or manifest file name.
+
+    Handles both ``part-000000005.jsonl`` and ``part-000000005.manifest.json``.
+    Returns 0 on names that do not match the naming contract; callers already
+    pre-filter by ``glob("part-*.jsonl")`` / ``glob("part-*.manifest.json")``,
+    so 0 means something else is on disk and we should ignore it.
+    """
+    stem = path.stem  # drops one suffix; for .manifest.json we want the numeric base
+    if stem.endswith(".manifest"):
+        stem = stem[: -len(".manifest")]
     try:
-        return int(path.stem.split("-")[1])
+        return int(stem.split("-")[1])
     except (IndexError, ValueError):
         return 0
 
@@ -1037,6 +1136,124 @@ def _write_part(path: Path, rows: list[Any]) -> Path:
         os.fsync(handle.fileno())
         temporary = handle.name
     Path(temporary).replace(path)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Provenance sidecar manifest helpers (WQN-26).
+#
+# These are module-level helpers so they can be called from both the
+# exporter (while writing a part) and from the manifest repair path
+# (``DecisionExporter._reconcile_manifest``).
+# ---------------------------------------------------------------------------
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65_536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _scan_part_for_manifest(
+    part_path: Path,
+) -> tuple[int, int | None, int | None, str | None, str | None]:
+    """Row count and seq/time range of the part, for the manifest."""
+    row_count = 0
+    first_seq: int | None = None
+    last_seq: int | None = None
+    first_ts: str | None = None
+    last_ts: str | None = None
+    with part_path.open("rb") as raw:
+        text = raw.read().decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        row_count += 1
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        seq = obj.get("export_seq")
+        if seq is not None:
+            try:
+                seq_int = int(seq)
+            except (TypeError, ValueError):
+                seq_int = None
+            if seq_int is not None:
+                if first_seq is None:
+                    first_seq = seq_int
+                last_seq = seq_int
+        ts = obj.get("decision_time_utc")
+        if isinstance(ts, str):
+            if first_ts is None:
+                first_ts = ts
+            last_ts = ts
+    return row_count, first_seq, last_seq, first_ts, last_ts
+
+
+def _canonical_json_for_signing(payload: dict[str, Any]) -> bytes:
+    """Deterministic JSON used as HMAC input.  Sort keys + compact separators."""
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+
+
+def _hmac_sign_manifest(key: str, payload: dict[str, Any]) -> str:
+    signing_payload = {k: v for k, v in payload.items() if k != "hmac_sha256"}
+    return hmac.new(
+        key.encode("utf-8"),
+        _canonical_json_for_signing(signing_payload),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _build_part_manifest(
+    part_path: Path,
+    *,
+    prev_manifest_bytes: bytes | None,
+    publisher_run_id: str,
+    signing_key: str | None,
+) -> dict[str, Any]:
+    """Construct the manifest payload for ``part_path``."""
+    index = _index_of(part_path)
+    row_count, first_seq, last_seq, first_ts, last_ts = _scan_part_for_manifest(part_path)
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "part_file": f"part-{index:09d}.jsonl",
+        "index": index,
+        "part_sha256": _sha256_file(part_path),
+        "row_count": row_count,
+        "first_export_seq": first_seq,
+        "last_export_seq": last_seq,
+        "first_decision_time_utc": first_ts,
+        "last_decision_time_utc": last_ts,
+        "prev_manifest_sha256": (
+            _sha256_bytes(prev_manifest_bytes) if prev_manifest_bytes is not None else None
+        ),
+        "publisher_run_id": publisher_run_id,
+        "created_at_utc": datetime.now(tz=UTC).isoformat(),
+        "hmac_sha256": None,
+    }
+    if signing_key:
+        manifest["hmac_sha256"] = _hmac_sign_manifest(signing_key, manifest)
+    return manifest
+
+
+def _write_part_manifest(path: Path, manifest: dict[str, Any]) -> Path:
+    """Write the sidecar manifest durably, in the same directory as the part."""
+    _atomic_write_json(path, manifest)
     return path
 
 
