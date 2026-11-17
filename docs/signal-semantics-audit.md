@@ -69,7 +69,7 @@ Paper 侧 SELL YES 依次经过以下五道环节，每一步的含义都是「�
    `STALE_SIGNAL`。这一步不检查库存。
 2. **库存闸门** [`paper/risk.py`](../src/weatherquant/paper/risk.py)
    `RiskGate.before_fill()`：
-   `SELL_YES` 且 `held_shares <= 0` → 在任何定价之前拒绝，原因
+   `SELL_YES` 且 `held_shares <= 1e-9`（即零库存）→ 在任何定价之前拒绝，原因
    `NO_INVENTORY`，detail 明确写 `no naked shorts`。
 3. **缩量** `RiskGate.size()`：卖出的请求量取
    `min(proposed_shares, held_shares)`；若缩量后低于交易所最小下单量，
@@ -102,7 +102,9 @@ BUY NO 动作。该函数的文档已按此语义修正。
 Shadow 的 SELL YES 没有库存概念（不持有任何东西），Paper 的 SELL YES 必须有库存。
 因此：
 
-- 一个 Shadow 的 SELL YES `ACCEPT` **永远不会**自动变成 Paper 的卖出成交；
+- 一个 Shadow 的 SELL YES `ACCEPT` **不保证**变成 Paper 的卖出成交：只有账户已持有该 YES token、
+  且按持有量缩量后不低于交易所最小下单量时，它才会作为**减仓/平仓**卖出成交（见契约测试
+  `test_sell_yes_only_reduces_inventory_and_never_opens_a_no_position`）；库存不足时以 `NO_INVENTORY` 拒绝；
 - Paper 可以因为 `NO_INVENTORY` 拒绝一个 Shadow 已经 `ACCEPT` 的信号；
 - 这是分层风控的正常结果，不是数据不一致。
 
