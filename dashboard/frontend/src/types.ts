@@ -368,6 +368,43 @@ export interface SystemData {
   unavailable: string[]
 }
 
+// --- layered health -------------------------------------------------------
+
+/** One pipeline layer's verdict. LAGGING is within its limit but blocked upstream. */
+export type LayerStatus = 'OK' | 'LAGGING' | 'STALE' | 'UNKNOWN'
+
+export type HealthLayerName = 'export' | 'performance_consume' | 'publish' | 'snapshot'
+
+export interface HealthLayer {
+  name: HealthLayerName
+  watermark_utc?: string | null
+  source: string
+  age_seconds?: number | null
+  lag_seconds?: number | null
+  threshold_seconds?: number | null
+  status: LayerStatus
+  reason?: string | null
+}
+
+export interface ServiceHealth {
+  name: string
+  status: LayerStatus
+  age_seconds?: number | null
+  reason?: string | null
+}
+
+export interface LayeredHealthData {
+  generation_id?: string | null
+  generation_source?: string | null
+  lagging_layer?: HealthLayerName | null
+  lagging_basis?: string | null
+  layers: HealthLayer[]
+  services: Record<string, ServiceHealth>
+  thresholds: Record<string, number>
+  dataset?: string | null
+  reason?: string | null
+}
+
 /**
  * A performance snapshot as the API serves it.
  *

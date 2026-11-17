@@ -49,12 +49,16 @@ __all__ = [
     "ForecastsData",
     "Freshness",
     "FreshnessState",
+    "HealthLayer",
     "HealthzData",
+    "LayerStatus",
+    "LayeredHealthData",
     "MarketDetailData",
     "MarketSummary",
     "MarketsData",
     "OverviewData",
     "PaperData",
+    "ServiceHealth",
     "ShadowHealthData",
     "ShadowReportData",
     "SystemData",
@@ -491,6 +495,71 @@ class SystemSourceHealth(BaseModel):
     status: str = "unknown"
     reasons: list[str] = Field(default_factory=list)
     age_seconds: float | None = None
+
+
+class LayerStatus(StrEnum):
+    """The four honest states one pipeline layer can be in.
+
+    ``LAGGING`` is deliberately distinct from ``STALE``: a layer can be behind
+    the position upstream of it while still inside its own tolerance (a
+    snapshot consumes one publish interval behind ingest by design). Only
+    ``STALE`` means the configured limit was crossed.
+    """
+
+    OK = "OK"
+    LAGGING = "LAGGING"
+    STALE = "STALE"
+    UNKNOWN = "UNKNOWN"
+
+
+class HealthLayer(BaseModel):
+    """One layer's live position, its age and the verdict for that layer.
+
+    ``watermark_utc`` is always the value read from the source named in
+    ``source``. It is never inferred from a different layer: in particular the
+    export layer is read from the shadow export's own state file, never from a
+    published manifest, whose watermark records what a snapshot consumed at
+    build time and would make a stopped export look caught up.
+    """
+
+    name: Literal["export", "performance_consume", "publish", "snapshot"]
+    watermark_utc: datetime | None = None
+    source: str
+    age_seconds: float | None = None
+    lag_seconds: float | None = None
+    threshold_seconds: float | None = None
+    status: LayerStatus = LayerStatus.UNKNOWN
+    reason: str | None = None
+
+
+class ServiceHealth(BaseModel):
+    """Collector / Shadow / Paper availability, using the layer vocabulary."""
+
+    name: str
+    status: LayerStatus = LayerStatus.UNKNOWN
+    age_seconds: float | None = None
+    reason: str | None = None
+
+
+class LayeredHealthData(BaseModel):
+    """Every freshness layer read from one published generation.
+
+    ``generation_id`` names the batch the publish/snapshot layers were read
+    from; the live export and ingest positions are labelled as live because
+    they are upstream of any generation. ``lagging_layer`` names the first
+    layer that crossed its threshold, most upstream first, and ``lagging_basis``
+    carries the measurements behind that choice so it can be checked.
+    """
+
+    generation_id: str | None = None
+    generation_source: str | None = None
+    lagging_layer: Literal["export", "performance_consume", "publish", "snapshot"] | None = None
+    lagging_basis: str | None = None
+    layers: list[HealthLayer] = Field(default_factory=list)
+    services: dict[str, ServiceHealth] = Field(default_factory=dict)
+    thresholds: dict[str, float] = Field(default_factory=dict)
+    dataset: str | None = None
+    reason: str | None = None
 
 
 class HealthzData(BaseModel):
