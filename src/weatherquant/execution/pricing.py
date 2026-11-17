@@ -396,9 +396,12 @@ def expected_net_profit_usd_sell(
         E[net] = (proceeds - fees - buffer) - q * shares
                = cost.net_proceeds_usd - q * filled_shares
 
-    Equivalent to buying NO at the same book, priced from the **bid** side,
-    which is the side a seller actually hits. Using the ask here - or the
-    midpoint - would value the trade against prices nobody would pay.
+    The payoff has the same algebraic shape as holding a NO position, but this
+    function values **closing a long YES position** - there is no order mapping
+    to BUY NO and no naked short. The paper engine only sells shares it already
+    holds (``paper/risk.py``). The price is taken from the **bid** side, which
+    is the side a seller actually hits. Using the ask here - or the midpoint -
+    would value the trade against prices nobody would pay.
     """
     if not 0.0 <= q <= 1.0:
         raise ValueError(f"q must be a probability in [0, 1], got {q}")

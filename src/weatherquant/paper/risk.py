@@ -24,7 +24,8 @@ The four rules:
   door, because the ledger's is the one that cannot be forgotten.
 * **No naked shorts**: a SELL YES without inventory is refused
   (``NO_INVENTORY``) before anything is priced. A sell is sized down to what
-  is actually held; only an empty position is a refusal.
+  is actually held; only an empty position - or a holding whose sized-down
+  quantity falls below the venue's minimum order - is a refusal.
 
 BUY NO is deliberately absent: pricing NO off the YES book (or a midpoint)
 would fabricate a price nobody quoted. The shadow's vocabulary cannot yet
