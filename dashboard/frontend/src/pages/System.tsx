@@ -5,11 +5,12 @@
  */
 import { usePoll } from '../api/client'
 import { Sparkline } from '../components/charts'
+import { LayeredHealthCard } from '../components/layered-health'
 import { FreshnessPill, StatusChip, ModeBadge } from '../components/status'
 import PageHeader from '../components/PageHeader'
 import { Banner, Card, EmptyState } from '../components/ui'
 import { fmtAge, fmtAgeShort, fmtBytes, fmtDateTime, fmtInt } from '../format'
-import type { SystemData } from '../types'
+import type { LayeredHealthData, SystemData } from '../types'
 
 function TrendTile({
   title,
@@ -51,6 +52,7 @@ function MetricTile({ label, value, sub }: { label: string; value: string; sub?:
 
 export default function System() {
   const { envelope, error } = usePoll<SystemData>('/api/v1/system', 5000)
+  const layers = usePoll<LayeredHealthData>('/api/v1/health/layers', 5000)
   const data = envelope?.data
 
   const collector = data?.collector
@@ -67,7 +69,7 @@ export default function System() {
       <PageHeader
         title="系统监控"
         english="System"
-        subtitle="Collector 与 Shadow 的运行状态"
+        subtitle="Collector、Shadow 与数据分层健康"
         envelope={envelope}
         right={
           <>
@@ -102,6 +104,19 @@ export default function System() {
           <EmptyState title="无法获取系统数据" reason={error} testId="system-error" />
         </Card>
       )}
+
+      <div className="mb-6">
+        <LayeredHealthCard
+          data={layers.envelope?.data}
+          freshness={layers.envelope?.freshness}
+          now={layers.lastFetchedAt ?? undefined}
+          reason={
+            layers.error
+              ? `无法获取分层健康数据（${layers.error}）`
+              : undefined
+          }
+        />
+      </div>
 
       {data && (
         <div className="space-y-6">

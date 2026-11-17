@@ -7,6 +7,7 @@ import type {
   Envelope,
   ForecastsData,
   Freshness,
+  LayeredHealthData,
   MarketSummary,
   MarketsData,
   OverviewData,
@@ -177,6 +178,86 @@ export function overviewFixture(overrides: Partial<OverviewData> = {}): Overview
       recent_events: [],
       shadow_mode: 'LIVE',
     },
+    ...overrides,
+  }
+}
+
+export function layeredHealthFixture(
+  overrides: Partial<LayeredHealthData> = {},
+): LayeredHealthData {
+  const now = Date.now()
+  const iso = (secondsAgo: number) =>
+    new Date(now - secondsAgo * 1000).toISOString()
+  return {
+    generation_id: 'gen-20261117-1200',
+    generation_source: 'performance current.json pointer · one published generation',
+    lagging_layer: 'publish',
+    lagging_basis: 'publish: publish is 2400s behind ingest (limit 1500s)',
+    layers: [
+      {
+        name: 'export',
+        watermark_utc: iso(30),
+        source: 'shadow export state.json · watermark[0]',
+        age_seconds: 30,
+        lag_seconds: 30,
+        threshold_seconds: 900,
+        status: 'OK',
+        reason: null,
+      },
+      {
+        name: 'performance_consume',
+        watermark_utc: iso(40),
+        source: 'performance ingest-state.json · watermark[0]',
+        age_seconds: 40,
+        lag_seconds: 0,
+        threshold_seconds: 900,
+        status: 'OK',
+        reason: null,
+      },
+      {
+        name: 'publish',
+        watermark_utc: iso(2400),
+        source: 'published snapshot summary.json · as_of_utc',
+        age_seconds: 2400,
+        lag_seconds: 2400,
+        threshold_seconds: 1500,
+        status: 'STALE',
+        reason: 'publish is 2400s behind ingest (limit 1500s)',
+      },
+      {
+        name: 'snapshot',
+        watermark_utc: null,
+        source: 'no published generation or summary file',
+        age_seconds: null,
+        lag_seconds: null,
+        threshold_seconds: 1500,
+        status: 'UNKNOWN',
+        reason: 'the published generation records no publish time',
+      },
+    ],
+    services: {
+      collector: { name: 'collector', status: 'OK', age_seconds: 2, reason: null },
+      shadow: {
+        name: 'shadow',
+        status: 'LAGGING',
+        age_seconds: 50,
+        reason: 'shadow heartbeat is 50s old but REST is healthy',
+      },
+      paper: {
+        name: 'paper',
+        status: 'UNKNOWN',
+        age_seconds: null,
+        reason: 'paper engine is unreachable',
+      },
+    },
+    thresholds: {
+      export_stale_after_seconds: 900,
+      performance_consume_stale_after_seconds: 900,
+      publish_stale_after_seconds: 1500,
+      snapshot_stale_after_seconds: 1500,
+    },
+    dataset: 'live',
+    reason: 'publish: publish is 2400s behind ingest (limit 1500s)',
     ...overrides,
   }
 }
