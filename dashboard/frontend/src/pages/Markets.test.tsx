@@ -36,8 +36,39 @@ describe('Markets', () => {
     expect(within(first).getByText('81°F')).toBeInTheDocument()
     expect(first).toHaveTextContent('0.62')
     expect(first).toHaveTextContent('0.65')
-    // model probability honestly absent
-    expect(first).toHaveTextContent('暂未接入')
+    // model probability honestly absent — N/A, never an empty cell
+    expect(first).toHaveTextContent('N/A')
+    expect(first).toHaveTextContent('OPEN')
+  })
+
+  it('shows UNKNOWN rather than OPEN when the schedule is unavailable', async () => {
+    const unknown = marketFixture({
+      open_now: null,
+      open_now_source: null,
+      open_now_reason: 'timezone-aware market start and end times are required',
+      start_time_utc: null,
+      end_time_utc: null,
+      target_date: null,
+      rules_text: null,
+      resolution_source: null,
+      rules_source: null,
+      rules_reason: 'Gamma metadata missing: rules_text, resolution_source',
+    })
+    mockFetch({ '/api/v1/markets': envelopeOf(marketsFixture([unknown])) })
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('market-open-state')).toBeInTheDocument())
+    const chip = screen.getByTestId('market-open-state')
+    expect(chip).toHaveTextContent('UNKNOWN')
+    expect(chip).not.toHaveTextContent('OPEN')
+    // reason comes straight from the backend (or the Chinese fallback when
+    // the backend left it blank) — either is fine; the key contract is
+    // UNKNOWN rather than a guessed OPEN.
+    const title = chip.getAttribute('title') ?? ''
+    expect(title).not.toBe('')
+    // missing target date and rules are named, not left blank
+    expect(screen.getByTestId('market-card')).toHaveTextContent('目标日 N/A')
+    expect(screen.getByTestId('market-card')).toHaveTextContent('规则 N/A')
   })
 
   it('marks stale books as STALE instead of quoting them as live', async () => {
@@ -72,17 +103,25 @@ describe('Markets', () => {
     expect(screen.getByTestId('markets-empty')).toHaveTextContent('collector raw archive not found')
   })
 
-  it('never calls a market whose New York day has ended ACTIVE', async () => {
+  it('closes a market whose schedule has ended, even if a New York day label remains', async () => {
     mockFetch({
       '/api/v1/markets': envelopeOf(
-        marketsFixture([marketFixture({ target_day_ended: true })]),
+        marketsFixture([
+          marketFixture({
+            target_day_ended: true,
+            open_now: false,
+            open_now_reason: 'current time is at/after the market end (end is exclusive)',
+          }),
+        ]),
       ),
     })
     renderPage()
 
     await waitFor(() => expect(screen.getByTestId('market-card')).toBeInTheDocument())
     expect(screen.getByText('目标日已过')).toBeInTheDocument()
+    expect(screen.getByTestId('market-open-state')).toHaveTextContent('CLOSED')
     expect(screen.queryByText('ACTIVE')).not.toBeInTheDocument()
+    expect(screen.queryByText('INACTIVE')).not.toBeInTheDocument()
   })
 
   it('opens on tradeable markets instead of the whole archive tail', async () => {

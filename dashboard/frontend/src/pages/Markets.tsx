@@ -23,10 +23,44 @@ import type { MarketSummary, MarketsData } from '../types'
  */
 const DEFAULT_STATUS = 'tradeable'
 
+/**
+ * Current open state comes from the server's timezone-aware schedule check.
+ * `open_now === null` means the inputs were insufficient: show UNKNOWN rather
+ * than inheriting the venue's `tradeable` flag as if it were a clock.
+ */
+function openState(market: MarketSummary): {
+  value: string
+  label: string
+  title: string
+} {
+  if (market.open_now === true) {
+    return {
+      value: 'live',
+      label: 'OPEN',
+      title: `依据 ${market.open_now_source ?? 'market schedule'}；开始时刻含、结束时刻不含`,
+    }
+  }
+  if (market.open_now === false) {
+    return {
+      value: 'stopped',
+      label: 'CLOSED',
+      title: market.open_now_reason ?? '真实交易时段之外或交易所不允许下单',
+    }
+  }
+  return {
+    value: 'unknown',
+    label: 'UNKNOWN',
+    title:
+      market.open_now_reason ??
+      '缺少带时区的真实起止时间，无法判断当前是否开放（不会默认开放）',
+  }
+}
+
 function MarketCard({ market }: { market: MarketSummary }) {
   const book = market.book
   const quoteFresh = Boolean(book?.available && !book.stale)
   const bookAge = book?.age_seconds ?? null
+  const open = openState(market)
 
   return (
     <Link
@@ -40,61 +74,51 @@ function MarketCard({ market }: { market: MarketSummary }) {
         </h3>
         <div className="flex shrink-0 flex-col items-end gap-1">
           <StatusChip
-            value={
-              market.closed
-                ? 'stopped'
-                : market.target_day_ended
-                  ? 'expired'
-                  : market.tradeable
-                    ? 'live'
-                    : 'unknown'
-            }
-            label={
-              market.closed
-                ? 'CLOSED'
-                : market.target_day_ended
-                  ? '目标日已过'
-                  : market.tradeable
-                    ? 'ACTIVE'
-                    : 'INACTIVE'
-            }
-            title={
-              market.closed
-                ? '市场已关闭'
-                : market.target_day_ended
-                  ? '目标日已经过去，交易所尚未标记关闭；这不是当前机会'
-                  : undefined
-            }
+            value={open.value}
+            label={open.label}
+            title={open.title}
+            testId="market-open-state"
           />
+          {market.target_day_ended && (
+            <span
+              className="text-[10px] text-warn"
+              title="目标日在纽约已过去；这是日程信息，不等于交易所的结束时间"
+            >
+              目标日已过
+            </span>
+          )}
         </div>
       </div>
 
       <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted">
-        <span className="tnum font-medium text-ink">{market.bracket_label || '—'}</span>
-        <span className="tnum">
-          目标日 {market.target_date ?? '—'}
+        <span className="tnum font-medium text-ink">{market.bracket_label || 'N/A'}</span>
+        <span className="tnum" title={market.target_date_reason ?? undefined}>
+          目标日 {market.target_date ?? 'N/A'}
           {daysUntil(market.target_date) && ` · ${daysUntil(market.target_date)}`}
         </span>
         {market.station && <span className="uppercase">{market.station}</span>}
+        <span title={market.rules_reason ?? market.schedule_reason ?? undefined}>
+          规则 {market.rules_source ?? 'N/A'}
+        </span>
       </div>
 
       <div className="mt-3 grid grid-cols-3 gap-2 border-t border-line pt-3">
         <div>
           <div className="text-[11px] text-muted">YES Bid</div>
           <div className="tnum text-base font-semibold text-ink">
-            {book?.available ? fmtUsd(book.best_bid) : '—'}
+            {book?.available ? fmtUsd(book.best_bid) : 'N/A'}
           </div>
         </div>
         <div>
           <div className="text-[11px] text-muted">YES Ask</div>
           <div className="tnum text-base font-semibold text-ink">
-            {book?.available ? fmtUsd(book.best_ask) : '—'}
+            {book?.available ? fmtUsd(book.best_ask) : 'N/A'}
           </div>
         </div>
         <div>
           <div className="text-[11px] text-muted">Spread</div>
           <div className="tnum text-base font-semibold text-ink">
-            {book?.available ? fmtUsd(book.spread) : '—'}
+            {book?.available ? fmtUsd(book.spread) : 'N/A'}
           </div>
         </div>
       </div>
@@ -105,7 +129,7 @@ function MarketCard({ market }: { market: MarketSummary }) {
           <div className="tnum mt-0.5 font-medium">
             {book?.available
               ? `B ${fmtUsdDepth(book.bid_depth_usd)} / A ${fmtUsdDepth(book.ask_depth_usd)}`
-              : '—'}
+              : 'N/A'}
           </div>
         </div>
         <div className="rounded-tile bg-canvas px-3 py-2">
@@ -115,13 +139,13 @@ function MarketCard({ market }: { market: MarketSummary }) {
               <span className="text-accent">{fmtProb(market.model_probability)}</span>
             ) : (
               <span className="text-muted" title={market.model_reason ?? undefined}>
-                暂未接入
+                N/A
               </span>
             )}
-            <span className="ml-1.5 text-muted">
+            <span className="ml-1.5 text-muted" title="理论净 Edge，非已实现收益">
               {market.net_edge_usd !== null && market.net_edge_usd !== undefined
                 ? `${market.net_edge_usd >= 0 ? '+' : ''}${fmtUsd(market.net_edge_usd)}`
-                : ''}
+                : 'N/A'}
             </span>
           </div>
         </div>
@@ -189,7 +213,7 @@ export default function Markets() {
         envelope={envelope}
         right={
           <span className="tnum text-xs text-muted">
-            {data ? `${data.total} 个市场` : '—'} · 来源 {data?.source ?? '—'}
+            {data ? `${data.total} 个市场` : 'N/A'} · 来源 {data?.source ?? 'N/A'}
           </span>
         }
       />
@@ -233,8 +257,8 @@ export default function Markets() {
             title="按最近一次 Shadow 决策状态筛选（需要 market-snapshot 快照）"
             data-testid="filter-decision"
           >
-            <option value="">最近决策（全部）</option>
-            <option value="ACCEPT">最近 ACCEPT</option>
+            <option value="">最近影子信号（全部）</option>
+            <option value="ACCEPT">最近影子信号 ACCEPT</option>
             <option value="REJECT">最近 REJECT</option>
             <option value="NO_TRADE">最近 NO_TRADE</option>
           </select>
@@ -316,7 +340,7 @@ export default function Markets() {
             </button>
           </div>
           <p className="mt-4 text-center text-xs text-muted">
-            报价为最近盘口快照，非可执行价格；模型概率与 Edge 在 Shadow 市场快照接入后展示。{' '}
+            报价为最近盘口快照，非可执行价格；开放状态按真实起止时间与交易所标志判断，数据不足时为 UNKNOWN。{' '}
             <button type="button" className="underline" onClick={() => navigate('/decisions')}>
               查看决策
             </button>

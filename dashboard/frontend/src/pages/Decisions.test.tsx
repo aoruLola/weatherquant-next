@@ -56,11 +56,17 @@ describe('groupConsecutiveAccepts', () => {
 })
 
 describe('Decisions page', () => {
-  it('keeps the ACCEPT disclaimer on screen no matter what', async () => {
+  it('keeps the shadow-signal disclaimer on screen no matter what', async () => {
     mockFetch({ '/api/v1/decisions': envelopeOf(decisionsFixture()) })
     renderPage()
     await waitFor(() => expect(screen.getByTestId('accept-disclaimer')).toBeInTheDocument())
-    expect(screen.getByTestId('accept-disclaimer')).toHaveTextContent('不代表已验证的盈利机会')
+    expect(screen.getByTestId('accept-disclaimer')).toHaveTextContent('影子信号')
+    expect(screen.getByTestId('accept-disclaimer')).toHaveTextContent('不代表下单')
+    expect(screen.getByTestId('accept-disclaimer')).toHaveTextContent('REPLAY')
+    // The old ACCEPT-as-trade wording must be gone from the banner.
+    expect(screen.getByTestId('accept-disclaimer')).not.toHaveTextContent(
+      /^ACCEPT 表示$/,
+    )
   })
 
   it('shows the disclaimer even when row detail is unavailable', async () => {
@@ -137,6 +143,29 @@ describe('Decisions page', () => {
     await waitFor(() => expect(screen.getByTestId('accept-scope-unavailable')).toBeInTheDocument())
     expect(screen.getByTestId('accept-scope-reason')).toHaveTextContent('不可用')
     expect(screen.queryByTestId('stat-accept-markets')).not.toBeInTheDocument()
+  })
+
+  it('shows model, version and decision-time evidence without inventing values', async () => {
+    mockFetch({ '/api/v1/decisions': envelopeOf(decisionsFixture()) })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('decisions-table')).toBeInTheDocument())
+    const table = screen.getByTestId('decisions-table')
+    expect(table).toHaveTextContent('calibrated / v1')
+    expect(table).toHaveTextContent('预测 run')
+    expect(table).toHaveTextContent('盘口 venue')
+    expect(table).toHaveTextContent('shadow_decisions')
+  })
+
+  it('labels ACCEPT as a shadow signal, not an executable instruction', async () => {
+    mockFetch({ '/api/v1/decisions': envelopeOf(decisionsFixture()) })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('decisions-table')).toBeInTheDocument())
+    const badge = screen.getAllByTestId('decision-badge-ACCEPT')[0]
+    expect(badge).toHaveTextContent('影子信号')
+    expect(badge).not.toHaveTextContent(/^ACCEPT$/)
+    // the filter value stays compatible with the API even though the label moved
+    expect(screen.getByTestId('filter-state')).toHaveValue('')
+    expect(within(screen.getByTestId('filter-state')).getByText('影子信号（ACCEPT）')).toBeInTheDocument()
   })
 
   it('calls the price column what it is, not what a trader would hope', async () => {

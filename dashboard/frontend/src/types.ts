@@ -170,6 +170,23 @@ export interface MarketSummary {
   event_id?: string | null
   question: string
   target_date?: string | null
+  target_date_reason?: string | null
+  /** Gamma rules / resolution metadata, when the archive tail carries it. */
+  rules_text?: string | null
+  resolution_source?: string | null
+  rules_source?: string | null
+  rules_reason?: string | null
+  start_time_utc?: string | null
+  end_time_utc?: string | null
+  schedule_source?: string | null
+  schedule_reason?: string | null
+  /**
+   * Server-derived from timezone-aware start/end plus venue flags.
+   * `null` means the inputs were insufficient - never treat it as open.
+   */
+  open_now?: boolean | null
+  open_now_source?: string | null
+  open_now_reason?: string | null
   bracket_label: string
   bracket_low?: number | null
   bracket_high?: number | null
@@ -230,10 +247,19 @@ export interface ForecastBucket {
 export interface ForecastDistribution {
   model: string
   version?: string | null
+  version_reason?: string | null
   target_date?: string | null
+  target_date_reason?: string | null
   forecast_run_time_utc?: string | null
+  /** Issued / run time, as distinct from publishable and received times. */
+  forecast_issued_at_utc?: string | null
+  forecast_issued_reason?: string | null
+  forecast_publishable_at_utc?: string | null
+  forecast_publishable_basis?: string | null
+  forecast_publishable_reason?: string | null
   training_cutoff_utc?: string | null
   forecast_received_at_utc?: string | null
+  forecast_received_reason?: string | null
   predicted_max_f?: number | null
   station?: string | null
   buckets: ForecastBucket[]
@@ -279,6 +305,20 @@ export interface DecisionRow {
   available_depth_usd?: number | null
   thresholds_version?: string | null
   run_id?: string | null
+  /** Forecast run stored on the decision row at decision time. */
+  forecast_run_time_utc?: string | null
+  snapshot_id?: string | null
+  book_id?: string | null
+  book_venue_ts_utc?: string | null
+  book_collector_received_at_utc?: string | null
+  book_shadow_received_at_utc?: string | null
+  spread?: number | null
+  mode_reason?: string | null
+  evidence_version?: number | null
+  book_source?: string | null
+  book_source_event_id?: string | null
+  evidence_source?: string
+  evidence_reason?: string | null
 }
 
 export interface DecisionsData {

@@ -31,7 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -173,6 +173,12 @@ class CatalogMarket:
     accepting_orders: bool
     raw_sha256: str
     source_run_id: str
+    rules_text: str | None = None
+    resolution_source: str | None = None
+    start_time_utc: datetime | None = None
+    end_time_utc: datetime | None = None
+    schedule_source: str | None = None
+    schedule_reason: str | None = None
 
     @property
     def tradeable(self) -> bool:
@@ -198,6 +204,26 @@ def _opt_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _schedule_time(
+    market: dict[str, Any], event: dict[str, Any], keys: tuple[str, ...]
+) -> tuple[datetime | None, str | None, str | None]:
+    """Read one trading-schedule timestamp without inventing a timezone."""
+    for owner_name, owner in (("market", market), ("event", event)):
+        for key in keys:
+            raw = owner.get(key)
+            if raw is None or raw == "":
+                continue
+            source = f"gamma:{owner_name}.{key}"
+            try:
+                parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except ValueError:
+                return None, source, f"{source} is not a valid ISO timestamp"
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return None, source, f"{source} has no timezone; trading time is unknown"
+            return parsed.astimezone(UTC), source, None
+    return None, None, f"gamma market/event has no {'/'.join(keys)}"
 
 
 def parse_gamma(
@@ -263,7 +289,18 @@ def parse_gamma(
             problems.append(f"{market_id}: no YES token id")
 
         fee_schedule = market.get("feeSchedule") or {}
-        market_rules = str(market.get("description") or rules)
+        market_rules = str(market.get("description") or rules) or None
+        market_resolution = str(market.get("resolutionSource") or resolution) or None
+        # The *Iso fields carry a time and offset; the plain ones are often
+        # date-only, so they are the fallback rather than the first choice.
+        start_time, start_source, start_reason = _schedule_time(
+            market, payload, ("startDateIso", "startDate")
+        )
+        end_time, end_source, end_reason = _schedule_time(
+            market, payload, ("endDateIso", "endDate")
+        )
+        schedule_sources = [source for source in (start_source, end_source) if source]
+        schedule_reasons = [reason for reason in (start_reason, end_reason) if reason]
         markets.append(
             CatalogMarket(
                 market_id=market_id,
@@ -286,6 +323,12 @@ def parse_gamma(
                 accepting_orders=bool(market.get("acceptingOrders")),
                 raw_sha256=digest,
                 source_run_id=run_id,
+                rules_text=market_rules,
+                resolution_source=market_resolution,
+                start_time_utc=start_time,
+                end_time_utc=end_time,
+                schedule_source=", ".join(schedule_sources) or None,
+                schedule_reason="; ".join(schedule_reasons) or None,
             )
         )
     return markets, problems

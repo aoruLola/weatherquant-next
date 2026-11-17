@@ -94,7 +94,10 @@ def build_decisions_snapshot(
                d.model_name, d.model_version, d.model_probability, d.market_price,
                d.best_bid, d.best_ask, d.net_edge, d.snapshot_age_ms,
                d.forecast_age_hours, d.available_depth_usd, d.thresholds_version,
-               d.run_id, c.question
+               d.run_id, d.forecast_run_time_utc, d.snapshot_id, d.book_id,
+               d.venue_ts_utc, d.collector_received_at_utc, d.shadow_received_at_utc,
+               d.spread, d.mode_reason, d.evidence_version, d.book_source,
+               d.book_source_event_id, c.question
         FROM shadow_decisions d
         LEFT JOIN market_catalog c ON c.market_id = d.market_id
         ORDER BY d.decision_time_utc DESC
@@ -120,7 +123,7 @@ def build_decisions_snapshot(
             "decision_id": str(row[0]),
             "decided_at_utc": _iso(row[1]),
             "market_id": str(row[2]),
-            "market_question": row[21],
+            "market_question": row[32],
             "bracket_label": row[3],
             "target_date": str(row[4]) if row[4] is not None else None,
             "direction": row[5],
@@ -139,6 +142,18 @@ def build_decisions_snapshot(
             "available_depth_usd": row[18],
             "thresholds_version": row[19],
             "run_id": row[20],
+            "forecast_run_time_utc": _iso(row[21]),
+            "snapshot_id": row[22],
+            "book_id": row[23],
+            "book_venue_ts_utc": _iso(row[24]),
+            "book_collector_received_at_utc": _iso(row[25]),
+            "book_shadow_received_at_utc": _iso(row[26]),
+            "spread": row[27],
+            "mode_reason": row[28],
+            "evidence_version": row[29],
+            "book_source": row[30],
+            "book_source_event_id": row[31],
+            "evidence_source": "shadow_decisions",
             "reasons": reasons.get(str(row[0]), []),
         }
         for row in rows
@@ -262,6 +277,18 @@ def build_markets_snapshot(
                 "event_id": str(event_id),
                 "question": str(question or ""),
                 "target_date": str(target_date) if target_date is not None else None,
+                "target_date_reason": None if target_date is not None else "market_catalog.target_date is null",
+                "rules_text": None,
+                "resolution_source": None,
+                "rules_source": None,
+                "rules_reason": "market_catalog does not store Gamma rules; API may supplement archive-tail metadata",
+                "start_time_utc": None,
+                "end_time_utc": None,
+                "schedule_source": None,
+                "schedule_reason": "market_catalog does not store Gamma trading start/end; API may supplement archive-tail metadata",
+                "open_now": None,
+                "open_now_source": None,
+                "open_now_reason": "timezone-aware trading start/end are unavailable in market_catalog",
                 "bracket_label": str(bracket_label or ""),
                 "bracket_low": None,
                 "bracket_high": None,
@@ -273,6 +300,7 @@ def build_markets_snapshot(
                 "token_yes": str(token_yes),
                 "book": quote,
                 "model_probability": probability,
+                "model_reason": None if probability is not None else "no primary-model probability for this bracket",
                 "model_version": version,
                 "forecast_run_time_utc": run_time,
                 "predicted_max_f": predicted_max,
@@ -368,6 +396,7 @@ def build_forecasts_snapshot(
         """
         SELECT model_name, model_version, target_date, event_id,
                probabilities_json, predicted_max_f, forecast_run_time_utc,
+               forecast_publishable_at_utc, forecast_publishable_basis,
                training_cutoff_utc, forecast_received_at_utc, station
         FROM model_predictions
         WHERE target_date <= ? AND forecast_run_time_utc <= ?
@@ -382,7 +411,20 @@ def build_forecasts_snapshot(
 
     distributions: list[dict[str, Any]] = []
     for row in rows:
-        model, version, target_date, _event_id, probs_json, predicted_max, run_time, cutoff, received, station = row
+        (
+            model,
+            version,
+            target_date,
+            _event_id,
+            probs_json,
+            predicted_max,
+            run_time,
+            publishable,
+            publishable_basis,
+            cutoff,
+            received,
+            station,
+        ) = row
         try:
             buckets_raw = json.loads(probs_json) if isinstance(probs_json, str) else probs_json
         except json.JSONDecodeError:
@@ -396,6 +438,9 @@ def build_forecasts_snapshot(
                 "target_date": str(target_date),
                 "event_id": str(_event_id),
                 "forecast_run_time_utc": _iso(run_time),
+                "forecast_issued_at_utc": _iso(run_time),
+                "forecast_publishable_at_utc": _iso(publishable),
+                "forecast_publishable_basis": publishable_basis,
                 "training_cutoff_utc": _iso(cutoff),
                 "forecast_received_at_utc": _iso(received),
                 "predicted_max_f": predicted_max,
