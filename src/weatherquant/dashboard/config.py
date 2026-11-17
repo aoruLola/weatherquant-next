@@ -98,6 +98,13 @@ class DashboardSettings(BaseSettings):
     archive_cache_seconds: float = Field(default=4.0, ge=0)
     """Minimum interval between archive re-reads; requests reuse the cache."""
 
+    # --- Paper engine (read-only HTTP only; never a database path) ---------
+    paper_api_base_url: str = "http://127.0.0.1:8790"
+    """Paper engine's GET-only API. Env: WQ_PAPER_API_BASE_URL."""
+
+    paper_api_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+    """Bound each upstream read; an unreachable engine becomes unavailable."""
+
     # --- api ---------------------------------------------------------------
     host: str = "0.0.0.0"
     port: int = Field(default=8787, ge=1, le=65535)

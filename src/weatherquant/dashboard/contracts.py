@@ -54,6 +54,7 @@ __all__ = [
     "MarketSummary",
     "MarketsData",
     "OverviewData",
+    "PaperData",
     "ShadowHealthData",
     "ShadowReportData",
     "SystemData",
@@ -528,6 +529,16 @@ class SystemData(BaseModel):
     storage: dict[str, Any] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
     unavailable: list[str] = Field(default_factory=list)
+
+
+class PaperData(BaseModel):
+    """Open Paper payload: the mode and availability are always explicit."""
+
+    model_config = ConfigDict(extra="allow")
+
+    status: str
+    mode: Literal["PAPER"] = "PAPER"
+    reason: str | None = None
 
 
 class PerformanceData(BaseModel):

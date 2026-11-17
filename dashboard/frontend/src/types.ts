@@ -409,6 +409,86 @@ export interface PerformancePayload {
   [k: string]: any
 }
 
+// --- Paper Trading (virtual simulation, isolated from reference capital) ---
+
+export interface PaperPosition {
+  market_id: string
+  token_id: string
+  shares: number
+  avg_cost_usd_per_share: number
+  cost_basis_usdc: number
+  mark_usd_per_share: number | null
+  market_value_usdc: number | null
+  unrealized_pnl_usdc: number | null
+  mark_status: 'OK' | 'MARK_UNAVAILABLE'
+}
+
+export interface PaperRejection {
+  decision_id: string
+  market_id: string
+  token_id?: string | null
+  direction?: string | null
+  refusal_reason?: string | null
+  refusal_detail?: string | null
+  decision_time_utc?: string | null
+  net_edge?: number | null
+}
+
+export interface PaperSummary {
+  status: 'ok' | 'unavailable'
+  mode: 'PAPER'
+  reason?: string | null
+  initial_capital_usdc: number | null
+  available_usdc: number | null
+  occupied_usdc: number | null
+  cost_equity_usdc: number | null
+  equity_usdc: number | null
+  realized_pnl_usdc: number | null
+  unrealized_pnl_usdc: number | null
+  roi: number | null
+  max_drawdown: number | null
+  drawdown_basis: 'ledger_cost'
+  equity_curve: {
+    basis: 'ledger_cost'
+    points: { t: string; v: number; seq: number }[]
+  }
+  positions: PaperPosition[]
+  marks_status: 'fresh' | 'unavailable' | 'not_required'
+  marks_reason?: string | null
+  rejection_summary: { reason: string; count: number }[]
+  rejections: PaperRejection[]
+  ledger_consistent?: boolean | null
+  conservation_ok?: boolean | null
+  fill_count?: number | null
+}
+
+export interface PaperFill {
+  decision_id: string
+  market_id: string
+  token_id: string
+  direction: string
+  side: 'BUY' | 'SELL'
+  requested_shares: number
+  filled_shares: number
+  avg_price_usd_per_share: number
+  fill_cost_usd: number
+  fees_usd: number
+  net_proceeds_usd?: number | null
+  complete: boolean
+  decision_time_utc?: string | null
+  filled_at_utc?: string | null
+}
+
+export interface PaperFills {
+  status: 'ok' | 'unavailable'
+  mode: 'PAPER'
+  reason?: string | null
+  fills: PaperFill[]
+  limit: number
+  next_cursor: string | null
+  has_more: boolean
+}
+
 export interface Healthz {
   status: string
   uptime_seconds: number
