@@ -54,7 +54,9 @@ export function StatusChip({
 }
 
 const STATE_LABEL: Record<string, string> = {
-  ACCEPT: 'ACCEPT',
+  // The API state stays ACCEPT for compatibility; the label must not read as
+  // an executed trade. This is a model/risk filter that passed once.
+  ACCEPT: '影子信号',
   REJECT: 'REJECT',
   NO_TRADE: 'NO_TRADE',
   DATA_UNAVAILABLE: 'DATA_UNAVAILABLE',

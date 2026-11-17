@@ -297,6 +297,18 @@ class MarketSummary(BaseModel):
     event_id: str | None = None
     question: str = ""
     target_date: date | None = None
+    target_date_reason: str | None = None
+    rules_text: str | None = None
+    resolution_source: str | None = None
+    rules_source: str | None = None
+    rules_reason: str | None = None
+    start_time_utc: datetime | None = None
+    end_time_utc: datetime | None = None
+    schedule_source: str | None = None
+    schedule_reason: str | None = None
+    open_now: bool | None = None
+    open_now_source: str | None = None
+    open_now_reason: str | None = None
     bracket_label: str = ""
     bracket_low: float | None = None
     bracket_high: float | None = None
@@ -367,10 +379,18 @@ class ForecastBucket(BaseModel):
 class ForecastDistribution(BaseModel):
     model: str
     version: str | None = None
+    version_reason: str | None = None
     target_date: date | None = None
+    target_date_reason: str | None = None
     forecast_run_time_utc: datetime | None = None
+    forecast_issued_at_utc: datetime | None = None
+    forecast_issued_reason: str | None = None
+    forecast_publishable_at_utc: datetime | None = None
+    forecast_publishable_basis: str | None = None
+    forecast_publishable_reason: str | None = None
     training_cutoff_utc: datetime | None = None
     forecast_received_at_utc: datetime | None = None
+    forecast_received_reason: str | None = None
     predicted_max_f: float | None = None
     station: str | None = None
     buckets: list[ForecastBucket] = Field(default_factory=list)
@@ -421,6 +441,19 @@ class DecisionRow(BaseModel):
     available_depth_usd: float | None = None
     thresholds_version: str | None = None
     run_id: str | None = None
+    forecast_run_time_utc: datetime | None = None
+    snapshot_id: str | None = None
+    book_id: str | None = None
+    book_venue_ts_utc: datetime | None = None
+    book_collector_received_at_utc: datetime | None = None
+    book_shadow_received_at_utc: datetime | None = None
+    spread: float | None = None
+    mode_reason: str | None = None
+    evidence_version: int | None = None
+    book_source: str | None = None
+    book_source_event_id: str | None = None
+    evidence_source: str = "shadow_decisions"
+    evidence_reason: str | None = None
 
 
 class DecisionsData(BaseModel):
@@ -445,8 +478,8 @@ class DecisionsData(BaseModel):
     last_cycle_status: FreshnessState = FreshnessState.MISSING
 
     disclaimer: str = (
-        "ACCEPT 表示符合当前模型与风险过滤条件，不代表已验证的盈利机会。"
-        " ACCEPT means the filters passed; it is not evidence of a profitable trade."
+        "影子信号仅表示通过当前模型与风险过滤的一次模拟评估，"
+        "不代表下单或成交，也不代表已验证的盈利机会。"
     )
     filters_applied: dict[str, Any] = Field(default_factory=dict)
 
