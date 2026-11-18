@@ -550,7 +550,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "build-performance",
-        help="build the six performance snapshots from a decisions export",
+        help="build the seven performance snapshots from a decisions export",
     )
     p.add_argument(
         "--export",
@@ -566,7 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--restore-settlements-backup",
         help="restore the complete streaming settlement layer from a retraction backup",
     )
-    p.add_argument("--out", required=True, help="directory to publish the six snapshots into")
+    p.add_argument("--out", required=True, help="directory to publish the seven snapshots into")
     p.add_argument(
         "--dataset",
         required=True,
@@ -1041,7 +1041,7 @@ def _atomic_write_json(path: Path, payload) -> None:
 
 
 def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
-    """Turn a decisions export plus settlements into the six snapshots.
+    """Turn a decisions export plus settlements into the seven snapshots.
 
     Two engines, chosen by what the input is:
 

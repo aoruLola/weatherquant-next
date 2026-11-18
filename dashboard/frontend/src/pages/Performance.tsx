@@ -22,9 +22,15 @@ import { FreshnessPill } from '../components/status'
 import PageHeader from '../components/PageHeader'
 import { Banner, Card, EmptyState, SectionTitle, StatCard, inputClass } from '../components/ui'
 import { fmtInt, fmtPct, fmtUsd } from '../format'
-import type { PerformancePayload } from '../types'
+import type {
+  PerformancePayload,
+  ResearchDriftBucket,
+  ResearchDriftData,
+  ResearchDriftEdgeTier,
+  ResearchDriftGranularity,
+} from '../types'
 
-function warningsOf(payload?: PerformancePayload | null): string[] {
+function warningsOf(payload?: PerformancePayload<any> | null): string[] {
   return payload?.warnings ?? []
 }
 
@@ -35,19 +41,19 @@ function warningsOf(payload?: PerformancePayload | null): string[] {
  * state of a dashboard that has data, which is exactly the confusion this
  * page exists to prevent.
  */
-function isMissing(payload?: PerformancePayload | null): boolean {
+function isMissing(payload?: PerformancePayload<any> | null): boolean {
   if (!payload) return true
   const body = payload.data
   return !body || Object.keys(body).length === 0
 }
 
-function ScopeLine({ payload }: { payload?: PerformancePayload | null }) {
+function ScopeLine({ payload }: { payload?: PerformancePayload<any> | null }) {
   const scope = payload?.statistical_scope ?? []
   if (scope.length === 0) return null
   return <span className="text-xs text-muted">统计范围：{scope.join(' · ')}</span>
 }
 
-function MissingCard({ payload, title }: { payload?: PerformancePayload | null; title: string }) {
+function MissingCard({ payload, title }: { payload?: PerformancePayload<any> | null; title: string }) {
   return (
     <Card title={title}>
       <EmptyState
@@ -76,6 +82,7 @@ export default function Performance() {
   const summary = usePoll<PerformancePayload>('/api/v1/performance/summary', 30000)
   const edge = usePoll<PerformancePayload>('/api/v1/performance/edge', 30000)
   const winRate = usePoll<PerformancePayload>('/api/v1/performance/win-rate', 60000)
+  const researchDrift = usePoll<ResearchDriftData>('/api/v1/performance/research-drift', 60000)
 
   const opportunitiesQuery = useMemo(() => {
     const params = new URLSearchParams()
@@ -315,6 +322,16 @@ export default function Performance() {
             ))}
           </div>
         </Card>
+      )}
+
+      {/* ---- Calibration and market-pricing drift ---- */}
+      <SectionTitle hint="按 ISO 周 / 月 / 天气目标日 · 三种样本与三层 Edge 不混用">
+        校准与定价漂移
+      </SectionTitle>
+      {isMissing(researchDrift.envelope?.data) ? (
+        <MissingCard payload={researchDrift.envelope?.data} title="校准与定价漂移" />
+      ) : (
+        <ResearchDriftView payload={researchDrift.envelope!.data} />
       )}
 
       {/* ---- Reference capital ---- */}
@@ -837,11 +854,229 @@ export default function Performance() {
   )
 }
 
+const driftGranularityLabels: Record<ResearchDriftGranularity, string> = {
+  iso_week: 'ISO 周',
+  month: '月份',
+  target_date: '天气目标日',
+}
+
+function fmtDrift(value: number | null | undefined, signed = false): string {
+  if (value == null || Number.isNaN(value)) return 'N/A'
+  return `${signed && value > 0 ? '+' : ''}${value.toFixed(4)}`
+}
+
+function DriftTierValue({ tier, usd = false }: { tier: ResearchDriftEdgeTier; usd?: boolean }) {
+  return (
+    <div className="tnum">
+      <div>{usd ? `${fmtUsd(tier.sum)} USD` : fmtDrift(tier.sum)}</div>
+      <div className="mt-1 text-[11px] font-normal text-muted">
+        均值 {usd ? fmtUsd(tier.mean) : fmtDrift(tier.mean)} · n={fmtInt(tier.n)}
+      </div>
+    </div>
+  )
+}
+
+function ResearchDriftView({ payload }: { payload: ResearchDriftData }) {
+  const [granularity, setGranularity] = useState<ResearchDriftGranularity>('iso_week')
+  const data = payload.data
+  if (!data) {
+    return (
+      <Card title="校准与定价漂移">
+        <EmptyState title="不可用" reason="研究回填尚未发布该快照" testId="performance-missing" />
+      </Card>
+    )
+  }
+  const rows = data.buckets[granularity] ?? []
+  const anomalies = data.anomalies.filter((item) => item.granularity === granularity)
+  const climatologyReason = rows[0]?.baseline_comparison.climatology.reason
+
+  return (
+    <Card testId="performance-research-drift" className="mb-4" bodyClassName="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <label className="flex flex-col gap-1">
+          <span className="text-xs text-muted">聚合粒度</span>
+          <select
+            value={granularity}
+            onChange={(event) => setGranularity(event.target.value as ResearchDriftGranularity)}
+            className={inputClass}
+            aria-label="研究聚合粒度"
+            data-testid="drift-granularity"
+          >
+            {Object.entries(driftGranularityLabels).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="text-xs text-muted">
+          全历史：观测 {fmtInt(data.totals.observation_count)} · Episode{' '}
+          {fmtInt(data.totals.episode_count)} · 每个可执行 Episode 独立参考本金{' '}
+          {fmtUsd(data.reference_capital_usdc)} USDC
+        </div>
+      </div>
+
+      <Banner tone="info" title="三层 Edge 独立呈现" testId="drift-tier-note">
+        理论观测 Edge 为每份合约的无量纲概率差；预期净 USD 只含可执行 Episode；已验证已实现净 USD
+        只含可执行且已验证结算的样本。每个 Episode 独立使用参考本金，USD 合计不是共享账户余额。
+      </Banner>
+
+      {rows.length === 0 ? (
+        <EmptyState title="该粒度暂无研究样本" reason="等待已发布 Episode 积累" testId="drift-empty" />
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[1420px] text-sm" data-testid="drift-table">
+            <thead>
+              <tr className="border-b border-line text-left text-xs text-muted">
+                <th className="pb-2 font-medium">{driftGranularityLabels[granularity]}</th>
+                <th className="pb-2 text-right font-medium">ACCEPT 观测</th>
+                <th className="pb-2 text-right font-medium">独立 Episode</th>
+                <th className="pb-2 text-right font-medium">实际可执行</th>
+                <th className="pb-2 font-medium">模型校准</th>
+                <th className="pb-2 font-medium">市场定价 / 基线</th>
+                <th className="pb-2 text-right font-medium">理论观测 Edge / 份</th>
+                <th className="pb-2 text-right font-medium">可执行预期净 USD</th>
+                <th className="pb-2 text-right font-medium">已验证已实现净 USD</th>
+                <th className="pb-2 font-medium">费用 / 盘口</th>
+                <th className="pb-2 font-medium">来源</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <ResearchDriftRow key={row.period} row={row} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="space-y-2" data-testid="drift-anomalies">
+        <div className="text-xs font-medium text-ink">
+          异常标记 {fmtInt(anomalies.length)} · 至少 4 个先前有效桶，偏离 &gt; 3 MAD；MAD=0
+          时任何非零偏离均标记
+        </div>
+        {anomalies.map((anomaly) => (
+          <details
+            key={`${anomaly.period}-${anomaly.metric}`}
+            className="rounded border border-warn/40 bg-warn-soft px-3 py-2 text-xs"
+            data-testid="drift-anomaly"
+          >
+            <summary className="cursor-pointer font-medium text-ink">
+              {anomaly.period} · {anomaly.metric} · 当前 {fmtDrift(anomaly.value)} · 偏离{' '}
+              {fmtDrift(anomaly.deviation)}
+            </summary>
+            <div className="mt-2 space-y-1 text-muted">
+              <div>
+                历史中位数 {fmtDrift(anomaly.trailing_median)} · MAD {fmtDrift(anomaly.trailing_mad)} ·
+                阈值 {fmtDrift(anomaly.threshold)} · 历史桶 {fmtInt(anomaly.trailing_bucket_count)}
+              </div>
+              <div className="break-all" data-testid="drift-anomaly-sources">
+                来源 Episode：{anomaly.source_episode_ids.join(' · ')}
+              </div>
+            </div>
+          </details>
+        ))}
+      </div>
+
+      <div className="space-y-2 border-t border-line pt-3 text-xs text-muted">
+        <div data-testid="drift-climatology">
+          气候基线：N/A{climatologyReason ? ` — ${climatologyReason}` : ' — 当前导出无气候概率，未插补'}
+        </div>
+        <ScopeLine payload={payload} />
+        <details>
+          <summary className="cursor-pointer">研究口径与限制</summary>
+          <ul className="mt-2 space-y-1">
+            {data.warnings.map((warning, index) => (
+              <li key={index}>· {warning}</li>
+            ))}
+          </ul>
+        </details>
+      </div>
+    </Card>
+  )
+}
+
+function ResearchDriftRow({ row }: { row: ResearchDriftBucket }) {
+  const feeRates = row.fee_assumption.rates
+    .map((item) => `${item.fee_rate.toFixed(4)} × ${fmtInt(item.episode_count)}`)
+    .join(' · ')
+  const reasons = Object.entries(row.not_executable_reason_counts)
+    .map(([reason, count]) => `${reason} ${fmtInt(count)}`)
+    .join(' · ')
+  return (
+    <tr className="border-b border-line/50 align-top last:border-0" data-testid="drift-row">
+      <td className="py-3 pr-3 text-xs font-medium">
+        <div>{row.period}</div>
+        <div className="mt-1 flex flex-wrap gap-1">
+          {row.small_sample && (
+            <span className="rounded border border-line px-1 py-0.5 text-[10px] font-normal text-muted">
+              小样本 n={fmtInt(row.episode_count)}
+            </span>
+          )}
+          {row.anomaly_metrics.length > 0 && (
+            <span
+              className="rounded border border-warn/40 px-1 py-0.5 text-[10px] font-normal text-warn"
+              title={row.anomaly_metrics.join(' · ')}
+              data-testid="drift-row-anomaly"
+            >
+              异常 {fmtInt(row.anomaly_metrics.length)}
+            </span>
+          )}
+        </div>
+      </td>
+      <td className="tnum py-3 pr-3 text-right">{fmtInt(row.observation_count)}</td>
+      <td className="tnum py-3 pr-3 text-right">{fmtInt(row.episode_count)}</td>
+      <td className="tnum py-3 pr-3 text-right">
+        {fmtInt(row.executable_count)}
+        <div className="mt-1 text-[11px] text-muted">不可执行 {fmtInt(row.not_executable_count)}</div>
+      </td>
+      <td className="tnum py-3 pr-3 text-xs">
+        <div>Brier {fmtDrift(row.calibration.brier)}</div>
+        <div className="mt-1">ECE {fmtDrift(row.calibration.ece)}</div>
+        <div className="mt-1 text-[11px] text-muted">
+          n={fmtInt(row.calibration.n)} · bins={fmtInt(row.calibration.bins.length)}
+        </div>
+      </td>
+      <td className="tnum py-3 pr-3 text-xs">
+        <div>偏差 {fmtDrift(row.market_bias.mean_market_minus_outcome, true)}</div>
+        <div className="mt-1 text-[11px] text-muted">
+          n={fmtInt(row.market_bias.n)} · 市场 Brier {fmtDrift(row.baseline_comparison.market.brier)}
+        </div>
+      </td>
+      <td className="py-3 pr-3 text-right text-xs">
+        <DriftTierValue tier={row.edge_tiers.theoretical_observation_edge_per_share} />
+      </td>
+      <td className="py-3 pr-3 text-right text-xs">
+        <DriftTierValue tier={row.edge_tiers.executable_expected_net_usd} usd />
+      </td>
+      <td className="py-3 pr-3 text-right text-xs">
+        <DriftTierValue tier={row.edge_tiers.verified_realised_net_usd} usd />
+      </td>
+      <td className="py-3 pr-3 text-[11px] text-muted">
+        <div>FEE_UNKNOWN {fmtInt(row.fee_unknown_count)}</div>
+        <div className="mt-1">NO_BOOK {fmtInt(row.no_book_count)}</div>
+        <div className="mt-1">已知费率：{feeRates || '无'}</div>
+        {reasons && <div className="mt-1">{reasons}</div>}
+      </td>
+      <td className="py-3 text-xs">
+        <details data-testid="drift-source-drilldown">
+          <summary className="cursor-pointer whitespace-nowrap text-accent">
+            Episode {fmtInt(row.source_episode_ids.length)}
+          </summary>
+          <div className="mt-2 max-w-64 break-all text-[11px] text-muted" data-testid="drift-source-ids">
+            {row.source_episode_ids.join(' · ')}
+          </div>
+        </details>
+      </td>
+    </tr>
+  )
+}
+
 function WinRateView({
   payload,
   overall,
 }: {
-  payload?: PerformancePayload | null
+  payload?: PerformancePayload<any> | null
   overall: any
 }) {
   if (!overall) {

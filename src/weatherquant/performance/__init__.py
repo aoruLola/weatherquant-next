@@ -5,7 +5,7 @@ settlement tables. It never opens a database the shadow engine holds a lease
 on, never writes to the collector's archive, and never places an order - the
 numbers here are model expectations and verified settlements, nothing else.
 
-Two engines read that history, and they publish the same six snapshots:
+Two engines read that history, and they publish the same seven snapshots:
 
 * ``build_performance`` holds the whole history in memory. It is the reference
   implementation, and it is the thing the streaming engine is checked against.

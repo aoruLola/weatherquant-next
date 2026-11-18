@@ -42,7 +42,8 @@ sys.path.insert(0, str(REPO / "src"))
 
 from weatherquant.performance.generation_lock import GenerationBusy, generation_lock  # noqa: E402
 
-SNAPSHOT_FILES = (
+#: Every generation ever published carries these six.
+CORE_SNAPSHOT_FILES = (
     "summary.json",
     "edge.json",
     "win-rate.json",
@@ -50,6 +51,10 @@ SNAPSHOT_FILES = (
     "settlements.json",
     "models.json",
 )
+#: Added later (WQN-37): required only when the generation's manifest declares it,
+#: so generations published before it remain complete rollback points.
+OPTIONAL_SNAPSHOT_FILES = ("research-drift.json",)
+SNAPSHOT_FILES = CORE_SNAPSHOT_FILES + OPTIONAL_SNAPSHOT_FILES
 
 #: What a Dashboard built before this round can and cannot read. The detail
 #: changed from an inline array to a partition descriptor, and the summary
@@ -103,12 +108,19 @@ def _load(path: Path) -> dict | None:
 
 def inspect(directory: Path) -> GenerationInfo:
     manifest = _load(directory / "manifest.json") or {}
-    present = tuple(name for name in SNAPSHOT_FILES if (directory / name).is_file())
-    missing = tuple(name for name in SNAPSHOT_FILES if name not in present)
+    files = manifest.get("files")
+    # The six core files are always required: a manifest cannot waive them, or
+    # a damaged generation could pass as a complete rollback point. Only the
+    # later-added files are taken from the manifest - current generations
+    # declare research-drift.json; historical ones did not, and remain valid
+    # rollback points for their paired historical Dashboard.
+    declared = set(files) if isinstance(files, dict) and files else set(SNAPSHOT_FILES)
+    required = CORE_SNAPSHOT_FILES + tuple(name for name in OPTIONAL_SNAPSHOT_FILES if name in declared)
+    present = tuple(name for name in required if (directory / name).is_file())
+    missing = tuple(name for name in required if name not in present)
     problems = []
     if manifest.get("generation_id") != directory.name:
         problems.append("missing manifest or generation ID mismatch")
-    files = manifest.get("files")
     for name in present:
         entry = files.get(name) if isinstance(files, dict) else None
         if not isinstance(entry, dict) or entry.get("bytes") != (directory / name).stat().st_size:

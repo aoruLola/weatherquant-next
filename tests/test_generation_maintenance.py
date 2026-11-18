@@ -94,6 +94,61 @@ def test_prune_requires_a_complete_legacy_rollback_point(tmp_path):
     assert all((tmp_path / "generations" / generation_id).is_dir() for generation_id in ids)
 
 
+def test_a_current_generation_cannot_omit_research_drift(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    from pin_performance_generation import inspect
+
+    generation_id = "20260102T000000Z-current"
+    _publish(tmp_path, generation_id)
+    generation = tmp_path / "generations" / generation_id
+    (generation / "research-drift.json").unlink()
+
+    info = inspect(generation)
+    assert not info.complete
+    assert info.missing_files == ("research-drift.json",)
+
+
+def test_a_manifest_cannot_waive_a_core_snapshot_file(tmp_path, monkeypatch):
+    """Only research-drift.json is optional (historical generations predate it).
+
+    A manifest that no longer lists a core file - and whose core file is gone -
+    must not make the generation look complete: prune keeps "complete"
+    generations as rollback points and treats incomplete ones as deletable.
+    """
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    from pin_performance_generation import inspect
+
+    generation_id = "20260102T000000Z-damaged"
+    _publish(tmp_path, generation_id)
+    generation = tmp_path / "generations" / generation_id
+    manifest_path = generation / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["files"]["edge.json"]
+    manifest_path.write_text(json.dumps(manifest))
+    (generation / "edge.json").unlink()
+
+    info = inspect(generation)
+    assert not info.complete
+    assert "edge.json" in info.missing_files
+
+
+def test_a_historical_generation_without_research_drift_stays_complete(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    from pin_performance_generation import inspect
+
+    generation_id = "20260101T000000Z-historical"
+    _publish(tmp_path, generation_id, legacy=True)
+    generation = tmp_path / "generations" / generation_id
+    manifest_path = generation / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["files"]["research-drift.json"]
+    manifest_path.write_text(json.dumps(manifest))
+    (generation / "research-drift.json").unlink()
+
+    info = inspect(generation)
+    assert info.complete, info.as_dict()
+
+
 def test_dry_run_takes_no_lock_and_deletes_nothing(tmp_path):
     _publish(tmp_path, "20260101T000000Z-legacy", legacy=True)
     _publish(tmp_path, "20260102T000000Z-stale")

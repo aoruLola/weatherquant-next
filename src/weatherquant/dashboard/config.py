@@ -38,7 +38,7 @@ class DashboardSettings(BaseSettings):
     """Shadow data root: <dir>/health/heartbeat.json and <dir>/reports/."""
 
     performance_data_dir: Path = Path("data/performance")
-    """Research analytics output: the six performance snapshots.
+    """Research analytics output: the seven performance snapshots.
 
     Written by the offline research process, read-only here. Kept separate
     from the shadow's directory so a slow backfill can never block the

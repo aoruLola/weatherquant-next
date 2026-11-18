@@ -152,9 +152,9 @@ weatherquant-research build-performance \
 | `--confirm-empty-retraction` | 与 `--settlements-replace` 合用、且索引为空时才需要：确认"全部撤销" |
 | `--retraction-reason` | 记录进全部撤销的备份，说明为什么清空结算层；不给则记 `null`，不猜 |
 
-输出是**一个世代**：`performance/generations/<id>/` 内放六份快照与 `manifest.json`，
+输出是**一个世代**：`performance/generations/<id>/` 内放七份快照与 `manifest.json`，
 最后以一次 rename 切换 `performance/current.json` 指针（契约 §7.1）。
-读者要么看到完整的一批，要么看到上一批，**不会**看到三个新、三个旧。
+读者要么看到完整的一批，要么看到上一批，**不会**看到不同世代的文件混合。
 中途失败时新世代无人跟随，上一批仍然 current。
 
 `manifest.json` 记录 `dataset`、输入水位 `watermark`、覆盖范围 `coverage`、
@@ -195,7 +195,7 @@ weatherquant-research build-performance --help
 |---|---|
 | 1 | 确认既有三个容器仍健康（`/healthz` 三源 `fresh`） |
 | 2 | 更新 Dashboard compose，加 `:ro` 挂载 `/sources/performance` |
-| 3 | 执行回填（§3），确认六个文件已原子发布 |
+| 3 | 执行回填（§3），确认七个文件已原子发布 |
 | 4 | Dashboard **Apply**（新镜像 `sha-<commit>`） |
 | 5 | 验证 `/api/v1/performance/summary` 返回 `fresh` |
 | 6 | MCP compose 填入 `MCP_SHA` / `WQ_MCP_DASHBOARD_URL` / `WQ_MCP_PLAINTEXT_NETWORKS` / `WQ_MCP_TOKEN` |

@@ -100,7 +100,7 @@ def test_a_missing_export_is_reported_not_guessed(tmp_path, capsys) -> None:
     assert "could not read decisions export" in capsys.readouterr().err
 
 
-# --- an offline run produces the six snapshots --------------------------------
+# --- an offline run produces the seven snapshots --------------------------------
 
 
 

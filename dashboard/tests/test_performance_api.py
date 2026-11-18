@@ -111,11 +111,13 @@ def test_every_performance_endpoint_answers_when_nothing_is_published(tmp_path, 
     with _client_for(root, settings_for) as client:
         for path in (
             "summary", "edge", "win-rate", "opportunities",
-            "settlements", "models", "reference-capital",
+            "settlements", "models", "research-drift", "reference-capital",
         ):
             response = client.get(f"/api/v1/performance/{path}")
             assert response.status_code == 200, path
             assert response.json()["freshness"]["state"] == "missing", path
+            if path == "research-drift":
+                assert response.json()["data"]["data"] is None
 
 
 # --- published snapshots ------------------------------------------------------
@@ -142,13 +144,37 @@ def test_the_summary_carries_its_scope_and_warnings(published) -> None:
     assert any("not profit" in w for w in data["warnings"])
 
 
-def test_all_six_snapshots_are_reachable(published) -> None:
-    # Five path-shaped endpoints plus reference-capital; the sixth file
-    # (summary) is served under its own path above.
-    for path in ("summary", "edge", "win-rate", "opportunities", "settlements", "models"):
+def test_all_seven_snapshots_are_reachable(published) -> None:
+    for path in (
+        "summary", "edge", "win-rate", "opportunities", "settlements", "models", "research-drift",
+    ):
         response = published.get(f"/api/v1/performance/{path}")
         assert response.status_code == 200, path
         assert response.json()["freshness"]["state"] == "fresh", path
+
+
+def test_research_drift_is_read_only_and_has_a_typed_contract(published) -> None:
+    response = published.get("/api/v1/performance/research-drift")
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    data = payload["data"]
+    assert payload["kind"] == "performance-research-drift"
+    assert data["reference_capital_usdc"] == 100.0
+    assert data["anomaly_rule"]["minimum_trailing_buckets"] == 4
+    bucket = data["buckets"]["iso_week"][0]
+    assert bucket["observation_count"] >= bucket["episode_count"] >= bucket["executable_count"]
+    assert set(bucket["edge_tiers"]) == {
+        "theoretical_observation_edge_per_share",
+        "executable_expected_net_usd",
+        "verified_realised_net_usd",
+    }
+    assert bucket["source_episode_ids"]
+    assert bucket["baseline_comparison"]["climatology"]["available"] is False
+    assert published.post("/api/v1/performance/research-drift").status_code == 405
+    schemas = published.get("/api/openapi.json").json()["components"]["schemas"]
+    assert "ResearchDriftBucket" in schemas
+    assert "ResearchDriftPayload" in schemas
 
 
 def test_edge_and_opportunity_sums_are_both_visible(published) -> None:

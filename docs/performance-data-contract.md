@@ -387,24 +387,25 @@ Win Rate = WIN / (WIN + LOSS)
 | `GET /api/v1/performance/opportunities` | `performance/opportunities.json` 描述符 + `opportunities/part-*.json`（服务端分页 + 筛选，§14.4） |
 | `GET /api/v1/performance/settlements` | `performance/settlements.json`（分页） |
 | `GET /api/v1/performance/models` | `performance/models.json` |
+| `GET /api/v1/performance/research-drift` | `performance/research-drift.json`（校准/市场偏差/三层 Edge；口径见 `research-drift-dashboard.md`） |
 | `GET /api/v1/performance/reference-capital` | **纯函数** `capital.simulate(...)`，参数：`capital_usdc`(默认100,>0)、`mode`、`max_allocation_fraction`。返回汇总 + 有界样本，总体为明细窗口（§14.6） |
 
 **快照缺失时**：`freshness.state = "missing"` + 原因，**禁止返回伪造数据**。
 
 ### 7.1 世代目录与一致性
 
-六份快照**作为一个世代发布**，不是六次独立 rename：
+七份快照**作为一个世代发布**，不是七次独立 rename：
 
 ```
 performance/
     current.json                      # {"generation_id": "<id>"}  原子指针
     generations/<id>/
         summary.json edge.json win-rate.json
-        opportunities.json settlements.json models.json
+        opportunities.json settlements.json models.json research-drift.json
         manifest.json                 # 数据集、水位、覆盖范围、文件清单
 ```
 
-**为什么不能直接 rename 六次**：那不是跨文件的原子提交。读者若在中途到达，
+**为什么不能直接 rename 七次**：那不是跨文件的原子提交。读者若在中途到达，
 会拿到「旧的 opportunities + 新的 win-rate」——两份从未同时存在的数据
 拼在一起，而这种不一致不会报错，只会被拿去评分。
 
@@ -458,6 +459,7 @@ source_endpoint   ← 证明数据来自哪个 API（禁止 MCP 自算）
 | `observation_all_accepts` | 全部 ACCEPT 评估（含重复） |
 | `opportunity_episodes` | 去重后的独立机会 |
 | `resolved_verified_only` | 仅 RESOLVED + VERIFIED（胜率分母） |
+| `episode_first_observation_calibration` | 校准与市场偏差只用每个 Episode 的首次概率 |
 | `out_of_sample_chronological` | 按时间顺序样本外 |
 | `reference_capital_hypothetical` | 参考本金假设，非实盘 |
 | `live_only` / `replay_only` / `live_and_replay` | 模式范围 |

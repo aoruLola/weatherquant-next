@@ -3,7 +3,7 @@
 What this replaces, and why
 ---------------------------
 ``build_performance`` reads every decision into a Python dict, sorts the lot,
-folds episodes in one pass and only then computes six snapshots. It is correct
+folds episodes in one pass and only then computes seven snapshots. It is correct
 and it is unaffordable: measured at about 6.8 KB per decision, it OOMed at
 960,000 rows under a 6.5 GB cap and took the whole NAS offline for 35 minutes
 at 7.5 GB. The export only grows, so no memory cap fixes that.
@@ -93,6 +93,7 @@ from weatherquant.performance.episodes import (
     episode_from_open,
     row_from_mapping,
 )
+from weatherquant.performance.research_drift import build_research_drift
 from weatherquant.performance.snapshot import (
     DETAIL_MAX_EPISODES,
     DETAIL_PARTITION_SIZE,
@@ -979,7 +980,7 @@ def build_streaming_payloads(
     detail_max_episodes: int = DETAIL_MAX_EPISODES,
     detail_window_days: int = DETAIL_WINDOW_DAYS,
 ) -> StreamingBuild:
-    """Build all six snapshots from the store, holding nothing that grows.
+    """Build all seven snapshots from the store, holding nothing that grows.
 
     The episode set is walked three times - once for the summary and the win
     rates together, once to stream the opportunities, once to stream the
@@ -1160,6 +1161,14 @@ def build_streaming_payloads(
 
     settlements_payload = settlement_payload(settlement_records, counts=rate.counts)
 
+    research_drift = build_research_drift(
+        (_render(stored) for stored in store.iter_episodes()),
+        answers=answers,
+        verified=verified,
+        book_for=book_for,
+        reference_capital_usdc=capital_usdc,
+    )
+
     models_payload = {
         "models": models,
         "by_model_edge": grouped_edges["model"],
@@ -1221,6 +1230,14 @@ def build_streaming_payloads(
             sample_size=sample,
             statistical_scope=["out_of_sample_chronological"],
             warnings=models_payload["warnings"],
+            **common,
+        ),
+        "research-drift.json": _envelope(
+            logical_name="performance-research-drift",
+            data=research_drift,
+            sample_size=research_drift["totals"]["observation_count"],
+            statistical_scope=research_drift["statistical_scope"],
+            warnings=research_drift["warnings"],
             **common,
         ),
     }
@@ -1560,7 +1577,7 @@ def build_performance_streaming(
     source: str = "weatherquant-research",
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Ingest whatever is new, then publish the six snapshots.
+    """Ingest whatever is new, then publish the seven snapshots.
 
     ``ingest=False`` rebuilds the snapshots from the store without touching the
     export, which is the "partial recompute" path: a settlement that arrives
