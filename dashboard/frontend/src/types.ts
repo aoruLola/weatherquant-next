@@ -413,7 +413,7 @@ export interface LayeredHealthData {
  * being read as a return. Typing the body tightly would drop the caveat
  * that travels with the number.
  */
-export interface PerformancePayload {
+export interface PerformancePayload<TData = Record<string, any>> {
   reason?: string | null
   statistical_scope: string[]
   warnings: string[]
@@ -422,7 +422,7 @@ export interface PerformancePayload {
   generated_at_utc?: string | null
   as_of_utc?: string | null
   dataset?: string | null
-  data?: Record<string, any>
+  data?: TData
   items?: Record<string, any>[]
   total?: number
   // A cursor belongs to one published generation, so it is opaque: the API
@@ -445,6 +445,127 @@ export interface PerformancePayload {
   source_endpoint?: string
   [k: string]: any
 }
+
+// --- calibration and market-pricing drift ---------------------------------
+
+export type ResearchDriftGranularity = 'iso_week' | 'month' | 'target_date'
+
+export interface ResearchDriftCalibrationBin {
+  lower: number
+  upper: number
+  predicted_mean: number
+  observed_frequency: number
+  count: number
+  gap: number
+}
+
+export interface ResearchDriftCalibration {
+  n: number
+  brier: number | null
+  ece: number | null
+  bins: ResearchDriftCalibrationBin[]
+}
+
+export interface ResearchDriftMarketBias {
+  n: number
+  mean_market_minus_outcome: number | null
+  mean_market_probability: number | null
+  mean_outcome: number | null
+}
+
+export interface ResearchDriftMarketBaseline extends ResearchDriftCalibration {
+  mean_market_minus_outcome: number | null
+}
+
+export interface ResearchDriftBaselineComparison {
+  market: ResearchDriftMarketBaseline
+  climatology: {
+    available: boolean
+    n: number
+    brier: number | null
+    ece: number | null
+    reason: string
+  }
+}
+
+export interface ResearchDriftBucket {
+  period: string
+  start_date: string
+  observation_count: number
+  episode_count: number
+  executable_count: number
+  not_executable_count: number
+  fee_unknown_count: number
+  no_book_count: number
+  not_executable_reason_counts: Record<string, number>
+  fee_assumption: {
+    source: string
+    known_count: number
+    unknown_count: number
+    rates: { fee_rate: number; episode_count: number }[]
+  }
+  calibration: ResearchDriftCalibration
+  market_bias: ResearchDriftMarketBias
+  baseline_comparison: ResearchDriftBaselineComparison
+  edge_tiers: {
+    theoretical_observation_edge_per_share: ResearchDriftEdgeTier
+    executable_expected_net_usd: ResearchDriftEdgeTier
+    verified_realised_net_usd: ResearchDriftEdgeTier
+  }
+  small_sample: boolean
+  source_episode_ids: string[]
+  anomaly_metrics: string[]
+}
+
+export interface ResearchDriftEdgeTier {
+  n: number
+  sum: number | null
+  mean: number | null
+  unit: string
+}
+
+export interface ResearchDriftAnomaly {
+  granularity: ResearchDriftGranularity
+  period: string
+  metric: string
+  value: number
+  trailing_median: number
+  trailing_mad: number
+  deviation: number
+  threshold: number
+  trailing_bucket_count: number
+  source_episode_ids: string[]
+}
+
+export interface ResearchDriftPayload {
+  totals: {
+    observation_count: number
+    episode_count: number
+    target_date_missing_episode_count: number
+  }
+  reference_capital_usdc: number
+  fee_assumption: {
+    source: string
+    unknown_fee_policy: string
+    missing_book_policy: string
+  } | null
+  calibration_bin_count: number
+  small_sample_threshold_episodes: number
+  anomaly_rule: {
+    statistic: string
+    threshold_mad: number
+    minimum_trailing_buckets: number
+    comparison: string
+    metrics: string[]
+  } | null
+  buckets: Record<ResearchDriftGranularity, ResearchDriftBucket[]>
+  anomalies: ResearchDriftAnomaly[]
+  statistical_scope: string[]
+  warnings: string[]
+}
+
+/** Null data means unpublished; it is never replaced by a zero-filled payload. */
+export type ResearchDriftData = PerformancePayload<ResearchDriftPayload | null>
 
 // --- Paper Trading (virtual simulation, isolated from reference capital) ---
 

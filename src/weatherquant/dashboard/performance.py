@@ -67,6 +67,7 @@ __all__ = [
     "performance_models",
     "performance_opportunities",
     "performance_reference_capital",
+    "performance_research_drift",
     "performance_settlements",
     "performance_summary",
     "performance_win_rate",
@@ -545,6 +546,17 @@ def performance_settlements(
         "warnings": payload.data.get("warnings") or [],
     }
     return envelope, freshness
+
+
+def performance_research_drift(state: PerformanceState, now: datetime) -> tuple[dict[str, Any], Any]:
+    payload, freshness = state.snapshot("performance-research-drift", "research-drift.json", now)
+    if payload.data == {} and payload.kind:
+        return {
+            "reason": payload.source or "research drift not published",
+            "statistical_scope": [],
+            "warnings": [],
+        }, freshness
+    return payload.model_dump(), freshness
 
 
 def performance_models(state: PerformanceState, now: datetime) -> tuple[dict[str, Any], Any]:

@@ -1,7 +1,7 @@
 """The streaming engine against the whole-history builder, on one dataset.
 
 The acceptance list for this refactor is a comparison, not a description: the
-streaming engine has to reproduce the in-memory builder's six snapshots on the
+streaming engine has to reproduce the in-memory builder's seven snapshots on the
 same input. So this file builds one fixed dataset, runs both, and asserts the
 published payloads are equal - field for field, float for float, including the
 parts that are easy to get *nearly* right:
@@ -207,7 +207,7 @@ def _run_legacy(
     out_dir: Path | None = None,
     watermark: list[str] | None = None,
 ) -> dict:
-    """Publish the whole-history builder's six snapshots, and read them back.
+    """Publish the whole-history builder's seven snapshots, and read them back.
 
     Comparing *published* output on both sides is the honest comparison: it is
     what a reader sees, it exercises the same writer, and it is the only way to
