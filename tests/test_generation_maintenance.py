@@ -94,6 +94,20 @@ def test_prune_requires_a_complete_legacy_rollback_point(tmp_path):
     assert all((tmp_path / "generations" / generation_id).is_dir() for generation_id in ids)
 
 
+def test_a_current_generation_cannot_omit_research_drift(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    from pin_performance_generation import inspect
+
+    generation_id = "20260102T000000Z-current"
+    _publish(tmp_path, generation_id)
+    generation = tmp_path / "generations" / generation_id
+    (generation / "research-drift.json").unlink()
+
+    info = inspect(generation)
+    assert not info.complete
+    assert info.missing_files == ("research-drift.json",)
+
+
 def test_dry_run_takes_no_lock_and_deletes_nothing(tmp_path):
     _publish(tmp_path, "20260101T000000Z-legacy", legacy=True)
     _publish(tmp_path, "20260102T000000Z-stale")

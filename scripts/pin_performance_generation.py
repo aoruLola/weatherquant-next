@@ -49,6 +49,7 @@ SNAPSHOT_FILES = (
     "opportunities.json",
     "settlements.json",
     "models.json",
+    "research-drift.json",
 )
 
 #: What a Dashboard built before this round can and cannot read. The detail
@@ -103,12 +104,17 @@ def _load(path: Path) -> dict | None:
 
 def inspect(directory: Path) -> GenerationInfo:
     manifest = _load(directory / "manifest.json") or {}
-    present = tuple(name for name in SNAPSHOT_FILES if (directory / name).is_file())
-    missing = tuple(name for name in SNAPSHOT_FILES if name not in present)
+    files = manifest.get("files")
+    # The manifest is that generation's completeness contract. Current
+    # generations declare research-drift.json; historical ones did not, and
+    # remain valid rollback points for their paired historical Dashboard.
+    declared = set(files) if isinstance(files, dict) and files else set(SNAPSHOT_FILES)
+    required = tuple(name for name in SNAPSHOT_FILES if name in declared)
+    present = tuple(name for name in required if (directory / name).is_file())
+    missing = tuple(name for name in required if name not in present)
     problems = []
     if manifest.get("generation_id") != directory.name:
         problems.append("missing manifest or generation ID mismatch")
-    files = manifest.get("files")
     for name in present:
         entry = files.get(name) if isinstance(files, dict) else None
         if not isinstance(entry, dict) or entry.get("bytes") != (directory / name).stat().st_size:

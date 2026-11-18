@@ -65,7 +65,7 @@ def _settlements(payouts=None, *, verified=True):
 # --- the envelope is the contract --------------------------------------------
 
 
-def test_all_six_snapshots_are_built() -> None:
+def test_all_seven_snapshots_are_built() -> None:
     payloads = build_performance(decisions=_decisions(), now=NOW)
 
     assert set(payloads) == set(SNAPSHOT_FILES)
@@ -238,7 +238,7 @@ def test_supplied_episodes_are_used_as_given() -> None:
 def test_every_file_carries_one_generation_id(tmp_path: Path) -> None:
     """A batch must be identifiable, not merely co-located.
 
-    Co-location is not consistency: six files in one directory can still be
+    Co-location is not consistency: seven files in one directory can still be
     three from one run and three from the last. The id is what a reader
     compares.
     """

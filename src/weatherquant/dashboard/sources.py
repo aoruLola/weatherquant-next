@@ -244,7 +244,7 @@ class SnapshotSources:
         simply has not happened yet would send an operator looking for a
         deployment that is not the problem.
 
-        Reads follow the generation pointer, so all six files come from one
+        Reads follow the generation pointer, so all seven files come from one
         published batch. That is the whole reason they are published that way
         - six independent renames into one directory would let a reader pair
         an old opportunities file with a new win-rate file and score a

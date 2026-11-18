@@ -36,6 +36,7 @@ from weatherquant.performance.episodes import (
     summarize,
 )
 from weatherquant.performance.generation_lock import generation_lock
+from weatherquant.performance.research_drift import build_research_drift
 from weatherquant.performance.settlement import classify, parse_resolutions
 from weatherquant.performance.settlement_queue import latest_settlement_rows, settlement_fetch_time
 from weatherquant.performance.winrate import (
@@ -88,6 +89,7 @@ SNAPSHOT_FILES: dict[str, str] = {
     "opportunities.json": "performance-opportunities",
     "settlements.json": "performance-settlements",
     "models.json": "performance-models",
+    "research-drift.json": "performance-research-drift",
 }
 
 
@@ -351,7 +353,7 @@ def build_performance(
     detail_window_days: int = DETAIL_WINDOW_DAYS,
     detail_partition_size: int = DETAIL_PARTITION_SIZE,
 ) -> dict[str, dict[str, Any]]:
-    """Build all six snapshots from one pass over the data.
+    """Build all seven snapshots from one pass over the data.
 
     ``episodes`` may be supplied to avoid rebuilding them; when it is not,
     they are derived from ``decisions`` under the same rules the rest of the
@@ -375,6 +377,7 @@ def build_performance(
     edge_summary = observation_edge(decisions)
     episode_summary = summarize(episodes)
     rate = win_rate(scored)
+    resolver = book_for or (lambda _e: None)
 
     # The portfolio is a hypothetical: no book resolver means no fills, and
     # the result says so rather than pricing against a displayed quote.
@@ -382,7 +385,7 @@ def build_performance(
         episodes,
         capital_usdc=capital_usdc,
         max_allocation_fraction=max_allocation_fraction,
-        book_for=book_for or (lambda _e: None),
+        book_for=resolver,
     )
 
     scope = ["observation_all_accepts", "opportunity_episodes", "database_lifetime"]
@@ -476,7 +479,6 @@ def build_performance(
         "warnings": rate.warnings,
     }
 
-    resolver = book_for or (lambda _e: None)
     outcomes = {item.episode.episode_id: item.outcome for item in scored}
     window_episodes, window = detail_window(
         episodes,
@@ -535,6 +537,14 @@ def build_performance(
         "warnings": ["Scores are out-of-sample and chronological; no future data is used."],
     }
 
+    research_drift = build_research_drift(
+        episodes,
+        answers=answers,
+        verified=frozenset(verified),
+        book_for=resolver,
+        reference_capital_usdc=capital_usdc,
+    )
+
     common = dict(now=now, source=source, dataset=dataset)
     return {
         "summary.json": _envelope(
@@ -569,6 +579,14 @@ def build_performance(
             statistical_scope=["out_of_sample_chronological"],
             warnings=models_payload["warnings"], **common,
         ),
+        "research-drift.json": _envelope(
+            logical_name="performance-research-drift",
+            data=research_drift,
+            sample_size=research_drift["totals"]["observation_count"],
+            statistical_scope=research_drift["statistical_scope"],
+            warnings=research_drift["warnings"],
+            **common,
+        ),
     }
 
 
@@ -598,9 +616,9 @@ def publish_performance(
     coverage: Mapping[str, Any] | None = None,
     extra_manifest: Mapping[str, Any] | None = None,
 ) -> list[Path]:
-    """Publish six snapshots as one generation, then switch the pointer.
+    """Publish seven snapshots as one generation, then switch the pointer.
 
-    Six separate renames into one directory is not an atomic cross-file
+    Seven separate renames into one directory is not an atomic cross-file
     commit: a reader that arrives halfway sees a mixture of two generations,
     and a mixture of an old opportunities file with a new win-rate file is
     exactly the kind of inconsistency nobody would notice until it was

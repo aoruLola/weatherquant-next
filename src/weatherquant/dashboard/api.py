@@ -49,6 +49,7 @@ from weatherquant.dashboard.contracts import (
     OverviewData,
     PaperData,
     PerformanceData,
+    ResearchDriftData,
     ServiceHealth,
     ShadowHealthData,
     ShadowReportData,
@@ -503,6 +504,16 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _perf_env(PerformanceData, "performance/settlements", data, freshness, now, dataset)
+
+    @app.get(
+        "/api/v1/performance/research-drift",
+        response_model=Envelope[ResearchDriftData],
+        tags=["v1"],
+    )
+    async def r_perf_research_drift() -> Envelope[ResearchDriftData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(perf.performance_research_drift, perf_state, now)
+        return _perf_env(ResearchDriftData, "performance/research-drift", data, freshness, now, dataset)
 
     @app.get("/api/v1/performance/models", response_model=Envelope[PerformanceData], tags=["v1"])
     async def r_perf_models() -> Envelope[PerformanceData]:

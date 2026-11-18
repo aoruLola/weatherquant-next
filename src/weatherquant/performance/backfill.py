@@ -1,4 +1,4 @@
-"""Offline backfill: decisions and settlements in, six snapshots out.
+"""Offline backfill: decisions and settlements in, seven snapshots out.
 
 Two rules govern every entry point here.
 
@@ -15,7 +15,7 @@ gateway both surface the label to whoever reads the number.
 
 Publication is atomic per file and all-or-nothing per run: every snapshot
 is built in memory first, and only then written. A crash halfway leaves the
-previous complete set in place rather than six files where three are new.
+previous complete set in place rather than seven files where three are new.
 """
 
 from __future__ import annotations
@@ -267,7 +267,7 @@ def build_performance_snapshots(
     now: datetime | None = None,
     watermark: Sequence[str] | None = None,
 ) -> list[Path]:
-    """Build and publish all six snapshots, or none of them.
+    """Build and publish all seven snapshots, or none of them.
 
     Everything is computed before anything is written: a failure partway
     leaves the previous complete set on disk rather than a mixture of old

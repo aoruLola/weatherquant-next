@@ -5,12 +5,12 @@
  * rate with too few samples must say so rather than render a ratio, and no
  * filter or empty state may hide the fact that nothing here was traded.
  */
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { envelopeOf, mockFetch, rejectFetch } from '../test/mock'
 import Performance from './Performance'
-import type { PerformancePayload } from '../types'
+import type { PerformancePayload, ResearchDriftBucket, ResearchDriftData } from '../types'
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -54,6 +54,129 @@ function emptyPayload(reason: string): PerformancePayload {
   }
 }
 
+function driftBucket(period: string, overrides: Partial<ResearchDriftBucket> = {}): ResearchDriftBucket {
+  return {
+    period,
+    start_date: '2026-10-12',
+    observation_count: 5,
+    episode_count: 3,
+    executable_count: 1,
+    not_executable_count: 2,
+    fee_unknown_count: 1,
+    no_book_count: 1,
+    not_executable_reason_counts: { FEE_UNKNOWN: 1, NO_BOOK: 1 },
+    fee_assumption: {
+      source: 'episode.fee_rate via execution/pricing.py',
+      known_count: 2,
+      unknown_count: 1,
+      rates: [{ fee_rate: 0, episode_count: 2 }],
+    },
+    calibration: {
+      n: 2,
+      brier: 0.1,
+      ece: 0.3,
+      bins: [
+        {
+          lower: 0.5,
+          upper: 0.6,
+          predicted_mean: 0.55,
+          observed_frequency: 0.5,
+          count: 2,
+          gap: 0.05,
+        },
+      ],
+    },
+    market_bias: {
+      n: 2,
+      mean_market_minus_outcome: 0.05,
+      mean_market_probability: 0.55,
+      mean_outcome: 0.5,
+    },
+    baseline_comparison: {
+      market: { n: 2, brier: 0.205, ece: 0.2, bins: [], mean_market_minus_outcome: 0.05 },
+      climatology: {
+        available: false,
+        n: 0,
+        brier: null,
+        ece: null,
+        reason: 'No climatology probability is exported.',
+      },
+    },
+    edge_tiers: {
+      theoretical_observation_edge_per_share: {
+        n: 5,
+        sum: 0.2,
+        mean: 0.04,
+        unit: 'probability_per_share',
+      },
+      executable_expected_net_usd: { n: 1, sum: 1.25, mean: 1.25, unit: 'USD' },
+      verified_realised_net_usd: { n: 1, sum: 0.75, mean: 0.75, unit: 'USD' },
+    },
+    small_sample: true,
+    source_episode_ids: ['ep-1', 'ep-2', 'ep-3'],
+    anomaly_metrics: ['calibration.brier'],
+    ...overrides,
+  }
+}
+
+function researchPayload(): ResearchDriftData {
+  return {
+    ...payload({ kind: 'performance-research-drift', sample_size: 5 }),
+    data: {
+      totals: { observation_count: 5, episode_count: 3, target_date_missing_episode_count: 0 },
+      reference_capital_usdc: 100,
+      fee_assumption: {
+        source: 'episode.fee_rate via execution/pricing.py',
+        unknown_fee_policy: 'exclude; never assume zero',
+        missing_book_policy: 'exclude; never use a displayed quote as a fill',
+      },
+      calibration_bin_count: 10,
+      small_sample_threshold_episodes: 20,
+      anomaly_rule: {
+        statistic: 'absolute deviation from trailing median',
+        threshold_mad: 3,
+        minimum_trailing_buckets: 4,
+        comparison: 'strictly greater than 3 MAD',
+        metrics: ['calibration.brier'],
+      },
+      buckets: {
+        iso_week: [driftBucket('2026-W42')],
+        month: [
+          driftBucket('2026-10', {
+            observation_count: 8,
+            episode_count: 4,
+            source_episode_ids: ['month-ep-1'],
+            anomaly_metrics: [],
+          }),
+        ],
+        target_date: [
+          driftBucket('2026-10-14', {
+            start_date: '2026-10-14',
+            source_episode_ids: ['target-ep-1'],
+            anomaly_metrics: [],
+          }),
+        ],
+      },
+      anomalies: [
+        {
+          granularity: 'iso_week',
+          period: '2026-W42',
+          metric: 'calibration.brier',
+          value: 0.1,
+          trailing_median: 0.01,
+          trailing_mad: 0,
+          deviation: 0.09,
+          threshold: 0,
+          trailing_bucket_count: 4,
+          source_episode_ids: ['ep-3'],
+        },
+      ],
+      statistical_scope: ['observation_all_accepts', 'opportunity_episodes'],
+      warnings: ['Observation Edge is not USD or realised profit.'],
+    },
+  }
+}
+
 function renderPage() {
   return render(
     <MemoryRouter>
@@ -92,6 +215,7 @@ function mockAll(overrides: Record<string, any> = {}) {
         },
       }),
     ),
+    '/api/v1/performance/research-drift': envelopeOf(researchPayload()),
     '/api/v1/performance/opportunities?limit=50': envelopeOf(
       payload({
         kind: 'performance-opportunities',
@@ -344,6 +468,76 @@ describe('Performance page', () => {
     // The band used to publish every value and the UI counted them; it now
     // publishes the count and the mean, and the page shows both.
     expect(screen.getByTestId('performance-edge')).toHaveTextContent('2 次评估')
+  })
+
+  it('keeps research populations and all three Edge tiers in separate columns', async () => {
+    mockFetch(mockAll())
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('drift-table')).toBeInTheDocument())
+    const cells = within(screen.getByTestId('drift-row')).getAllByRole('cell')
+    expect(cells).toHaveLength(11)
+    expect(cells[1]).toHaveTextContent('5')
+    expect(cells[2]).toHaveTextContent('3')
+    expect(cells[3]).toHaveTextContent('1')
+    expect(cells[3]).toHaveTextContent('不可执行 2')
+    expect(cells[4]).toHaveTextContent('Brier 0.1000')
+    expect(cells[4]).toHaveTextContent('ECE 0.3000')
+    expect(cells[5]).toHaveTextContent('偏差 +0.0500')
+    expect(cells[5]).toHaveTextContent('市场 Brier 0.2050')
+    expect(cells[6]).toHaveTextContent('0.2000')
+    expect(cells[6]).not.toHaveTextContent('USD')
+    expect(cells[7]).toHaveTextContent('1.250 USD')
+    expect(cells[8]).toHaveTextContent('0.750 USD')
+    expect(cells[9]).toHaveTextContent('FEE_UNKNOWN 1')
+    expect(cells[9]).toHaveTextContent('NO_BOOK 1')
+    expect(cells[0]).toHaveTextContent('小样本 n=3')
+  })
+
+  it('switches between ISO week, month and weather target date locally', async () => {
+    mockFetch(mockAll())
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('drift-table')).toBeInTheDocument())
+    expect(screen.getByTestId('drift-table')).toHaveTextContent('2026-W42')
+
+    fireEvent.change(screen.getByTestId('drift-granularity'), { target: { value: 'month' } })
+    await waitFor(() => expect(screen.getByTestId('drift-table')).toHaveTextContent('2026-10'))
+    expect(screen.getByTestId('drift-table')).not.toHaveTextContent('2026-W42')
+    expect(screen.getByTestId('drift-row')).toHaveTextContent('month-ep-1')
+
+    fireEvent.change(screen.getByTestId('drift-granularity'), { target: { value: 'target_date' } })
+    await waitFor(() => expect(screen.getByTestId('drift-table')).toHaveTextContent('2026-10-14'))
+    expect(screen.getByTestId('drift-row')).toHaveTextContent('target-ep-1')
+    expect(screen.getByTestId('drift-anomalies')).toHaveTextContent('异常标记 0')
+  })
+
+  it('shows anomaly metrics and their source Episode ids for drill-down', async () => {
+    mockFetch(mockAll())
+    renderPage()
+
+    await waitFor(() => expect(screen.getByTestId('drift-anomaly')).toBeInTheDocument())
+    const anomaly = screen.getByTestId('drift-anomaly')
+    expect(anomaly).toHaveTextContent('calibration.brier')
+    expect(anomaly).toHaveTextContent('历史中位数 0.0100')
+    expect(screen.getByTestId('drift-anomaly-sources')).toHaveTextContent('ep-3')
+    expect(screen.getByTestId('drift-row-anomaly')).toHaveTextContent('异常 1')
+    expect(screen.getByTestId('drift-source-ids')).toHaveTextContent('ep-1 · ep-2 · ep-3')
+    fireEvent.click(within(anomaly).getByText(/2026-W42 · calibration\.brier/))
+    expect(anomaly).toHaveAttribute('open')
+  })
+
+  it('does not turn an unpublished research snapshot into zero-valued trends', async () => {
+    mockFetch(
+      mockAll({
+        '/api/v1/performance/research-drift': envelopeOf(emptyPayload('drift backfill has not run')),
+      }),
+    )
+    renderPage()
+
+    await waitFor(() => expect(screen.getAllByText('drift backfill has not run')).toHaveLength(1))
+    expect(screen.queryByTestId('performance-research-drift')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('drift-table')).not.toBeInTheDocument()
   })
 })
 
