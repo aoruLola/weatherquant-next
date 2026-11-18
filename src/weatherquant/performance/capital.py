@@ -38,6 +38,7 @@ from weatherquant.execution.pricing import (
     execution_cost,
     expected_net_profit_usd,
     expected_net_profit_usd_sell,
+    max_shares_for_notional,
 )
 from weatherquant.markets.models import BookLevel, OrderBook, Side
 from weatherquant.performance.episodes import Episode
@@ -272,22 +273,11 @@ def _max_shares_for(book: OrderBook, side: Side, capital: float) -> tuple[float,
     between knowing what depth exists and assuming it: the best level may
     hold a fraction of what the stake wants, and the answer changes as soon
     as the walk moves to a worse price.
+
+    The walk itself lives in :func:`weatherquant.execution.pricing.max_shares_for_notional`
+    so research sizing and live sizing cannot drift apart.
     """
-    levels = book.asks if side is Side.BUY else book.bids
-    remaining = capital
-    shares = 0.0
-    for level in levels:
-        if remaining <= 0:
-            break
-        level_notional = level.price_usd_per_share * level.size_shares
-        take = min(level_notional, remaining)
-        shares += take / level.price_usd_per_share
-        remaining -= take
-    # Decided after the walk, not inside it: a single-level book never gets
-    # a second iteration in which to notice that the stake ran out first, so
-    # asking the question mid-loop reports the shallowest book as exhausted.
-    exhausted = bool(levels) and remaining > 0
-    return shares, exhausted
+    return max_shares_for_notional(book, side=side, notional_usd=capital)
 
 
 def simulate_single(
