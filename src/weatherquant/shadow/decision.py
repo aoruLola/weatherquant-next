@@ -63,6 +63,7 @@ from weatherquant.execution.pricing import (
     build_fill_plan,
     edge_usd_per_share,
     edge_usd_per_share_sell,
+    execution_charges_usd,
     execution_cost,
     expected_net_profit_usd,
     expected_net_profit_usd_sell,
@@ -545,17 +546,10 @@ def _price(*, market, snapshot, direction, q, thresholds, buffer_fraction):
 
 
 def _charged_costs(cost) -> float | None:
-    """Fees plus execution buffer: the terms charged on top of the fill.
-
-    The fill itself is not included, because for a *sell* that term is money
-    received rather than money spent. Keeping one column that means "what the
-    fill cost beyond its own notional" avoids a column that silently changes
-    meaning by direction; the fill total is ``estimated_fill_price *
-    estimated_fill_shares``.
-    """
+    """Fees plus execution buffer, from the one pricing helper that defines them."""
     if cost is None:
         return None
-    return cost.fees_usd + cost.execution_buffer_usd
+    return execution_charges_usd(cost)
 
 
 def _map_refusal_error(exc: ExecutionRefused, fail) -> None:

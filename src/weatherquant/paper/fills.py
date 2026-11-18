@@ -39,6 +39,7 @@ from typing import Any
 from weatherquant.execution.pricing import (
     ExecutionRefused,
     FeeStructureUnknown,
+    adverse_slippage_usd_per_share,
     build_fill_plan,
     execution_cost,
 )
@@ -371,7 +372,9 @@ class FillEngine:
             filled_shares=plan.filled_shares,
             avg_price_usd_per_share=avg,
             best_price_usd_per_share=best,
-            slippage_usd_per_share=max(avg - best, 0.0),
+            slippage_usd_per_share=adverse_slippage_usd_per_share(
+                side=side, vwap_usd_per_share=avg, top_of_book_usd_per_share=best
+            ),
             fill_cost_usd=plan.fill_cost_usd,
             fees_usd=cost.fees_usd,
             execution_buffer_usd=cost.execution_buffer_usd,
