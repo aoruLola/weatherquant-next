@@ -338,3 +338,24 @@ def test_lag_is_measured_against_the_collector_clock_not_ours(tmp_path) -> None:
     result = tailer.poll()
     assert result.stats.shadow_lag_ms_max == pytest.approx(7000.0, rel=1e-6)
     assert result.stats.collector_received_max == received
+
+
+def test_invalid_sidecar_blocks_checkpoint_until_repaired(tmp_path):
+    from weatherquant.data.archive import ArchiveRecord, RawArchive
+
+    with RawArchive(tmp_path, run_id="collector") as writer:
+        writer.append(ArchiveRecord("gamma", gamma_event(), NOW, None, "ok", "collector"))
+    path = next(tmp_path.glob("gamma/*.jsonl.sha256"))
+    receipt = path.read_bytes()
+    path.write_bytes(b"{")
+    tailer = _tailer(tmp_path)
+    blocked = tailer.poll()
+    assert blocked.stats.lines_read == 0
+    assert not blocked.checkpoints
+    assert [q.kind for q in blocked.quality] == ["archive_file_unreadable"]
+    assert "invalid checksum sidecar" in blocked.quality[0].detail
+    path.write_bytes(receipt)
+    repaired = tailer.poll()
+    assert repaired.stats.lines_read == 1
+    _commit(tailer, repaired)
+    assert tailer.poll().stats.lines_read == 0
