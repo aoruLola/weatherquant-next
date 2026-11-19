@@ -9,6 +9,13 @@ Design
   already-recorded version is a hard error, because silently diverging schemas
   are exactly how a reproducible research database stops being reproducible.
 * Every migration runs inside a transaction. A failure leaves no partial schema.
+* Once anything has been applied the connection is ``CHECKPOINT``ed. DuckDB
+  keeps committed DDL in the write-ahead log until a checkpoint; a process
+  killed before that first checkpoint leaves a ``.wal`` that a read-only open
+  cannot replay ("Could not write file ... Bad file descriptor"), so the
+  read-only ownership probe used by the shadow/performance engines would fail
+  forever. Folding the WAL into the main file here makes the schema durable at
+  the moment the ledger records it.
 * There are no down-migrations. Reproducibility comes from re-running the
   pipeline from raw data, not from editing history.
 
@@ -92,12 +99,38 @@ def applied_migrations(con: duckdb.DuckDBPyConnection) -> dict[str, str]:
 
 
 def migrate(con: duckdb.DuckDBPyConnection, directory: Path = MIGRATIONS_DIR) -> list[str]:
-    """Apply every pending migration. Returns the names applied by this call."""
+    """Apply every pending migration and checkpoint the WAL.
+
+    Returns the names applied by this call (empty when the schema is current).
+    The checkpoint runs only when something was applied; a database that is
+    already up to date is left untouched, so the call stays idempotent.
+    """
     con.execute(_BOOTSTRAP)
     specs = available_migrations(directory)
     applied = applied_migrations(con)
     done: list[str] = []
+    try:
+        _apply_pending(con, specs, applied, done)
+    except BaseException:
+        # Also when a later migration fails: the ones that committed before it
+        # are on disk only in the WAL until a checkpoint, which is the same
+        # kill -9 window this exists to close. The migration error is the one
+        # the caller must see, so a failing checkpoint cannot replace it.
+        if done:
+            with contextlib.suppress(duckdb.Error):
+                con.execute("CHECKPOINT")
+        raise
+    if done:
+        con.execute("CHECKPOINT")
+    return done
 
+
+def _apply_pending(
+    con: duckdb.DuckDBPyConnection,
+    specs: list[MigrationSpec],
+    applied: dict[str, str],
+    done: list[str],
+) -> None:
     for spec in specs:
         existing = applied.get(spec.version)
         if existing is not None:
@@ -123,5 +156,3 @@ def migrate(con: duckdb.DuckDBPyConnection, directory: Path = MIGRATIONS_DIR) ->
             raise MigrationError(f"migration {spec.version}_{spec.name} failed: {exc}") from exc
 
         done.append(f"{spec.version}_{spec.name}")
-
-    return done
