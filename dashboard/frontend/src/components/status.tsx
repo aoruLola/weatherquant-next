@@ -20,7 +20,7 @@ const TONE_CLASS: Record<Tone, string> = {
 function toneFor(value: string | null | undefined): Tone {
   const v = (value ?? '').toLowerCase()
   if (['healthy', 'live', 'fresh', 'ok', 'connected', 'running'].includes(v)) return 'accent'
-  if (['degraded', 'stale', 'replay', 'starting', 'warn', 'one_sided', 'expired'].includes(v))
+  if (['degraded', 'lagging', 'stale', 'replay', 'starting', 'warn', 'one_sided', 'expired'].includes(v))
     return 'warn'
   if (['unhealthy', 'fatal', 'corrupt', 'down', 'failed', 'error'].includes(v)) return 'danger'
   if (['stopped', 'stopped_clean'].includes(v)) return 'muted'
@@ -54,7 +54,9 @@ export function StatusChip({
 }
 
 const STATE_LABEL: Record<string, string> = {
-  ACCEPT: 'ACCEPT',
+  // The API state stays ACCEPT for compatibility; the label must not read as
+  // an executed trade. This is a model/risk filter that passed once.
+  ACCEPT: '影子信号',
   REJECT: 'REJECT',
   NO_TRADE: 'NO_TRADE',
   DATA_UNAVAILABLE: 'DATA_UNAVAILABLE',

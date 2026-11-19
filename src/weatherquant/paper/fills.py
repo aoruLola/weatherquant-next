@@ -39,6 +39,7 @@ from typing import Any
 from weatherquant.execution.pricing import (
     ExecutionRefused,
     FeeStructureUnknown,
+    adverse_slippage_usd_per_share,
     build_fill_plan,
     execution_cost,
 )
@@ -219,7 +220,7 @@ class FillEngine:
                     key = outcome.reason or "UNKNOWN"
                     result.by_reason[key] = result.by_reason.get(key, 0) + 1
         except Exception as exc:  # a side channel must not raise
-            result.notes.append(f"fill pass failed: {type(exc).__name__}: {exc}")
+            return FillResult(attempted=result.attempted, notes=[f"fill pass failed: {type(exc).__name__}: {exc}"])
         return result
 
     def _settle(self, fill: PaperFill, now: datetime) -> tuple[bool, tuple[str, str] | None]:
@@ -298,7 +299,10 @@ class FillEngine:
             outcome.reason, outcome.detail = verdict.reason, verdict.detail
             return outcome
 
-        evidence = self.books.resolve(token_id=event.token_id, decision_time=event.decision_time_utc)
+        if event.evidence_version is not None:
+            evidence = BookEvidence.from_signal(event)
+        else:
+            evidence = self.books.resolve(token_id=event.token_id, decision_time=event.decision_time_utc)
         gate = self._gate_book(event, evidence)
         if gate is not None:
             outcome.reason, outcome.detail = gate
@@ -368,7 +372,9 @@ class FillEngine:
             filled_shares=plan.filled_shares,
             avg_price_usd_per_share=avg,
             best_price_usd_per_share=best,
-            slippage_usd_per_share=max(avg - best, 0.0),
+            slippage_usd_per_share=adverse_slippage_usd_per_share(
+                side=side, vwap_usd_per_share=avg, top_of_book_usd_per_share=best
+            ),
             fill_cost_usd=plan.fill_cost_usd,
             fees_usd=cost.fees_usd,
             execution_buffer_usd=cost.execution_buffer_usd,

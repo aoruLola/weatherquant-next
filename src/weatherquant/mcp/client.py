@@ -114,7 +114,17 @@ def resolve_path(path: str) -> str:
 
 
 class ClientError(Exception):
-    """The dashboard could not be reached or answered with an error."""
+    """The dashboard could not be reached or answered with an error.
+
+    Carries the HTTP status (when the dashboard answered) so callers can tell
+    a 409 (cursor from another generation) from a 422 (bad argument) from a
+    503 (read failure) without parsing the message.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None, detail: str | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
 
 
 class TimeoutError(ClientError):
@@ -277,7 +287,20 @@ class DashboardClient:
             raise ClientError(f"request to {path} failed: {type(exc).__name__}") from exc
 
         if response.status_code >= 400:
-            raise ClientError(f"dashboard returned {response.status_code} for {path}")
+            detail = None
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    detail = body.get("detail") or body.get("reason")
+                elif isinstance(body, str):
+                    detail = body
+            except ValueError:
+                detail = response.text[:500] or None
+            raise ClientError(
+                f"dashboard returned {response.status_code} for {path}",
+                status_code=response.status_code,
+                detail=detail,
+            )
 
         body = response.content
         if len(body) > self.max_response_bytes:

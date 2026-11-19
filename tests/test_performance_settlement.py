@@ -255,3 +255,12 @@ def test_price_normalisation_accepts_only_answers(raw, expected) -> None:
     from weatherquant.performance.settlement import _normalise_price
 
     assert _normalise_price(raw) == expected
+
+def test_fetch_uses_only_the_requested_condition():
+    foreign = {"condition_id": "0xdef", "status": "resolved", "price": "1"}
+    matching = {"condition_id": "0xABC", "status": "resolved", "price": "0"}
+    status, record = fetch_resolution(lambda *a, **k: {"data": [foreign, matching]}, condition_id="0xabc")
+    assert status == SettlementStatus.RESOLVED and record.price == 0.0
+    assert fetch_resolution(lambda *a, **k: {"data": [foreign]}, condition_id="0xabc") == (
+        SettlementStatus.UNAVAILABLE, None,
+    )

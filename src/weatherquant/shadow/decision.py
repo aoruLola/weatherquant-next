@@ -63,12 +63,14 @@ from weatherquant.execution.pricing import (
     build_fill_plan,
     edge_usd_per_share,
     edge_usd_per_share_sell,
+    execution_charges_usd,
     execution_cost,
     expected_net_profit_usd,
     expected_net_profit_usd_sell,
 )
 from weatherquant.markets.models import Side
 from weatherquant.shadow.config import Thresholds
+from weatherquant.shadow.events import BookObservation
 from weatherquant.shadow.forecast import ResolvedForecast
 from weatherquant.shadow.inference import ModelRefusal, PredictionResult
 
@@ -237,6 +239,9 @@ class Decision:
     expected_net_profit_usd: float | None = None
     net_edge: float | None = None
     decision_latency_ms: int | None = None
+    live_book: BookObservation | None = None
+    fee_rate: float | None = None
+    fee_exponent: float | None = None
 
     @property
     def primary_reason(self) -> Reason | None:
@@ -504,6 +509,9 @@ def evaluate(
         collector_received_at_utc=snapshot.collector_received_at_utc if snapshot else None,
         shadow_received_at_utc=snapshot.shadow_received_at_utc if snapshot else None,
         snapshot_age_ms=snapshot_age_ms,
+        live_book=snapshot if mode is Mode.LIVE else None,
+        fee_rate=market.fee_rate,
+        fee_exponent=market.fee_exponent,
         model_probability=q,
         market_price=_market_price(book, direction),
         best_bid=book.best_bid_usd_per_share if book else None,
@@ -538,17 +546,10 @@ def _price(*, market, snapshot, direction, q, thresholds, buffer_fraction):
 
 
 def _charged_costs(cost) -> float | None:
-    """Fees plus execution buffer: the terms charged on top of the fill.
-
-    The fill itself is not included, because for a *sell* that term is money
-    received rather than money spent. Keeping one column that means "what the
-    fill cost beyond its own notional" avoids a column that silently changes
-    meaning by direction; the fill total is ``estimated_fill_price *
-    estimated_fill_shares``.
-    """
+    """Fees plus execution buffer, from the one pricing helper that defines them."""
     if cost is None:
         return None
-    return cost.fees_usd + cost.execution_buffer_usd
+    return execution_charges_usd(cost)
 
 
 def _map_refusal_error(exc: ExecutionRefused, fail) -> None:

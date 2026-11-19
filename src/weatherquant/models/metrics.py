@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 __all__ = [
     "CalibrationBin",
+    "brier_binary",
     "brier_multiclass",
     "calibration_bins",
     "date_level_summary",
@@ -63,6 +64,16 @@ def rmse(y_true: Sequence[float], y_pred: Sequence[float]) -> float:
     """Root mean squared error [same unit as the inputs, e.g. degF]."""
     _check_lengths(y_true, y_pred, "y_true", "y_pred")
     return math.sqrt(math.fsum((t - p) ** 2 for t, p in zip(y_true, y_pred, strict=True)) / len(y_true))
+
+
+def brier_binary(probabilities: Sequence[float], outcomes: Sequence[float]) -> float:
+    """Binary Brier score, ``mean((p - y) ** 2)`` in ``[0, 1]``."""
+    _check_lengths(probabilities, outcomes, "probabilities", "outcomes")
+    if any(not 0.0 <= p <= 1.0 for p in probabilities):
+        raise ValueError("probability outside [0, 1]")
+    if any(y not in (0.0, 1.0) for y in outcomes):
+        raise ValueError("binary outcome must be 0 or 1")
+    return math.fsum((p - y) ** 2 for p, y in zip(probabilities, outcomes, strict=True)) / len(probabilities)
 
 
 def brier_multiclass(probabilities: Sequence[Sequence[float]], outcomes: Sequence[Sequence[float]]) -> float:

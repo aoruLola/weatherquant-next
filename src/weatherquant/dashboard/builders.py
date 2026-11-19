@@ -23,6 +23,7 @@ Decision rules that are easy to break, restated where they happen:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
@@ -40,13 +41,22 @@ from weatherquant.dashboard.contracts import (
     ForecastsData,
     Freshness,
     FreshnessState,
+    HealthLayer,
+    LayeredHealthData,
+    LayerStatus,
     MarketDetailData,
     MarketsData,
     MarketSummary,
     OverviewData,
+    ServiceHealth,
     ShadowHealthData,
     ShadowReportData,
     SystemData,
+)
+from weatherquant.dashboard.performance_freshness import (
+    build_layer_report,
+    read_export_state,
+    read_ingest_state,
 )
 from weatherquant.dashboard.sources import SnapshotSources, age_seconds, parse_utc
 from weatherquant.dashboard.trends import COLLECTOR_COUNTER_KEYS, TrendBuffer
@@ -58,9 +68,7 @@ from weatherquant.weather.daily_max import local_day_bounds_utc
 #: What the decision aggregates cover, for the case where the report predates
 #: the field. Nothing in the shadow report filters on run_id and nothing
 #: deletes decisions, so these totals span the database, not the process.
-_DATABASE_LIFETIME_WINDOW = (
-    "cumulative over this shadow database's lifetime; a restart does not reset it"
-)
+_DATABASE_LIFETIME_WINDOW = "cumulative over this shadow database's lifetime; a restart does not reset it"
 
 __all__ = [
     "DashboardState",
@@ -68,6 +76,7 @@ __all__ = [
     "collector_metrics",
     "decisions",
     "forecasts",
+    "layered_health",
     "market_detail",
     "markets",
     "overview",
@@ -151,7 +160,9 @@ def collector_health(state: DashboardState, now: datetime) -> tuple[CollectorHea
         return parse_utc(payload.get(key))
 
     stats_raw = payload.get("stats") or {}
-    stats = {k: int(v) for k, v in stats_raw.items() if isinstance(v, (int, float))} if isinstance(stats_raw, dict) else {}
+    stats = (
+        {k: int(v) for k, v in stats_raw.items() if isinstance(v, (int, float))} if isinstance(stats_raw, dict) else {}
+    )
 
     data = CollectorHealthData(
         present=True,
@@ -349,6 +360,64 @@ def _target_day_ended(target_date: date | None, now: datetime) -> bool:
     return now >= end
 
 
+def _parse_aware(value: Any) -> datetime | None:
+    """Parse a trading timestamp; unlike source timestamps, naive means unknown."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _open_now(
+    start: datetime | None,
+    end: datetime | None,
+    now: datetime,
+    *,
+    tradeable: bool | None,
+    schedule_source: str | None,
+    schedule_reason: str | None,
+) -> tuple[bool | None, str | None, str | None]:
+    """Whether the venue is accepting orders right now.
+
+    Decided by the venue's own flags (``active`` and ``acceptingOrders`` and
+    not ``closed``), not by the Gamma schedule: weather markets keep accepting
+    orders and trading after their published ``endDate`` until the venue
+    closes them, so ``[start, end)`` would call a live book closed. The
+    schedule stays informational and is mentioned in the reason. Unknown
+    flags stay unknown.
+    """
+    del schedule_reason  # informational only; it never decides the answer
+    if tradeable is None:
+        return None, None, "venue order-acceptance flags are unavailable"
+    source = "venue flags (active, acceptingOrders, closed)"
+    if not tradeable:
+        return False, source, "venue flags do not currently allow order acceptance"
+    if end is not None and now >= end:
+        where = schedule_source or "market schedule"
+        return True, source, f"past the scheduled end ({where}); the venue still accepts orders"
+    if start is not None and now < start:
+        where = schedule_source or "market schedule"
+        return True, source, f"before the scheduled start ({where}); the venue already accepts orders"
+    return True, source, None
+
+
+def _rules_reason(rules_text: str | None, resolution_source: str | None) -> str | None:
+    missing = [
+        name
+        for name, value in (("rules_text", rules_text), ("resolution_source", resolution_source))
+        if not value
+    ]
+    return f"Gamma metadata missing: {', '.join(missing)}" if missing else None
+
+
 def _summary_from_catalog(
     market,
     book: BookQuote | None,
@@ -357,11 +426,37 @@ def _summary_from_catalog(
     model_reason: str,
 ) -> MarketSummary:
     target = market.target_date if isinstance(market.target_date, date) else None
+    start = getattr(market, "start_time_utc", None)
+    end = getattr(market, "end_time_utc", None)
+    schedule_source = getattr(market, "schedule_source", None)
+    schedule_reason = getattr(market, "schedule_reason", None)
+    open_now, open_source, open_reason = _open_now(
+        start,
+        end,
+        now,
+        tradeable=market.tradeable,
+        schedule_source=schedule_source,
+        schedule_reason=schedule_reason,
+    )
+    rules_text = getattr(market, "rules_text", None)
+    resolution_source = getattr(market, "resolution_source", None)
     return MarketSummary(
         market_id=market.market_id,
         event_id=market.event_id,
         question=market.question,
         target_date=target,
+        target_date_reason=None if target else "Gamma event target date is missing or unparseable",
+        rules_text=rules_text,
+        resolution_source=resolution_source,
+        rules_source="archive-tail:gamma" if rules_text or resolution_source else None,
+        rules_reason=_rules_reason(rules_text, resolution_source),
+        start_time_utc=start,
+        end_time_utc=end,
+        schedule_source=schedule_source,
+        schedule_reason=schedule_reason,
+        open_now=open_now,
+        open_now_source=open_source,
+        open_now_reason=open_reason,
         target_day_ended=_target_day_ended(target, now),
         bracket_label=market.bracket_label,
         bracket_low=market.bracket.low if market.bracket else None,
@@ -382,7 +477,12 @@ def _summary_from_catalog(
     )
 
 
-def _producer_markets(payload: dict[str, Any], now: datetime, book_stale_seconds: float) -> list[MarketSummary]:
+def _producer_markets(
+    payload: dict[str, Any],
+    now: datetime,
+    book_stale_seconds: float,
+    archive: ArchiveResult | None = None,
+) -> list[MarketSummary]:
     """Adapt a published market-snapshot.json (contract §3) to summaries."""
     items: list[MarketSummary] = []
     raw_items = payload.get("data", {}).get("markets", []) if isinstance(payload.get("data"), dict) else []
@@ -415,12 +515,63 @@ def _producer_markets(payload: dict[str, Any], now: datetime, book_stale_seconds
             )
         model_prob = _num(entry.get("model_probability"))
         target = _parse_date(entry.get("target_date"))
+        market_id = str(entry.get("market_id") or "")
+        catalog = archive.catalog.get(market_id) if archive is not None else None
+
+        rules_text = entry.get("rules_text") or getattr(catalog, "rules_text", None)
+        resolution_source = entry.get("resolution_source") or getattr(
+            catalog, "resolution_source", None
+        )
+        rules_sources = []
+        if entry.get("rules_text") or entry.get("resolution_source"):
+            rules_sources.append("market-snapshot")
+        if catalog is not None and (
+            getattr(catalog, "rules_text", None) or getattr(catalog, "resolution_source", None)
+        ):
+            rules_sources.append("archive-tail:gamma")
+
+        raw_start, raw_end = entry.get("start_time_utc"), entry.get("end_time_utc")
+        start = _parse_aware(raw_start) if raw_start else getattr(catalog, "start_time_utc", None)
+        end = _parse_aware(raw_end) if raw_end else getattr(catalog, "end_time_utc", None)
+        schedule_source = entry.get("schedule_source") or getattr(catalog, "schedule_source", None)
+        schedule_reason = (
+            None
+            if start is not None and end is not None
+            else getattr(catalog, "schedule_reason", None) or entry.get("schedule_reason")
+        )
+        invalid_raw_schedule = (bool(raw_start) and start is None) or (bool(raw_end) and end is None)
+        if invalid_raw_schedule:
+            schedule_reason = "market-snapshot start/end must be timezone-aware ISO timestamps"
+        open_now, open_source, open_reason = _open_now(
+            start,
+            end,
+            now,
+            tradeable=(
+                bool(entry["tradeable"]) if entry.get("tradeable") is not None else None
+            ),
+            schedule_source=schedule_source,
+            schedule_reason=schedule_reason,
+        )
         items.append(
             MarketSummary(
-                market_id=str(entry.get("market_id") or ""),
+                market_id=market_id,
                 event_id=entry.get("event_id"),
                 question=str(entry.get("question") or ""),
                 target_date=target,
+                target_date_reason=(
+                    None if target else entry.get("target_date_reason") or "market-snapshot has no valid target_date"
+                ),
+                rules_text=rules_text,
+                resolution_source=resolution_source,
+                rules_source=" + ".join(rules_sources) or None,
+                rules_reason=_rules_reason(rules_text, resolution_source),
+                start_time_utc=start,
+                end_time_utc=end,
+                schedule_source=schedule_source,
+                schedule_reason=schedule_reason,
+                open_now=open_now,
+                open_now_source=open_source,
+                open_now_reason=open_reason,
                 target_day_ended=_target_day_ended(target, now),
                 bracket_label=str(entry.get("bracket_label") or ""),
                 bracket_low=_num(entry.get("bracket_low")),
@@ -434,11 +585,13 @@ def _producer_markets(payload: dict[str, Any], now: datetime, book_stale_seconds
                 book=book,
                 model_probability=model_prob,
                 net_edge_usd=_num(entry.get("net_edge_usd")),
-                last_decision=entry.get("last_decision")
-                if isinstance(entry.get("last_decision"), dict)
-                else None,
+                last_decision=entry.get("last_decision") if isinstance(entry.get("last_decision"), dict) else None,
                 model_source="market-snapshot",
-                model_reason=None,
+                model_reason=(
+                    None
+                    if model_prob is not None
+                    else entry.get("model_reason") or "market-snapshot has no model_probability for this market"
+                ),
                 updated_at_utc=_parse_any(entry.get("updated_at_utc")),
             )
         )
@@ -459,10 +612,15 @@ def markets(
 ) -> tuple[MarketsData, Freshness]:
     producer = state.sources.named_snapshot("market-snapshot", "market-snapshot.json", now)
     if producer.payload is not None:
-        items = _producer_markets(producer.payload, now, state.settings.book_stale_seconds)
+        # DuckDB's market_catalog has no rules/schedule columns. Supplement the
+        # producer row by market_id from the bounded Gamma tail; never replace
+        # its decision-time model/book evidence with a newer archive book.
+        archive = state.archive.read(now)
+        items = _producer_markets(
+            producer.payload, now, state.settings.book_stale_seconds, archive
+        )
         source, source_status = "market-snapshot", producer.freshness.state
         reason = producer.freshness.reason
-        archive: ArchiveResult | None = None
     else:
         archive = state.archive.read(now)
         source, source_status = "archive-tail", archive.freshness.state
@@ -516,7 +674,9 @@ def markets(
             "cursor": cursor,
         },
     )
-    return data, producer.freshness if producer.payload is not None else (archive.freshness if archive else Freshness(state=FreshnessState.MISSING))
+    return data, producer.freshness if producer.payload is not None else (
+        archive.freshness if archive else Freshness(state=FreshnessState.MISSING)
+    )
 
 
 def _filter_markets(
@@ -539,11 +699,7 @@ def _filter_markets(
         out = [m for m in out if m.closed]
     if query:
         needle = query.lower()
-        out = [
-            m
-            for m in out
-            if needle in m.question.lower() or needle in m.bracket_label.lower()
-        ]
+        out = [m for m in out if needle in m.question.lower() or needle in m.bracket_label.lower()]
     if book_state == "fresh":
         out = [m for m in out if m.book and not m.book.stale and m.book.available]
     elif book_state == "stale":
@@ -553,12 +709,7 @@ def _filter_markets(
     if decision:
         # "最近一次决策是 X 的市场" - needs the producer snapshot; without it
         # every market lacks a decision and the filter correctly returns none.
-        out = [
-            m
-            for m in out
-            if m.last_decision
-            and str(m.last_decision.get("state", "")).upper() == decision.upper()
-        ]
+        out = [m for m in out if m.last_decision and str(m.last_decision.get("state", "")).upper() == decision.upper()]
     return out
 
 
@@ -586,9 +737,7 @@ def market_detail(state: DashboardState, now: datetime, market_id: str) -> tuple
     if decisions.payload is not None:
         rows = decisions.payload.get("data", {}).get("decisions", [])
         if isinstance(rows, list):
-            recent = [
-                r for r in rows if isinstance(r, dict) and r.get("market_id") == market_id
-            ][:50]
+            recent = [r for r in rows if isinstance(r, dict) and r.get("market_id") == market_id][:50]
         status, reason = decisions.freshness.state, decisions.freshness.reason
     else:
         status, reason = FreshnessState.UNAVAILABLE, decisions.reason
@@ -663,14 +812,38 @@ def forecasts(state: DashboardState, now: datetime) -> tuple[ForecastsData, Fres
                     for b in entry.get("buckets", [])
                     if isinstance(b, dict)
                 ]
+                issued = _parse_any(
+                    entry.get("forecast_issued_at_utc") or entry.get("forecast_run_time_utc")
+                )
+                publishable = _parse_any(entry.get("forecast_publishable_at_utc"))
+                publishable_basis = entry.get("forecast_publishable_basis")
+                received = _parse_any(entry.get("forecast_received_at_utc"))
+                version = entry.get("version")
+                target = _parse_date(entry.get("target_date"))
                 distributions.append(
                     ForecastDistribution(
                         model=str(entry.get("model") or ""),
-                        version=entry.get("version"),
-                        target_date=_parse_date(entry.get("target_date")),
-                        forecast_run_time_utc=_parse_any(entry.get("forecast_run_time_utc")),
+                        version=version,
+                        version_reason=None if version else "model_predictions.model_version is missing",
+                        target_date=target,
+                        target_date_reason=None if target else "model_predictions.target_date is missing or invalid",
+                        forecast_run_time_utc=issued,
+                        forecast_issued_at_utc=issued,
+                        forecast_issued_reason=(
+                            None if issued else "model_predictions.forecast_run_time_utc is missing or invalid"
+                        ),
+                        forecast_publishable_at_utc=publishable,
+                        forecast_publishable_basis=publishable_basis,
+                        forecast_publishable_reason=(
+                            None
+                            if publishable and publishable_basis
+                            else "forecast publishable time/basis is unavailable in model_predictions"
+                        ),
                         training_cutoff_utc=_parse_any(entry.get("training_cutoff_utc")),
-                        forecast_received_at_utc=_parse_any(entry.get("forecast_received_at_utc")),
+                        forecast_received_at_utc=received,
+                        forecast_received_reason=(
+                            None if received else "model_predictions.forecast_received_at_utc is missing or invalid"
+                        ),
                         predicted_max_f=_num(entry.get("predicted_max_f")),
                         station=entry.get("station"),
                         buckets=buckets,
@@ -689,13 +862,13 @@ def forecasts(state: DashboardState, now: datetime) -> tuple[ForecastsData, Fres
         distributions_status=dist_status,
         distributions_reason=dist_reason,
         observation_status=FreshnessState.UNAVAILABLE,
-        observation_reason=(
-            "实际观测与官方结算数据暂未接入；结算由研究管线回溯评分，"
-            "不会在决策时点被当作已知信息"
-        ),
+        observation_reason=("实际观测与官方结算数据暂未接入；结算由研究管线回溯评分，不会在决策时点被当作已知信息"),
         reason=None if report.present else report.reason,
     )
-    return data, _worst(report_freshness, producer.freshness if producer.payload else Freshness(state=FreshnessState.UNAVAILABLE, reason=dist_reason))
+    return data, _worst(
+        report_freshness,
+        producer.freshness if producer.payload else Freshness(state=FreshnessState.UNAVAILABLE, reason=dist_reason),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +941,7 @@ def decisions(
             model=model,
             since=since,
         )
-        adapted.sort(key=lambda r: (r.decided_at_utc or datetime.min.replace(tzinfo=UTC)), reverse=True)
+        adapted.sort(key=lambda r: r.decided_at_utc or datetime.min.replace(tzinfo=UTC), reverse=True)
         total_rows = len(adapted)
         window = adapted[cursor : cursor + limit]
         rows = window
@@ -787,11 +960,7 @@ def decisions(
         totals_status=totals_status,
         totals_source=totals_source,
         last_cycle=last_cycle,
-        last_cycle_status=(
-            shadow_freshness.state
-            if (last_cycle or not shadow.present)
-            else FreshnessState.MISSING
-        ),
+        last_cycle_status=(shadow_freshness.state if (last_cycle or not shadow.present) else FreshnessState.MISSING),
         filters_applied={
             "state": decision_state,
             "mode": mode,
@@ -813,7 +982,7 @@ def decisions(
 
 
 def _row_from_entry(entry: dict[str, Any]) -> DecisionRow:
-    return DecisionRow(
+    row = DecisionRow(
         decision_id=str(entry.get("decision_id") or ""),
         decided_at_utc=_parse_any(entry.get("decided_at_utc")),
         market_id=str(entry.get("market_id") or ""),
@@ -837,7 +1006,44 @@ def _row_from_entry(entry: dict[str, Any]) -> DecisionRow:
         available_depth_usd=_num(entry.get("available_depth_usd")),
         thresholds_version=entry.get("thresholds_version"),
         run_id=entry.get("run_id"),
+        forecast_run_time_utc=_parse_any(entry.get("forecast_run_time_utc")),
+        snapshot_id=entry.get("snapshot_id"),
+        book_id=entry.get("book_id"),
+        book_venue_ts_utc=_parse_any(entry.get("book_venue_ts_utc")),
+        book_collector_received_at_utc=_parse_any(entry.get("book_collector_received_at_utc")),
+        book_shadow_received_at_utc=_parse_any(entry.get("book_shadow_received_at_utc")),
+        spread=_num(entry.get("spread")),
+        mode_reason=entry.get("mode_reason"),
+        evidence_version=_int(entry.get("evidence_version")),
+        book_source=entry.get("book_source"),
+        book_source_event_id=entry.get("book_source_event_id"),
+        evidence_source="shadow_decisions",
     )
+    missing = [
+        field
+        for field in (
+            "mode",
+            "model_name",
+            "model_version",
+            "model_probability",
+            "forecast_run_time_utc",
+            "best_bid",
+            "best_ask",
+            "net_edge_usd",
+            "book_source",
+            "book_venue_ts_utc",
+            "book_collector_received_at_utc",
+            "book_shadow_received_at_utc",
+        )
+        if getattr(row, field) is None
+    ]
+    row.evidence_reason = (
+        f"shadow_decisions has no stored value for: {', '.join(missing)}; "
+        "later token_books are not substituted"
+        if missing
+        else None
+    )
+    return row
 
 
 def _filter_rows(
@@ -861,11 +1067,7 @@ def _filter_rows(
     if since is not None:
         # A row without a timestamp cannot prove it is inside the window, so
         # it drops out rather than silently counting as recent.
-        out = [
-            r
-            for r in out
-            if r.decided_at_utc is not None and r.decided_at_utc >= since
-        ]
+        out = [r for r in out if r.decided_at_utc is not None and r.decided_at_utc >= since]
     return out
 
 
@@ -918,7 +1120,11 @@ def overview(state: DashboardState, now: datetime) -> tuple[OverviewData, Freshn
     model_rows: list[MarketSummary] = []
     producer = state.sources.named_snapshot("market-snapshot", "market-snapshot.json", now)
     if producer.payload is not None:
-        model_rows = [m for m in _producer_markets(producer.payload, now, state.settings.book_stale_seconds) if m.model_probability is not None]
+        model_rows = [
+            m
+            for m in _producer_markets(producer.payload, now, state.settings.book_stale_seconds)
+            if m.model_probability is not None
+        ]
         mvm_status = producer.freshness.state
         mvm_reason = producer.freshness.reason
     else:
@@ -1012,9 +1218,7 @@ def _system_health(
         # "暂未接入" while a number is on screen would be the lie the note
         # exists to prevent, so the reason only appears with a null.
         "shadow_db_reason": (
-            None
-            if shadow.db_bytes is not None
-            else "shadow heartbeat does not report a database size (暂未接入)"
+            None if shadow.db_bytes is not None else "shadow heartbeat does not report a database size (暂未接入)"
         ),
     }
 
@@ -1116,6 +1320,306 @@ def system(state: DashboardState, now: datetime) -> tuple[SystemData, Freshness]
         ]
     )
     return data, overall
+
+
+# ---------------------------------------------------------------------------
+# layered health
+# ---------------------------------------------------------------------------
+
+
+def layered_health(
+    state: DashboardState,
+    now: datetime,
+    *,
+    paper: ServiceHealth | None = None,
+) -> tuple[LayeredHealthData, Freshness]:
+    """Read all four pipeline layers and the three service livenesses.
+
+    The generation pointer is resolved exactly once and the publish/snapshot
+    layers are read from that one directory, so a publish landing mid-request
+    cannot mix two generations in one response. The live export and ingest
+    positions are separate reads by design; their sources say so.
+    """
+    settings = state.settings
+    generation = state.sources.performance_generation()
+    manifest = generation.manifest or {}
+    # A broken pointer is not "nothing published": falling back to flat files
+    # here could mix a previous batch into a response that claims one
+    # generation. Report the break instead.
+    summary = (
+        None
+        if generation.problem
+        else _read_generation_json(generation, settings.performance_snapshots_dir, "summary.json")
+    )
+    if summary is None and generation.manifest is None and generation.directory is not None:
+        # A published generation whose summary is unreadable is still a
+        # generation: keep the manifest's publish time and consumed watermark
+        # and report the missing payload rather than falling back to flat files
+        # that may belong to the previous batch.
+        summary = {}
+    if summary is not None:
+        summary = _same_generation_payload(summary, manifest)
+
+    generation_id = manifest.get("generation_id")
+    payload_generation = summary.get("generation_id") if isinstance(summary, dict) else None
+    if generation_id is None and isinstance(payload_generation, str):
+        generation_id = payload_generation
+
+    published_at, published_source = _published_time(summary, manifest)
+    consumed_at, consumed_source = _consumed_time(summary, manifest)
+    declared = _publish_interval(summary, settings.performance_publish_interval_seconds)
+    interval = declared + settings.performance_publish_grace_seconds
+
+    report = build_layer_report(
+        now=now,
+        export_state=read_export_state(settings.shadow_export_dir),
+        ingest_state=read_ingest_state(settings.performance_snapshots_dir),
+        snapshot_consumed_time=consumed_at,
+        published_at_utc=published_at,
+        publish_interval_seconds=interval,
+        export_stale_after_seconds=settings.shadow_export_stale_seconds,
+        ingest_stale_after_seconds=settings.performance_ingest_stale_seconds,
+        publication_stale_after_seconds=settings.performance_publication_stale_seconds,
+        generation_id=generation_id,
+        consumed_source=consumed_source,
+        published_source=published_source,
+    )
+
+    collector, collector_freshness = collector_health(state, now)
+    shadow, shadow_freshness = shadow_health(state, now)
+    services = {
+        "collector": _service_health("collector", collector, collector_freshness),
+        "shadow": _service_health("shadow", shadow, shadow_freshness),
+        "paper": paper
+        or ServiceHealth(
+            name="paper",
+            status=LayerStatus.UNKNOWN,
+            reason="paper status is not part of this read-only builder call",
+        ),
+    }
+
+    unknown_reasons = [
+        f"{layer.name}: {layer.reason}"
+        for layer in report.layers
+        if layer.status is LayerStatus.UNKNOWN and layer.reason
+    ]
+    if report.lagging_layer is not None:
+        freshness = Freshness(
+            state=FreshnessState.STALE,
+            age_seconds=report.layers[-1].age_seconds,
+            as_of_utc=published_at,
+            stale_after_seconds=interval,
+            reason=report.lagging_basis,
+            export_data_lag_seconds=report.layers[0].lag_seconds,
+            ingestion_lag_seconds=report.layers[1].lag_seconds,
+            publication_lag_seconds=report.layers[2].lag_seconds,
+            snapshot_age_seconds=report.layers[3].age_seconds,
+            export_watermark_utc=report.layers[0].watermark_time,
+            consumed_watermark_utc=report.layers[1].watermark_time,
+            published_at_utc=published_at,
+            # Envelope freshness keeps the existing pipeline vocabulary;
+            # data.lagging_layer uses the four Jira layer names.
+            lagging_layer=_legacy_lagging_layer(report.lagging_layer),
+            publish_interval_seconds=interval,
+        )
+    elif report.layers[-1].status is LayerStatus.UNKNOWN:
+        # Without a snapshot age the response cannot claim the payload is
+        # current, even when the live upstream watermarks were readable.
+        freshness = Freshness(
+            state=FreshnessState.UNAVAILABLE,
+            reason="the snapshot layer cannot be measured: " + "; ".join(unknown_reasons),
+        )
+    else:
+        freshness = Freshness(
+            state=FreshnessState.FRESH,
+            age_seconds=report.layers[-1].age_seconds,
+            as_of_utc=published_at,
+            stale_after_seconds=interval,
+            reason=("; ".join(unknown_reasons) if unknown_reasons else None),
+            export_data_lag_seconds=report.layers[0].lag_seconds,
+            ingestion_lag_seconds=report.layers[1].lag_seconds,
+            publication_lag_seconds=report.layers[2].lag_seconds,
+            snapshot_age_seconds=report.layers[3].age_seconds,
+            export_watermark_utc=report.layers[0].watermark_time,
+            consumed_watermark_utc=report.layers[1].watermark_time,
+            published_at_utc=published_at,
+            lagging_layer=None,
+            publish_interval_seconds=interval,
+        )
+
+    data = LayeredHealthData(
+        generation_id=report.generation_id,
+        generation_source=_generation_source(generation),
+        lagging_layer=report.lagging_layer,
+        lagging_basis=report.lagging_basis,
+        layers=[
+            HealthLayer(
+                name=layer.name,
+                watermark_utc=layer.watermark_time,
+                source=layer.source,
+                age_seconds=layer.age_seconds,
+                lag_seconds=layer.lag_seconds,
+                threshold_seconds=layer.threshold_seconds,
+                status=layer.status,
+                reason=layer.reason,
+            )
+            for layer in report.layers
+        ],
+        services=services,
+        thresholds=report.thresholds,
+        dataset=_dataset(summary, manifest, settings.dataset),
+        reason=freshness.reason,
+    )
+    return data, freshness
+
+
+def _read_generation_json(generation: Any, root: Any, filename: str) -> dict[str, Any] | None:
+    """Read one file from the generation already resolved by the caller."""
+    path = generation.directory / filename if generation.directory is not None else root / filename
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _same_generation_payload(summary: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
+    """Refuse payload fields stamped with a different generation id."""
+    manifest_id = manifest.get("generation_id")
+    payload_id = summary.get("generation_id")
+    if manifest_id and payload_id and str(manifest_id) != str(payload_id):
+        return {}
+    return summary
+
+
+def _published_time(
+    summary: dict[str, Any] | None,
+    manifest: dict[str, Any],
+) -> tuple[datetime | None, str]:
+    if isinstance(summary, dict):
+        published = parse_utc(summary.get("generated_at_utc"))
+        if published is not None:
+            return published, "published snapshot summary.json · generated_at_utc"
+    published = parse_utc(manifest.get("published_at_utc"))
+    if published is not None:
+        return published, "generation manifest.json · published_at_utc"
+    return None, "no published generation or summary file"
+
+
+def _consumed_time(
+    summary: dict[str, Any] | None,
+    manifest: dict[str, Any],
+) -> tuple[datetime | None, str]:
+    """The business-time watermark the published generation consumed.
+
+    The manifest's ``watermark[0]`` is that watermark, on the same clock as the
+    export and ingest watermarks it is compared with. A payload's
+    ``as_of_utc`` is stamped with the build's wall clock, so it is only a
+    fallback for generations published before the manifest recorded one -
+    preferring it would hide however far the consumed data trailed the build.
+    """
+    watermark = manifest.get("watermark")
+    if isinstance(watermark, (list, tuple)) and watermark:
+        consumed = parse_utc(watermark[0])
+        if consumed is not None:
+            return consumed, "generation manifest.json · watermark[0]"
+    if isinstance(summary, dict):
+        consumed = parse_utc(summary.get("as_of_utc"))
+        if consumed is not None:
+            return consumed, "published snapshot summary.json · as_of_utc (build time; no manifest watermark)"
+    return None, "no snapshot or manifest watermark"
+
+
+def _publish_interval(summary: dict[str, Any] | None, fallback: float) -> float:
+    if isinstance(summary, dict):
+        declared = _num(summary.get("stale_after_seconds"))
+        if declared is not None and declared > 0:
+            return declared
+    return fallback
+
+
+def _legacy_lagging_layer(layer: str | None) -> str | None:
+    """Map the Jira layer names onto the Freshness contract's existing codes."""
+    return (
+        {
+            "export": "shadow_export",
+            "performance_consume": "ingestion",
+            "publish": "publication",
+            "snapshot": "publish_interval",
+        }.get(layer)
+        if layer
+        else None
+    )
+
+
+def _generation_source(generation: Any) -> str:
+    if generation.directory is not None:
+        return "performance current.json pointer · one published generation"
+    if generation.problem:
+        return f"performance current.json pointer is broken: {generation.problem}"
+    return "flat performance directory (no published generation)"
+
+
+def _dataset(
+    summary: dict[str, Any] | None,
+    manifest: dict[str, Any],
+    fallback: str,
+) -> str:
+    for candidate in (
+        summary.get("dataset") if isinstance(summary, dict) else None,
+        manifest.get("dataset"),
+    ):
+        if candidate in {"live", "fixture"}:
+            return candidate
+    return fallback
+
+
+def _service_health(name: str, data: Any, freshness: Freshness) -> ServiceHealth:
+    """Map a heartbeat's probe verdict onto the four layer statuses."""
+    if not getattr(data, "present", False):
+        return ServiceHealth(
+            name=name,
+            status=LayerStatus.UNKNOWN,
+            age_seconds=freshness.age_seconds,
+            reason=getattr(data, "reason", None) or freshness.reason,
+        )
+    reasons = list(getattr(data, "health_reasons", []) or [])
+    reason = "; ".join(reasons) or getattr(data, "reason", None) or freshness.reason
+    if freshness.state is FreshnessState.STALE:
+        return ServiceHealth(
+            name=name,
+            status=LayerStatus.STALE,
+            age_seconds=freshness.age_seconds,
+            reason=reason,
+        )
+    if freshness.state in {FreshnessState.MISSING, FreshnessState.CORRUPT, FreshnessState.UNAVAILABLE}:
+        return ServiceHealth(
+            name=name,
+            status=LayerStatus.UNKNOWN,
+            age_seconds=freshness.age_seconds,
+            reason=reason,
+        )
+    health_status = str(getattr(data, "health_status", "") or "")
+    if health_status == "unhealthy":
+        return ServiceHealth(
+            name=name,
+            status=LayerStatus.STALE,
+            age_seconds=freshness.age_seconds,
+            reason=reason,
+        )
+    if health_status == "degraded":
+        return ServiceHealth(
+            name=name,
+            status=LayerStatus.LAGGING,
+            age_seconds=freshness.age_seconds,
+            reason=reason,
+        )
+    return ServiceHealth(
+        name=name,
+        status=LayerStatus.OK,
+        age_seconds=freshness.age_seconds,
+        reason=None,
+    )
 
 
 # ---------------------------------------------------------------------------

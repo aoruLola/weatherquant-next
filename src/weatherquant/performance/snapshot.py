@@ -31,11 +31,14 @@ from weatherquant.performance.capital import lifetime_portfolio_payload, simulat
 from weatherquant.performance.edge import daily_edge, edge_by_bin, grouped_edge, observation_edge
 from weatherquant.performance.episodes import (
     Episode,
-    _timestamp,
     build_episodes,
+    observation_bounds,
     summarize,
 )
+from weatherquant.performance.generation_lock import generation_lock
+from weatherquant.performance.research_drift import build_research_drift
 from weatherquant.performance.settlement import classify, parse_resolutions
+from weatherquant.performance.settlement_queue import latest_settlement_rows, settlement_fetch_time
 from weatherquant.performance.winrate import (
     SettlementAnswer,
     assign_outcomes,
@@ -86,6 +89,7 @@ SNAPSHOT_FILES: dict[str, str] = {
     "opportunities.json": "performance-opportunities",
     "settlements.json": "performance-settlements",
     "models.json": "performance-models",
+    "research-drift.json": "performance-research-drift",
 }
 
 
@@ -133,13 +137,14 @@ def detail_window(
     recent = [episode for episode in episodes if episode.first_seen_utc >= cutoff]
     recent.sort(key=lambda e: (e.first_seen_utc, e.episode_id), reverse=True)
     window = recent[:max_episodes]
+    start, end = observation_bounds(window)
     descriptor = detail_window_descriptor(
         window_episodes=len(window),
         all_episodes=len(episodes),
         max_episodes=max_episodes,
         days=days,
-        first_seen_utc=window[0].first_seen_utc.isoformat() if window else None,
-        last_seen_utc=window[-1].first_seen_utc.isoformat() if window else None,
+        first_seen_utc=start,
+        last_seen_utc=end,
     )
     return window, descriptor
 
@@ -198,41 +203,6 @@ def _envelope(
     return payload
 
 
-def _settlement_index(
-    payloads: Iterable[Any],
-) -> tuple[dict[tuple[str, str | None], SettlementAnswer], frozenset[tuple[str, str | None]]]:
-    """Fold raw resolution bodies into ``(market, date) -> answer``.
-
-    Accepts either a parsed mapping or a raw ``/v2/resolutions`` body, so a
-    backfill can hand over exactly what the platform returned without
-    re-encoding it first.
-    """
-    answers: dict[tuple[str, str | None], SettlementAnswer] = {}
-    verified: set[tuple[str, str | None]] = set()
-    for item in payloads:
-        if not isinstance(item, Mapping):
-            continue
-        market_id = str(item.get("market_id") or "")
-        if not market_id:
-            continue
-        target_date = item.get("target_date")
-        status = str(item.get("settlement_status") or "UNAVAILABLE")
-        payout = item.get("resolved_outcome")
-        answers[(market_id, str(target_date) if target_date else None)] = SettlementAnswer(
-            status=status,
-            payout=float(payout) if payout in (0, 1, 0.0, 1.0) else None,
-        )
-        if status == "RESOLVED" and str(item.get("verification_status")) == "VERIFIED":
-            verified.add((market_id, str(target_date) if target_date else None))
-        # A raw resolutions body may be passed through untouched.
-        if "data" in item and item.get("data") is not None:
-            for record in parse_resolutions(item):
-                key = (market_id, str(target_date) if target_date else None)
-                status = classify(record)
-                answers[key] = SettlementAnswer(status=status, payout=record.price)
-    return answers, frozenset(verified)
-
-
 @dataclass(frozen=True, slots=True)
 class SettlementRecord:
     """One settlement answer with the evidence that produced it.
@@ -257,52 +227,24 @@ class SettlementRecord:
 
 def settlement_records_from_index(payloads: Iterable[Any]) -> list[SettlementRecord]:
     """The published records for a settlement index, in a stable order."""
-    answers, verified = _settlement_index(payloads)
-    provenance = _settlement_provenance(payloads)
-    records = [
-        SettlementRecord(
-            market_id=market_id,
-            target_date=target_date,
-            status=answer.status,
-            payout=answer.payout,
-            verified=(market_id, target_date) in verified,
-            verification_status=provenance.get((market_id, target_date), (None, None, None))[0],
-            resolution_source=provenance.get((market_id, target_date), (None, None, None))[1],
-            fetched_at_utc=provenance.get((market_id, target_date), (None, None, None))[2],
-        )
-        for (market_id, target_date), answer in answers.items()
-    ]
-    return sorted(records, key=lambda r: (r.market_id, r.target_date or ""))
-
-
-def _settlement_provenance(
-    payloads: Iterable[Any],
-) -> dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]]:
-    """``(verification_status, resolution_source, fetched_at)`` per answer."""
-    out: dict[tuple[str, str | None], tuple[str | None, str | None, datetime | None]] = {}
-    for item in payloads:
-        if not isinstance(item, Mapping):
-            continue
-        market_id = str(item.get("market_id") or "")
-        if not market_id:
-            continue
-        raw = item.get("target_date")
-        key = (market_id, str(raw) if raw else None)
-        stamp = item.get("fetched_at_utc")
-        fetched: datetime | None = None
-        if stamp is not None:
-            try:
-                fetched = _timestamp(stamp)
-            except (TypeError, ValueError):
-                fetched = None
+    records = []
+    for (market_id, target_date), item in latest_settlement_rows(payloads).items():
+        status = str(item.get("settlement_status") or "UNAVAILABLE")
+        claimed = item.get("resolved_outcome")
+        payout = float(claimed) if type(claimed) in (int, float) and claimed in (0, 1) else None
+        if "data" in item:
+            for raw in parse_resolutions(item):
+                status, payout = classify(raw), raw.price
         verdict = item.get("verification_status")
         source = item.get("resolution_source")
-        out[key] = (
-            str(verdict) if verdict is not None else None,
-            str(source) if source is not None else None,
-            fetched,
-        )
-    return out
+        records.append(SettlementRecord(
+            market_id=market_id, target_date=target_date, status=status, payout=payout,
+            verified=status == "RESOLVED" and payout is not None and payout == claimed and verdict == "VERIFIED",
+            verification_status=str(verdict) if verdict is not None else None,
+            resolution_source=str(source) if source is not None else None,
+            fetched_at_utc=settlement_fetch_time(item),
+        ))
+    return sorted(records, key=lambda r: (r.market_id, r.target_date or ""))
 
 
 def _settlement_coverage(
@@ -411,7 +353,7 @@ def build_performance(
     detail_window_days: int = DETAIL_WINDOW_DAYS,
     detail_partition_size: int = DETAIL_PARTITION_SIZE,
 ) -> dict[str, dict[str, Any]]:
-    """Build all six snapshots from one pass over the data.
+    """Build all seven snapshots from one pass over the data.
 
     ``episodes`` may be supplied to avoid rebuilding them; when it is not,
     they are derived from ``decisions`` under the same rules the rest of the
@@ -427,13 +369,15 @@ def build_performance(
     else:
         episode_counters = {"episodes_built": len(episodes)}
 
-    answers, verified = _settlement_index(settlements)
     settlement_records = settlement_records_from_index(settlements)
+    answers = {(r.market_id, r.target_date): SettlementAnswer(status=r.status, payout=r.payout) for r in settlement_records}
+    verified = {(r.market_id, r.target_date) for r in settlement_records if r.verified}
     scored = assign_outcomes(episodes, answers=answers, verified=verified)
 
     edge_summary = observation_edge(decisions)
     episode_summary = summarize(episodes)
     rate = win_rate(scored)
+    resolver = book_for or (lambda _e: None)
 
     # The portfolio is a hypothetical: no book resolver means no fills, and
     # the result says so rather than pricing against a displayed quote.
@@ -441,11 +385,12 @@ def build_performance(
         episodes,
         capital_usdc=capital_usdc,
         max_allocation_fraction=max_allocation_fraction,
-        book_for=book_for or (lambda _e: None),
+        book_for=resolver,
     )
 
     scope = ["observation_all_accepts", "opportunity_episodes", "database_lifetime"]
 
+    start, end = observation_bounds(episodes)
     summary = {
         "observation_edge_sum": edge_summary["overall"]["sum"],
         "unique_opportunity_edge_sum": episode_summary["unique_opportunity_edge_sum"],
@@ -466,16 +411,8 @@ def build_performance(
                 all_episodes=len(episodes),
                 max_episodes=len(episodes),
                 days=0,
-                first_seen_utc=(
-                    min((e.first_seen_utc for e in episodes), default=None).isoformat()
-                    if episodes
-                    else None
-                ),
-                last_seen_utc=(
-                    max((e.first_seen_utc for e in episodes), default=None).isoformat()
-                    if episodes
-                    else None
-                ),
+                first_seen_utc=start,
+                last_seen_utc=end,
             ),
             settlement_coverage=_settlement_coverage(settlement_records, rate),
         ),
@@ -542,7 +479,6 @@ def build_performance(
         "warnings": rate.warnings,
     }
 
-    resolver = book_for or (lambda _e: None)
     outcomes = {item.episode.episode_id: item.outcome for item in scored}
     window_episodes, window = detail_window(
         episodes,
@@ -601,6 +537,14 @@ def build_performance(
         "warnings": ["Scores are out-of-sample and chronological; no future data is used."],
     }
 
+    research_drift = build_research_drift(
+        episodes,
+        answers=answers,
+        verified=frozenset(verified),
+        book_for=resolver,
+        reference_capital_usdc=capital_usdc,
+    )
+
     common = dict(now=now, source=source, dataset=dataset)
     return {
         "summary.json": _envelope(
@@ -635,6 +579,14 @@ def build_performance(
             statistical_scope=["out_of_sample_chronological"],
             warnings=models_payload["warnings"], **common,
         ),
+        "research-drift.json": _envelope(
+            logical_name="performance-research-drift",
+            data=research_drift,
+            sample_size=research_drift["totals"]["observation_count"],
+            statistical_scope=research_drift["statistical_scope"],
+            warnings=research_drift["warnings"],
+            **common,
+        ),
     }
 
 
@@ -664,9 +616,9 @@ def publish_performance(
     coverage: Mapping[str, Any] | None = None,
     extra_manifest: Mapping[str, Any] | None = None,
 ) -> list[Path]:
-    """Publish six snapshots as one generation, then switch the pointer.
+    """Publish seven snapshots as one generation, then switch the pointer.
 
-    Six separate renames into one directory is not an atomic cross-file
+    Seven separate renames into one directory is not an atomic cross-file
     commit: a reader that arrives halfway sees a mixture of two generations,
     and a mixture of an old opportunities file with a new win-rate file is
     exactly the kind of inconsistency nobody would notice until it was
@@ -685,55 +637,57 @@ def publish_performance(
     target = Path(directory)
     now = datetime.now(tz=UTC)
     gid = generation_id or new_generation_id(now=now, payloads=payloads)
-    generation_dir = target / "generations" / gid
-    generation_dir.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True)
+    with generation_lock(target):
+        generation_dir = target / "generations" / gid
+        generation_dir.mkdir(parents=True, exist_ok=True)
 
-    written: list[Path] = []
-    files_meta: dict[str, Any] = {}
-    for filename in SNAPSHOT_FILES:
-        if filename not in payloads:
-            continue
-        payload = dict(payloads[filename])
-        payload["generation_id"] = gid
-        path = generation_dir / filename
-        atomic_write_json_streaming(path, payload, root=generation_dir)
-        written.append(path)
-        files_meta[filename] = {"bytes": path.stat().st_size}
+        written: list[Path] = []
+        files_meta: dict[str, Any] = {}
+        for filename in SNAPSHOT_FILES:
+            if filename not in payloads:
+                continue
+            payload = dict(payloads[filename])
+            payload["generation_id"] = gid
+            path = generation_dir / filename
+            atomic_write_json_streaming(path, payload, root=generation_dir)
+            written.append(path)
+            files_meta[filename] = {"bytes": path.stat().st_size}
 
-    missing = [name for name in SNAPSHOT_FILES if name not in files_meta]
-    if missing:
-        raise RuntimeError(
-            f"generation {gid} is incomplete: missing {missing}; "
-            "the previous generation stays current"
-        )
+        missing = [name for name in SNAPSHOT_FILES if name not in files_meta]
+        if missing:
+            raise RuntimeError(
+                f"generation {gid} is incomplete: missing {missing}; "
+                "the previous generation stays current"
+            )
 
-    manifest = {
-        "generation_id": gid,
-        "published_at_utc": now.astimezone(UTC).isoformat(),
-        "generated_at_utc": now.astimezone(UTC).isoformat(),
-        "dataset": next(
-            (p.get("dataset") for p in payloads.values() if p.get("dataset")), None
-        ),
-        "source": next(
-            (p.get("source") for p in payloads.values() if p.get("source")), None
-        ),
-        "watermark": watermark,
-        "coverage": dict(coverage or {}),
-        "files": files_meta,
-        "performance_schema_version": PERFORMANCE_SCHEMA_VERSION,
-    }
-    if extra_manifest:
-        # Additive only. ``algorithm_version``, ``input_source`` and
-        # ``input_range`` describe *how* this batch was produced; a reader that
-        # predates them ignores them, and one that does not can tell two
-        # differently-built generations apart without diffing the payloads.
-        manifest.update(dict(extra_manifest))
-    atomic_write_json(generation_dir / "manifest.json", manifest)
+        manifest = {
+            "generation_id": gid,
+            "published_at_utc": now.astimezone(UTC).isoformat(),
+            "generated_at_utc": now.astimezone(UTC).isoformat(),
+            "dataset": next(
+                (p.get("dataset") for p in payloads.values() if p.get("dataset")), None
+            ),
+            "source": next(
+                (p.get("source") for p in payloads.values() if p.get("source")), None
+            ),
+            "watermark": watermark,
+            "coverage": dict(coverage or {}),
+            "files": files_meta,
+            "performance_schema_version": PERFORMANCE_SCHEMA_VERSION,
+        }
+        if extra_manifest:
+            # Additive only. ``algorithm_version``, ``input_source`` and
+            # ``input_range`` describe *how* this batch was produced; a reader that
+            # predates them ignores them, and one that does not can tell two
+            # differently-built generations apart without diffing the payloads.
+            manifest.update(dict(extra_manifest))
+        atomic_write_json(generation_dir / "manifest.json", manifest)
 
-    # One rename publishes the batch. Before this line the previous
-    # generation is still the current one; after it, this one is.
-    atomic_write_json(target / CURRENT_POINTER, {"generation_id": gid})
-    return written
+        # One rename publishes the batch. Before this line the previous
+        # generation is still the current one; after it, this one is.
+        atomic_write_json(target / CURRENT_POINTER, {"generation_id": gid})
+        return written
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,7 +1,13 @@
-/** Formatting helpers: one place for how a number is shown. */
+/**
+ * Formatting helpers: one place for how a number is shown.
+ *
+ * Missing values render as `N/A`, never as an empty string: an empty cell and
+ * a genuinely zero value must not look alike.
+ */
+const MISSING = 'N/A'
 
 export function fmtInt(value: number | null | undefined): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return '—'
+  if (value === null || value === undefined || Number.isNaN(value)) return MISSING
   return Math.round(value).toLocaleString('zh-CN')
 }
 
@@ -9,7 +15,7 @@ export function fmtPct(
   value: number | null | undefined,
   digits = 1,
 ): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return '—'
+  if (value === null || value === undefined || Number.isNaN(value)) return MISSING
   return `${(value * 100).toFixed(digits)}%`
 }
 
@@ -19,18 +25,18 @@ export function fmtProb(value: number | null | undefined): string {
 }
 
 export function fmtUsd(value: number | null | undefined, digits = 3): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return '—'
+  if (value === null || value === undefined || Number.isNaN(value)) return MISSING
   return value.toFixed(digits)
 }
 
 export function fmtUsdDepth(value: number | null | undefined): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return '—'
+  if (value === null || value === undefined || Number.isNaN(value)) return MISSING
   if (value >= 1000) return `$${(value / 1000).toFixed(1)}k`
   return `$${value.toFixed(value >= 100 ? 0 : 1)}`
 }
 
 export function fmtBytes(value: number | null | undefined): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return '—'
+  if (value === null || value === undefined || Number.isNaN(value)) return MISSING
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let size = value
   let unit = 0
@@ -42,7 +48,7 @@ export function fmtBytes(value: number | null | undefined): string {
 }
 
 export function fmtAge(seconds: number | null | undefined): string {
-  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return '—'
+  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return MISSING
   const s = Math.max(0, seconds)
   if (s < 90) return `${Math.round(s)} 秒前`
   if (s < 5400) return `${Math.round(s / 60)} 分钟前`
@@ -51,7 +57,7 @@ export function fmtAge(seconds: number | null | undefined): string {
 }
 
 export function fmtAgeShort(seconds: number | null | undefined): string {
-  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return '—'
+  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return MISSING
   const s = Math.max(0, seconds)
   if (s < 60) return `${Math.round(s)}s`
   if (s < 3600) return `${Math.round(s / 60)}m`
@@ -61,9 +67,9 @@ export function fmtAgeShort(seconds: number | null | undefined): string {
 
 /** Local wall-clock time for an ISO timestamp: 14:03:21 or 10-11 14:03. */
 export function fmtTime(iso: string | null | undefined, withDate = false): string {
-  if (!iso) return '—'
+  if (!iso) return MISSING
   const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return '—'
+  if (Number.isNaN(d.getTime())) return MISSING
   const hh = String(d.getHours()).padStart(2, '0')
   const mm = String(d.getMinutes()).padStart(2, '0')
   const ss = String(d.getSeconds()).padStart(2, '0')
@@ -74,9 +80,9 @@ export function fmtTime(iso: string | null | undefined, withDate = false): strin
 }
 
 export function fmtDateTime(iso: string | null | undefined): string {
-  if (!iso) return '—'
+  if (!iso) return MISSING
   const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return '—'
+  if (Number.isNaN(d.getTime())) return MISSING
   return d.toLocaleString('zh-CN', { hour12: false })
 }
 

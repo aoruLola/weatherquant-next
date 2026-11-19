@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from weatherquant.dashboard import API_SCHEMA_VERSION
 from weatherquant.dashboard import builders as builders
+from weatherquant.dashboard import paper as paper
 from weatherquant.dashboard import performance as perf
 from weatherquant.dashboard.archive import ArchiveTail
 from weatherquant.dashboard.config import DashboardSettings
@@ -39,11 +40,17 @@ from weatherquant.dashboard.contracts import (
     Envelope,
     ForecastsData,
     Freshness,
+    FreshnessState,
     HealthzData,
+    LayeredHealthData,
+    LayerStatus,
     MarketDetailData,
     MarketsData,
     OverviewData,
+    PaperData,
     PerformanceData,
+    ResearchDriftData,
+    ServiceHealth,
     ShadowHealthData,
     ShadowReportData,
     SystemData,
@@ -68,6 +75,10 @@ def create_app(settings: DashboardSettings | None = None) -> FastAPI:
         archive=ArchiveTail(settings),
         trends=TrendBuffer(max_samples=settings.trend_history_samples),
     )
+    paper_client = paper.PaperClient(
+        settings.paper_api_base_url,
+        timeout_seconds=settings.paper_api_timeout_seconds,
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -78,6 +89,7 @@ def create_app(settings: DashboardSettings | None = None) -> FastAPI:
             sampler.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sampler
+            await paper_client.aclose()
 
     app = FastAPI(
         title="WeatherQuant Dashboard",
@@ -91,6 +103,7 @@ def create_app(settings: DashboardSettings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.wq_state = state
+    app.state.paper_client = paper_client
 
     _install_rate_limit(app, settings)
     _install_api_routes(app, state, settings)
@@ -130,9 +143,7 @@ def _perf_dataset(data: Any, configured: str) -> str:
     return configured
 
 
-def _perf_env(
-    cls: Any, api: str, data: Any, freshness: Freshness, now: datetime, configured: str
-) -> Envelope[Any]:
+def _perf_env(cls: Any, api: str, data: Any, freshness: Freshness, now: datetime, configured: str) -> Envelope[Any]:
     dataset = _perf_dataset(data, configured)
     if dataset != configured and isinstance(data, dict):
         warnings = data.get("warnings")
@@ -141,7 +152,7 @@ def _perf_env(
             f"as {configured!r}; the snapshot's own label governs"
         )
         data = dict(data)
-        data["warnings"] = ([*(warnings or []), note] if isinstance(warnings, list) else [note])
+        data["warnings"] = [*(warnings or []), note] if isinstance(warnings, list) else [note]
     return _env(cls, api, data, freshness, now, dataset)
 
 
@@ -268,7 +279,9 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
 
     @app.get("/api/v1/decisions", response_model=Envelope[DecisionsData], tags=["v1"])
     async def r_decisions(
-        state_filter: str | None = Query(None, alias="state", pattern="^(ACCEPT|REJECT|NO_TRADE|DATA_UNAVAILABLE|CANDIDATE)$"),
+        state_filter: str | None = Query(
+            None, alias="state", pattern="^(ACCEPT|REJECT|NO_TRADE|DATA_UNAVAILABLE|CANDIDATE)$"
+        ),
         mode: str | None = Query(None, pattern="^(LIVE|REPLAY)$"),
         market_id: str | None = Query(None, max_length=200),
         model: str | None = Query(None, max_length=80),
@@ -308,6 +321,94 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
         data, freshness = await asyncio.to_thread(builders.system, state, now)
         return _env(SystemData, "system", data, freshness, now, dataset)
 
+    @app.get("/api/v1/health/layers", response_model=Envelope[LayeredHealthData], tags=["ops"])
+    async def r_health_layers() -> Envelope[LayeredHealthData]:
+        """Export -> Performance Consume -> Publish -> Snapshot, one response.
+
+        The publish and snapshot layers come from the single generation the
+        pointer resolved to; export and ingest are read live and named as such.
+        Paper is the only service whose liveness is not a file, so it is probed
+        here rather than in the synchronous builder.
+        """
+        now = _utcnow()
+        try:
+            account = await app.state.paper_client.get("account")
+        except paper.PaperUnavailable as exc:
+            paper_status = ServiceHealth(
+                name="paper",
+                status=LayerStatus.UNKNOWN,
+                reason=str(exc),
+            )
+        else:
+            as_of = parse_utc(
+                account.get("as_of_utc") or account.get("updated_at_utc") or account.get("generated_at_utc")
+            )
+            paper_status = ServiceHealth(
+                name="paper",
+                status=LayerStatus.OK,
+                age_seconds=(round(max((now - as_of).total_seconds(), 0.0), 3) if as_of is not None else None),
+            )
+        data, freshness = await asyncio.to_thread(builders.layered_health, state, now, paper=paper_status)
+        return _env(
+            LayeredHealthData,
+            "health/layers",
+            data,
+            freshness,
+            now,
+            data.dataset or dataset,
+        )
+
+    # -- Paper Trading ------------------------------------------------------
+    # A deliberately narrow HTTP proxy: only these two dashboard routes exist,
+    # and the client itself accepts only a whitelist of GET resources. No
+    # database path or write method is part of this integration.
+
+    @app.get("/api/v1/paper/summary", response_model=Envelope[PaperData], tags=["paper"])
+    async def r_paper_summary() -> Envelope[PaperData]:
+        now = _utcnow()
+        market_data, market_freshness = await asyncio.to_thread(builders.markets, state, now, limit=500)
+        marks = paper.current_marks(market_data.items)
+        marks_reason = (
+            market_data.reason or market_freshness.reason or "one or more open positions has no fresh best bid"
+        )
+        try:
+            data = await paper.build_summary(
+                app.state.paper_client,
+                marks,
+                marks_reason=marks_reason,
+            )
+            freshness = Freshness(state=FreshnessState.FRESH)
+        except paper.PaperUnavailable as exc:
+            data = paper.unavailable_summary(str(exc))
+            freshness = Freshness(state=FreshnessState.UNAVAILABLE, reason=str(exc))
+        return _env(PaperData, "paper/summary", data, freshness, now, dataset)
+
+    @app.get("/api/v1/paper/fills", response_model=Envelope[PaperData], tags=["paper"])
+    async def r_paper_fills(
+        limit: int = Query(20, ge=1, le=500),
+        cursor: str | None = Query(None, max_length=200),
+    ) -> Envelope[PaperData]:
+        now = _utcnow()
+        params: dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            page = await app.state.paper_client.get("fills", params=params)
+            data = {**page, "status": "ok", "mode": "PAPER"}
+            freshness = Freshness(state=FreshnessState.FRESH)
+        except paper.PaperUnavailable as exc:
+            data = {
+                "status": "unavailable",
+                "mode": "PAPER",
+                "reason": str(exc),
+                "fills": [],
+                "limit": limit,
+                "next_cursor": None,
+                "has_more": False,
+            }
+            freshness = Freshness(state=FreshnessState.UNAVAILABLE, reason=str(exc))
+        return _env(PaperData, "paper/fills", data, freshness, now, dataset)
+
     # -- performance -------------------------------------------------------
     # All seven read snapshots the research process already computed. None
     # of them opens a database, and none of them derives a figure a second
@@ -344,9 +445,7 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
         direction: str | None = Query(None, pattern="^(buy_yes|sell_yes)$"),
         mode: str | None = Query(None, pattern="^(LIVE|REPLAY)$"),
         target_date: str | None = Query(None, max_length=32),
-        outcome: str | None = Query(
-            None, pattern="^(WIN|LOSS|PENDING|DISPUTED|UNVERIFIABLE|UNAVAILABLE)$"
-        ),
+        outcome: str | None = Query(None, pattern="^(WIN|LOSS|PENDING|DISPUTED|UNVERIFIABLE|UNAVAILABLE)$"),
         min_edge: float | None = Query(None),
         max_edge: float | None = Query(None),
     ) -> Envelope[PerformanceData]:
@@ -385,23 +484,36 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
     )
     async def r_perf_settlements(
         limit: int = Query(50, ge=1, le=perf.MAX_PAGE),
-        cursor: int = Query(0, ge=0),
-        status: str | None = Query(
-            None, pattern="^(PENDING|RESOLVED|DISPUTED|UNAVAILABLE|UNVERIFIABLE)$"
-        ),
+        cursor: str | None = Query(None),
+        status: str | None = Query(None, pattern="^(PENDING|RESOLVED|DISPUTED|UNAVAILABLE|UNVERIFIABLE)$"),
         market_id: str | None = Query(None, max_length=64),
     ) -> Envelope[PerformanceData]:
         now = _utcnow()
-        data, freshness = await asyncio.to_thread(
-            perf.performance_settlements,
-            perf_state,
-            now,
-            limit=limit,
-            cursor=cursor,
-            status=status,
-            market_id=market_id,
-        )
+        try:
+            data, freshness = await asyncio.to_thread(
+                perf.performance_settlements,
+                perf_state,
+                now,
+                limit=limit,
+                cursor=cursor,
+                status=status,
+                market_id=market_id,
+            )
+        except perf.CursorGenerationChanged as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _perf_env(PerformanceData, "performance/settlements", data, freshness, now, dataset)
+
+    @app.get(
+        "/api/v1/performance/research-drift",
+        response_model=Envelope[ResearchDriftData],
+        tags=["v1"],
+    )
+    async def r_perf_research_drift() -> Envelope[ResearchDriftData]:
+        now = _utcnow()
+        data, freshness = await asyncio.to_thread(perf.performance_research_drift, perf_state, now)
+        return _perf_env(ResearchDriftData, "performance/research-drift", data, freshness, now, dataset)
 
     @app.get("/api/v1/performance/models", response_model=Envelope[PerformanceData], tags=["v1"])
     async def r_perf_models() -> Envelope[PerformanceData]:
@@ -428,9 +540,7 @@ def _install_api_routes(app: FastAPI, state: builders.DashboardState, settings: 
             mode=mode,
             max_allocation_fraction=max_allocation_fraction,
         )
-        return _perf_env(
-            PerformanceData, "performance/reference-capital", data, freshness, now, dataset
-        )
+        return _perf_env(PerformanceData, "performance/reference-capital", data, freshness, now, dataset)
 
 
 # ---------------------------------------------------------------------------
@@ -546,7 +656,9 @@ async def _sample_loop(state: builders.DashboardState) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="weatherquant-dashboard", description="WeatherQuant read-only dashboard server.")
+    parser = argparse.ArgumentParser(
+        prog="weatherquant-dashboard", description="WeatherQuant read-only dashboard server."
+    )
     parser.add_argument("--host", default=None, help="bind address (default: WQ_HOST or 0.0.0.0)")
     parser.add_argument("--port", type=int, default=None, help="port (default: WQ_PORT or 8787)")
     args = parser.parse_args(argv)
