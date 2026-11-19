@@ -320,3 +320,66 @@ def test_migrate_survives_sigkill(tmp_path: Path) -> None:
             assert "idx_foo" in indexes, f"index missing after SIGKILL: {indexes}"
         finally:
             con.close()
+
+
+_PARTIALLY_MIGRATING_CHILD = textwrap.dedent(
+    """
+    import sys, time
+    from pathlib import Path
+
+    import duckdb
+
+    from weatherquant.storage.migrator import MigrationError, migrate
+
+    db, migrations, marker = (Path(arg) for arg in sys.argv[1:4])
+    con = duckdb.connect(str(db))
+    con.execute("SET checkpoint_threshold='100GB'")
+    try:
+        migrate(con, migrations)
+    except MigrationError as exc:
+        marker.write_text("failed: " + str(exc).split(":")[0], encoding="utf-8")
+    time.sleep(600)
+    """
+)
+
+
+def test_migrations_committed_before_a_failing_one_survive_sigkill(tmp_path: Path) -> None:
+    """0001 commits, 0002 fails. The process is then killed before it closes
+    the connection. 0001 must already be checkpointed: otherwise it lives only
+    in the WAL, which is the stranded-WAL window the checkpoint exists to close.
+    """
+    directory = tmp_path / "migrations"
+    directory.mkdir()
+    (directory / "0001_bulk.sql").write_text(
+        "CREATE TABLE foo (id INTEGER, payload VARCHAR);\n"
+        "INSERT INTO foo SELECT i, 'x' FROM range(200000) tbl(i);\n"
+        "CREATE INDEX idx_foo ON foo (id);\n",
+        encoding="utf-8",
+    )
+    (directory / "0002_broken.sql").write_text("SELECT * FROM no_such_table;\n", encoding="utf-8")
+
+    db_file = tmp_path / "partial.duckdb"
+    script = tmp_path / "partially_migrating_child.py"
+    script.write_text(_PARTIALLY_MIGRATING_CHILD, encoding="utf-8")
+    marker = tmp_path / "partial.marker"
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    proc = subprocess.Popen(
+        [sys.executable, str(script), str(db_file), str(directory), str(marker)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    assert _wait_for_migration(proc, marker).startswith("failed: migration 0002_broken failed")
+
+    proc.send_signal(signal.SIGKILL)
+    proc.communicate(timeout=30)
+
+    assert _wal_is_empty(db_file), "a committed migration must be checkpointed even when a later one fails"
+    con = duckdb.connect(str(db_file), read_only=True)
+    try:
+        versions = {row[0] for row in con.execute("SELECT version FROM schema_migrations").fetchall()}
+        assert versions == {"0001"}
+        assert con.execute("SELECT COUNT(*) FROM foo").fetchone()[0] == 200000
+    finally:
+        con.close()

@@ -109,7 +109,28 @@ def migrate(con: duckdb.DuckDBPyConnection, directory: Path = MIGRATIONS_DIR) ->
     specs = available_migrations(directory)
     applied = applied_migrations(con)
     done: list[str] = []
+    try:
+        _apply_pending(con, specs, applied, done)
+    except BaseException:
+        # Also when a later migration fails: the ones that committed before it
+        # are on disk only in the WAL until a checkpoint, which is the same
+        # kill -9 window this exists to close. The migration error is the one
+        # the caller must see, so a failing checkpoint cannot replace it.
+        if done:
+            with contextlib.suppress(duckdb.Error):
+                con.execute("CHECKPOINT")
+        raise
+    if done:
+        con.execute("CHECKPOINT")
+    return done
 
+
+def _apply_pending(
+    con: duckdb.DuckDBPyConnection,
+    specs: list[MigrationSpec],
+    applied: dict[str, str],
+    done: list[str],
+) -> None:
     for spec in specs:
         existing = applied.get(spec.version)
         if existing is not None:
@@ -135,8 +156,3 @@ def migrate(con: duckdb.DuckDBPyConnection, directory: Path = MIGRATIONS_DIR) ->
             raise MigrationError(f"migration {spec.version}_{spec.name} failed: {exc}") from exc
 
         done.append(f"{spec.version}_{spec.name}")
-
-    if done:
-        con.execute("CHECKPOINT")
-
-    return done

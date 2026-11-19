@@ -217,7 +217,7 @@ exit code 0/1 对应一致/不一致。
 WAL 折进主库文件。否则"迁移已提交、首次 checkpoint 前进程被 kill -9"会留下 `.wal`，
 只读打开无法回放（`Could not write file ... Bad file descriptor`），Shadow 启动时用于
 识别外来库的只读探针会永久失败，引擎再也起不来。该 CHECKPOINT 与迁移在同一次启动中
-完成，且幂等：已迁移库再启动一次不重放、不报错、不改变数据。所有 migrations 目录
+完成，且幂等：已迁移库再启动一次不重放、不报错、不改变数据。若某个迁移失败，之前已提交的迁移同样先 CHECKPOINT 再抛出原错误，不会只留在 WAL 里。所有 migrations 目录
 （主库、shadow、performance、paper、research）共用同一个 `migrate()`，因此同时生效。
 
 ### 8.3 回滚
