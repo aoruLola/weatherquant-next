@@ -26,7 +26,7 @@ from weatherquant.dashboard.producer import (
     build_markets_snapshot,
 )
 from weatherquant.shadow.report import _percentile
-
+from weatherquant.storage.retention import apply_retention
 
 NOW = datetime(2026, 11, 11, 12, 0, tzinfo=UTC)
 
@@ -45,7 +45,20 @@ def con():
             net_edge DOUBLE,
             mode VARCHAR,
             primary_reason VARCHAR,
-            decision_latency_ms BIGINT
+            decision_latency_ms BIGINT,
+            export_seq BIGINT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE rejection_reasons (
+            decision_id VARCHAR NOT NULL,
+            ordinal INTEGER NOT NULL,
+            reason VARCHAR NOT NULL,
+            is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+            detail VARCHAR,
+            PRIMARY KEY (decision_id, reason)
         )
         """
     )
@@ -78,6 +91,8 @@ def con():
             target_date DATE NOT NULL,
             event_id VARCHAR NOT NULL,
             forecast_run_time_utc TIMESTAMPTZ NOT NULL,
+            forecast_publishable_at_utc TIMESTAMPTZ,
+            forecast_publishable_basis VARCHAR,
             probabilities_json VARCHAR NOT NULL,
             predicted_max_f DOUBLE,
             lead_hours DOUBLE,
@@ -222,7 +237,7 @@ def test_market_snapshot_window_filters_old_decisions(con):
             continue
         last_decision = datetime.fromisoformat(last_ts)
         assert last_decision >= window_start, (
-            f"market {market_id} last_decision_time_utc={last_decision} "
+            f"market {mk['market_id']} last_decision_time_utc={last_decision} "
             f"is outside the {MARKET_DECISION_WINDOW_DAYS}-day window "
             f"(window starts at {window_start}) - the WHERE clause was dropped!"
         )
@@ -272,14 +287,18 @@ def test_forecast_snapshot_lookback_filters_old_predictions(con):
         """
         INSERT INTO model_predictions
             (model_name, model_version, station, target_date, event_id,
-             forecast_run_time_utc, probabilities_json, predicted_max_f)
+             forecast_run_time_utc, forecast_publishable_at_utc,
+             forecast_publishable_basis, probabilities_json, predicted_max_f)
         VALUES
-            ('ecmwf_raw','v1','S01',?, 'EV1', ?, '{}', 32.0),
-            ('ecmwf_raw','v1','S01',?, 'EV1', ?, '{}', 33.0)
+            ('ecmwf_raw','v1','S01',?, 'EV1', ?, ?,
+             'forecast_run_time_utc', '{}', 32.0),
+            ('ecmwf_raw','v1','S01',?, 'EV1', ?, ?,
+             'forecast_run_time_utc', '{}', 33.0)
         """,
         [
-            (now - timedelta(days=3)).date(), now - timedelta(hours=2),
-            (now - timedelta(days=FORECAST_LOOKBACK_DAYS + 2)).date(), now - timedelta(hours=1),
+            (now - timedelta(days=3)).date(), now - timedelta(hours=2), now - timedelta(hours=2),
+            (now - timedelta(days=FORECAST_LOOKBACK_DAYS + 2)).date(),
+            now - timedelta(hours=1), now - timedelta(hours=1),
         ],
     )
     from weatherquant.dashboard.producer import build_forecasts_snapshot
@@ -295,3 +314,189 @@ def test_forecast_snapshot_lookback_filters_old_predictions(con):
                 f"forecast target_date={hd} is below "
                 f"FORECAST_LOOKBACK_DAYS={FORECAST_LOOKBACK_DAYS} bound ({lb})"
             )
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: retention must never delete unexported decisions and must be atomic
+# ---------------------------------------------------------------------------
+
+def _decision_ids(con):
+    return {row[0] for row in con.execute("SELECT decision_id FROM shadow_decisions ORDER BY decision_id").fetchall()}
+
+
+def _reason_ids(con):
+    return {row[0] for row in con.execute("SELECT decision_id FROM rejection_reasons ORDER BY decision_id").fetchall()}
+
+
+def _prediction_runs(con):
+    return {
+        row[0]
+        for row in con.execute(
+            "SELECT forecast_run_time_utc FROM model_predictions ORDER BY forecast_run_time_utc"
+        ).fetchall()
+    }
+
+
+def _seed_retention_scenario(con, *, now=NOW):
+    old = now - timedelta(days=40)
+    new = now - timedelta(days=1)
+    con.executemany(
+        "INSERT INTO shadow_decisions "
+        "(decision_id, market_id, state, decision_time_utc, primary_reason, export_seq) "
+        "VALUES (?,?,?,?,?,?)",
+        [
+            ("D_EXPORTED", "M1", "REJECT", old, "edge", 1),
+            ("D_PENDING", "M2", "REJECT", old, "edge", 2),
+            ("D_NULL_SEQ", "M3", "REJECT", old, "edge", None),
+            ("D_FRESH", "M4", "REJECT", new, "edge", 3),
+        ],
+    )
+    con.executemany(
+        "INSERT INTO rejection_reasons (decision_id, ordinal, reason) VALUES (?,?,?)",
+        [
+            ("D_EXPORTED", 0, "edge"),
+            ("D_EXPORTED", 1, "liquidity"),
+            ("D_PENDING", 0, "edge"),
+            ("D_NULL_SEQ", 0, "edge"),
+            ("D_FRESH", 0, "edge"),
+        ],
+    )
+    con.execute(
+        """
+        INSERT INTO model_predictions
+            (model_name, model_version, station, target_date, event_id,
+             forecast_run_time_utc, forecast_publishable_at_utc,
+             forecast_publishable_basis, probabilities_json, predicted_max_f)
+        VALUES
+            ('ecmwf_raw','v1','S01',?, 'EV1', ?, ?,
+             'forecast_run_time_utc', '{}', 31.0),
+            ('ecmwf_raw','v1','S01',?, 'EV1', ?, ?,
+             'forecast_run_time_utc', '{}', 32.0)
+        """,
+        [
+            old.date(), old, old,
+            new.date(), new, new,
+        ],
+    )
+    return old, new
+
+
+def _parquet_ids(con, path):
+    return {row[0] for row in con.execute("SELECT decision_id FROM read_parquet(?)", [str(path)]).fetchall()}
+
+
+def test_retention_archives_only_exported_old_decisions_and_reasons(con, tmp_path):
+    old, new = _seed_retention_scenario(con)
+
+    result = apply_retention(
+        con,
+        days=30,
+        archive_dir=tmp_path,
+        exported_through_seq=1,
+        now=NOW,
+    )
+
+    assert result.deleted_decisions == 1
+    assert result.deleted_predictions == 1
+    assert _decision_ids(con) == {"D_PENDING", "D_NULL_SEQ", "D_FRESH"}
+    assert _reason_ids(con) == {"D_PENDING", "D_NULL_SEQ", "D_FRESH"}
+    assert _prediction_runs(con) == {new}
+
+    decision_archive = next(tmp_path.glob("shadow_decisions_*.parquet"))
+    reason_archive = next(tmp_path.glob("rejection_reasons_*.parquet"))
+    prediction_archive = next(tmp_path.glob("model_predictions_*.parquet"))
+    assert _parquet_ids(con, decision_archive) == {"D_EXPORTED"}
+    assert [
+        row[0]
+        for row in con.execute("SELECT decision_id FROM read_parquet(?)", [str(reason_archive)]).fetchall()
+    ] == ["D_EXPORTED", "D_EXPORTED"]
+    assert {
+        row[0]
+        for row in con.execute(
+            "SELECT forecast_run_time_utc FROM read_parquet(?)", [str(prediction_archive)]
+        ).fetchall()
+    } == {old}
+
+
+def test_retention_without_export_cursor_keeps_decisions_but_prunes_predictions(con, tmp_path):
+    _old, new = _seed_retention_scenario(con)
+
+    result = apply_retention(con, days=30, archive_dir=tmp_path, now=NOW)
+
+    assert result.ran is True
+    assert result.deleted_decisions == 0
+    assert result.deleted_predictions == 1
+    assert _decision_ids(con) == {"D_EXPORTED", "D_PENDING", "D_NULL_SEQ", "D_FRESH"}
+    assert _reason_ids(con) == {"D_EXPORTED", "D_PENDING", "D_NULL_SEQ", "D_FRESH"}
+    assert _prediction_runs(con) == {new}
+    assert not list(tmp_path.glob("shadow_decisions_*.parquet"))
+    assert not list(tmp_path.glob("rejection_reasons_*.parquet"))
+    assert list(tmp_path.glob("model_predictions_*.parquet"))
+
+
+class _FailingPredictionCopyCon:
+    def __init__(self, con):
+        self._con = con
+
+    def execute(self, sql, params=None):
+        if sql.startswith("COPY (SELECT * FROM model_predictions"):
+            raise RuntimeError("prediction archive disk full")
+        return self._con.execute(sql, params) if params is not None else self._con.execute(sql)
+
+
+def test_retention_failure_rolls_back_database_and_removes_uncommitted_archives(con, tmp_path):
+    _seed_retention_scenario(con)
+    before_decisions = _decision_ids(con)
+    before_reasons = _reason_ids(con)
+    before_predictions = _prediction_runs(con)
+
+    with pytest.raises(RuntimeError, match="prediction archive disk full"):
+        apply_retention(
+            _FailingPredictionCopyCon(con),
+            days=30,
+            archive_dir=tmp_path,
+            exported_through_seq=1,
+            now=NOW,
+        )
+
+    assert _decision_ids(con) == before_decisions
+    assert _reason_ids(con) == before_reasons
+    assert _prediction_runs(con) == before_predictions
+    assert list(tmp_path.glob("*.parquet")) == []
+
+
+def test_runner_passes_confirmed_export_cursor_to_retention(con, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from weatherquant.shadow import runner as runner_module
+
+    captured = {}
+
+    class FakeExporter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def state(self):
+            return {"version": 2, "cursor_seq": 1}
+
+    def fake_apply_retention(_con, **kwargs):
+        captured.update(kwargs)
+        return runner_module.RetentionResult()
+
+    monkeypatch.setattr(runner_module, "DecisionExporter", FakeExporter)
+    monkeypatch.setattr(runner_module, "apply_retention", fake_apply_retention)
+
+    r = object.__new__(runner_module.ShadowRunner)
+    r.clock = lambda: NOW
+    r._next_retention = NOW - timedelta(seconds=1)
+    r.shadow = SimpleNamespace(
+        shadow_retention_days=30,
+        shadow_retention_archive_dir=tmp_path,
+        shadow_report_path=tmp_path / "report.json",
+    )
+    r.db = SimpleNamespace(con=con)
+    r.store = None
+
+    r._maybe_retention()
+
+    assert captured["exported_through_seq"] == 1

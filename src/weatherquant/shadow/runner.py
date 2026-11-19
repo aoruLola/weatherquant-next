@@ -58,9 +58,9 @@ from weatherquant.shadow.health import disk_free_percent, write_heartbeat
 from weatherquant.shadow.inference import PredictionResult, Predictor, prediction_rows
 from weatherquant.shadow.ingest import ArchiveTailer, QualityEvent
 from weatherquant.shadow.report import build_report, publish_report_snapshot
-from weatherquant.storage.retention import apply_retention
 from weatherquant.shadow.state import ShadowState
 from weatherquant.shadow.store import ShadowStore
+from weatherquant.storage.retention import apply_retention
 from weatherquant.storage.shadow import ShadowDatabase
 from weatherquant.weather.daily_max import local_day_bounds_utc
 from weatherquant.weather.single_runs import SingleRunsClient
@@ -755,11 +755,26 @@ class ShadowRunner:
         self._next_retention = now + timedelta(hours=12)
         if self.shadow.shadow_retention_days is None:
             return
+        exported_through_seq = None
+        try:
+            export_state = DecisionExporter(
+                self.db.con,
+                self.shadow.shadow_report_path.parent / "decisions-export",
+            ).state()
+            if int(export_state.get("version") or 1) >= 2:
+                cursor_seq = export_state.get("cursor_seq")
+                if cursor_seq is not None:
+                    exported_through_seq = int(cursor_seq)
+        except Exception as exc:
+            # Predictions are independent and still safe to prune, but decisions
+            # must never be deleted without a durable, confirmed export cursor.
+            log.warning("could not confirm decision export cursor; retaining decisions: %s", exc)
         try:
             result = apply_retention(
                 self.db.con,
                 days=self.shadow.shadow_retention_days,
                 archive_dir=self.shadow.shadow_retention_archive_dir,
+                exported_through_seq=exported_through_seq,
                 now=now,
             )
             if result.ran:
@@ -1107,7 +1122,7 @@ def _rss_mb() -> float | None:
     Linux-only (reads /proc/self/statm). Non-Linux platforms (macOS inside
     tests) get None - callers must tolerate that."""
     try:
-        with open("/proc/self/statm", "r") as fh:
+        with open("/proc/self/statm") as fh:
             parts = fh.read().split()
         # rss is the second field, in pages. Page size on all current Linuxes
         # is 4096 bytes; if that ever changes (unlikely) the number will drift
