@@ -68,6 +68,39 @@ describe('Forecasts', () => {
     expect(screen.getByTestId('forecast-empty')).toHaveTextContent('forecast-snapshot not published')
   })
 
+  it('separates issued, publishable and received times, and says N/A when absent', async () => {
+    mockFetch({ '/api/v1/forecasts': envelopeOf(forecastsFixture()) })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('forecast-issued')).toBeInTheDocument())
+    expect(screen.getByTestId('forecast-issued')).not.toHaveTextContent(/^N\/A$/)
+    expect(screen.getByTestId('forecast-publishable').parentElement).toHaveTextContent(
+      'forecast_run_time_utc',
+    )
+    expect(screen.getByTestId('forecast-received')).not.toHaveTextContent(/^N\/A$/)
+    expect(screen.getByText('出报时刻（run）：')).toBeInTheDocument()
+  })
+
+  it('marks missing forecast evidence as N/A with a reason instead of blank', async () => {
+    const fixture = forecastsFixture()
+    fixture.distributions = fixture.distributions.map((dist) => ({
+      ...dist,
+      forecast_issued_at_utc: null,
+      forecast_publishable_at_utc: null,
+      forecast_publishable_basis: null,
+      forecast_received_at_utc: null,
+      forecast_issued_reason: 'model_predictions.forecast_run_time_utc is missing or invalid',
+    }))
+    mockFetch({ '/api/v1/forecasts': envelopeOf(fixture) })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('forecast-issued')).toBeInTheDocument())
+    expect(screen.getByTestId('forecast-issued')).toHaveTextContent('N/A')
+    expect(screen.getByTestId('forecast-issued').parentElement?.getAttribute('title')).toContain(
+      'forecast_run_time_utc',
+    )
+    expect(screen.getByTestId('forecast-publishable')).toHaveTextContent('N/A')
+    expect(screen.getByTestId('forecast-received')).toHaveTextContent('N/A')
+  })
+
   it('renders an error state when the API is unreachable', async () => {
     rejectFetch()
     renderPage()

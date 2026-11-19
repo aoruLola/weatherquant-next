@@ -49,11 +49,16 @@ __all__ = [
     "ForecastsData",
     "Freshness",
     "FreshnessState",
+    "HealthLayer",
     "HealthzData",
+    "LayerStatus",
+    "LayeredHealthData",
     "MarketDetailData",
     "MarketSummary",
     "MarketsData",
     "OverviewData",
+    "PaperData",
+    "ServiceHealth",
     "ShadowHealthData",
     "ShadowReportData",
     "SystemData",
@@ -292,6 +297,18 @@ class MarketSummary(BaseModel):
     event_id: str | None = None
     question: str = ""
     target_date: date | None = None
+    target_date_reason: str | None = None
+    rules_text: str | None = None
+    resolution_source: str | None = None
+    rules_source: str | None = None
+    rules_reason: str | None = None
+    start_time_utc: datetime | None = None
+    end_time_utc: datetime | None = None
+    schedule_source: str | None = None
+    schedule_reason: str | None = None
+    open_now: bool | None = None
+    open_now_source: str | None = None
+    open_now_reason: str | None = None
     bracket_label: str = ""
     bracket_low: float | None = None
     bracket_high: float | None = None
@@ -362,10 +379,18 @@ class ForecastBucket(BaseModel):
 class ForecastDistribution(BaseModel):
     model: str
     version: str | None = None
+    version_reason: str | None = None
     target_date: date | None = None
+    target_date_reason: str | None = None
     forecast_run_time_utc: datetime | None = None
+    forecast_issued_at_utc: datetime | None = None
+    forecast_issued_reason: str | None = None
+    forecast_publishable_at_utc: datetime | None = None
+    forecast_publishable_basis: str | None = None
+    forecast_publishable_reason: str | None = None
     training_cutoff_utc: datetime | None = None
     forecast_received_at_utc: datetime | None = None
+    forecast_received_reason: str | None = None
     predicted_max_f: float | None = None
     station: str | None = None
     buckets: list[ForecastBucket] = Field(default_factory=list)
@@ -416,6 +441,19 @@ class DecisionRow(BaseModel):
     available_depth_usd: float | None = None
     thresholds_version: str | None = None
     run_id: str | None = None
+    forecast_run_time_utc: datetime | None = None
+    snapshot_id: str | None = None
+    book_id: str | None = None
+    book_venue_ts_utc: datetime | None = None
+    book_collector_received_at_utc: datetime | None = None
+    book_shadow_received_at_utc: datetime | None = None
+    spread: float | None = None
+    mode_reason: str | None = None
+    evidence_version: int | None = None
+    book_source: str | None = None
+    book_source_event_id: str | None = None
+    evidence_source: str = "shadow_decisions"
+    evidence_reason: str | None = None
 
 
 class DecisionsData(BaseModel):
@@ -440,8 +478,8 @@ class DecisionsData(BaseModel):
     last_cycle_status: FreshnessState = FreshnessState.MISSING
 
     disclaimer: str = (
-        "ACCEPT 表示符合当前模型与风险过滤条件，不代表已验证的盈利机会。"
-        " ACCEPT means the filters passed; it is not evidence of a profitable trade."
+        "影子信号仅表示通过当前模型与风险过滤的一次模拟评估，"
+        "不代表下单或成交，也不代表已验证的盈利机会。"
     )
     filters_applied: dict[str, Any] = Field(default_factory=dict)
 
@@ -457,6 +495,71 @@ class SystemSourceHealth(BaseModel):
     status: str = "unknown"
     reasons: list[str] = Field(default_factory=list)
     age_seconds: float | None = None
+
+
+class LayerStatus(StrEnum):
+    """The four honest states one pipeline layer can be in.
+
+    ``LAGGING`` is deliberately distinct from ``STALE``: a layer can be behind
+    the position upstream of it while still inside its own tolerance (a
+    snapshot consumes one publish interval behind ingest by design). Only
+    ``STALE`` means the configured limit was crossed.
+    """
+
+    OK = "OK"
+    LAGGING = "LAGGING"
+    STALE = "STALE"
+    UNKNOWN = "UNKNOWN"
+
+
+class HealthLayer(BaseModel):
+    """One layer's live position, its age and the verdict for that layer.
+
+    ``watermark_utc`` is always the value read from the source named in
+    ``source``. It is never inferred from a different layer: in particular the
+    export layer is read from the shadow export's own state file, never from a
+    published manifest, whose watermark records what a snapshot consumed at
+    build time and would make a stopped export look caught up.
+    """
+
+    name: Literal["export", "performance_consume", "publish", "snapshot"]
+    watermark_utc: datetime | None = None
+    source: str
+    age_seconds: float | None = None
+    lag_seconds: float | None = None
+    threshold_seconds: float | None = None
+    status: LayerStatus = LayerStatus.UNKNOWN
+    reason: str | None = None
+
+
+class ServiceHealth(BaseModel):
+    """Collector / Shadow / Paper availability, using the layer vocabulary."""
+
+    name: str
+    status: LayerStatus = LayerStatus.UNKNOWN
+    age_seconds: float | None = None
+    reason: str | None = None
+
+
+class LayeredHealthData(BaseModel):
+    """Every freshness layer read from one published generation.
+
+    ``generation_id`` names the batch the publish/snapshot layers were read
+    from; the live export and ingest positions are labelled as live because
+    they are upstream of any generation. ``lagging_layer`` names the first
+    layer that crossed its threshold, most upstream first, and ``lagging_basis``
+    carries the measurements behind that choice so it can be checked.
+    """
+
+    generation_id: str | None = None
+    generation_source: str | None = None
+    lagging_layer: Literal["export", "performance_consume", "publish", "snapshot"] | None = None
+    lagging_basis: str | None = None
+    layers: list[HealthLayer] = Field(default_factory=list)
+    services: dict[str, ServiceHealth] = Field(default_factory=dict)
+    thresholds: dict[str, float] = Field(default_factory=dict)
+    dataset: str | None = None
+    reason: str | None = None
 
 
 class HealthzData(BaseModel):
@@ -497,6 +600,16 @@ class SystemData(BaseModel):
     unavailable: list[str] = Field(default_factory=list)
 
 
+class PaperData(BaseModel):
+    """Open Paper payload: the mode and availability are always explicit."""
+
+    model_config = ConfigDict(extra="allow")
+
+    status: str
+    mode: Literal["PAPER"] = "PAPER"
+    reason: str | None = None
+
+
 class PerformanceData(BaseModel):
     """A performance snapshot, passed through with its own scope attached.
 
@@ -520,3 +633,154 @@ class PerformanceData(BaseModel):
     as_of_utc: datetime | None = None
     dataset: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchDriftModel(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class ResearchDriftTotals(ResearchDriftModel):
+    observation_count: int = 0
+    episode_count: int = 0
+    target_date_missing_episode_count: int = 0
+
+
+class ResearchDriftCalibrationBin(ResearchDriftModel):
+    lower: float
+    upper: float
+    predicted_mean: float
+    observed_frequency: float
+    count: int
+    gap: float
+
+
+class ResearchDriftCalibration(ResearchDriftModel):
+    n: int = 0
+    brier: float | None = None
+    ece: float | None = None
+    bins: list[ResearchDriftCalibrationBin] = Field(default_factory=list)
+
+
+class ResearchDriftMarketBias(ResearchDriftModel):
+    n: int = 0
+    mean_market_minus_outcome: float | None = None
+    mean_market_probability: float | None = None
+    mean_outcome: float | None = None
+
+
+class ResearchDriftMarketBaseline(ResearchDriftCalibration):
+    mean_market_minus_outcome: float | None = None
+
+
+class ResearchDriftClimatologyBaseline(ResearchDriftModel):
+    available: bool = False
+    n: int = 0
+    brier: float | None = None
+    ece: float | None = None
+    reason: str
+
+
+class ResearchDriftBaselineComparison(ResearchDriftModel):
+    market: ResearchDriftMarketBaseline
+    climatology: ResearchDriftClimatologyBaseline
+
+
+class ResearchDriftFeeRateCount(ResearchDriftModel):
+    fee_rate: float
+    episode_count: int
+
+
+class ResearchDriftBucketFeeAssumption(ResearchDriftModel):
+    source: str
+    known_count: int
+    unknown_count: int
+    rates: list[ResearchDriftFeeRateCount] = Field(default_factory=list)
+
+
+class ResearchDriftEdgeTier(ResearchDriftModel):
+    n: int
+    sum: float | None
+    mean: float | None
+    unit: str
+
+
+class ResearchDriftEdgeTiers(ResearchDriftModel):
+    theoretical_observation_edge_per_share: ResearchDriftEdgeTier
+    executable_expected_net_usd: ResearchDriftEdgeTier
+    verified_realised_net_usd: ResearchDriftEdgeTier
+
+
+class ResearchDriftBucket(ResearchDriftModel):
+    period: str
+    start_date: date
+    observation_count: int
+    episode_count: int
+    executable_count: int
+    not_executable_count: int
+    fee_unknown_count: int
+    no_book_count: int
+    not_executable_reason_counts: dict[str, int] = Field(default_factory=dict)
+    fee_assumption: ResearchDriftBucketFeeAssumption
+    calibration: ResearchDriftCalibration
+    market_bias: ResearchDriftMarketBias
+    baseline_comparison: ResearchDriftBaselineComparison
+    edge_tiers: ResearchDriftEdgeTiers
+    small_sample: bool
+    source_episode_ids: list[str] = Field(default_factory=list)
+    anomaly_metrics: list[str] = Field(default_factory=list)
+
+
+class ResearchDriftBuckets(ResearchDriftModel):
+    iso_week: list[ResearchDriftBucket] = Field(default_factory=list)
+    month: list[ResearchDriftBucket] = Field(default_factory=list)
+    target_date: list[ResearchDriftBucket] = Field(default_factory=list)
+
+
+class ResearchDriftAnomalyRule(ResearchDriftModel):
+    statistic: str
+    threshold_mad: float
+    minimum_trailing_buckets: int
+    comparison: str
+    metrics: list[str] = Field(default_factory=list)
+
+
+class ResearchDriftAnomaly(ResearchDriftModel):
+    granularity: Literal["iso_week", "month", "target_date"]
+    period: str
+    metric: str
+    value: float
+    trailing_median: float
+    trailing_mad: float
+    deviation: float
+    threshold: float
+    trailing_bucket_count: int
+    source_episode_ids: list[str] = Field(default_factory=list)
+
+
+class ResearchDriftFeePolicy(ResearchDriftModel):
+    source: str
+    unknown_fee_policy: str
+    missing_book_policy: str
+
+
+class ResearchDriftPayload(ResearchDriftModel):
+    totals: ResearchDriftTotals = Field(default_factory=ResearchDriftTotals)
+    reference_capital_usdc: float = 100.0
+    fee_assumption: ResearchDriftFeePolicy | None = None
+    calibration_bin_count: int = 10
+    small_sample_threshold_episodes: int = 20
+    anomaly_rule: ResearchDriftAnomalyRule | None = None
+    buckets: ResearchDriftBuckets = Field(default_factory=ResearchDriftBuckets)
+    anomalies: list[ResearchDriftAnomaly] = Field(default_factory=list)
+    statistical_scope: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ResearchDriftData(PerformanceData):
+    """Typed read-only contract for the calibration/pricing research snapshot.
+
+    An unpublished snapshot has no research body. A default payload here would
+    turn "not published" into zero counts and empty trends, so absence is null.
+    """
+
+    data: ResearchDriftPayload | None = None

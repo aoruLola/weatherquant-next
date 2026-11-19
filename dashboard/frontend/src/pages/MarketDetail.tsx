@@ -74,6 +74,10 @@ export default function MarketDetail() {
   }
 
   const book = market?.book
+  const openLabel =
+    market?.open_now === true ? 'OPEN' : market?.open_now === false ? 'CLOSED' : 'UNKNOWN'
+  const openTone =
+    market?.open_now === true ? 'live' : market?.open_now === false ? 'stopped' : 'unknown'
 
   return (
     <>
@@ -85,8 +89,12 @@ export default function MarketDetail() {
         right={
           market && (
             <StatusChip
-              value={market.closed ? 'stopped' : market.tradeable ? 'live' : 'unknown'}
-              label={market.closed ? 'CLOSED' : market.tradeable ? 'ACTIVE' : 'INACTIVE'}
+              value={openTone}
+              label={openLabel}
+              title={
+                market.open_now_reason ??
+                `依据 ${market.open_now_source ?? '交易所下单标志'}`
+              }
             />
           )
         }
@@ -102,21 +110,25 @@ export default function MarketDetail() {
       {market && (
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
-            <StatCard label="目标日期" value={market.target_date ?? '—'} sub={daysUntil(market.target_date) ?? undefined} />
-            <StatCard label="温度区间" value={market.bracket_label || '—'} sub="bracket" />
+            <StatCard
+              label="目标日期"
+              value={market.target_date ?? 'N/A'}
+              sub={daysUntil(market.target_date) ?? market.target_date_reason ?? undefined}
+            />
+            <StatCard label="温度区间" value={market.bracket_label || 'N/A'} sub="bracket" />
             <StatCard
               label="YES Bid"
-              value={book?.available ? fmtUsd(book.best_bid) : '—'}
+              value={book?.available ? fmtUsd(book.best_bid) : 'N/A'}
               sub={book?.available ? `深度 ${fmtUsdDepth(book.bid_depth_usd)}` : book?.reason ?? '无盘口'}
             />
             <StatCard
               label="YES Ask"
-              value={book?.available ? fmtUsd(book.best_ask) : '—'}
+              value={book?.available ? fmtUsd(book.best_ask) : 'N/A'}
               sub={book?.available ? `深度 ${fmtUsdDepth(book.ask_depth_usd)}` : book?.reason ?? '无盘口'}
             />
             <StatCard
               label="Spread"
-              value={book?.available ? fmtUsd(book.spread) : '—'}
+              value={book?.available ? fmtUsd(book.spread) : 'N/A'}
               sub="盘口快照 · 非可执行价格"
               tone={book?.stale ? 'warn' : 'neutral'}
             />
@@ -131,10 +143,54 @@ export default function MarketDetail() {
               sub={
                 market.model_source === 'market-snapshot'
                   ? 'shadow market-snapshot'
-                  : '暂未接入 producer'
+                  : market.model_reason ?? '暂未接入 producer'
               }
             />
           </div>
+
+          <Card title="规则与交易时段" hint="来自 Gamma 元数据；缺失时明确标注原因">
+            <div className="grid grid-cols-1 gap-4 text-sm sm:grid-cols-3">
+              <Field label="当前开放状态">
+                <span className="flex items-center gap-2">
+                  <StatusChip
+                    value={openTone}
+                    label={openLabel}
+                    title={market.open_now_reason ?? undefined}
+                    testId="detail-open-state"
+                  />
+                </span>
+                <span className="mt-1 block text-xs text-muted">
+                  {market.open_now_source ?? market.open_now_reason ?? 'N/A'}
+                </span>
+              </Field>
+              <Field label="交易开始（含）">
+                <span className="tnum">{fmtDateTime(market.start_time_utc)}</span>
+                <span className="mt-1 block text-xs text-muted">
+                  {market.schedule_source ?? market.schedule_reason ?? 'N/A'}
+                </span>
+              </Field>
+              <Field label="交易结束（不含）">
+                <span className="tnum">{fmtDateTime(market.end_time_utc)}</span>
+                <span className="mt-1 block text-xs text-muted">
+                  {market.schedule_reason ?? '绝对时刻按 UTC 存储并本地显示'}
+                </span>
+              </Field>
+              <Field label="结算来源">
+                <span>{market.resolution_source ?? 'N/A'}</span>
+                <span className="mt-1 block text-xs text-muted">
+                  {market.rules_source ?? market.rules_reason ?? 'N/A'}
+                </span>
+              </Field>
+              <Field label="规则文本">
+                <span className="text-xs">
+                  {market.rules_text ?? 'N/A'}
+                  {!market.rules_text && market.rules_reason && (
+                    <span className="mt-1 block text-muted">{market.rules_reason}</span>
+                  )}
+                </span>
+              </Field>
+            </div>
+          </Card>
 
           <Card title="盘口 / Order Book" hint="最近一次归档快照的 L2 报价">
             {book?.available ? (
@@ -151,11 +207,12 @@ export default function MarketDetail() {
                   <span className="tnum text-xs text-muted">
                     levels: {book.levels_bid} bid / {book.levels_ask} ask
                   </span>
-                  {book.venue_ts_utc && (
-                    <span className="tnum text-xs text-muted">
-                      venue 时间 {fmtDateTime(book.venue_ts_utc)}
-                    </span>
-                  )}
+                  <span
+                    className="tnum text-xs text-muted"
+                    title={book.venue_ts_utc ? undefined : '盘口未携带 venue 时间戳'}
+                  >
+                    venue 时间 {fmtDateTime(book.venue_ts_utc)}
+                  </span>
                   <span className="text-xs text-muted">来源 {book.source}</span>
                 </div>
                 {book.defects.length > 0 && (
@@ -165,12 +222,12 @@ export default function MarketDetail() {
                 )}
                 <div className="grid grid-cols-1 gap-4 text-sm sm:grid-cols-3">
                   <Field label="Token (YES)">
-                    <span className="break-all text-xs">{market.token_yes ?? '—'}</span>
+                    <span className="break-all text-xs">{market.token_yes ?? 'N/A'}</span>
                   </Field>
                   <Field label="市场 ID">
                     <span className="break-all text-xs">{market.market_id}</span>
                   </Field>
-                  <Field label="Station">{market.station ?? '—'}</Field>
+                  <Field label="Station">{market.station ?? 'N/A'}</Field>
                 </div>
                 {depth && (
                   <p className="text-xs text-muted">{String(depth.note ?? '')}</p>
@@ -225,7 +282,7 @@ export default function MarketDetail() {
 
           <Card
             title="最近 Shadow 决策"
-            hint="ACCEPT 表示符合当前模型与风险过滤条件，不代表已验证的盈利机会"
+            hint="影子信号表示符合当前模型与风险过滤条件，不代表下单、成交或已验证的盈利机会"
           >
             {noRecentRows ? (
               <EmptyState
@@ -251,7 +308,7 @@ export default function MarketDetail() {
                     {recentDecisions.slice(0, 20).map((row: any) => (
                       <tr key={row.decision_id} className="border-b border-line/60 last:border-0">
                         <td className="tnum py-2">{fmtDateTime(row.decided_at_utc)}</td>
-                        <td className="py-2 text-xs uppercase">{row.direction ?? '—'}</td>
+                        <td className="py-2 text-xs uppercase">{row.direction ?? 'N/A'}</td>
                         <td className="py-2">
                           <DecisionBadge state={row.state} />
                         </td>
@@ -261,7 +318,7 @@ export default function MarketDetail() {
                         <td className="tnum py-2 text-right">{fmtProb(row.model_probability)}</td>
                         <td className="tnum py-2 text-right">
                           {row.net_edge_usd == null
-                            ? '—'
+                            ? 'N/A'
                             : `${row.net_edge_usd >= 0 ? '+' : ''}${fmtUsd(row.net_edge_usd)}`}
                         </td>
                       </tr>
@@ -276,13 +333,11 @@ export default function MarketDetail() {
             元数据
           </SectionTitle>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-            <StatCard label="Event" value={market.event_id ?? '—'} sub="gamma event id" />
+            <StatCard label="Event" value={market.event_id ?? 'N/A'} sub="gamma event id" />
             <StatCard
               label="状态"
-              value={
-                market.active ? (market.accepting_orders && !market.closed ? 'OPEN' : 'PAUSED') : 'INACTIVE'
-              }
-              sub={market.closed ? 'closed' : 'active / acceptingOrders'}
+              value={openLabel}
+              sub={market.open_now_source ?? market.open_now_reason ?? 'N/A'}
             />
             <StatCard label="最近更新" value={fmtDateTime(market.updated_at_utc)} sub="book received" />
           </div>

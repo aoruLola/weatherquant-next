@@ -7,6 +7,7 @@ import type {
   Envelope,
   ForecastsData,
   Freshness,
+  LayeredHealthData,
   MarketSummary,
   MarketsData,
   OverviewData,
@@ -181,11 +182,102 @@ export function overviewFixture(overrides: Partial<OverviewData> = {}): Overview
   }
 }
 
+export function layeredHealthFixture(
+  overrides: Partial<LayeredHealthData> = {},
+): LayeredHealthData {
+  const now = Date.now()
+  const iso = (secondsAgo: number) =>
+    new Date(now - secondsAgo * 1000).toISOString()
+  return {
+    generation_id: 'gen-20261117-1200',
+    generation_source: 'performance current.json pointer · one published generation',
+    lagging_layer: 'publish',
+    lagging_basis: 'publish: publish is 2400s behind ingest (limit 1500s)',
+    layers: [
+      {
+        name: 'export',
+        watermark_utc: iso(30),
+        source: 'shadow export state.json · watermark[0]',
+        age_seconds: 30,
+        lag_seconds: 30,
+        threshold_seconds: 900,
+        status: 'OK',
+        reason: null,
+      },
+      {
+        name: 'performance_consume',
+        watermark_utc: iso(40),
+        source: 'performance ingest-state.json · watermark[0]',
+        age_seconds: 40,
+        lag_seconds: 0,
+        threshold_seconds: 900,
+        status: 'OK',
+        reason: null,
+      },
+      {
+        name: 'publish',
+        watermark_utc: iso(2400),
+        source: 'generation manifest.json · watermark[0]',
+        age_seconds: 2400,
+        lag_seconds: 2400,
+        threshold_seconds: 1500,
+        status: 'STALE',
+        reason: 'publish is 2400s behind ingest (limit 1500s)',
+      },
+      {
+        name: 'snapshot',
+        watermark_utc: null,
+        source: 'no published generation or summary file',
+        age_seconds: null,
+        lag_seconds: null,
+        threshold_seconds: 1500,
+        status: 'UNKNOWN',
+        reason: 'the published generation records no publish time',
+      },
+    ],
+    services: {
+      collector: { name: 'collector', status: 'OK', age_seconds: 2, reason: null },
+      shadow: {
+        name: 'shadow',
+        status: 'LAGGING',
+        age_seconds: 50,
+        reason: 'shadow heartbeat is 50s old but REST is healthy',
+      },
+      paper: {
+        name: 'paper',
+        status: 'UNKNOWN',
+        age_seconds: null,
+        reason: 'paper engine is unreachable',
+      },
+    },
+    thresholds: {
+      export_stale_after_seconds: 900,
+      performance_consume_stale_after_seconds: 900,
+      publish_stale_after_seconds: 1500,
+      snapshot_stale_after_seconds: 1500,
+    },
+    dataset: 'live',
+    reason: 'publish: publish is 2400s behind ingest (limit 1500s)',
+    ...overrides,
+  }
+}
+
 export function marketFixture(overrides: Partial<MarketSummary> = {}): MarketSummary {
   return {
     market_id: 'm-81',
     question: 'Will the highest temperature in New York City be 81°F on October 12?',
     target_date: '2026-10-12',
+    rules_text: 'Resolved on the official NWS daily maximum for KLGA.',
+    resolution_source: 'NOAA',
+    rules_source: 'archive-tail:gamma',
+    rules_reason: null,
+    start_time_utc: new Date(Date.now() - 3600e3).toISOString(),
+    end_time_utc: new Date(Date.now() + 86400e3).toISOString(),
+    schedule_source: 'gamma:event.startDateIso, gamma:event.endDateIso',
+    schedule_reason: null,
+    open_now: true,
+    open_now_source: 'gamma:event.startDateIso, gamma:event.endDateIso + venue flags',
+    open_now_reason: null,
     bracket_label: '81°F',
     bracket_low: 81,
     bracket_high: 81,
@@ -259,6 +351,19 @@ export function decisionRows() {
     available_depth_usd: 48,
     thresholds_version: 'v3',
     run_id: 'run-1',
+    forecast_run_time_utc: new Date(Date.now() - 6 * 3600e3).toISOString(),
+    snapshot_id: 'snapshot-d1',
+    book_id: 'book-d1',
+    book_venue_ts_utc: new Date(Date.now() - 3100).toISOString(),
+    book_collector_received_at_utc: new Date(Date.now() - 3000).toISOString(),
+    book_shadow_received_at_utc: new Date(Date.now() - 2900).toISOString(),
+    spread: 0.03,
+    mode_reason: 'configured',
+    evidence_version: 1,
+    book_source: 'rest',
+    book_source_event_id: 'book-event-d1',
+    evidence_source: 'shadow_decisions',
+    evidence_reason: null,
   }
   return [
     { ...base, decision_id: 'd1' },
@@ -288,7 +393,7 @@ export function decisionsFixture(overrides: Partial<DecisionsData> = {}): Decisi
     last_cycle: shadowHealth.last_cycle,
     last_cycle_status: 'fresh',
     disclaimer:
-      'ACCEPT 表示符合当前模型与风险过滤条件，不代表已验证的盈利机会。 ACCEPT means the filters passed; it is not evidence of a profitable trade.',
+      '影子信号仅表示通过当前模型与风险过滤的一次模拟评估，不代表下单或成交，也不代表已验证的盈利机会。',
     filters_applied: {},
     ...overrides,
   }
@@ -311,7 +416,11 @@ export function forecastsFixture(overrides: Partial<ForecastsData> = {}): Foreca
         version: 'v1',
         target_date: '2026-10-12',
         forecast_run_time_utc: new Date(Date.now() - 6 * 3600e3).toISOString(),
+        forecast_issued_at_utc: new Date(Date.now() - 6 * 3600e3).toISOString(),
+        forecast_publishable_at_utc: new Date(Date.now() - 6 * 3600e3).toISOString(),
+        forecast_publishable_basis: 'forecast_run_time_utc',
         training_cutoff_utc: '2026-09-01T00:00:00Z',
+        forecast_received_at_utc: new Date(Date.now() - 5.9 * 3600e3).toISOString(),
         predicted_max_f: 81.4,
         station: 'KLGA',
         buckets: [
@@ -328,7 +437,11 @@ export function forecastsFixture(overrides: Partial<ForecastsData> = {}): Foreca
         version: 'v1',
         target_date: '2026-10-12',
         forecast_run_time_utc: new Date(Date.now() - 6 * 3600e3).toISOString(),
+        forecast_issued_at_utc: new Date(Date.now() - 6 * 3600e3).toISOString(),
+        forecast_publishable_at_utc: new Date(Date.now() - 6 * 3600e3).toISOString(),
+        forecast_publishable_basis: 'forecast_run_time_utc',
         training_cutoff_utc: '2026-09-01T00:00:00Z',
+        forecast_received_at_utc: new Date(Date.now() - 5.9 * 3600e3).toISOString(),
         predicted_max_f: 80.9,
         station: 'KLGA',
         buckets: [

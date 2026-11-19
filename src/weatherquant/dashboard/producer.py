@@ -48,6 +48,19 @@ SNAPSHOT_SCHEMA_VERSION = 1
 DECISION_WINDOW = 500
 FORECAST_HORIZON_DAYS = 10
 
+#: Markets snapshot: decisions considered "current" enough that we should
+#: bother finding the last row per market. Older decisions are outside the
+#: engine's retained window anyway (shadow_decisions grows unbounded today
+#: but we cap the scan); the window below is generous enough that a market
+#: inactive for a while still shows its last decision, and tight enough that
+#: the query does not ROW_NUMBER() across a multi-million-row table.
+MARKET_DECISION_WINDOW_DAYS = 30
+
+#: Forecasts snapshot: how far back target_date goes before we stop caring.
+#: Anything older than today minus this is ancient history the dashboard has
+#: never shown and will never need to.
+FORECAST_LOOKBACK_DAYS = 1
+
 
 def _envelope(
     kind: str,
@@ -94,7 +107,10 @@ def build_decisions_snapshot(
                d.model_name, d.model_version, d.model_probability, d.market_price,
                d.best_bid, d.best_ask, d.net_edge, d.snapshot_age_ms,
                d.forecast_age_hours, d.available_depth_usd, d.thresholds_version,
-               d.run_id, c.question
+               d.run_id, d.forecast_run_time_utc, d.snapshot_id, d.book_id,
+               d.venue_ts_utc, d.collector_received_at_utc, d.shadow_received_at_utc,
+               d.spread, d.mode_reason, d.evidence_version, d.book_source,
+               d.book_source_event_id, c.question
         FROM shadow_decisions d
         LEFT JOIN market_catalog c ON c.market_id = d.market_id
         ORDER BY d.decision_time_utc DESC
@@ -120,7 +136,7 @@ def build_decisions_snapshot(
             "decision_id": str(row[0]),
             "decided_at_utc": _iso(row[1]),
             "market_id": str(row[2]),
-            "market_question": row[21],
+            "market_question": row[32],
             "bracket_label": row[3],
             "target_date": str(row[4]) if row[4] is not None else None,
             "direction": row[5],
@@ -139,6 +155,18 @@ def build_decisions_snapshot(
             "available_depth_usd": row[18],
             "thresholds_version": row[19],
             "run_id": row[20],
+            "forecast_run_time_utc": _iso(row[21]),
+            "snapshot_id": row[22],
+            "book_id": row[23],
+            "book_venue_ts_utc": _iso(row[24]),
+            "book_collector_received_at_utc": _iso(row[25]),
+            "book_shadow_received_at_utc": _iso(row[26]),
+            "spread": row[27],
+            "mode_reason": row[28],
+            "evidence_version": row[29],
+            "book_source": row[30],
+            "book_source_event_id": row[31],
+            "evidence_source": "shadow_decisions",
             "reasons": reasons.get(str(row[0]), []),
         }
         for row in rows
@@ -192,30 +220,41 @@ def build_markets_snapshot(
         ).fetchall()
     }
 
-    latest_predictions: dict[tuple[str, str], tuple[Any, ...]] = {}
-    for row in con.execute(
+    # Newest prediction per (event_id, target_date) for primary_model, SQL-side.
+    # model_predictions grows unbounded (each forecast run adds a row); qualify
+    # + a lower bound on target_date keeps this bounded without pulling the
+    # whole history into Python.
+    lb_target = (now.date() - timedelta(days=FORECAST_LOOKBACK_DAYS))
+    latest_predictions_rows = con.execute(
         """
         SELECT event_id, target_date, probabilities_json, forecast_run_time_utc, model_version
         FROM model_predictions
         WHERE model_name = ?
+          AND target_date >= ?
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY event_id, target_date
+            ORDER BY forecast_run_time_utc DESC
+        ) = 1
         """,
-        [str(primary_model)],
-    ).fetchall():
-        key = (str(row[0]), str(row[1]))
-        previous = latest_predictions.get(key)
-        if previous is None or (row[3] or datetime.min.replace(tzinfo=UTC)) > (
-            previous[3] or datetime.min.replace(tzinfo=UTC)
-        ):
-            latest_predictions[key] = row
+        [str(primary_model), lb_target],
+    ).fetchall()
+    latest_predictions: dict[tuple[str, str], tuple[Any, ...]] = {
+        (str(row[0]), str(row[1])): row for row in latest_predictions_rows
+    }
 
+    # Last decision per market_id, SQL-side, only within a rolling window so
+    # ROW_NUMBER() does not span the entire history of shadow_decisions.
+    decision_window_start = now - timedelta(days=MARKET_DECISION_WINDOW_DAYS)
     last_decisions = {
         str(row[0]): row
         for row in con.execute(
             """
             SELECT market_id, state, decision_time_utc, net_edge, mode, primary_reason
             FROM shadow_decisions
+            WHERE decision_time_utc >= ?
             QUALIFY ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY decision_time_utc DESC) = 1
-            """
+            """,
+            [decision_window_start],
         ).fetchall()
     }
 
@@ -262,6 +301,18 @@ def build_markets_snapshot(
                 "event_id": str(event_id),
                 "question": str(question or ""),
                 "target_date": str(target_date) if target_date is not None else None,
+                "target_date_reason": None if target_date is not None else "market_catalog.target_date is null",
+                "rules_text": None,
+                "resolution_source": None,
+                "rules_source": None,
+                "rules_reason": "market_catalog does not store Gamma rules; API may supplement archive-tail metadata",
+                "start_time_utc": None,
+                "end_time_utc": None,
+                "schedule_source": None,
+                "schedule_reason": "market_catalog does not store Gamma trading start/end; API may supplement archive-tail metadata",
+                "open_now": None,
+                "open_now_source": None,
+                "open_now_reason": "computed by the dashboard API from the venue order-acceptance flags",
                 "bracket_label": str(bracket_label or ""),
                 "bracket_low": None,
                 "bracket_high": None,
@@ -273,6 +324,7 @@ def build_markets_snapshot(
                 "token_yes": str(token_yes),
                 "book": quote,
                 "model_probability": probability,
+                "model_reason": None if probability is not None else "no primary-model probability for this bracket",
                 "model_version": version,
                 "forecast_run_time_utc": run_time,
                 "predicted_max_f": predicted_max,
@@ -364,25 +416,40 @@ def build_forecasts_snapshot(
     can never present a forecast as knowing what happened after it was issued.
     """
     horizon = now.date() + timedelta(days=max(horizon_days, 1))
+    lb_target = now.date() - timedelta(days=FORECAST_LOOKBACK_DAYS)
     rows = con.execute(
         """
         SELECT model_name, model_version, target_date, event_id,
                probabilities_json, predicted_max_f, forecast_run_time_utc,
+               forecast_publishable_at_utc, forecast_publishable_basis,
                training_cutoff_utc, forecast_received_at_utc, station
         FROM model_predictions
-        WHERE target_date <= ? AND forecast_run_time_utc <= ?
+        WHERE target_date >= ? AND target_date <= ? AND forecast_run_time_utc <= ?
         QUALIFY ROW_NUMBER() OVER (
             PARTITION BY model_name, target_date, event_id
             ORDER BY forecast_run_time_utc DESC
         ) = 1
         ORDER BY target_date, model_name, event_id
         """,
-        [horizon, now],
+        [lb_target, horizon, now],
     ).fetchall()
 
     distributions: list[dict[str, Any]] = []
     for row in rows:
-        model, version, target_date, _event_id, probs_json, predicted_max, run_time, cutoff, received, station = row
+        (
+            model,
+            version,
+            target_date,
+            _event_id,
+            probs_json,
+            predicted_max,
+            run_time,
+            publishable,
+            publishable_basis,
+            cutoff,
+            received,
+            station,
+        ) = row
         try:
             buckets_raw = json.loads(probs_json) if isinstance(probs_json, str) else probs_json
         except json.JSONDecodeError:
@@ -396,6 +463,9 @@ def build_forecasts_snapshot(
                 "target_date": str(target_date),
                 "event_id": str(_event_id),
                 "forecast_run_time_utc": _iso(run_time),
+                "forecast_issued_at_utc": _iso(run_time),
+                "forecast_publishable_at_utc": _iso(publishable),
+                "forecast_publishable_basis": publishable_basis,
                 "training_cutoff_utc": _iso(cutoff),
                 "forecast_received_at_utc": _iso(received),
                 "predicted_max_f": predicted_max,

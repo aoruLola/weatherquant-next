@@ -147,6 +147,8 @@ def test_a_second_cycle_reads_nothing_that_the_first_already_consumed(tmp_path) 
 
     first = runner.cycle()
     assert first.lines_read > 0, "the first cycle should consume the archive"
+    # Persist the first real batch after a fresh migration, including rejection reasons.
+    runner.db.execute("CHECKPOINT")
 
     for label in ("second", "third", "fourth"):
         cycle = runner.cycle()

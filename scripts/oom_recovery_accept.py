@@ -44,19 +44,52 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
-import shutil
-import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CGROUP_PATH = Path("/sys/fs/cgroup/wq-oom-accept")
+CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 #: Under this ceiling the interpreter plus the duckdb import can be OOM-killed
 #: before the writer even opens the database, which would prove nothing.
 MIN_MEMORY_BYTES = 512 * 1024 * 1024
+
+#: The repository's production data directory. A drill may never write here,
+#: even when a checkout happens to have no data yet: the whole point is that a
+#: production path is impossible by construction, not merely unlikely.
+PRODUCTION_DATA_DIR = PROJECT_ROOT / "data"
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _isolation_refusal(data_dir: Path) -> str | None:
+    """Why ``data_dir`` is not an isolated drill location, or None when it is.
+
+    Two guards, both cheap and both checked before anything is created:
+
+    * the path must not be the production data directory (or inside it, or the
+      directory holding ``WQ_DB_PATH``) - a typo must not point a drill at the
+      collector's real database;
+    * the path must not already exist - a drill only ever creates its own
+      private directory, never reuses (and never deletes) someone else's.
+    """
+    configured = os.environ.get("WQ_DB_PATH")
+    guarded = {PRODUCTION_DATA_DIR.resolve()}
+    if configured:
+        guarded.add(Path(configured).expanduser().resolve().parent)
+    for root in guarded:
+        if _is_within(data_dir, root):
+            return f"--data {data_dir} is inside the production data directory {root}"
+    if data_dir.exists():
+        return f"--data {data_dir} already exists; a drill only writes to a new directory"
+    return None
 
 
 def _parse_size(text: str) -> int:
@@ -69,7 +102,7 @@ def _parse_size(text: str) -> int:
     return int(float(cleaned))
 
 
-def _cgroup_counter(name: str, key: str) -> int:
+def _cgroup_counter(group: Path, name: str, key: str) -> int:
     """Read a counter from a cgroup control file.
 
     ``memory.events`` is ``key value`` lines; ``memory.peak`` is a bare
@@ -77,7 +110,7 @@ def _cgroup_counter(name: str, key: str) -> int:
     a single number.
     """
     try:
-        text = (CGROUP_PATH / name).read_text()
+        text = (group / name).read_text()
     except OSError:
         return 0
     for line in text.splitlines():
@@ -94,7 +127,7 @@ def _cgroup_counter(name: str, key: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def run_child(data_dir: Path, row_bytes: int, rows_per_batch: int) -> int:
+def run_child(data_dir: Path, row_bytes: int, rows_per_batch: int, *, resume_once: bool) -> int:
     """Write committed, journalled batches until killed.
 
     The engine budget is forced *below* the cgroup cap on purpose: it makes
@@ -114,10 +147,7 @@ def run_child(data_dir: Path, row_bytes: int, rows_per_batch: int) -> int:
     # Every commit stays in the WAL, so the kill is guaranteed to leave
     # un-checkpointed commits behind and the replay check has teeth.
     con.execute("SET checkpoint_threshold='1TB'")
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS oom_batches ("
-        "batch_id INTEGER, seq INTEGER, payload VARCHAR)"
-    )
+    con.execute("CREATE TABLE IF NOT EXISTS oom_batches (batch_id INTEGER, seq INTEGER, payload VARCHAR)")
 
     start_id = int(con.execute("SELECT COALESCE(MAX(batch_id), 0) FROM oom_batches").fetchone()[0])
     print(f"child: starting at batch {start_id + 1}", flush=True)
@@ -156,6 +186,9 @@ def run_child(data_dir: Path, row_bytes: int, rows_per_batch: int) -> int:
             fh.write(f"{batch_id}\n")
             fh.flush()
             os.fsync(fh.fileno())
+        if resume_once:
+            con.close()
+            return 0
         if batch_id % 5 == 0:
             print(f"child: committed batch {batch_id}", flush=True)
     return 0  # pragma: no cover - the kernel ends this loop, not us
@@ -166,7 +199,7 @@ def run_child(data_dir: Path, row_bytes: int, rows_per_batch: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _spawn_child(data_dir: Path, row_bytes: int, rows_per_batch: int) -> subprocess.Popen:
+def _spawn_child(data_dir: Path, row_bytes: int, rows_per_batch: int, *, resume_once: bool = False) -> subprocess.Popen:
     env = dict(os.environ)
     # The child's engine budget is its own decision, never inherited: a 1GB
     # parent budget would let the engine - not the Python heap - fill the
@@ -181,7 +214,7 @@ def _spawn_child(data_dir: Path, row_bytes: int, rows_per_batch: int) -> subproc
             "--data",
             str(data_dir),
             "--child",
-            str(data_dir),
+            *(["--resume-once"] if resume_once else []),
             "--row-bytes",
             str(row_bytes),
             "--rows-per-batch",
@@ -209,20 +242,19 @@ def _dump_tail(proc: subprocess.Popen, limit: int = 15) -> None:
 
 def _wait_until_gone(proc: subprocess.Popen, timeout_s: float) -> tuple[bool, str]:
     """Wait for the child to die. Returns (died_on_its_own, note)."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            return True, f"process gone with return code {proc.returncode}"
-        time.sleep(0.5)
-    if proc.poll() is None:
-        proc.kill()
-        proc.wait(timeout=10)
-        return False, "kernel did not OOM in time; SIGKILLed by the harness"
-    return True, f"process gone with return code {proc.returncode}"
+    try:
+        proc.wait(timeout=timeout_s)
+        return True, f"process gone with return code {proc.returncode}"
+    except subprocess.TimeoutExpired:
+        return False, "deadline expired; terminated by the harness"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
 
-def _db_state(db_path: Path) -> tuple[int, int, int]:
-    """(max batch_id, row count, journalled batch count).
+def _db_state(db_path: Path, rows_per_batch: int) -> tuple[int, int, list[int]]:
+    """Return the last full batch, row count and durable journal entries.
 
     Opened **writable, under a budget** - which is what a restarted collector
     does, and not an aesthetic choice: a read-only connection carries no
@@ -234,15 +266,18 @@ def _db_state(db_path: Path) -> tuple[int, int, int]:
 
     con = connect(db_path)
     try:
-        max_id = int(con.execute("SELECT COALESCE(MAX(batch_id), 0) FROM oom_batches").fetchone()[0])
-        rows = int(con.execute("SELECT COUNT(*) FROM oom_batches").fetchone()[0])
+        batches = con.execute(
+            "SELECT batch_id, COUNT(*), COUNT(DISTINCT seq), MIN(seq), MAX(seq) "
+            "FROM oom_batches GROUP BY batch_id ORDER BY batch_id"
+        ).fetchall()
     finally:
         con.close()
     journal = db_path.parent / "oom-journal.txt"
-    journalled = 0
-    if journal.exists():
-        journalled = sum(1 for line in journal.read_text().splitlines() if line.strip())
-    return max_id, rows, journalled
+    for expected, batch in enumerate(batches, start=1):
+        if batch != (expected, rows_per_batch, rows_per_batch, 0, rows_per_batch - 1):
+            raise ValueError(f"committed batch {expected} is missing, duplicated or torn: {batch}")
+    journalled = [int(line) for line in journal.read_text().splitlines()] if journal.exists() else []
+    return len(batches), len(batches) * rows_per_batch, journalled
 
 
 def _chown_tree(root: Path, uid: int | None, gid: int | None) -> None:
@@ -261,13 +296,16 @@ def main() -> int:
     parser.add_argument("--row-bytes", type=int, default=1024)
     parser.add_argument("--rows-per-batch", type=int, default=20000)
     parser.add_argument("--keep", action="store_true")
-    parser.add_argument("--child", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--resume-once", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    if args.child is not None:
-        return run_child(args.child, args.row_bytes, args.rows_per_batch)
+    if args.child:
+        # Enter the configured cgroup before opening the DB or allocating rows.
+        (CGROUP_ROOT / f"wq-oom-accept-{os.getppid()}" / "cgroup.procs").write_text(str(os.getpid()))
+        return run_child(args.data, args.row_bytes, args.rows_per_batch, resume_once=args.resume_once)
 
-    if os.geteuid() != 0:
+    if sys.platform != "linux" or os.geteuid() != 0:
         print(
             "root is required to create a cgroup. Re-run with sudo, e.g.\n"
             "  sudo -E uv run python scripts/oom_recovery_accept.py "
@@ -283,11 +321,6 @@ def main() -> int:
     os.environ.setdefault("WQ_DUCKDB_MEMORY_LIMIT", "1GB")
     sys.stdout.reconfigure(line_buffering=True)
 
-    data_dir = args.data.resolve()
-    if data_dir.exists():
-        shutil.rmtree(data_dir)
-    data_dir.mkdir(parents=True)
-
     limit = _parse_size(args.memory_max)
     if limit < MIN_MEMORY_BYTES:
         print(
@@ -298,47 +331,59 @@ def main() -> int:
         )
         return 2
 
+    if args.rows_per_batch <= 0 or args.row_bytes <= 0 or args.timeout <= 0:
+        parser.error("batch size, row bytes and timeout must be positive")
+    data_dir = args.data.resolve()
+    refusal = _isolation_refusal(data_dir)
+    if refusal:
+        parser.error(refusal)
+    data_dir.mkdir(parents=True)
     failures: list[str] = []
     print(f"oom acceptance: memory.max={args.memory_max} over {data_dir}")
-
-    CGROUP_PATH.mkdir(parents=True, exist_ok=True)
-    (CGROUP_PATH / "memory.max").write_text(str(limit))
-    (CGROUP_PATH / "memory.swap.max").write_text("0")
 
     invoker_uid = int(os.environ.get("SUDO_UID", "0")) or None
     invoker_gid = int(os.environ.get("SUDO_GID", "0")) or None
 
+    group = CGROUP_ROOT / f"wq-oom-accept-{os.getpid()}"
+    group.mkdir()
     try:
+        (group / "memory.max").write_text(str(limit))
+        (group / "memory.swap.max").write_text("0")
         # --- the kill ------------------------------------------------------
         proc = _spawn_child(data_dir, args.row_bytes, args.rows_per_batch)
-        CGROUP_PATH.joinpath("cgroup.procs").write_text(str(proc.pid))
         died, note = _wait_until_gone(proc, args.timeout)
         if not died or proc.returncode not in (-9, 137):
             # Anything other than a SIGKILL-shaped exit means the child never
             # got to the point of being OOM-killed; show what it said.
             _dump_tail(proc)
-        oom_kills = _cgroup_counter("memory.events", "oom_kill")
-        peak = _cgroup_counter("memory.peak", "peak") if (CGROUP_PATH / "memory.peak").exists() else 0
+        oom_kills = _cgroup_counter(group, "memory.events", "oom_kill")
+        peak = _cgroup_counter(group, "memory.peak", "peak")
         wal = data_dir / "weatherquant.duckdb.wal"
         wal_bytes = wal.stat().st_size if wal.exists() else 0
         print(
             f"  kill:          {note}; kernel oom_kill={oom_kills}; "
             f"peak={peak / 1024 / 1024:.0f} MiB; wal={wal_bytes / 1024:.0f} KiB"
         )
-        if not died:
-            failures.append("the child had to be SIGKILLed by the harness, not the kernel")
+        if not died or proc.returncode not in (-9, 137):
+            failures.append(f"the child did not die from a kernel SIGKILL: {note}")
         if oom_kills < 1:
             failures.append("memory.events shows no kernel oom_kill")
 
+        if wal_bytes == 0:
+            failures.append("no nonempty WAL was left to replay")
+        if failures:
+            print("RESULT: FAILED - " + "; ".join(failures))
+            return 1
+
         # --- recovery: reopen and verify the committed prefix --------------
-        max_id, rows, journalled = _db_state(data_dir / "weatherquant.duckdb")
+        try:
+            max_id, rows, journal = _db_state(data_dir / "weatherquant.duckdb", args.rows_per_batch)
+        except ValueError as exc:
+            print(f"RESULT: FAILED - {exc}")
+            return 1
+        journalled = len(journal)
         print(f"  recovered:     max batch={max_id}, rows={rows}, journalled={journalled}")
-        if rows != max_id * args.rows_per_batch:
-            failures.append(
-                f"row count {rows} does not equal {max_id} committed batches x "
-                f"{args.rows_per_batch} rows: a committed transaction was lost or torn"
-            )
-        if not journalled <= max_id <= journalled + 1:
+        if journal != list(range(1, journalled + 1)) or not 1 <= journalled <= max_id <= journalled + 1:
             failures.append(
                 f"journal ({journalled}) and database ({max_id}) disagree by more than "
                 "one batch: the committed prefix moved backwards"
@@ -351,31 +396,29 @@ def main() -> int:
         con.execute("CHECKPOINT")
         con.close()
         wal_after = wal.stat().st_size if wal.exists() else 0
-        print(
-            f"  wal replay:    {wal_bytes / 1024:.0f} KiB -> {wal_after / 1024:.0f} KiB "
-            "after checkpoint"
-        )
-        if wal_bytes > 0 and wal_after >= wal_bytes:
-            failures.append("WAL did not shrink on checkpoint: replay did not fold it in")
+        print(f"  wal replay:    {wal_bytes / 1024:.0f} KiB -> {wal_after / 1024:.0f} KiB after checkpoint")
+        if wal_after != 0:
+            failures.append("WAL was not fully folded into the database after checkpoint")
 
         # --- restart continuation ------------------------------------------
-        child = _spawn_child(data_dir, args.row_bytes, args.rows_per_batch)
-        time.sleep(12.0)  # long enough to import and commit several batches
-        child.send_signal(signal.SIGTERM)  # what `docker stop` delivers
+        child = _spawn_child(data_dir, args.row_bytes, args.rows_per_batch, resume_once=True)
+        finished, note = _wait_until_gone(child, args.timeout)
+        if not finished or child.returncode != 0:
+            _dump_tail(child)
+            failures.append(f"the budgeted restart did not finish cleanly: {note}")
         try:
-            child.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait(timeout=10)
-        max_after, rows_after, _ = _db_state(data_dir / "weatherquant.duckdb")
+            max_after, rows_after, journal_after = _db_state(data_dir / "weatherquant.duckdb", args.rows_per_batch)
+        except ValueError as exc:
+            print(f"RESULT: FAILED - {exc}")
+            return 1
         gained = max_after - max_id
         print(f"  restart:       batches {max_id} -> {max_after} (+{gained}), rows={rows_after}")
-        if gained < 1:
-            failures.append("the restarted writer committed no new batches")
-        if rows_after != max_after * args.rows_per_batch:
-            failures.append("restarted writer left a non-contiguous row set")
+        if gained != 1:
+            failures.append(f"the restarted writer should add exactly one batch; added {gained}")
+        if journal_after != [*journal, max_id + 1]:
+            failures.append("restart journal does not match the next committed batch")
     finally:
-        shutil.rmtree(CGROUP_PATH, ignore_errors=True)
+        group.rmdir()
         _chown_tree(data_dir, invoker_uid, invoker_gid)
 
     print("\n" + "=" * 64)
