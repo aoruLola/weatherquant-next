@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -53,9 +54,14 @@ def apply_retention(
     """Archive eligible rows older than ``days``, then delete them atomically.
 
     Decisions are eligible only after the durable decision-export cursor has
-    passed their ``export_seq``. Predictions have no such dependency and are
-    retained independently. Rejection reasons always follow the exact same
-    decision set, keeping report aggregates inside the retained window.
+    passed their ``export_seq``. Predictions do not wait for the export
+    cursor, but a prediction is kept for as long as any retained decision
+    still points at its forecast run (same model, version, station, event
+    and run): the alignment audit and the dashboard trace every decision to
+    its prediction, and a decision just inside the window routinely uses a
+    run initialised hours before the cutoff. Rejection reasons always follow
+    the exact same decision set, keeping report aggregates inside the
+    retained window. Every archive is fsynced before the first delete.
 
     Returns a :class:`RetentionResult` even when the call is a no-op, so
     callers can log a stable shape.
@@ -98,7 +104,27 @@ def apply_retention(
     reasons_out = archive_dir / f"rejection_reasons_{ts}.parquet"
     predictions_out = archive_dir / f"model_predictions_{ts}.parquet"
     outputs = (decisions_out, reasons_out, predictions_out)
+    # An archive of a committed earlier pass may be the only copy of its rows.
+    # Never overwrite one, and never let this pass's failure cleanup unlink it.
+    existing = [path for path in outputs if path.exists()]
+    if existing:
+        raise FileExistsError(
+            f"retention archive already exists, refusing to overwrite: {existing[0]}"
+        )
     decision_params = [cutoff, exported_through_seq]
+    # Evaluated after the decision deletes, so a run referenced only by
+    # decisions retired in this same transaction becomes eligible.
+    prediction_where = """
+        WHERE p.forecast_run_time_utc < ?
+          AND NOT EXISTS (
+              SELECT 1 FROM shadow_decisions d
+              WHERE d.model_name = p.model_name
+                AND d.model_version = p.model_version
+                AND d.station = p.station
+                AND d.event_id = p.event_id
+                AND d.forecast_run_time_utc = p.forecast_run_time_utc
+          )
+    """
     n_dec = 0
     n_reasons = 0
 
@@ -108,6 +134,7 @@ def apply_retention(
         # cannot escape the statement.
         target = str(path).replace("'", "''")
         con.execute(f"{query} TO '{target}' (FORMAT PARQUET)", params)
+        _fsync_file(path)
 
     try:
         con.execute("BEGIN TRANSACTION")
@@ -132,16 +159,10 @@ def apply_retention(
         else:
             log.info("retention: no confirmed v2 export cursor; retaining decisions and rejection reasons")
 
-        n_pred = con.execute(
-            """
-            SELECT count(*) FROM model_predictions WHERE forecast_run_time_utc < ?
-            """,
-            [cutoff],
-        ).fetchone()[0]
-
-        # Publish every archive before deleting anything. The surrounding
-        # transaction also covers the deletes: a later failure rolls the whole
-        # database change back before these uncommitted archives are removed.
+        # Every archive is written and fsynced before the delete it covers.
+        # The surrounding transaction covers all deletes: a later failure
+        # rolls the whole database change back before these uncommitted
+        # archives are removed.
         if n_dec:
             copy_to(
                 """
@@ -167,12 +188,8 @@ def apply_retention(
                 decision_params,
                 reasons_out,
             )
-        if n_pred:
-            copy_to(
-                "COPY (SELECT * FROM model_predictions WHERE forecast_run_time_utc < ?)",
-                [cutoff],
-                predictions_out,
-            )
+        if n_dec or n_reasons:
+            _fsync_dir(archive_dir)
 
         if n_reasons:
             con.execute(
@@ -195,8 +212,18 @@ def apply_retention(
                 decision_params,
             )
             con.execute("VACUUM shadow_decisions")
+
+        n_pred = con.execute(
+            f"SELECT count(*) FROM model_predictions p {prediction_where}", [cutoff]
+        ).fetchone()[0]
         if n_pred:
-            con.execute("DELETE FROM model_predictions WHERE forecast_run_time_utc < ?", [cutoff])
+            copy_to(
+                f"COPY (SELECT * FROM model_predictions p {prediction_where})",
+                [cutoff],
+                predictions_out,
+            )
+            _fsync_dir(archive_dir)
+            con.execute(f"DELETE FROM model_predictions p {prediction_where}", [cutoff])
             con.execute("VACUUM model_predictions")
         con.execute("COMMIT")
     except BaseException:
@@ -223,3 +250,27 @@ def apply_retention(
     if not n_dec and not n_pred:
         log.debug("retention: no eligible rows older than %s days; nothing to archive", days)
     return result
+
+
+def _fsync_file(path: Path) -> None:
+    """Force an archive's bytes to disk before any row it holds is deleted.
+
+    DuckDB's COPY closes the file but does not promise it reached the disk;
+    the database COMMIT is durable, so without this a power cut after the
+    commit could lose the only copy of the deleted rows.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Make the archives' directory entries durable as well as their bytes."""
+    with contextlib.suppress(OSError):  # not every platform can open a directory
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)

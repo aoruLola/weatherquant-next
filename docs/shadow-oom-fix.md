@@ -47,7 +47,10 @@ Shadow Runner 在生产环境运行约 2 周后出现间歇性 OOM（容器被 `
 - 文件：`src/weatherquant/shadow/config.py`（新增 `shadow_retention_days` / `shadow_retention_archive_dir`）
 - 文件：`src/weatherquant/shadow/runner.py`（cycle 末尾调用 `_maybe_retention()`，12 小时节流）
 - **默认行为**：`shadow_retention_days is None` → 直接返回，零副作用
-- **启用时**：先把旧行导出为 Parquet 到 `archive_dir/<table>/YYYY-MM-DD.parquet`，再 SQL DELETE
+- **启用时**：同一个 DuckDB 事务内，先把旧行导出为 Parquet 到 `archive_dir/<table>_<YYYYMMDDTHHMMSSZ>.parquet` 并 fsync，再 DELETE；任一步失败整体回滚并删除本轮未提交的归档文件
+  - 决策只删 `export_seq <= 已确认导出游标` 的行；没有 v2 游标时一条决策都不删；rejection_reasons 跟随同一批决策
+  - 预测按 `forecast_run_time_utc` 过期，但只要还有保留中的决策引用同一 forecast run（model/version/station/event/run），该预测就保留，否则对齐审计和看板会出现无法追溯的决策
+  - 同名归档已存在时拒绝运行，绝不覆盖或删除上一轮已提交的归档
 
 ### Fix 5 · 心跳增加可观测性
 - 文件：`src/weatherquant/shadow/runner.py`
@@ -86,21 +89,25 @@ Shadow Runner 在生产环境运行约 2 周后出现间歇性 OOM（容器被 `
 
 **数值一致性**：1M/3M/5M 三档 Python `_percentile()` 与 DuckDB `quantile_cont` 返回值完全相同（diff=0.000）。
 
+> 3.2 / 3.3 重新测量：最初的种子脚本对整张表只取一次 `random()`，所有行落在同一时刻，
+> 时间窗要么全滤掉要么全保留（1M 行时出现 0 ms）。修正为逐行随机后，数据均匀分布在
+> 60 天内，约一半在 30 天窗口之外。以下为修正后的新/旧耗时比。
+
 ### 3.2 Markets 快照时间窗
 
-| 行数 | 旧（全表扫描） | 新（30 天窗口） | 新/旧 |
-|------|--------------|---------------|-------|
-| 1M   | 37 ms        | 0 ms          | 0.00× |
-| 3M   | 48 ms        | 43 ms         | 0.90× |
-| 5M   | 94 ms        | 69 ms         | **0.73×** |
+| 行数 | 新（30 天窗口）/ 旧（全表扫描） |
+|------|------------------------------|
+| 1M   | 0.54× |
+| 3M   | 0.68× |
+| 5M   | **0.58×** |
 
 ### 3.3 Forecasts 快照时间窗
 
-| 行数 | 旧（全表扫描） | 新（1 天 lookback） | 新/旧 |
-|------|--------------|-------------------|-------|
-| 1M   | 27 ms        | 18 ms             | 0.67× |
-| 3M   | 74 ms        | 45 ms             | 0.61× |
-| 5M   | 130 ms       | 78 ms             | **0.60×** |
+| 行数 | 新（1 天 lookback）/ 旧（全表扫描） |
+|------|---------------------------------|
+| 1M   | 0.72× |
+| 3M   | 0.74× |
+| 5M   | **0.67×** |
 
 **结论**：P95 修正是 **主故障根因**（5M 行时 411 MB Python heap 几乎填满 Shadow 默认内存 budget），时间窗过滤是次要但持续的改善，compose 的 mem_limit 是防止再次 OOM 的兜底。
 

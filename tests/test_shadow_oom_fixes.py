@@ -46,7 +46,12 @@ def con():
             mode VARCHAR,
             primary_reason VARCHAR,
             decision_latency_ms BIGINT,
-            export_seq BIGINT
+            export_seq BIGINT,
+            event_id VARCHAR,
+            station VARCHAR,
+            model_name VARCHAR,
+            model_version VARCHAR,
+            forecast_run_time_utc TIMESTAMPTZ
         )
         """
     )
@@ -500,3 +505,136 @@ def test_runner_passes_confirmed_export_cursor_to_retention(con, tmp_path, monke
     r._maybe_retention()
 
     assert captured["exported_through_seq"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Retention on the real migrated schema: predictions a retained decision
+# still traces to, and archive durability before any delete
+# ---------------------------------------------------------------------------
+
+def _real_shadow_db(tmp_path):
+    from weatherquant.storage.shadow import ShadowDatabase
+
+    db = ShadowDatabase(tmp_path / "shadow.duckdb")
+    db.open()
+    return db
+
+
+def _insert_prediction(con, *, run, target):
+    con.execute(
+        """
+        INSERT INTO model_predictions (
+            model_name, model_version, station, target_date, event_id,
+            forecast_run_time_utc, probabilities_json, lead_hours, model_run_id,
+            training_cutoff_utc, forecast_publishable_at_utc, forecast_publishable_basis,
+            forecast_received_at_utc, decision_time_utc, calibration_version,
+            source_data_hash, computed_at_utc)
+        VALUES ('ecmwf_raw', 'v1', 'KNYC', ?, 'EV1', ?, '{}', 12, 'mr', ?, ?,
+                'estimated', ?, ?, 'c1', 'h', ?)
+        """,
+        [target, run, run, run, run, run, run],
+    )
+
+
+def _insert_decision(con, decision_id, *, run, at, seq):
+    con.execute(
+        """
+        INSERT INTO shadow_decisions (
+            decision_id, run_id, cycle_id, market_id, event_id, target_date, station,
+            direction, state, model_name, model_version, forecast_run_time_utc,
+            decision_time_utc, created_at_utc, export_seq)
+        VALUES (?, 'r', ?, 'M1', 'EV1', ?, 'KNYC', 'buy_yes', 'REJECT',
+                'ecmwf_raw', 'v1', ?, ?, ?, ?)
+        """,
+        [decision_id, decision_id, at.date(), run, at, at, seq],
+    )
+
+
+def test_retention_keeps_a_prediction_a_retained_decision_still_traces_to(tmp_path):
+    """A decision just inside the window routinely uses a forecast run
+    initialised hours before the cutoff. Deleting that run's prediction
+    leaves the retained decision untraceable in the alignment audit."""
+    from weatherquant.shadow.alignment import audit_alignment
+
+    db = _real_shadow_db(tmp_path)
+    con = db.con
+    cutoff = NOW - timedelta(days=30)
+    shared_run = cutoff - timedelta(hours=6)
+    _insert_prediction(con, run=shared_run, target=(cutoff + timedelta(hours=1)).date())
+    _insert_decision(con, "D_INSIDE", run=shared_run, at=cutoff + timedelta(hours=1), seq=2)
+    # A run used only by an exported decision that retires in the same pass.
+    retired_run = cutoff - timedelta(days=5)
+    _insert_prediction(con, run=retired_run, target=retired_run.date())
+    _insert_decision(con, "D_RETIRED", run=retired_run, at=retired_run + timedelta(hours=1), seq=1)
+    # An old run nothing references.
+    orphan_run = cutoff - timedelta(days=10)
+    _insert_prediction(con, run=orphan_run, target=orphan_run.date())
+    assert audit_alignment(con).violations == []
+
+    result = apply_retention(
+        con, days=30, archive_dir=tmp_path / "archive", exported_through_seq=2, now=NOW
+    )
+
+    assert _decision_ids(con) == {"D_INSIDE"}
+    assert _prediction_runs(con) == {shared_run}
+    assert result.deleted_predictions == 2
+    assert [v.kind for v in audit_alignment(con).violations] == []
+    archived = next((tmp_path / "archive").glob("model_predictions_*.parquet"))
+    assert {
+        row[0]
+        for row in con.execute(
+            "SELECT forecast_run_time_utc FROM read_parquet(?)", [str(archived)]
+        ).fetchall()
+    } == {retired_run, orphan_run}
+    db.close()
+
+
+def test_retention_fsyncs_every_archive_before_the_first_delete(con, tmp_path, monkeypatch):
+    import os
+
+    _seed_retention_scenario(con)
+    events: list[str] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd):
+        events.append("fsync:" + os.path.basename(os.readlink(f"/proc/self/fd/{fd}")))
+        return real_fsync(fd)
+
+    class RecordingCon:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=None):
+            if sql.lstrip().upper().startswith("DELETE"):
+                events.append("delete")
+            return self._inner.execute(sql, params) if params is not None else self._inner.execute(sql)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    apply_retention(RecordingCon(con), days=30, archive_dir=tmp_path, exported_through_seq=1, now=NOW)
+
+    archives = sorted(p.name for p in tmp_path.glob("*.parquet"))
+    assert len(archives) == 3
+    first_delete = events.index("delete")
+    synced_before_first_delete = {e.split(":", 1)[1] for e in events[:first_delete] if e.startswith("fsync:")}
+    # Decisions and reasons are deleted first; both archives must be on disk by then.
+    assert {a for a in archives if not a.startswith("model_predictions")} <= synced_before_first_delete
+    # The prediction archive is synced before the prediction delete.
+    pred = next(a for a in archives if a.startswith("model_predictions"))
+    pred_sync = events.index(f"fsync:{pred}")
+    assert "delete" in events[pred_sync + 1:]
+
+
+def test_retention_never_overwrites_or_unlinks_an_existing_archive(con, tmp_path):
+    """Archives are named by the second. A pass that lands on an existing
+    name must not overwrite it, nor remove it in its failure cleanup: it may
+    be the only copy of rows an earlier pass already deleted."""
+    _seed_retention_scenario(con)
+    earlier = tmp_path / f"shadow_decisions_{NOW.strftime('%Y%m%dT%H%M%SZ')}.parquet"
+    earlier.write_bytes(b"earlier committed archive")
+    before = _decision_ids(con)
+
+    with pytest.raises(FileExistsError):
+        apply_retention(con, days=30, archive_dir=tmp_path, exported_through_seq=1, now=NOW)
+
+    assert earlier.read_bytes() == b"earlier committed archive"
+    assert _decision_ids(con) == before

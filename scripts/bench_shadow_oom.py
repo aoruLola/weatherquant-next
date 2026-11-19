@@ -194,10 +194,14 @@ def _seed(
             d_time                                          AS created_at_utc,
             'LIVE'                                          AS mode,
             NULL                                            AS mode_reason
-        FROM generate_series(1, {n_decisions}) AS g(id)
+        FROM (
+            -- One timestamp per row: an uncorrelated scalar subquery would
+            -- evaluate random() once and give every row the same instant.
+            SELECT s.id, TIMESTAMPTZ '{start_iso}' + INTERVAL '60 days' * random() AS d_time
+            FROM generate_series(1, {n_decisions}) AS s(id)
+        ) AS g
         JOIN (SELECT *, ROW_NUMBER() OVER () AS rn FROM market_catalog) m
-          ON m.rn = (g.id % {n_markets}) + 1,
-             (SELECT TIMESTAMPTZ '{start_iso}' + INTERVAL '60 days' * random() AS d_time) dt
+          ON m.rn = (g.id % {n_markets}) + 1
         """
     )
     con.execute("VACUUM shadow_decisions")
@@ -234,10 +238,14 @@ def _seed(
             'v3'                                    AS calibration_version,
             'hash' || LPAD((g.id % 1000000)::VARCHAR, 6, '0') AS source_data_hash,
             frun + INTERVAL '30 seconds'            AS computed_at_utc
-        FROM generate_series(1, {n_predictions}) AS g(id)
+        FROM (
+            -- One timestamp per row: an uncorrelated scalar subquery would
+            -- evaluate random() once and give every row the same instant.
+            SELECT s.id, TIMESTAMPTZ '{start_iso}' + INTERVAL '60 days' * random() AS frun
+            FROM generate_series(1, {n_predictions}) AS s(id)
+        ) AS g
         JOIN (SELECT *, ROW_NUMBER() OVER () AS rn FROM market_catalog) m
-          ON m.rn = (g.id % {n_markets}) + 1,
-             (SELECT TIMESTAMPTZ '{start_iso}' + INTERVAL '60 days' * random() AS frun) dt
+          ON m.rn = (g.id % {n_markets}) + 1
         """
     )
     con.execute("VACUUM model_predictions")
