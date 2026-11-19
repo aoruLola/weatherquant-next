@@ -8,7 +8,7 @@ stop that look identical until you ask why.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -87,6 +87,17 @@ def test_the_first_price_and_probability_are_the_first_ones_seen() -> None:
     assert episode.first_market_price == pytest.approx(0.60)
     assert episode.first_available_depth_usd == pytest.approx(10.0)
     assert episode.first_model_probability == pytest.approx(0.67)
+
+
+def test_later_accept_cannot_supply_the_opening_execution_evidence() -> None:
+    first = dict(_row(minutes=0, price=None, depth=None), model_probability=None)
+    later = dict(_row(minutes=1), fee_rate=0.0)
+    (episode,), _ = build_episodes([first, later])
+    assert episode.observation_count == 2
+    assert episode.fee_rate is None
+    assert episode.first_market_price is None
+    assert episode.first_available_depth_usd is None
+    assert episode.first_model_probability is None
 
 
 # --- what ends an episode ---------------------------------------------------
@@ -257,6 +268,27 @@ def test_a_zulu_suffix_is_read_as_utc() -> None:
     episodes, _ = build_episodes(rows)
 
     assert episodes[0].first_seen_utc.tzinfo is not None
+
+
+def test_an_explicit_offset_is_normalised_before_episode_identity() -> None:
+    utc_rows = [_row(minutes=0), _row(minutes=10)]
+    offset_rows = [
+        {
+            **row,
+            "decided_at_utc": row["decided_at_utc"]
+            .astimezone(timezone(timedelta(hours=8)))
+            .isoformat(),
+        }
+        for row in utc_rows
+    ]
+
+    utc_episodes, _ = build_episodes(utc_rows)
+    offset_episodes, _ = build_episodes(offset_rows)
+
+    assert [episode.as_dict() for episode in offset_episodes] == [
+        episode.as_dict() for episode in utc_episodes
+    ]
+    assert offset_episodes[0].first_seen_utc.isoformat().endswith("+00:00")
 
 
 def test_a_timestamp_that_is_not_a_time_is_refused() -> None:

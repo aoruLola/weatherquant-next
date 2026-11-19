@@ -267,3 +267,20 @@ def test_the_new_reader_still_reads_a_legacy_snapshot(tmp_path) -> None:
         # The summary's own capital block is passed through, whatever shape it
         # has; only the on-demand simulation is ours.
         assert capital_out["scope"] == "window"
+
+
+@pytest.mark.parametrize("damage", ["part", "manifest_id"])
+def test_pin_refuses_a_generation_that_does_not_match_its_manifest(tmp_path, damage):
+    root = tmp_path / "performance"
+    target = _publish(root, 4)
+    current = _publish(root, 6)
+    directory = root / "generations" / target
+    if damage == "part":
+        next((directory / "opportunities").glob("part-*.json")).unlink()
+    else:
+        path = directory / "manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest["generation_id"] = current
+        path.write_text(json.dumps(manifest))
+    assert pin_main(["--performance", str(root), "--generation", target, "--apply"]) == 2
+    assert current_pointer(root) == current

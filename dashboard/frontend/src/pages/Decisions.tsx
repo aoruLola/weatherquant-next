@@ -118,9 +118,10 @@ export default function Decisions() {
       />
 
       {/* The disclaimer is unconditional and cannot be filtered away. */}
-      <Banner tone="warn" title="关于 ACCEPT" testId="accept-disclaimer">
-        ACCEPT 表示符合当前模型与风险过滤条件，不代表已验证的盈利机会；系统没有真实成交，
-        也不会生成收益曲线。REPLAY 数据是历史回放，不是当时可做出的决策。
+      <Banner tone="warn" title="关于影子信号" testId="accept-disclaimer">
+        影子信号（内部状态 ACCEPT）表示通过当前模型与风险过滤的一次模拟评估，
+        不代表下单、成交或已验证的盈利机会；系统没有真实成交，也不会生成收益曲线。
+        REPLAY 数据是历史回放，不是当时可做出的决策。
       </Banner>
 
       {/*
@@ -141,7 +142,7 @@ export default function Decisions() {
             {totals.runs_in_database != null && (
               <> · 已记录 {fmtInt(Number(totals.runs_in_database))} 次运行</>
             )}
-            <> · 本页所有 ACCEPT / REJECT / NO_TRADE / 已评估均属此范围</>
+            <> · 本页所有影子信号 / REJECT / NO_TRADE / 已评估均属此范围</>
             <> · Shadow 重启不会清零这些计数</>
           </Banner>
         </div>
@@ -150,10 +151,10 @@ export default function Decisions() {
       <div className="my-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard
           testId="stat-accept"
-          label="ACCEPT"
+          label="影子信号 ACCEPT"
           value={fmtInt(totals?.accepted ?? 0)}
           tone="accent"
-          sub={`LIVE ${fmtInt(totals?.live_accepted ?? 0)} · REPLAY ${fmtInt(totals?.replay_accepted ?? 0)}`}
+          sub={`LIVE ${fmtInt(totals?.live_accepted ?? 0)} · REPLAY ${fmtInt(totals?.replay_accepted ?? 0)} · 模拟评估`}
         />
         <StatCard
           testId="stat-reject"
@@ -186,14 +187,14 @@ export default function Decisions() {
         <Card
           testId="accept-scope"
           className="mb-4"
-          title="ACCEPT 的独立度"
+          title="影子信号的独立度"
           hint={`${String(totals.accept_scope.note ?? '')} · 范围：全库累计，重启不清零`}
           bodyClassName="p-3.5"
         >
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
             <StatCard
               testId="stat-accept-observations"
-              label="ACCEPT 观测次数"
+              label="影子信号观测次数"
               value={fmtInt(totals.accept_scope.accepted_observations ?? 0)}
               tone="accent"
               sub="每个周期各记一次"
@@ -233,7 +234,7 @@ export default function Decisions() {
         </Card>
       ) : (
         totals && (
-          <Card testId="accept-scope-unavailable" className="mb-4" title="ACCEPT 的独立度">
+          <Card testId="accept-scope-unavailable" className="mb-4" title="影子信号的独立度">
             <EmptyState
               title="不可用"
               reason="当前 Shadow report 未包含 accept_scope 维度（需要含该字段的版本）"
@@ -263,7 +264,7 @@ export default function Decisions() {
             data-testid="filter-state"
           >
             <option value="">全部状态</option>
-            <option value="ACCEPT">ACCEPT</option>
+            <option value="ACCEPT">影子信号（ACCEPT）</option>
             <option value="REJECT">REJECT</option>
             <option value="NO_TRADE">NO_TRADE</option>
             <option value="DATA_UNAVAILABLE">DATA_UNAVAILABLE</option>
@@ -340,7 +341,7 @@ export default function Decisions() {
       )}
 
       {envelope && data && (
-        <Card title="决策流" hint="按时间倒序 · 同市场同方向的连续 ACCEPT 已分组">
+        <Card title="决策流" hint="按时间倒序 · 同市场同方向的连续影子信号已分组">
           {data.rows_status === 'unavailable' ? (
             <EmptyState
               title="决策明细暂未接入"
@@ -358,7 +359,7 @@ export default function Decisions() {
             />
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[900px] text-sm" data-testid="decisions-table">
+              <table className="w-full min-w-[1100px] text-sm" data-testid="decisions-table">
                 <thead>
                   <tr className="border-b border-line text-left text-xs text-muted">
                     <th className="pb-2 font-medium">决策时间</th>
@@ -366,6 +367,9 @@ export default function Decisions() {
                     <th className="pb-2 font-medium">方向</th>
                     <th className="pb-2 font-medium">状态</th>
                     <th className="pb-2 font-medium">模式</th>
+                    <th className="pb-2 font-medium" title="模型名与版本，以及决策时点已保存的预测与盘口证据时间">
+                      模型 / 证据
+                    </th>
                     <th className="pb-2 text-right font-medium">模型概率</th>
                     <th
                       className="pb-2 text-right font-medium"
@@ -388,21 +392,27 @@ export default function Decisions() {
                     >
                       <td className="tnum py-2.5 pr-3 text-xs">
                         {fmtDateTime(row.decided_at_utc)}
+                        <div className="text-[11px] text-muted" title="证据来源">
+                          {row.evidence_source ?? 'shadow_decisions'}
+                        </div>
                       </td>
                       <td className="max-w-[220px] py-2.5 pr-3">
                         <div className="truncate text-xs font-medium">
                           {row.market_question || row.market_id}
                         </div>
-                        <div className="tnum text-[11px] text-muted">{row.bracket_label}</div>
+                        <div className="tnum text-[11px] text-muted">{row.bracket_label ?? 'N/A'}</div>
+                        <div className="tnum text-[11px] text-muted">
+                          目标日 {row.target_date ?? 'N/A'}
+                        </div>
                       </td>
-                      <td className="py-2.5 pr-3 text-xs uppercase">{row.direction ?? '—'}</td>
+                      <td className="py-2.5 pr-3 text-xs uppercase">{row.direction ?? 'N/A'}</td>
                       <td className="py-2.5 pr-3">
                         <div className="flex items-center gap-1.5">
                           <DecisionBadge state={row.state} />
                           {kind === 'group' && (
                             <span
                               className="rounded-full bg-accent px-1.5 py-0.5 text-[10px] font-bold text-white"
-                              title="同一市场、同一方向的连续 ACCEPT 观测；这是 1 个机会被重复观察，不是 N 个独立机会"
+                              title="同一市场、同一方向的连续影子信号观测；这是 1 个机会被重复观察，不是 N 个独立机会"
                               data-testid="accept-group-badge"
                             >
                               连续 ×{count}
@@ -412,18 +422,45 @@ export default function Decisions() {
                       </td>
                       <td className="py-2.5 pr-3">
                         <ModeBadge mode={row.mode} />
+                        {row.mode_reason && (
+                          <div className="text-[11px] text-muted">{row.mode_reason}</div>
+                        )}
+                      </td>
+                      <td
+                        className="py-2.5 pr-3 text-[11px] text-muted"
+                        title={row.evidence_reason ?? '决策时点已持久化的预测与盘口证据'}
+                      >
+                        <div className="text-ink">
+                          {row.model_name ?? 'N/A'} / {row.model_version ?? 'N/A'}
+                        </div>
+                        <div className="tnum">
+                          预测 run {fmtDateTime(row.forecast_run_time_utc)}
+                        </div>
+                        <div className="tnum">
+                          盘口 venue {fmtDateTime(row.book_venue_ts_utc)}
+                        </div>
+                        <div className="tnum">
+                          采集/接收 {fmtDateTime(row.book_collector_received_at_utc)} /{' '}
+                          {fmtDateTime(row.book_shadow_received_at_utc)}
+                        </div>
+                        <div>
+                          {row.book_source ?? 'N/A'}
+                          {row.evidence_version != null && ` · v${row.evidence_version}`}
+                        </div>
                       </td>
                       <td className="tnum py-2.5 pr-3 text-right">
                         {fmtProb(row.model_probability)}
                       </td>
                       <td className="tnum py-2.5 pr-3 text-right">
-                        {row.best_ask != null || row.best_bid != null
-                          ? fmtUsd(row.direction?.startsWith('buy') ? row.best_ask : row.best_bid)
-                          : '—'}
+                        <div>B {fmtUsd(row.best_bid)}</div>
+                        <div>A {fmtUsd(row.best_ask)}</div>
+                        <div className="text-[11px] text-muted">
+                          使用 {row.direction?.startsWith('buy') ? 'ask' : 'bid'}
+                        </div>
                       </td>
                       <td className="tnum py-2.5 pr-3 text-right">
                         {row.net_edge_usd == null ? (
-                          '—'
+                          'N/A'
                         ) : (
                           <span className={row.net_edge_usd > 0 ? 'text-accent' : 'text-muted'}>
                             {row.net_edge_usd > 0 ? '+' : ''}
@@ -432,13 +469,13 @@ export default function Decisions() {
                         )}
                       </td>
                       <td className="py-2.5 pr-3 text-xs text-muted">
-                        {row.primary_reason ?? (row.reasons.length ? row.reasons.join(', ') : '—')}
+                        {row.primary_reason ?? (row.reasons.length ? row.reasons.join(', ') : 'N/A')}
                         {kind === 'group' && (
                           <div className="text-[11px] text-warn">连续观测已合并</div>
                         )}
                       </td>
                       <td className="tnum py-2.5 text-right text-xs text-muted">
-                        {row.snapshot_age_ms != null ? `${row.snapshot_age_ms} ms` : '—'}
+                        {row.snapshot_age_ms != null ? `${row.snapshot_age_ms} ms` : 'N/A'}
                       </td>
                     </tr>
                   ))}
@@ -451,10 +488,10 @@ export default function Decisions() {
             <FreshnessPill freshness={envelope.freshness} />
             <span>
               模型 {String(data.filters_applied['model'] ?? '全部')} · 阈值版本{' '}
-              {data.rows[0]?.thresholds_version ?? '—'}
+              {data.rows[0]?.thresholds_version ?? 'N/A'}
             </span>
             <span className="flex items-center gap-2">
-              最近周期：{data.last_cycle ? `${fmtInt((data.last_cycle as any).decisions)} 次评估` : '—'}
+              最近周期：{data.last_cycle ? `${fmtInt((data.last_cycle as any).decisions)} 次评估` : 'N/A'}
             </span>
           </div>
         </Card>

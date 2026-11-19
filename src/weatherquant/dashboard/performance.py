@@ -58,7 +58,7 @@ from weatherquant.performance.capital import (
     simulate_portfolio,
     window_portfolio_payload,
 )
-from weatherquant.performance.episodes import Episode, episode_from_mapping
+from weatherquant.performance.episodes import Episode, episode_from_mapping, observation_bounds
 
 __all__ = [
     "OPPORTUNITY_FILTERS",
@@ -67,6 +67,7 @@ __all__ = [
     "performance_models",
     "performance_opportunities",
     "performance_reference_capital",
+    "performance_research_drift",
     "performance_settlements",
     "performance_summary",
     "performance_win_rate",
@@ -173,7 +174,11 @@ class PerformanceState:
         # manifest's publish time is the fallback for a generation that has no
         # payload-level timestamp.
         published_at = payload.generated_at_utc or parse_utc(manifest.get("published_at_utc"))
-        consumed_at = payload.as_of_utc or parse_utc(_watermark_time(manifest))
+        # The consumed watermark is business time, like the export and ingest
+        # watermarks it is compared with. The payload's as_of_utc is the build's
+        # wall clock, so it is only the fallback for a generation published
+        # before the manifest recorded its watermark (see _watermark_time).
+        consumed_at = parse_utc(_watermark_time(manifest)) or payload.as_of_utc
         # The snapshot declares the cadence it is republished on; the Dashboard
         # only adds its grace. One meaning for `stale_after_seconds` on both
         # sides, rather than the manifest saying 300 and the reader saying 1500.
@@ -489,14 +494,16 @@ def performance_settlements(
     now: datetime,
     *,
     limit: int = 50,
-    cursor: int = 0,
+    cursor: str | int | None = None,
     status: str | None = None,
     market_id: str | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """One page of the settlement answers.
 
     Bounded by construction - one row per market and target date, not per
-    decision - so this stays an offset cursor rather than a keyset one.
+    decision - so this stays an offset cursor. The cursor is still stamped
+    with the published generation id, so a republish between two pages is
+    refused (409) rather than silently served as a mix of two batches.
     """
     payload, freshness = state.snapshot("performance-settlements", "settlements.json", now)
     if payload.data == {} and payload.kind:
@@ -507,33 +514,49 @@ def performance_settlements(
         }, freshness
 
     limit = max(1, min(int(limit), MAX_PAGE))
-    cursor = max(0, int(cursor))
+    offset = _decode_cursor(cursor, payload.generation_id)
     rows = list(payload.data.get("answers") or [])
     if status:
         rows = [row for row in rows if str(row.get("status") or "") == status]
     if market_id:
         rows = [row for row in rows if str(row.get("market_id") or "") == market_id]
 
-    window = rows[cursor : cursor + limit]
+    window = rows[offset : offset + limit]
     envelope = payload.model_dump()
     envelope.pop("data", None)
     envelope["items"] = window
     envelope["total"] = len(rows)
-    envelope["next_cursor"] = (cursor + limit) if cursor + limit < len(rows) else None
-    envelope["prev_cursor"] = max(0, cursor - limit) if cursor > 0 else None
+    next_offset = offset + len(window)
+    envelope["next_cursor"] = (
+        _encode_cursor(payload.generation_id, next_offset) if next_offset < len(rows) else None
+    )
+    envelope["prev_cursor"] = (
+        _encode_cursor(payload.generation_id, max(0, offset - limit)) if offset > 0 else None
+    )
     envelope["data"] = {
         "collection": "answers",
         "returned": len(window),
         "total": len(rows),
-        "offset": cursor,
+        "offset": offset,
         "limit": limit,
-        "cursor": cursor,
+        "cursor": cursor if cursor not in (None, "") else None,
         "filters": {k: v for k, v in (("status", status), ("market_id", market_id)) if v},
         "freshness": payload.data.get("freshness"),
         "statistical_scope": payload.data.get("statistical_scope") or ["resolved_verified_only"],
         "warnings": payload.data.get("warnings") or [],
     }
     return envelope, freshness
+
+
+def performance_research_drift(state: PerformanceState, now: datetime) -> tuple[dict[str, Any], Any]:
+    payload, freshness = state.snapshot("performance-research-drift", "research-drift.json", now)
+    if payload.data == {} and payload.kind:
+        return {
+            "reason": payload.source or "research drift not published",
+            "statistical_scope": [],
+            "warnings": [],
+        }, freshness
+    return payload.model_dump(), freshness
 
 
 def performance_models(state: PerformanceState, now: datetime) -> tuple[dict[str, Any], Any]:
@@ -618,6 +641,9 @@ def performance_reference_capital(
         source = "weatherquant.performance.capital.simulate_portfolio"
 
     window = dict(payload.data.get("window") or {})
+    # Older generations describe the newest and oldest episode starts in reverse.
+    # The retained rows also carry the final observation of each episode.
+    window["first_seen_utc_from"], window["last_seen_utc_to"] = observation_bounds(episodes)
     payload_out = window_portfolio_payload(
         result,
         window=window,

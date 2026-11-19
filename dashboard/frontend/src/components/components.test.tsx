@@ -38,6 +38,10 @@ describe('DecisionBadge / ModeBadge', () => {
     expect(container.querySelector('[data-testid="decision-badge-ACCEPT"]')).toHaveClass(
       'text-accent',
     )
+    // The API state stays ACCEPT, but the visible label must not read as a trade.
+    expect(container.querySelector('[data-testid="decision-badge-ACCEPT"]')).toHaveTextContent(
+      '影子信号',
+    )
     expect(container.querySelector('[data-testid="decision-badge-REJECT"]')).toHaveClass(
       'text-warn',
     )

@@ -281,22 +281,23 @@ def test_a_second_process_is_refused_rather_than_corrupting_the_store(tmp_path) 
     import sys
 
     rows = _dataset(seed=91, rows=200)
-    _write_parts(tmp_path, rows, 2)
     state_db = tmp_path / "state.duckdb"
+    _ingest(tmp_path, rows, parts=2, state_db=state_db)
+    probe = [
+        sys.executable, "-c",
+        "import duckdb, sys; print('opening', flush=True); con = duckdb.connect(sys.argv[1]); "
+        "print('opened', flush=True); "
+        "print(con.execute('SELECT SUM(rows) FROM performance_parts').fetchone()[0])",
+        str(state_db),
+    ]
     with PerformanceStateStore(state_db):
-        attempt = subprocess.run(
-            [sys.executable, "-c", f"import duckdb; duckdb.connect({str(state_db)!r})"],
-            capture_output=True,
-            text=True,
-        )
-    assert attempt.returncode != 0
-    message = (attempt.stderr or attempt.stdout).lower()
-    # The wording is platform-specific - DuckDB says "Conflicting lock is held"
-    # on Linux and "File is already open in" on Windows - so asserting one of
-    # them makes this test pass or fail on the operating system rather than on
-    # the behaviour. What has to hold is that the second process is refused,
-    # and refused for *this* reason rather than an unrelated one.
-    assert "lock" in message or "already open" in message, message
+        attempt = subprocess.run(probe, capture_output=True)
+        assert attempt.returncode != 0
+        assert attempt.stdout.splitlines() == [b"opening"], attempt.stderr
+    # The identical process can open the same file and see its committed rows
+    # once the owner releases it, regardless of the OS language.
+    released = subprocess.run(probe, check=True, capture_output=True)
+    assert released.stdout.splitlines() == [b"opening", b"opened", str(len(rows)).encode()]
 
 
 # ---------------------------------------------------------------------------
@@ -797,13 +798,7 @@ def test_the_empty_retraction_refusal_reaches_the_command(tmp_path, capsys) -> N
 
 
 def test_an_existing_state_database_keeps_working(tmp_path) -> None:
-    """Migration regression: a store built before this change still opens.
-
-    No migration was added for the retraction guard - it is CLI and control
-    flow, not schema - so the check that matters is that an existing database
-    is not disturbed: the migration set is unchanged, reopening re-applies
-    nothing, and the settlement rows survive.
-    """
+    """Reopening a migrated database preserves its settlement rows."""
     from weatherquant.performance.state import PERFORMANCE_MIGRATIONS_DIR
     from weatherquant.storage.migrator import applied_migrations, available_migrations
 
@@ -821,11 +816,7 @@ def test_an_existing_state_database_keeps_working(tmp_path) -> None:
 
     versions = [spec.version for spec in available_migrations(PERFORMANCE_MIGRATIONS_DIR)]
     assert versions == sorted(versions, key=int), versions
-    assert versions == ["0001", "0002", "0003", "0004"], (
-        "0003 adds the ingest columns for the write-sequence cursor (WQN-20); "
-        "any other new one here means an existing state database has to be "
-        "upgraded before it can be read, which is a decision to make openly"
-    )
+    assert versions == ["0001", "0002", "0003", "0004", "0005"]
 
     # Reopen: migrations are idempotent and nothing is lost.
     with PerformanceStateStore(state_db) as store:
@@ -1315,3 +1306,153 @@ def test_a_store_from_the_previous_migration_upgrades_in_place(tmp_path) -> None
         ]
         assert store.summary()["counts"]["episodes"] == 1
     del applied
+
+
+def test_partial_retraction_and_restore_use_the_normal_command(tmp_path):
+    from weatherquant.cli import main
+
+    rows = _dataset(seed=211, rows=600)
+    export = _write_parts(tmp_path, rows, 3)
+    out = tmp_path / "out"
+    state = tmp_path / "state.duckdb"
+    cmd = ["build-performance", "--export", str(export), "--out", str(out), "--dataset", "fixture",
+           "--state-db", str(state)]
+    index = _settlements(rows)
+    index[0].update(resolution_source="historical fetch", fetched_at_utc="2026-10-01T12:00:00+00:00")
+    source = tmp_path / "index.json"
+    source.write_text(json.dumps(index))
+    assert main([*cmd, "--settlements", str(source)]) == 0
+    with PerformanceStateStore(state) as store:
+        # Migrated v1 rows can have a verified bit but no recorded verdict.
+        store.con.execute("UPDATE performance_settlements SET verification_status = NULL WHERE market_id = ?",
+                          [index[-1]["market_id"]])
+        original = store.load_settlements()
+    assert main([*cmd, "--no-ingest"]) == 0
+    before = _read_generation(out)
+    subset = [{**index[0], "resolved_outcome": 1 - index[0]["resolved_outcome"]}]
+    source.write_text(json.dumps(subset))
+    assert main([*cmd, "--settlements", str(source), "--settlements-replace", "--no-ingest"]) == 0
+    changed = _read_generation(out)
+    assert changed["win-rate.json"]["data"]["overall"] != before["win-rate.json"]["data"]["overall"]
+    backup, = tmp_path.glob("*.retracted-*.json")
+    saved = json.loads(backup.read_text(encoding="utf-8"))
+    assert saved["settlements"] == original
+    assert saved["rows_retracted"] == len(original) - 1
+    capital_coverage = changed["summary.json"]["data"]["reference_capital"]["settlement_coverage"]
+    assert capital_coverage["answers"] == 1
+    assert capital_coverage["decisive_episodes"] == changed["win-rate.json"]["data"]["overall"]["valid_samples"]
+    assert capital_coverage["decisive_episodes"] < before["win-rate.json"]["data"]["overall"]["valid_samples"]
+    assert main([*cmd, "--restore-settlements-backup", str(backup), "--no-ingest"]) == 0
+    with PerformanceStateStore(state) as store:
+        assert store.load_settlements() == original
+    restored = _read_generation(out)
+    assert restored["win-rate.json"]["data"]["overall"] == before["win-rate.json"]["data"]["overall"]
+    assert restored["summary.json"]["data"]["reference_capital"] == before["summary.json"]["data"]["reference_capital"]
+
+
+def test_restore_keeps_unverified_answers_unverified(tmp_path):
+    """A restore puts back the verdict that was saved, not a fresh conclusion.
+
+    The win rate is gated on RESOLVED + observation-verified (WQN-32/33), so a
+    restore that silently promoted UNVERIFIED rows would inflate the
+    denominator without a single observation being checked.
+    """
+    rows = _dataset(seed=211, rows=200)
+    index = _settlements(rows, verified=False)
+    out = tmp_path / "out"
+    state = tmp_path / "state.duckdb"
+    options = dict(export=_write_parts(tmp_path, rows, 2), out_dir=out,
+                   state_db=state, dataset="fixture", now=NOW)
+    build_performance_streaming(**options, settlements=index)
+    before = _read_generation(out)
+    assert before["settlements.json"]["data"]["verified"] == []
+    assert all(row["verification_status"] == "UNVERIFIED" for row in before["settlements.json"]["data"]["answers"])
+
+    build_performance_streaming(**options, settlements=index[:1], settlements_replace=True)
+    backup, = tmp_path.glob("*.retracted-*.json")
+    build_performance_streaming(**options, restore_settlements_backup=backup)
+
+    restored = _read_generation(out)
+    answers = restored["settlements.json"]["data"]["answers"]
+    assert len(answers) == len(index)
+    assert all(row["verification_status"] == "UNVERIFIED" for row in answers)
+    assert restored["settlements.json"]["data"]["verified"] == []
+    assert restored["win-rate.json"]["data"]["overall"] == before["win-rate.json"]["data"]["overall"]
+    assert restored["summary.json"]["data"]["reference_capital"] == before["summary.json"]["data"]["reference_capital"]
+
+
+def test_last_settlement_revision_also_owns_its_verification(tmp_path):
+    rows = _dataset(seed=211, rows=200)
+    index = _settlements(rows)
+    revised = {**index[0], "verification_status": "UNVERIFIABLE"}
+    path = tmp_path / "state.duckdb"
+    build_performance_streaming(export=_write_parts(tmp_path, rows, 2), out_dir=tmp_path / "out",
+                                state_db=path, settlements=[index[0], revised], dataset="fixture")
+    with PerformanceStateStore(path) as store:
+        answer, = store.load_settlements()
+    assert answer["verification_status"] == "UNVERIFIABLE"
+    assert not answer["verified"]
+
+
+def test_reset_and_same_time_retry_preserve_restore_points(tmp_path):
+    rows = _dataset(seed=211, rows=100)
+    index = _settlements(rows)
+    state = tmp_path / "state.duckdb"
+    options = dict(export=_write_parts(tmp_path, rows, 2), out_dir=tmp_path / "out",
+                   state_db=state, dataset="fixture", now=NOW)
+    build_performance_streaming(**options, settlements=index)
+    with PerformanceStateStore(state) as store:
+        previous = store.load_settlements()
+    build_performance_streaming(**options, reset=True, settlements_replace=True, confirm_empty_retraction=True)
+    original, = tmp_path.glob("*.retracted-*.json")
+    saved = json.loads(original.read_text())
+    assert saved["settlements"] == previous
+    build_performance_streaming(**options, settlements_replace=True, confirm_empty_retraction=True)
+    assert len(list(tmp_path.glob("*.retracted-*.json"))) == 2
+    assert json.loads(original.read_text()) == saved
+
+    # A backup from before rows_backed_up was introduced can be restored directly.
+    saved.pop("rows_backed_up")
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps(saved))
+    build_performance_streaming(**options, restore_settlements_backup=legacy)
+    with PerformanceStateStore(state) as store:
+        assert store.load_settlements() == previous
+
+
+def test_failed_settlement_upsert_rolls_back_omissions(tmp_path, monkeypatch):
+    rows = _dataset(seed=211, rows=100)
+    state = tmp_path / "state.duckdb"
+    index = _settlements(rows)
+    options = dict(export=_write_parts(tmp_path, rows, 2), out_dir=tmp_path / "out",
+                   state_db=state, dataset="fixture", now=NOW)
+    build_performance_streaming(**options, settlements=index)
+    with PerformanceStateStore(state) as store:
+        previous = store.load_settlements()
+
+    def fail(self, answers, **kwargs):
+        raise RuntimeError("replacement write failed")
+
+    monkeypatch.setattr(PerformanceStateStore, "upsert_settlements", fail)
+    with pytest.raises(RuntimeError, match="replacement write failed"):
+        build_performance_streaming(**options, settlements=index[:1], settlements_replace=True)
+    with PerformanceStateStore(state) as store:
+        assert store.load_settlements() == previous
+
+
+def test_invalid_and_empty_restore_are_refused_before_opening_state(tmp_path):
+    from weatherquant.cli import main
+
+    export = tmp_path / "export"
+    export.mkdir()
+    state = tmp_path / "state.duckdb"
+    source = tmp_path / "backup.json"
+    cmd = ["build-performance", "--export", str(export), "--out", str(tmp_path / "out"), "--dataset", "fixture",
+           "--state-db", str(state), "--restore-settlements-backup", str(source)]
+    for backup in [
+        {"rows_retracted": 0, "settlements": []},
+        {"rows_retracted": 1, "settlements": []},
+        {"rows_retracted": 1, "settlements": [{"market_id": "m"}]},
+    ]:
+        source.write_text(json.dumps(backup))
+        assert main(cmd) == 2 and not state.exists()

@@ -255,13 +255,13 @@ class SignalConsumer:
             if not items:
                 result.caught_up = True
                 return result
-            result.cursor = next_cursor
             result.lines_read = len(items)
+            batch = ConsumerResult(cursor=next_cursor, lines_read=len(items))
             now = self.clock()
             quality: list[tuple[str, str, str | None, int | None, str]] = []
             with self.store.db.transaction():
                 for part_index, text, line_no in items:
-                    self._consume_line(part_index, text, line_no, now, result, quality)
+                    self._consume_line(part_index, text, line_no, now, batch, quality)
                 for kind, severity, path, line, detail in quality:
                     self.store.record_quality_event(
                         kind=kind,
@@ -271,8 +271,9 @@ class SignalConsumer:
                         line_no=line,
                         ts_utc=now,
                     )
-                result.quality_events = len(quality)
+                batch.quality_events = len(quality)
                 self.store.save_state(CURSOR_KEY, next_cursor.as_dict(), now=now)
+            return batch
         except ExportGapError as exc:
             result.notes.append(f"export gap: {exc}")
         except Exception as exc:  # a side channel must not raise
@@ -314,13 +315,7 @@ class SignalConsumer:
             return
 
         reason, detail = self._gate(event, now)
-        if reason is None:
-            outcome = "ACCEPTED"
-            result.accepted += 1
-        else:
-            outcome = "REFUSED"
-            result.refused += 1
-
+        outcome = "ACCEPTED" if reason is None else "REFUSED"
         inserted = self.store.record_signal(
             event,
             tradeable=event.tradeable,
@@ -331,6 +326,10 @@ class SignalConsumer:
         )
         if inserted:
             result.signals_recorded += 1
+            if reason is None:
+                result.accepted += 1
+            else:
+                result.refused += 1
         else:
             # The primary key absorbed this row: the engine has seen the
             # decision before (a rewound cursor, a restored backup, a double

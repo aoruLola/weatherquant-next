@@ -379,3 +379,73 @@ def test_the_mcp_container_has_no_order_tool_imported() -> None:
             if forbidden in source:
                 offenders.append(f"{path.name}: {forbidden}")
     assert not offenders, offenders
+
+
+# --- WQN-55 CI dedup: dev triggers, concurrency, and the image gate --------
+
+DEV_CI_WORKFLOWS = ("ci.yml", "dashboard-ci.yml", "shadow-ci.yml")
+
+
+@pytest.mark.parametrize("name", DEV_CI_WORKFLOWS)
+def test_dev_ci_triggers_only_main_pr_and_dispatch(name: str) -> None:
+    """Dev CI may not push-on-every-branch - that doubled GitHub Actions bill."""
+    text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    assert "workflow_dispatch:" in text, f"{name} must have workflow_dispatch"
+    # push.branches must be [main], not ["**"] or anything broader
+    assert "branches: [main]" in text, f"{name} must push to main only"
+    assert 'branches: ["**"]' not in text, (
+        f"{name} triggers on every branch push - same commit runs twice"
+    )
+
+
+@pytest.mark.parametrize("name", DEV_CI_WORKFLOWS)
+def test_dev_ci_has_cancel_on_pr_concurrency(name: str) -> None:
+    """Superseded PR runs must cancel; main and dispatch must not cancel each other."""
+    text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    assert "concurrency:" in text, f"{name} has no concurrency"
+    # PR number in the group name (so same-PR runs cancel each other)
+    assert "pull_request.number" in text, f"{name} concurrency must key on PR number"
+    # run_id as fallback (main pushes each get their own group)
+    assert "github.run_id" in text, f"{name} concurrency must fallback to run_id"
+    # Cancel-on-progress only for PR events
+    assert "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in text, (
+        f"{name} must cancel-in-progress only for PRs"
+    )
+
+
+@pytest.mark.parametrize("name", DEV_CI_WORKFLOWS)
+def test_dev_ci_uses_gate_script_and_fetch_depth_two(name: str) -> None:
+    """The gate diffs against HEAD^1, which requires at least two commits."""
+    text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    assert "fetch-depth: 2" in text, f"{name} checkout must fetch at least 2 commits"
+    assert "ci_image_gate.sh" in text, f"{name} must call the gate script"
+    assert "$GITHUB_OUTPUT" in text, f"{name} must write gate decision to GITHUB_OUTPUT"
+
+
+@pytest.mark.parametrize("name", DEV_CI_WORKFLOWS)
+def test_dev_ci_build_job_is_gated_on_output(name: str) -> None:
+    """Image build + acceptance jobs must skip when the gate says build_image=false."""
+    text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    # The test job declares outputs.build_image from the gate step
+    assert "build_image: ${{ steps.image.outputs.build_image }}" in text, (
+        f"{name} must expose build_image output from the gate step"
+    )
+    # The build job gates on the output being true
+    assert "if: needs." in text and ".outputs.build_image == 'true'" in text, (
+        f"{name} build job must gate on build_image output"
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    ("release.yml", "dashboard-release.yml", "shadow-release.yml", "mcp-release.yml"),
+)
+def test_release_workflows_not_weakened_by_dedup(name: str) -> None:
+    """WQN-55 touched only dev CI - release workflows must still trigger and run full gates."""
+    text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    # Still triggered by tag push (release) or tag push + dispatch (all)
+    assert "tags:" in text, f"{name} still needs a tag trigger"
+    # Release workflows keep cancel-in-progress: false
+    assert "cancel-in-progress: false" in text, f"{name} must never cancel mid-publish"
+    # Release jobs still run the full test + build + verify + publish chain
+    assert "docker/build-push-action" in text, f"{name} must still build images"

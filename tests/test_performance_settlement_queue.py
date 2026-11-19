@@ -317,7 +317,9 @@ def test_verified_pairs_are_exactly_what_the_engine_scores(tmp_path: Path) -> No
         _settlement("m-0", "2026-10-13", status="RESOLVED", outcome=1.0, verification="VERIFIED"),
         _settlement("m-1", "2026-10-13", status="RESOLVED", outcome=0.0, verification="VERIFIED"),
         _settlement("m-2", "2026-10-13", status="PENDING"),
-        # m-3 has no record at all: missing, never asked.
+        _settlement("m-3", "2026-10-13", status="RESOLVED", outcome=0.0, verification="UNVERIFIED"),
+        _settlement("m-3", "2026-10-13", status="RESOLVED", outcome=1.0, verification="VERIFIED",
+                    fetched_at="2000-01-01T00:00:00Z"),
     ]
     export = tmp_path / "export" / "parts"
     export.mkdir(parents=True)
@@ -331,9 +333,18 @@ def test_verified_pairs_are_exactly_what_the_engine_scores(tmp_path: Path) -> No
         settlements=settlements,
         now=NOW,
     )
+    # A later invocation imports the older file after the correction was stored.
+    build_performance_streaming(
+        export=tmp_path / "export", out_dir=tmp_path / "out", dataset="fixture",
+        state_db=tmp_path / "state.duckdb", settlements=[settlements[-1]], now=NOW,
+    )
     generation = json.loads((tmp_path / "out" / "current.json").read_text())["generation_id"]
     win_rate = json.loads((tmp_path / "out" / "generations" / generation / "win-rate.json").read_text())
 
+    from weatherquant.performance.snapshot import build_performance
+
+    materialized = build_performance(decisions=decisions, settlements=settlements, dataset="fixture", now=NOW)
+    assert materialized["win-rate.json"]["data"]["overall"]["valid_samples"] == 2
     queue = build_settlement_queue(decisions, settlements=settlements, now=NOW)
     assert queue["coverage"]["win_loss_eligible_markets"] == 2
     assert win_rate["data"]["overall"]["valid_samples"] == 2, (
