@@ -476,6 +476,24 @@ docker start weatherquant-collector
 `archive_seq` 在单个文件内跨重启严格递增(重启会先读该文件最后一条持久
 行的序号再继续,回扫不受超长撕裂片段影响),重放不会铸造死掉的运行已经用过的序号。
 
+采集器在新分区首次写入前发布零字节摘要。每批 JSONL 完成 `fsync` 后，采集器才更新摘要中的字节数。Shadow 只处理这个位置之前的完整记录。尚无摘要的旧分区仍按完整换行读取。
+
+采集器重启时也检查之前日期的分区。若文件比摘要长，会先核对摘要已覆盖的字节，再发布完整的后续记录并隔离末尾残片。若已覆盖的数据与摘要不符(摘要无法由文件字节复算,即损坏或篡改),采集器**不再 FATAL 退出**:它把整个分区(数据文件 + `.sha256`)原样移进 `quarantine/<source>/` 作为证据(摘要**绝不**改写去"迁就"坏数据),移动前先在恢复日志写一条 `partition_quarantine_started`(意图先落盘),移动并 fsync 两个目录后再写 `partition_quarantined`,然后在该路径以新摘要、空文件继续采集——采集不中断,但事件必须被看到。只有"隔离证据本身失败"(例如磁盘满、无法 rename)时才回退为 FATAL 退出,以免静默丢弃或掩盖数据。若进程恰好死在"数据文件已移走、摘要还没移"之间,下次启动会识别这个特征(`quarantine/` 里有数据证据却没有对应摘要证据),补完摘要的移动并照常启动；没有任何隔离证据而数据文件凭空消失的情况仍按截断拒绝启动。
+
+隔离会同时体现在告警面上,复用现有健康机制而非新增通道:
+
+- 日志:`log.error("archive partition quarantined (digest/data mismatch) …")` 一行,带路径与证据目录。
+- 心跳:`stats.archive_quarantined`(按 `quarantine/*/` 里的隔离证据计数,数据文件与其摘要同一时间戳算一次,`*.torn` 撕裂片段不计;仪表盘与探针都能读)与 `telemetry.archive_quarantine`(`count` + 最近一次的 `path`/`reason`/`quarantined_sha256`/`quarantine_path`)。只要 `quarantine/` 里还有未处理的隔离证据,心跳 `status` 至少为 `degraded`——**重启不会清除告警**。人工复核后把证据移出 `quarantine/`(例如移到 `<raw>/quarantine-reviewed/`)即视为确认,下次重启采集器后告警解除。
+- 探针:`evaluate_health` 将 `archive_quarantined > 0` 判为 **degraded(exit 0)**——这是要人看的数据完整性告警,但采集已继续,不应重启容器把它刷掉。采集器真正退出(FATAL)时仍是 `unhealthy`(exit 1)。
+
+升级/回滚注意:
+
+- **升级到本版本**：旧版本写的分区没有 `*.sha256`，不会被启动恢复改写。采集器第一次向该分区追加时补发零字节摘要，再由每批 `fsync` 推进；Shadow 在摘要发布前仍按完整换行读取，所以升级时不必停机对齐，也不会重读整段历史。
+- **回滚到本版本之前的镜像**：数据文件格式未变，旧代码忽略 `*.sha256`、`recovery.jsonl` 与 `quarantine/`，可直接回滚；回滚期间新写入的批次没有摘要，再次升级后按"旧分区无摘要"补发。`quarantine/` 里的内容是证据(撕裂片段与已隔离的损坏分区)，回滚不要删除。
+- **人工修复前先停采集器**：摘要与数据不符时，采集器已把原文件与摘要冻结进 `quarantine/<source>/` 并继续写新文件，因此**不需要**人工立即介入即可维持采集。不要手工改 `.sha256` 让它"对上"——那会把一次可证实的损坏洗成静默通过。确需回溯时，用上面的只读校验命令确认范围，再从 `quarantine/` 里取回证据或从备份恢复。
+- Shadow 遇到摘要落后于自己的 checkpoint、或摘要声明的字节数超过文件时，停在该位置并记一条 error 级质量事件（`archive_trail_behind_checkpoint` / `archive_trail_ahead_of_file`），不会越过不确定的字节继续消费。
+- 若 Shadow 读到某分区已被隔离(`recovery.jsonl` 里有对应的 `partition_quarantined`)，它**不在旧偏移上继续**：记一条 error 级 `archive_partition_quarantined`(带上丢失的字节范围),把该分区 checkpoint 归零,只消费替换后新文件中已认证的字节；`partition_quarantine_started` 同样算数,所以即使采集器在移动后、写 `partition_quarantined` 前崩溃,Shadow 也能识别；判断依据是 checkpoint 记录的文件 inode 变化,因此新文件即便已经比旧偏移更长也不会被跳读。该事件计入 data gap 统计,Shadow 心跳的 `quarantined_partitions` 取本进程计数与 `quarantine/` 证据数的较大值(同样重启不清除),探针判为 degraded(exit 0),不会重启 Shadow。
+
 在 NAS 上验收(只读操作,随时可跑):
 
 ```bash

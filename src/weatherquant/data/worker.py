@@ -331,6 +331,7 @@ class CollectorWorker:
             )
 
             self._archive = archive = RawArchive(settings.raw_dir, run_id=self.run_id)
+            archive.recover_pending_partitions()
             self._http = http = ResilientHttp(
                 timeout_seconds=settings.http_timeout_seconds,
                 retries=settings.http_retries,
@@ -1257,6 +1258,12 @@ class CollectorWorker:
                 "frames_dropped": self._frames_dropped,
             },
             "per_token_book_age_ms": self._per_token_book_age(),
+            "archive_quarantine": {
+                "count": self._archive.quarantined_partitions if self._archive is not None else 0,
+                "last": dict(self._archive.last_quarantine)
+                if self._archive is not None and self._archive.last_quarantine
+                else None,
+            },
         }
 
     def _per_token_book_age(self) -> dict[str, Any] | None:
@@ -1354,6 +1361,16 @@ class CollectorWorker:
             if (wall - contact).total_seconds() <= UPSTREAM_STALL_SOFT_SECONDS:
                 self._status = HealthStatus.HEALTHY
 
+        # A quarantined partition is an operator-visible integrity alert even
+        # though collection carried on. Keep the published file honest: never
+        # let it read `healthy` on a run that had to freeze evidence.
+        if (
+            self._archive is not None
+            and self._archive.quarantined_partitions > 0
+            and self._status is HealthStatus.HEALTHY
+        ):
+            self._status = HealthStatus.DEGRADED
+
         heartbeat = Heartbeat(
             status=self._status,
             run_id=self.run_id,
@@ -1392,6 +1409,7 @@ class CollectorWorker:
                 dedupe_hits_total=writer_stats.get("books_deduplicated", 0)
                 + writer_stats.get("prices_deduplicated", 0),
                 errors_total=self.stats.errors_total,
+                archive_quarantined=self._archive.quarantined_partitions if self._archive is not None else 0,
             ),
             db_bytes=int(disk.get("db_bytes", 0)),
             raw_bytes=raw_bytes,

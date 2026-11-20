@@ -411,6 +411,7 @@ def _beat(
     disk_total_bytes: int = 100_000_000_000,
     rest_failures: int = 0,
     fatal: str | None = None,
+    archive_quarantined: int = 0,
 ) -> Heartbeat:
     return Heartbeat(
         status=status,
@@ -426,7 +427,7 @@ def _beat(
         rest_consecutive_failures=rest_failures,
         disk_free_percent=disk_free_percent,
         disk_total_bytes=disk_total_bytes,
-        stats=CollectionStats(),
+        stats=CollectionStats(archive_quarantined=archive_quarantined),
         fatal_error=fatal,
     )
 
@@ -567,6 +568,20 @@ def test_hard_silence_is_unhealthy(tmp_path: Path) -> None:
     HeartbeatWriter(path).write(_beat(updated_at=NOW, contact=NOW - timedelta(seconds=2000)))
     verdict = evaluate_health(path, now=NOW, upstream_stall_soft_seconds=900.0, upstream_stall_hard_seconds=1800.0)
     assert verdict.exit_code == 1
+
+
+def test_a_quarantined_partition_is_degraded_and_visible(tmp_path: Path) -> None:
+    """A frozen partition must surface in the probe (and dashboard) as a
+    non-healthy state, but not restart the collector - collection resumed."""
+    path = tmp_path / "heartbeat.json"
+    HeartbeatWriter(path).write(_beat(archive_quarantined=1))
+    verdict = evaluate_health(path, now=NOW)
+    assert verdict.status is HealthStatus.DEGRADED
+    assert verdict.exit_code == 0
+    assert any("quarantined" in reason for reason in verdict.reasons)
+
+    # Reading the file back preserves the counter the dashboard renders.
+    assert read_heartbeat(path).stats.archive_quarantined == 1
 
 
 def test_low_disk_warns_without_failing(tmp_path: Path) -> None:
