@@ -179,9 +179,22 @@ echo '<PAT>' | docker login ghcr.io -u '<你的GitHub用户名>' --password-stdi
 1. Unraid Web UI → **Apps → Compose Manager Plus → Add Compose Stack**
 2. **Name**: `weatherquant-next`
 3. 把 `docker/compose.unraid.yaml` 的内容粘进编辑器。
-   `image:` **已经填好**，指向已发布的镜像：
-   `ghcr.io/aorulola/weatherquant-next:stable`
-   （不可变版本用 `sha-5410c75d584771b4477de07f4b1d7b83b764bfe1`，回滚见 §10）
+   镜像行是 **不可变 SHA 标签**，由 stack 目录里的 `.env` 决定：
+
+   ```yaml
+   image: ghcr.io/aorulola/weatherquant-next:sha-${COLLECTOR_SHA:?...}
+   ```
+
+   在同一个 stack 目录新建/编辑 `.env`，写入要运行的**完整 40 位 commit sha**：
+
+   ```bash
+   COLLECTOR_SHA=5410c75d584771b4477de07f4b1d7b83b764bfe1
+   ```
+
+   `GIT_SHA` 与 `IMAGE_TAG` 也从这同一个变量读取，容器上报的版本不可能与
+   实际运行的镜像不一致。变量未设置时 compose **拒绝启动**，不会退回
+   `stable` 这种浮动标签（回滚见 §10，完整流程见
+   `docs/release-rollback.md`）。
 4. 确认 `volumes` 指向你的 appdata 路径
 5. **Apply / Start**
 
@@ -207,15 +220,19 @@ Unraid → **Settings → User Utilities → User Scripts**，新建脚本 `wq-u
 
 **最省事的做法：用 Compose Manager Plus 自带的 "Check for updates / Update" 按钮。**
 它会重新拉取 `image:` 指向的标签并重建容器，路径由它自己管理，不必手写。
+注意 `image:` 现在指向 `sha-${COLLECTOR_SHA}`：**升级 = 修改 `.env` 里的
+`COLLECTOR_SHA`**，不是 `pull stable`。
 
 若要走定时脚本（User Scripts → Schedule，例如 `0 4 * * 0` 每周日 04:00），把
 `<STACK_DIR>` 换成 Compose Manager Plus 给这个 stack 的实际目录（在其 UI 的
-stack 详情页能看到）：
+stack 详情页能看到）。脚本只确保当前 pin 的镜像在本机，**不改变** pin：
 
 ```bash
 #!/bin/bash
 STACK_DIR=/mnt/user/appdata/compose-manager/weatherquant-next   # 按实际路径改
-docker pull ghcr.io/<owner>/<repo>:stable || exit 1
+SHA="$(grep -E '^COLLECTOR_SHA=' "$STACK_DIR/.env" | cut -d= -f2)"
+[ -n "$SHA" ] || { echo "COLLECTOR_SHA is not set in $STACK_DIR/.env" >&2; exit 1; }
+docker pull "ghcr.io/<owner>/<repo>:sha-${SHA}" || exit 1
 docker compose -f "$STACK_DIR/docker-compose.yml" up -d
 ```
 
@@ -223,9 +240,9 @@ docker compose -f "$STACK_DIR/docker-compose.yml" up -d
 > `reason='start_after_restart'` 的一行。**缺口是可见的，不是无声丢失** ——
 > 这正是"更新期间的数据缺口会被记录"这一验收项的含义。
 
-**为什么默认不自动更新**：`stable` 一变，容器就会被重建。无人值守的自动更新在
-你睡觉时引入回归，而这个采集器的产出是**不可再生的历史数据**。更新应是你主动
-选择的时刻——或者至少是你设的时间窗。
+**为什么默认不自动更新**：改 `.env` 里的 SHA 就是一次版本切换，容器会被重建。
+无人值守的自动更新在你睡觉时引入回归，而这个采集器的产出是**不可再生的历史数据**。
+更新应是你主动选择的时刻——或者至少是你设的时间窗。
 
 `[待NAS验证]` 手动执行一次该脚本，确认容器被重建且数据仍在。
 
@@ -419,7 +436,9 @@ Unraid **User Scripts**，每日 01:00：
 set -euo pipefail
 SRC=/mnt/user/appdata/weatherquant-next/backups
 DST=/mnt/user/backup/weatherquant-next          # 或用 rclone 到 S3 / 另一台机器
-IMAGE=ghcr.io/<owner>/<repo>:stable
+# 用当前 pin 的版本校验，而不是浮动标签
+COLLECTOR_SHA="$(grep -E '^COLLECTOR_SHA=' /mnt/user/appdata/compose-manager/weatherquant-next/.env | cut -d= -f2)"
+IMAGE="ghcr.io/<owner>/<repo>:sha-${COLLECTOR_SHA}"
 mkdir -p "$DST"
 
 # 1) 只保留最近 7 份，避免无限增长（采集器自己不会删备份——自动删历史太危险）
@@ -510,29 +529,43 @@ docker run --rm -v /mnt/user/appdata/weatherquant-next:/data:ro \
 ## 10. 回滚到上一个 SHA 版本
 
 镜像按 **不可变 SHA** 发布：`ghcr.io/<owner>/<repo>:sha-<git sha>`。
-SHA 标签**永不被重写**，`stable` 只是它的移动指针。
+SHA 标签**永不被重写**，`stable` 只是它的移动指针。生产 stack 运行哪个
+版本，只由 stack 目录 `.env` 里的 `COLLECTOR_SHA` 决定。
 
 ### 步骤
 
 ```bash
-# 1. 找出历史版本（GitHub → Packages → 本镜像 → Tags）
-#    或在 Unraid 上：
-docker pull ghcr.io/<owner>/<repo>:stable
-docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/<owner>/<repo>:stable
+STACK_DIR=/mnt/user/appdata/compose-manager/weatherquant-next
 
-# 2. 改 compose 的 image: 为具体 SHA
-#    image: ghcr.io/<owner>/<repo>:sha-0123456789abcdef0123456789abcdef01234567
+# 1. 变更前先快照（compose + .env + 当前 SHA；数据目录只读，不复制数据库）
+uv run python scripts/stack_snapshot.py \
+  --out /mnt/user/backups/wq-snapshots \
+  --stack collector="$STACK_DIR" \
+  --performance /mnt/user/appdata/weatherquant-next/performance
 
-# 3. 重建
-cd /mnt/user/appdata/weatherquant-next   # 或你的 stack 目录
+# 2. 干跑：只打印要恢复的 .env diff，什么都不写
+uv run python scripts/stack_rollback.py --snapshot /mnt/user/backups/wq-snapshots/<时间戳>
+
+# 3. 确认 diff 只改 COLLECTOR_SHA 后应用：只重写 .env，不碰数据
+uv run python scripts/stack_rollback.py --snapshot /mnt/user/backups/wq-snapshots/<时间戳> --apply
+
+# 4. 让 compose 读取恢复后的变量并重建
+cd "$STACK_DIR"
 docker compose -f compose.yaml up -d
 
-# 4. 验证
+# 5. 验证：镜像标签、GIT_SHA、IMAGE_TAG 必须与 COLLECTOR_SHA 一致
+docker inspect weatherquant-collector > /tmp/collector-inspect.json
+uv run python scripts/verify_running_image.py \
+  --inspect /tmp/collector-inspect.json --sha "$(grep '^COLLECTOR_SHA=' .env | cut -d= -f2)"
 docker inspect --format '{{.State.Health.Status}}' weatherquant-collector
-docker exec weatherquant-collector python -c "import weatherquant; print(weatherquant.__version__)"
 ```
 
+也可以手工回滚：把 `.env` 里的 `COLLECTOR_SHA` 改回上一个已验证的完整
+commit sha，再 `docker compose up -d`。无论哪种方式，**只改 `.env`**，
+不要改 compose 里的 `image:` 行——那行的变量名是 pin 的契约。
+
 **回滚不会动数据。** 镜像里没有数据库；升级/降级只换代码层，`/data` 原封不动。
+`stack_rollback.py --apply` 也只重写 `.env`，不会读写任何 DuckDB/WAL/归档文件。
 迁移是**只前进**的：如果新版本加过迁移而你回滚到旧版本，旧版本会读到
 `schema_migrations` 里它不认识的更高版本——它会跳过已知校验和一致的迁移，
 不会删表。**只有当前进到的 schema 版本 ≤ 代码支持的版本时回滚才是安全的**；
@@ -548,6 +581,7 @@ print('code supports  :', __import__('glob').glob('/app/.venv/lib/python3.12/sit
 ```
 
 `[待NAS验证]` 做一次真实回滚演练并确认 §10 的 schema 版本对照输出合理。
+完整的部署顺序、快照内容和演练时间线模板见 `docs/release-rollback.md`。
 
 ---
 
