@@ -47,6 +47,7 @@ import duckdb
 
 from weatherquant.config import Settings
 from weatherquant.dashboard.producer import publish_detail_snapshots
+from weatherquant.data.archive import count_quarantined_partitions
 from weatherquant.data.http import ResilientHttp
 from weatherquant.data.lock import LockError, SingleInstanceLock
 from weatherquant.execution.fees import FEE_SOURCE_FALLBACK, load_fee_schedule
@@ -134,6 +135,11 @@ class CycleStats:
 class ShadowRunner:
     """Owns the database, the lock, and the loop. One instance per process."""
 
+    #: Class-level default so instances built with ``object.__new__`` in tests
+    #: (which skip ``__init__``) still expose the quarantine counter that
+    #: ``_write_heartbeat`` reads.
+    _quarantined_partitions = 0
+
     #: Days either side of today that a market is worth watching, and the
     #: horizon the forecast cache holds runs for (Open-Meteo serves 240h).
     _horizon_days: int = 10
@@ -185,6 +191,10 @@ class ShadowRunner:
         self._collector_last_seen: datetime | None = None
         self._phase_started_at: datetime | None = None
         self._closed = False
+        #: Cumulative partitions the collector quarantined and this process
+        #: observed. Surfaced on the heartbeat so the dashboard health layer can
+        #: flag a data gap even though ingestion carries on with a fresh file.
+        self._quarantined_partitions = 0
         #: Decided once, after the first ingest, and held for the whole run.
         self._mode: Mode | None = None
         self._mode_reason: str | None = None
@@ -393,6 +403,9 @@ class ShadowRunner:
 
         # Phase 1: ingest, atomically with its offsets.
         tail = self.tailer.poll()
+        self._quarantined_partitions += sum(
+            1 for event in tail.quality if event.kind == "archive_partition_quarantined"
+        )
         # Prepare a candidate state without mutating the committed view.
         # Rollback must leave both market metadata and books unchanged.
         candidate = ShadowState()
@@ -1074,6 +1087,22 @@ class ShadowRunner:
             "equity_curve": None,
         }
 
+
+    def _quarantine_count(self) -> int:
+        """Quarantined partitions still awaiting review.
+
+        The poll counter only knows what this process saw; the evidence in
+        ``quarantine/`` survives restarts, so the alert stays up until an
+        operator moves the reviewed evidence out.
+        """
+        tailer = getattr(self, "tailer", None)
+        evidence = 0
+        if tailer is not None:
+            try:
+                evidence = count_quarantined_partitions(tailer.raw_dir)
+            except OSError:
+                evidence = 0
+        return max(self._quarantined_partitions, evidence)
     def _write_heartbeat(self, *, status: str, fatal: str | None = None, reason: str | None = None) -> None:
         path = self.shadow.shadow_health_dir / "heartbeat.json"
         now = self.clock()
@@ -1105,6 +1134,7 @@ class ShadowRunner:
             "primary_model": self.shadow.shadow_primary_model,
             "disk": {"free_percent": disk},
             "last_cycle": self._last_cycle.as_dict() if self._last_cycle else None,
+            "quarantined_partitions": self._quarantine_count(),
             "report_duration_ms": self._report_duration_ms,
             "rss_mb": _rss_mb(),
             # Identity and size, so an operator can answer "which build is

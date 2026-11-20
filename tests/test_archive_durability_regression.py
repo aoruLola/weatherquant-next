@@ -325,7 +325,8 @@ def test_bytes_beyond_the_trail_are_reported_as_a_crash_window_not_corruption(tm
 
     verdict = {r["path"]: r for r in verify_archive_tree(root)}[str(path)]
     assert not verdict["ok"]
-    assert any("beyond" in p for p in verdict["problems"]), verdict["problems"]
+    assert len(verdict["problems"]) == 1
+    assert "beyond" in verdict["problems"][0]
 
 
 def test_a_forged_sidecar_is_rejected_by_verification(tmp_path):
@@ -467,3 +468,378 @@ def test_disk_full_kills_the_collector_loudly_and_the_restart_continues_the_arch
     # The recovery log itself is a durable JSONL file the operator reads.
     for event in _recovery_events(tmp_path / "raw"):
         assert set(event) >= {"ts_utc", "event", "run_id"}, event
+
+
+def test_restart_after_large_complete_record_keeps_sequence(tmp_path):
+    root = tmp_path / "raw"
+    record = _record()
+    with RawArchive(root, run_id=record.run_id) as first:
+        first.append(ArchiveRecord(record.source, "x" * 150000, record.received_at_utc, None, "ok", record.run_id))
+    with RawArchive(root, run_id="next") as restarted:
+        restarted.append(_record(1, run_id="next"))
+    assert [row["archive_seq"] for row in _lines(root)] == [1, 2]
+    assert _all_ok(root)
+
+
+def test_restart_quarantines_a_changed_prefix_and_keeps_collecting(tmp_path):
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    path = next(tmp_path.glob("rest/*.jsonl"))
+    receipt = path.with_suffix(".jsonl.sha256")
+    original_receipt = receipt.read_bytes()
+    # Make the file longer than the certified trail *and* change a certified
+    # byte, so the checksum prefix can no longer be reproduced.
+    tampered = path.read_bytes().replace(b'"n":0', b'"n":9') + b'{"archive_seq":2}\n'
+    path.write_bytes(tampered)
+
+    writer = RawArchive(tmp_path, run_id="restart")
+    writer.recover_pending_partitions()
+
+    # The digest was never rewritten to match the tampered bytes: the partition
+    # is gone from the live tree and frozen, unchanged, as evidence.
+    assert not path.exists()
+    assert not receipt.exists()
+    evidence = sorted((tmp_path / "quarantine" / "rest").glob("*.quarantine"))
+    data_evidence = [p for p in evidence if ".sha256." not in p.name]
+    sidecar_evidence = [p for p in evidence if ".sha256." in p.name]
+    assert len(data_evidence) == 1
+    assert data_evidence[0].read_bytes() == tampered
+    assert len(sidecar_evidence) == 1
+    assert sidecar_evidence[0].read_bytes() == original_receipt
+
+    # A durable recovery event names the quarantine and the frozen digest.
+    event = _recovery_events(tmp_path)[-1]
+    assert event["event"] == "partition_quarantined"
+    assert event["quarantined_sha256"] == hashlib.sha256(tampered).hexdigest()
+    assert writer.quarantined_partitions == 1
+    assert writer.last_quarantine["file_bytes"] == len(tampered)
+
+    # Live collection continues into a fresh file with a new digest.
+    writer.append(_record(run_id="restart"))
+    assert writer.flush() == 1
+    writer.close()
+    fresh = next(tmp_path.glob("rest/*.jsonl"))
+    assert fresh.read_bytes() != tampered
+    assert fresh.with_suffix(".jsonl.sha256").read_bytes() != original_receipt
+    assert [r["payload"]["n"] for r in _lines(tmp_path)] == [0]
+    assert _all_ok(tmp_path)
+
+
+def test_flush_quarantines_a_changed_prefix_and_reopens_a_fresh_file(tmp_path):
+    """The live flush path detects the mismatch too (not just startup
+    recovery) and must reopen a fresh descriptor instead of writing through
+    the one that still points at the quarantined inode."""
+    root = tmp_path / "raw"
+    first = RawArchive(root, run_id="wqn-21", flush_records=1000)
+    first.append(_record(0))
+    assert first.flush() == 1
+    first.close()
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    tampered = path.read_bytes().replace(b'"n":0', b'"n":9') + b'{"archive_seq":2}\n'
+    path.write_bytes(tampered)
+
+    second = RawArchive(root, run_id="restart", flush_records=1000)
+    second.append(_record(1, run_id="restart"))
+    assert second.flush() == 1
+    # No write landed in the frozen evidence.
+    evidence = next(p for p in (root / "quarantine" / "rest").glob("*") if ".sha256." not in p.name)
+    assert evidence.read_bytes() == tampered
+    assert second.quarantined_partitions == 1
+    # The fresh file holds only the new run's line.
+    assert [r["payload"]["n"] for r in _lines(root)] == [1]
+    assert _all_ok(root)
+    second.close()
+
+
+def test_a_quarantine_that_cannot_move_evidence_falls_back_to_fatal(tmp_path, monkeypatch):
+    """If freezing the evidence fails (e.g. ENOSPC), the collector must not
+    silently discard or "repair" the partition - it raises for a FATAL exit."""
+    root = tmp_path / "raw"
+    first = RawArchive(root, run_id="wqn-21", flush_records=1000)
+    first.append(_record(0))
+    assert first.flush() == 1
+    first.close()
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    tampered = path.read_bytes().replace(b'"n":0', b'"n":9') + b'{"archive_seq":2}\n'
+    path.write_bytes(tampered)
+
+    def refuse_replace(src, dst):
+        raise OSError(28, "No space left on device")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", refuse_replace)
+        with pytest.raises(OSError, match="No space left"):
+            RawArchive(root, run_id="restart").recover_pending_partitions()
+
+    # The mismatched partition is untouched: no silent data loss.
+    assert path.exists()
+    events = [e["event"] for e in _recovery_events(root)]
+    assert "partition_quarantine_failed" in events
+    assert "partition_quarantined" not in events
+
+
+def test_failed_sequence_read_is_retried_before_minting_an_id(tmp_path, monkeypatch):
+    from weatherquant.data import archive as archive_module
+
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    writer = RawArchive(tmp_path, run_id="restart")
+
+    def fail_read(fd, size):
+        raise OSError("injected sequence read failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(archive_module, "_read_full", fail_read)
+        with pytest.raises(OSError, match="sequence read failure"):
+            writer.append(_record(run_id="restart"))
+    writer.append(_record(run_id="restart"))
+    writer.close()
+    assert [row["archive_seq"] for row in _lines(tmp_path)] == [1, 2]
+    assert _all_ok(tmp_path)
+
+
+@pytest.mark.parametrize("receipt", [b"{", b'{"bytes":-1,"lines":1,"chain_sha256":"bad"}'])
+def test_unreadable_receipt_is_preserved_and_reported(tmp_path, receipt):
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    path = next(tmp_path.glob("rest/*.jsonl.sha256"))
+    path.write_bytes(receipt)
+    with pytest.raises(ValueError, match="invalid checksum sidecar"):
+        RawArchive(tmp_path, run_id="restart").recover_pending_partitions()
+    assert path.read_bytes() == receipt
+    assert not verify_archive_tree(tmp_path)[0]["ok"]
+
+
+def test_a_failed_sidecar_publish_does_not_certify_the_new_bytes(tmp_path, monkeypatch):
+    """Data fsync succeeded, so the bytes are durable - but until the sidecar
+    says so, no consumer may treat them as committed evidence."""
+    from weatherquant.data import archive as archive_module
+    from weatherquant.data.archive import read_archive_sidecar
+
+    root = tmp_path / "raw"
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    archive = RawArchive(root, run_id="wqn-21", flush_records=1000)
+    archive.append(_record(0))
+    assert archive.flush() == 1
+    certified = read_archive_sidecar(path)
+    archive.append(_record(1))
+    real = archive_module._write_sidecar
+
+    def fail_past_the_certified_boundary(target, state):
+        if state["bytes"] > certified["bytes"]:
+            raise OSError(28, "No space left on device")
+        real(target, state)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(archive_module, "_write_sidecar", fail_past_the_certified_boundary)
+        with pytest.raises(OSError, match="No space left"):
+            archive.flush()
+
+    # The second line is on disk, uncertified: the trail still describes only
+    # the first, and the line stays in "written but not published" territory.
+    assert read_archive_sidecar(path) == certified
+    assert path.stat().st_size > certified["bytes"]
+    assert archive.records_written == 2
+
+    # Once the publish can succeed the boundary catches up, exactly once.
+    archive.close()
+    assert read_archive_sidecar(path)["bytes"] == path.stat().st_size
+    assert [row["archive_seq"] for row in _lines(root)] == [1, 2]
+    assert _all_ok(root)
+
+
+def test_a_partition_truncated_below_its_trail_is_refused_at_startup_and_logged(tmp_path):
+    root = tmp_path / "raw"
+    with RawArchive(root, run_id="wqn-21", flush_records=1000) as archive:
+        archive.append(_record(0))
+        archive.append(_record(1))
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    receipt = path.with_suffix(".jsonl.sha256")
+    published = receipt.read_bytes()
+    whole = path.read_bytes()
+    damaged = whole[: whole.index(b"\n") + 10]
+    path.write_bytes(damaged)
+
+    with pytest.raises(ValueError, match="shorter than its published checksum trail"):
+        RawArchive(root, run_id="restart").recover_pending_partitions()
+
+    # Neither the file nor its certificate is rewritten to agree with the loss.
+    assert path.read_bytes() == damaged
+    assert receipt.read_bytes() == published
+    assert [e["event"] for e in _recovery_events(root)][-2:] == [
+        "partition_truncated",
+        "partition_recovery_failed",
+    ]
+    verdict = {r["path"]: r for r in verify_archive_tree(root)}[str(path)]
+    assert any("shorter than the checksum trail" in p for p in verdict["problems"]), verdict["problems"]
+
+
+def test_append_to_a_truncated_partition_logs_and_writes_nothing(tmp_path):
+    root = tmp_path / "raw"
+    with RawArchive(root, run_id="wqn-21", flush_records=1000) as archive:
+        archive.append(_record(0))
+        archive.append(_record(1))
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    receipt = path.with_suffix(".jsonl.sha256")
+    published = receipt.read_bytes()
+    whole = path.read_bytes()
+    damaged = whole[: whole.index(b"\n") + 1]
+    path.write_bytes(damaged)
+
+    restarted = RawArchive(root, run_id="restart", flush_records=1000)
+    restarted.append(_record(2, run_id="restart"))
+    with pytest.raises(ValueError, match="shorter than its published checksum trail"):
+        restarted.flush()
+
+    assert path.read_bytes() == damaged
+    assert receipt.read_bytes() == published
+    assert len(restarted._buffer) == 1, "the refused record must remain retryable"
+    event = _recovery_events(root)[-1]
+    assert event["event"] == "partition_truncated"
+    assert (event["file_bytes"], event["sidecar_bytes"]) == (len(damaged), len(whole))
+
+
+def test_a_quarantine_write_failure_leaves_the_fragment_and_the_batch_retryable(tmp_path, monkeypatch):
+    from weatherquant.data.archive import read_archive_sidecar
+
+    root = tmp_path / "raw"
+    with RawArchive(root, run_id="wqn-21", flush_records=1000) as archive:
+        archive.append(_record(0))
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    durable = path.read_bytes()
+    torn = b'{"crash":"half a line"'
+    with path.open("ab") as handle:
+        handle.write(torn)
+
+    restarted = RawArchive(root, run_id="restart", flush_records=1000)
+    restarted.append(_record(1, run_id="restart"))
+    real_open = os.open
+
+    def refuse_the_quarantine_copy(target, flags, *args, **kwargs):
+        if str(target).endswith(".torn"):
+            raise OSError(28, "No space left on device")
+        return real_open(target, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", refuse_the_quarantine_copy)
+        with pytest.raises(OSError, match="No space left"):
+            restarted.flush()
+
+    # The fragment survives where it was and the data file is untouched: the
+    # quarantine copy is written before the truncate precisely so this failure
+    # cannot destroy the evidence.
+    assert path.read_bytes() == durable + torn
+    assert list((root / "quarantine" / "rest").glob("*.torn")) == []
+    assert read_archive_sidecar(path)["bytes"] == len(durable)
+
+    assert restarted.flush() == 1
+    restarted.close()
+    assert [row["payload"]["n"] for row in _lines(root)] == [0, 1]
+    assert _all_ok(root)
+
+
+def _tamper(path: Path) -> bytes:
+    tampered = path.read_bytes().replace(b'"n":0', b'"n":9') + b'{"archive_seq":2}\n'
+    path.write_bytes(tampered)
+    return tampered
+
+
+def test_a_crash_between_the_two_quarantine_moves_does_not_wedge_startup(tmp_path, monkeypatch):
+    """The data file is moved first, the sidecar second. Dying in between
+    left a live sidecar with no data, which every later start refused as a
+    truncation: the collector could never start again."""
+    import weatherquant.data.archive as archive_mod
+
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    path = next(tmp_path.glob("rest/*.jsonl"))
+    receipt = path.with_suffix(".jsonl.sha256")
+    original_receipt = receipt.read_bytes()
+    tampered = _tamper(path)
+
+    real_replace = os.replace
+    moves: list[Any] = []
+
+    def die_on_second_move(src, dst):
+        moves.append(src)
+        if len(moves) == 2:
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(archive_mod.os, "replace", die_on_second_move)
+    with pytest.raises(OSError):
+        RawArchive(tmp_path, run_id="dies").recover_pending_partitions()
+    monkeypatch.setattr(archive_mod.os, "replace", real_replace)
+    assert not path.exists() and receipt.exists(), "the window this test is about"
+
+    writer = RawArchive(tmp_path, run_id="restart")
+    writer.recover_pending_partitions()  # must not raise
+
+    evidence = sorted((tmp_path / "quarantine" / "rest").glob("*.quarantine"))
+    assert [p.read_bytes() for p in evidence if ".sha256." not in p.name] == [tampered]
+    assert [p.read_bytes() for p in evidence if ".sha256." in p.name] == [original_receipt]
+    assert not receipt.exists()
+    event = _recovery_events(tmp_path)[-1]
+    assert event["event"] == "partition_quarantined"
+    assert event["path"] == str(path)
+    assert writer.quarantined_partitions == 1
+
+    writer.append(_record(run_id="restart"))
+    assert writer.flush() == 1
+    writer.close()
+    assert _all_ok(tmp_path)
+
+
+def test_a_missing_partition_without_quarantine_evidence_is_still_refused(tmp_path):
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    path = next(tmp_path.glob("rest/*.jsonl"))
+    path.unlink()
+    with pytest.raises(OSError):
+        RawArchive(tmp_path, run_id="restart").recover_pending_partitions()
+    assert path.with_suffix(".jsonl.sha256").exists()
+
+
+def test_the_quarantine_alert_survives_a_restart_until_the_evidence_is_reviewed(tmp_path):
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    path = next(tmp_path.glob("rest/*.jsonl"))
+    _tamper(path)
+    first = RawArchive(tmp_path, run_id="restart")
+    first.recover_pending_partitions()
+    first.close()
+    assert first.quarantined_partitions == 1
+
+    # A plain restart must not quietly clear the integrity alert.
+    second = RawArchive(tmp_path, run_id="again")
+    second.recover_pending_partitions()
+    assert second.quarantined_partitions == 1
+    second.close()
+
+    # Moving the reviewed evidence out of quarantine/ is the acknowledgement.
+    (tmp_path / "quarantine").rename(tmp_path / "quarantine-reviewed")
+    third = RawArchive(tmp_path, run_id="reviewed")
+    assert third.quarantined_partitions == 0
+    third.close()
+
+
+def test_the_quarantine_intent_is_durable_before_the_evidence_moves(tmp_path, monkeypatch):
+    """A crash after the moves but before ``partition_quarantined`` must
+    still leave a line naming the replaced path for the shadow."""
+    import weatherquant.data.archive as archive_mod
+
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    path = next(tmp_path.glob("rest/*.jsonl"))
+    _tamper(path)
+
+    real_replace = os.replace
+    seen: list[list[str]] = []
+
+    def record_log_then_move(src, dst):
+        seen.append([e["event"] for e in _recovery_events(tmp_path)])
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(archive_mod.os, "replace", record_log_then_move)
+    RawArchive(tmp_path, run_id="restart").recover_pending_partitions()
+    assert seen and "partition_quarantine_started" in seen[0]

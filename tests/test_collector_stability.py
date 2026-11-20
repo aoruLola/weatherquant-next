@@ -140,6 +140,8 @@ class _RecordingArchive:
 
     def __init__(self) -> None:
         self.records: list[Any] = []
+        self.quarantined_partitions = 0
+        self.last_quarantine = None
 
     def append(self, record: Any) -> None:
         self.records.append(record)
