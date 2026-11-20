@@ -52,6 +52,7 @@ def run_gate(repo: Path, event: str, module: str) -> subprocess.CompletedProcess
         ("docker/healthcheck_paper.py", {"paper"}),
         # Shadow deliberately treats the shared configs directory as an input.
         ("configs/paper-risk.json", {"paper", "shadow"}),
+        ("configs/fee-schedule.json", {"paper", "shadow"}),
         ("Dockerfile.paper", {"paper"}),
         (".github/workflows/paper-ci.yml", {"paper"}),
         # Dashboard-only paths

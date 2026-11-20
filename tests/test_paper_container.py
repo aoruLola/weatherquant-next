@@ -82,6 +82,8 @@ def test_dockerfile_paper_contract() -> None:
     assert "useradd --uid 1000" in text
     assert "USER wq" in text
     assert "configs/paper-risk.json" in text
+    assert "configs/fee-schedule.json" in text
+    assert "WQ_PAPER_FEE_SCHEDULE_PATH=/app/configs/fee-schedule.json" in text
     assert "docker/healthcheck_paper.py" in text
     assert 'ENTRYPOINT ["weatherquant-paper"]' in text
     assert 'CMD ["serve"]' in text
@@ -179,6 +181,7 @@ def test_offline_serve_consumes_fills_and_reports_fresh_health(tmp_path, monkeyp
     monkeypatch.setenv("WQ_PAPER_RAW_DIR", str(raw_dir))
     monkeypatch.setenv("WQ_PAPER_HEALTH_DIR", str(health_dir))
     monkeypatch.setenv("WQ_PAPER_RISK_RULES_PATH", str(ROOT / "configs" / "paper-risk.json"))
+    monkeypatch.setenv("WQ_PAPER_FEE_SCHEDULE_PATH", str(ROOT / "configs" / "fee-schedule.json"))
     monkeypatch.setenv("WQ_PAPER_API_HOST", "127.0.0.1")
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

@@ -54,7 +54,12 @@ case "$1" in
     ;;
   paper)
     dockerfile=Dockerfile.paper
-    inputs+=(docker/healthcheck_paper.py configs/paper-risk.json .github/workflows/paper-ci.yml)
+    inputs+=(
+      docker/healthcheck_paper.py
+      configs/paper-risk.json
+      configs/fee-schedule.json
+      .github/workflows/paper-ci.yml
+    )
     ;;
   dashboard)
     dockerfile=Dockerfile.dashboard

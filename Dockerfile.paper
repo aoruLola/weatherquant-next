@@ -3,8 +3,9 @@
 # WeatherQuant Next paper engine image. Kept separate from the collector and
 # Shadow Dockerfiles so a Paper release cannot change either image.
 #
-# The versioned risk rules are baked into the image. /shadow-decisions and
-# /collector-raw are read-only mount points; /data is Paper's own state.
+# The versioned risk rules and dated fallback fee schedule are baked into the
+# image. /shadow-decisions and /collector-raw are read-only mount points;
+# /data is Paper's own state.
 
 ARG PYTHON_VERSION=3.12
 
@@ -45,13 +46,14 @@ ENV PATH="/app/.venv/bin:$PATH" \
     WQ_PAPER_EVENTS_DIR=/shadow-decisions \
     WQ_PAPER_RAW_DIR=/collector-raw \
     WQ_PAPER_RISK_RULES_PATH=/app/configs/paper-risk.json \
+    WQ_PAPER_FEE_SCHEDULE_PATH=/app/configs/fee-schedule.json \
     WQ_PAPER_API_HOST=0.0.0.0 \
     WQ_PAPER_API_PORT=8790
 
 WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
-COPY --chown=wq:wq configs/paper-risk.json ./configs/paper-risk.json
+COPY --chown=wq:wq configs/paper-risk.json configs/fee-schedule.json ./configs/
 COPY --chown=wq:wq docker/healthcheck_paper.py /usr/local/bin/healthcheck.py
 
 RUN mkdir -p /data /shadow-decisions /collector-raw \

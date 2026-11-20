@@ -30,6 +30,7 @@ x-common: &common
     WQ_PAPER_EVENTS_DIR: /shadow-decisions
     WQ_PAPER_RAW_DIR: /collector-raw
     WQ_PAPER_RISK_RULES_PATH: /app/configs/paper-risk.json
+    WQ_PAPER_FEE_SCHEDULE_PATH: /app/configs/fee-schedule.json
     # The process must listen inside the container for Docker's explicit LAN
     # address publication below. The host does not listen on 0.0.0.0.
     WQ_PAPER_API_HOST: 0.0.0.0
