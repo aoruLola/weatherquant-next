@@ -481,19 +481,101 @@ def test_restart_after_large_complete_record_keeps_sequence(tmp_path):
     assert _all_ok(root)
 
 
-def test_restart_refuses_to_recertify_changed_prefix(tmp_path):
+def test_restart_quarantines_a_changed_prefix_and_keeps_collecting(tmp_path):
     with RawArchive(tmp_path, run_id="wqn-21") as writer:
         writer.append(_record())
     path = next(tmp_path.glob("rest/*.jsonl"))
     receipt = path.with_suffix(".jsonl.sha256")
-    previous_receipt = receipt.read_bytes()
-    data = path.read_bytes().replace(b'"n":0', b'"n":9') + b'{"archive_seq":2}\n'
-    path.write_bytes(data)
-    with pytest.raises(ValueError, match="checksum prefix"):
-        RawArchive(tmp_path, run_id="restart").recover_pending_partitions()
-    assert receipt.read_bytes() == previous_receipt
-    assert path.read_bytes() == data
-    assert _recovery_events(tmp_path)[-1]["event"] == "partition_recovery_failed"
+    original_receipt = receipt.read_bytes()
+    # Make the file longer than the certified trail *and* change a certified
+    # byte, so the checksum prefix can no longer be reproduced.
+    tampered = path.read_bytes().replace(b'"n":0', b'"n":9') + b'{"archive_seq":2}\n'
+    path.write_bytes(tampered)
+
+    writer = RawArchive(tmp_path, run_id="restart")
+    writer.recover_pending_partitions()
+
+    # The digest was never rewritten to match the tampered bytes: the partition
+    # is gone from the live tree and frozen, unchanged, as evidence.
+    assert not path.exists()
+    assert not receipt.exists()
+    evidence = sorted((tmp_path / "quarantine" / "rest").glob("*.quarantine"))
+    data_evidence = [p for p in evidence if ".sha256." not in p.name]
+    sidecar_evidence = [p for p in evidence if ".sha256." in p.name]
+    assert len(data_evidence) == 1
+    assert data_evidence[0].read_bytes() == tampered
+    assert len(sidecar_evidence) == 1
+    assert sidecar_evidence[0].read_bytes() == original_receipt
+
+    # A durable recovery event names the quarantine and the frozen digest.
+    event = _recovery_events(tmp_path)[-1]
+    assert event["event"] == "partition_quarantined"
+    assert event["quarantined_sha256"] == hashlib.sha256(tampered).hexdigest()
+    assert writer.quarantined_partitions == 1
+    assert writer.last_quarantine["file_bytes"] == len(tampered)
+
+    # Live collection continues into a fresh file with a new digest.
+    writer.append(_record(run_id="restart"))
+    assert writer.flush() == 1
+    writer.close()
+    fresh = next(tmp_path.glob("rest/*.jsonl"))
+    assert fresh.read_bytes() != tampered
+    assert fresh.with_suffix(".jsonl.sha256").read_bytes() != original_receipt
+    assert [r["payload"]["n"] for r in _lines(tmp_path)] == [0]
+    assert _all_ok(tmp_path)
+
+
+def test_flush_quarantines_a_changed_prefix_and_reopens_a_fresh_file(tmp_path):
+    """The live flush path detects the mismatch too (not just startup
+    recovery) and must reopen a fresh descriptor instead of writing through
+    the one that still points at the quarantined inode."""
+    root = tmp_path / "raw"
+    first = RawArchive(root, run_id="wqn-21", flush_records=1000)
+    first.append(_record(0))
+    assert first.flush() == 1
+    first.close()
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    tampered = path.read_bytes().replace(b'"n":0', b'"n":9') + b'{"archive_seq":2}\n'
+    path.write_bytes(tampered)
+
+    second = RawArchive(root, run_id="restart", flush_records=1000)
+    second.append(_record(1, run_id="restart"))
+    assert second.flush() == 1
+    # No write landed in the frozen evidence.
+    evidence = next(p for p in (root / "quarantine" / "rest").glob("*") if ".sha256." not in p.name)
+    assert evidence.read_bytes() == tampered
+    assert second.quarantined_partitions == 1
+    # The fresh file holds only the new run's line.
+    assert [r["payload"]["n"] for r in _lines(root)] == [1]
+    assert _all_ok(root)
+    second.close()
+
+
+def test_a_quarantine_that_cannot_move_evidence_falls_back_to_fatal(tmp_path, monkeypatch):
+    """If freezing the evidence fails (e.g. ENOSPC), the collector must not
+    silently discard or "repair" the partition - it raises for a FATAL exit."""
+    root = tmp_path / "raw"
+    first = RawArchive(root, run_id="wqn-21", flush_records=1000)
+    first.append(_record(0))
+    assert first.flush() == 1
+    first.close()
+    path = root / "rest" / f"{NOW.date().isoformat()}.jsonl"
+    tampered = path.read_bytes().replace(b'"n":0', b'"n":9') + b'{"archive_seq":2}\n'
+    path.write_bytes(tampered)
+
+    def refuse_replace(src, dst):
+        raise OSError(28, "No space left on device")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", refuse_replace)
+        with pytest.raises(OSError, match="No space left"):
+            RawArchive(root, run_id="restart").recover_pending_partitions()
+
+    # The mismatched partition is untouched: no silent data loss.
+    assert path.exists()
+    events = [e["event"] for e in _recovery_events(root)]
+    assert "partition_quarantine_failed" in events
+    assert "partition_quarantined" not in events
 
 
 def test_failed_sequence_read_is_retried_before_minting_an_id(tmp_path, monkeypatch):

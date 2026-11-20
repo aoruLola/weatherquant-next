@@ -671,6 +671,24 @@ def test_a_stale_heartbeat_is_unhealthy(tmp_path) -> None:
     assert verdict.exit_code == 1
 
 
+def test_a_quarantined_partition_is_degraded_in_the_shadow_probe(tmp_path) -> None:
+    from weatherquant.shadow.health import evaluate_shadow_health, write_heartbeat
+
+    path = tmp_path / "hb.json"
+    write_heartbeat(
+        path,
+        {
+            "status": "running",
+            "updated_at_utc": NOW.isoformat(),
+            "quarantined_partitions": 1,
+        },
+    )
+    verdict = evaluate_shadow_health(path, now=NOW)
+    assert verdict.status == "degraded"
+    assert verdict.exit_code == 0, "a data gap must not restart the shadow"
+    assert any("quarantined" in reason for reason in verdict.reasons)
+
+
 # --- report ----------------------------------------------------------------
 
 

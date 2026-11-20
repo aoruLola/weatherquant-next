@@ -9,6 +9,7 @@ reader either reports the problem or quietly invents continuity.
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -439,3 +440,104 @@ def test_a_checksum_trail_ahead_of_the_file_parks_with_an_error(tmp_path):
     assert result.stats.lines_read == 0
     assert not result.checkpoints
     assert [q.kind for q in result.quality] == ["archive_trail_ahead_of_file"]
+
+
+def test_a_flush_landing_between_fstat_and_sidecar_does_not_falsely_park(tmp_path, monkeypatch):
+    """P2 race: the collector flushes (data fsync + sidecar publish) between
+    the tailer's fstat snapshot and its ``read_archive_sidecar``. The first
+    fstat sees the old size; the sidecar then describes the new, larger size.
+    Without the re-check this looks like ``archive_trail_ahead_of_file`` and
+    the tail parks even though the bytes are all there. The re-check of the
+    open file must observe the flush and consume the new line."""
+    from weatherquant.data.archive import ArchiveRecord, RawArchive, read_archive_sidecar
+
+    with RawArchive(tmp_path, run_id="collector") as writer:
+        writer.append(ArchiveRecord("gamma", gamma_event(), NOW, None, "ok", "collector"))
+    path = tmp_path / "gamma" / f"{TARGET_DATE}.jsonl"
+    stale_size = path.stat().st_size  # one line certified
+
+    # A second flush lands: the file grows and the sidecar is extended to
+    # cover it. By the time the tailer reads the sidecar, both are current.
+    with RawArchive(tmp_path, run_id="collector") as writer:
+        writer.append(ArchiveRecord("gamma", gamma_event(), NOW, None, "ok", "collector"))
+    current_size = path.stat().st_size
+    assert current_size > stale_size
+    assert read_archive_sidecar(path)["bytes"] == current_size
+
+    real_fstat = os.fstat
+    calls = {"n": 0}
+
+    class _StaleFirstStat:
+        """Proxy the real stat_result but report a smaller ``st_size`` once."""
+
+        def __init__(self, real, st_size: int) -> None:
+            self._real = real
+            self.st_size = st_size
+
+        def __getattr__(self, name: str):
+            return getattr(self._real, name)
+
+    def stale_first_fstat(fd):
+        real = real_fstat(fd)
+        if calls["n"] == 0:
+            calls["n"] += 1
+            return _StaleFirstStat(real, stale_size)
+        return real
+
+    # Only the poll's fstat calls are affected: the archive was built before
+    # the patch, and read_archive_sidecar / Path.stat do not go through fstat.
+    monkeypatch.setattr(os, "fstat", stale_first_fstat)
+
+    tailer = _tailer(tmp_path)
+    result = tailer.poll()
+    kinds = [q.kind for q in result.quality]
+    assert "archive_trail_ahead_of_file" not in kinds, kinds
+    assert result.stats.lines_read == 2
+    _commit(tailer, result)
+    assert tailer.poll().stats.lines_read == 0
+
+
+def test_a_quarantined_partition_is_recorded_and_the_tail_restarts_on_the_fresh_file(tmp_path):
+    """When the collector freezes a corrupt partition and starts a fresh file
+    at the same path, the tail must not read the uncertain range: it records
+    an error-level gap and resumes on the fresh, separately certified file."""
+    from weatherquant.data.archive import ArchiveRecord, RawArchive
+
+    def event(second: int, run_id: str) -> ArchiveRecord:
+        return ArchiveRecord("gamma", gamma_event(), NOW + timedelta(seconds=second), None, "ok", run_id)
+
+    with RawArchive(tmp_path, run_id="collector") as writer:
+        for i in range(3):
+            writer.append(event(i, "collector"))
+    path = tmp_path / "gamma" / f"{TARGET_DATE}.jsonl"
+    tailer = _tailer(tmp_path)
+    _commit(tailer, tailer.poll())
+    committed = tailer.checkpoints[str(path)].offset_bytes
+    assert committed > 0
+
+    # Corrupt one certified byte and lengthen the file; the next collector
+    # flush cannot reproduce the digest, so it quarantines and writes afresh.
+    tampered = path.read_bytes().replace(b'"source":"gamma"', b'"source":"gammA"') + b'{"archive_seq":99}\n'
+    path.write_bytes(tampered)
+    with RawArchive(tmp_path, run_id="collector2") as writer:
+        writer.append(event(10, "collector2"))
+
+    fresh_size = path.stat().st_size
+    assert fresh_size < committed  # one fresh line, shorter than three committed
+    assert list((tmp_path / "quarantine" / "gamma").glob("*.quarantine"))
+
+    result = tailer.poll()
+    quarantines = [q for q in result.quality if q.kind == "archive_partition_quarantined"]
+    assert len(quarantines) == 1
+    assert quarantines[0].severity == "error"
+    assert quarantines[0].offset_bytes == committed
+    # Only the fresh line is consumed; the quarantined bytes are never read.
+    assert result.stats.lines_read == 1
+
+    _commit(tailer, result)
+    assert tailer.checkpoints[str(path)].offset_bytes == fresh_size
+    # Progressing normally afterwards: the durable quarantine note does not
+    # rewind the tail again on the next poll.
+    again = tailer.poll()
+    assert "archive_partition_quarantined" not in {q.kind for q in again.quality}
+    assert again.stats.lines_read == 0

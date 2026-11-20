@@ -37,6 +37,7 @@ collapsing them would make a slow shadow look like a fast collector.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
@@ -177,6 +178,10 @@ class ArchiveTailer:
         self.market_of_token_map: dict[str, str] = {}
         # Changes learned during a poll are provisional until Runner commits.
         self._poll_market_of_token_map: dict[str, str] = {}
+        # Quarantined-live-path index, keyed on the recovery log's stat so a
+        # poll does not re-parse it when nothing changed.
+        self._quarantine_cache_key: tuple[int, int] | None = None
+        self._quarantine_cache: set[str] = set()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -252,17 +257,28 @@ class ArchiveTailer:
 
             offset = existing.offset_bytes if existing else 0
             was_truncated = False
-            if existing is not None and _is_truncated(path, offset):
+            restart = self._partition_restart(path, offset) if existing is not None else None
+            if restart is not None:
                 was_truncated = True
+                quarantined = restart == "quarantine"
+                if quarantined:
+                    detail = (
+                        f"{path} was quarantined after a digest/data mismatch; the "
+                        f"certified range up to byte {offset} is recorded as a gap "
+                        "and never consumed - the tail restarts at byte 0 on the "
+                        "fresh partition that replaced it"
+                    )
+                else:
+                    detail = (
+                        f"{path} shrank from offset {offset} to {path.stat().st_size} "
+                        "bytes; the tail restarts at byte 0 and the lost range is "
+                        "recorded rather than assumed continuous"
+                    )
                 quality.append(
                     QualityEvent(
-                        kind="archive_file_truncated",
+                        kind="archive_partition_quarantined" if quarantined else "archive_file_truncated",
                         severity="error",
-                        detail=(
-                            f"{path} shrank from offset {offset} to {path.stat().st_size} "
-                            "bytes; the tail restarts at byte 0 and the lost range is "
-                            "recorded rather than assumed continuous"
-                        ),
+                        detail=detail,
                         source=source,
                         path=key,
                         offset_bytes=offset,
@@ -412,14 +428,27 @@ class ArchiveTailer:
         with path.open("rb") as handle:
             # Snapshot the file size before reading the boundary: legacy files
             # receive their first sidecar before the collector appends new bytes.
+            # Without a sidecar this snapshot is also the read boundary: growing
+            # it mid-poll would let an uncertified tail slip in, so the snapshot
+            # is kept even if the file grows before we read.
             limit = os.fstat(handle.fileno()).st_size
             sidecar = read_archive_sidecar(path)
             if sidecar is not None:
                 if sidecar["bytes"] > limit:
-                    raise _ChecksumDisagreement(
-                        "archive_trail_ahead_of_file",
-                        f"checksum trail covers {sidecar['bytes']} bytes but the file has {limit}",
-                    )
+                    # A flush can land between the fstat snapshot above and
+                    # reading the sidecar: the collector writes new bytes and
+                    # then publishes a sidecar that covers them. Re-check the
+                    # open file's live size before declaring the trail ahead of
+                    # the file - a flush that just landed is not corruption.
+                    # Only if the file still falls short of what the trail
+                    # claims do we park with the error.
+                    current = os.fstat(handle.fileno()).st_size
+                    if sidecar["bytes"] > current:
+                        raise _ChecksumDisagreement(
+                            "archive_trail_ahead_of_file",
+                            f"checksum trail covers {sidecar['bytes']} bytes but the file has {current}",
+                        )
+                    limit = current
                 if offset > sidecar["bytes"]:
                     raise _ChecksumDisagreement(
                         "archive_trail_behind_checkpoint",
@@ -441,6 +470,69 @@ class ArchiveTailer:
             # Tail of an in-flight line: leave it for the next poll.
             return b"", offset, False
         return data[: cut + 1], offset + cut + 1, False
+
+    def _partition_restart(self, path: Path, offset: int) -> str | None:
+        """Whether the committed offset no longer fits this file, and why.
+
+        Returns ``"quarantine"`` when the collector froze this partition after
+        a digest/data mismatch and began a fresh file at the same path, or
+        ``"truncated"`` when the file merely shrank. Both require the tail to
+        restart at byte 0 without reading the uncertain range.
+
+        A trail that lags the checkpoint while the file is otherwise intact
+        (a rolled-back sidecar) is deliberately *not* a restart: that parks
+        with ``archive_trail_behind_checkpoint`` instead of silently rewinding.
+        """
+        if offset <= 0:
+            return None
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        quarantined = str(path) in self._quarantined_paths()
+        if size < offset:
+            return "quarantine" if quarantined else "truncated"
+        if quarantined:
+            try:
+                sidecar = read_archive_sidecar(path)
+            except ValueError:
+                return None
+            if sidecar is not None and sidecar["bytes"] < offset:
+                return "quarantine"
+        return None
+
+    def _quarantined_paths(self) -> set[str]:
+        """Live archive paths the collector has quarantined, from ``recovery.jsonl``.
+
+        Cached on the log's ``(size, mtime_ns)``: the collector appends one
+        line per quarantine, so an unchanged log cannot hide a new one.
+        """
+        log_path = self.raw_dir / "recovery.jsonl"
+        try:
+            stat = log_path.stat()
+        except OSError:
+            return set()
+        cache_key = (stat.st_size, stat.st_mtime_ns)
+        if self._quarantine_cache_key == cache_key:
+            return self._quarantine_cache
+        paths: set[str] = set()
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    if entry.get("event") == "partition_quarantined" and entry.get("path"):
+                        paths.add(str(entry["path"]))
+        except OSError:
+            return set()
+        self._quarantine_cache_key = cache_key
+        self._quarantine_cache = paths
+        return paths
 
     def _consume(
         self,
@@ -632,13 +724,6 @@ class ArchiveTailer:
             )
         if previous is None or day > previous:
             pending[source] = day
-
-
-def _is_truncated(path: Path, offset: int) -> bool:
-    try:
-        return path.stat().st_size < offset
-    except OSError:
-        return True
 
 
 def _identity(path: Path) -> str:

@@ -85,6 +85,18 @@ EMPTY_CHAIN = hashlib.sha256(b"").hexdigest()
 _TAIL_READ_BYTES = 65536
 
 
+class ChecksumMismatch(ValueError):
+    """The published sidecar's chain does not match the file's recomputed digest.
+
+    Raised by :func:`_scan_file_trail` when a partition's certified prefix
+    cannot be reproduced from its bytes - i.e. the data on disk disagrees with
+    the digest that certified it. This is corruption or tampering, not a
+    recoverable lag: the collector quarantines the mismatched partition (data +
+    sidecar moved aside as evidence) and continues into a fresh file with a new
+    digest, rather than rewriting the digest to match bad data.
+    """
+
+
 def _read_full(fd: int, count: int) -> bytes:
     """Read exactly ``count`` bytes from the descriptor's current position.
 
@@ -170,6 +182,11 @@ class RawArchive:
         # Partitions whose files have had their archive_seq baseline read.
         self._seen_partitions: set[tuple[str, date]] = set()
         self._pending_sidecars: set[tuple[str, date]] = set()
+        # Digest/data mismatches that were quarantined rather than fatal-exiting
+        # the collector. Surfaced on the heartbeat so an operator is alerted
+        # even though collection continues into a fresh file.
+        self.quarantined_partitions: int = 0
+        self.last_quarantine: dict[str, Any] | None = None
 
     # -- writing -----------------------------------------------------------
 
@@ -209,6 +226,13 @@ class RawArchive:
                 _write_sidecar(path, {"chain": chain, "bytes": covered, "lines": lines})
                 self._log_recovery("checksum_rebuilt", path=str(path), sidecar_bytes=state["bytes"],
                                    trail_bytes=covered, reason="restart after interrupted flush")
+            except ChecksumMismatch as exc:
+                # The file's bytes no longer reproduce the certified prefix:
+                # corruption, not lag. Freeze the whole partition + its sidecar
+                # as evidence and keep going; the next append starts a fresh
+                # file with a new digest at this path.
+                self._quarantine_partition_locked(path, reason=str(exc), sidecar=state)
+                continue
             except (OSError, ValueError) as exc:
                 self._log_recovery("partition_recovery_failed", path=str(path), error=str(exc))
                 raise
@@ -323,6 +347,83 @@ class RawArchive:
         )
         return keep_bytes
 
+    def _quarantine_partition_locked(
+        self, path: Path, *, reason: str, sidecar: dict[str, Any] | None
+    ) -> None:
+        """Freeze a digest-mismatched partition as evidence and start fresh.
+
+        Called when :func:`_scan_file_trail` reports that the file's bytes no
+        longer reproduce the sidecar's certified prefix - corruption or
+        tampering, not a recoverable lag. The whole partition (data file + its
+        ``.sha256`` sidecar) is moved into ``quarantine/<source>/`` *unchanged*
+        so the evidence is preserved; the digest is **never** rewritten to
+        match the bad data. A fresh, empty partition with a new digest takes
+        its place on the next append so live collection is not lost.
+
+        The in-memory chain state for this key is reset; the caller republishes
+        a zero-byte sidecar for the fresh file. If moving the evidence aside
+        itself fails (e.g. ENOSPC) this re-raises after logging, so the caller
+        falls back to a FATAL exit rather than losing or silently "fixing"
+        data.
+        """
+        source = path.parent.name
+        file_bytes = path.stat().st_size if path.exists() else 0
+        quarantined_sha256 = (
+            hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+        )
+        sidecar_path = _sidecar_path(path)
+        sidecar_existed = sidecar_path.exists()
+        stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        quarantine_dir = self.root / "quarantine" / source
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        data_dest = quarantine_dir / f"{path.name}.{stamp}.quarantine"
+        sidecar_dest = quarantine_dir / f"{path.name}.sha256.{stamp}.quarantine"
+        try:
+            if path.exists():
+                os.replace(path, data_dest)
+            if sidecar_existed:
+                os.replace(sidecar_path, sidecar_dest)
+            _fsync_dir(quarantine_dir)
+        except OSError:
+            self._log_recovery(
+                "partition_quarantine_failed",
+                path=str(path),
+                reason=reason,
+                detail="could not move mismatched partition into quarantine",
+            )
+            log.error("archive quarantine failed for %s: %s", path, reason, exc_info=True)
+            raise
+        self.quarantined_partitions += 1
+        self.last_quarantine = {
+            "path": str(path),
+            "reason": reason,
+            "file_bytes": file_bytes,
+            "sidecar_bytes": None if sidecar is None else sidecar.get("bytes"),
+            "quarantined_sha256": quarantined_sha256,
+            "quarantine_path": str(data_dest),
+        }
+        self._log_recovery(
+            "partition_quarantined",
+            path=str(path),
+            reason=reason,
+            file_bytes=file_bytes,
+            sidecar_bytes=None if sidecar is None else sidecar.get("bytes"),
+            quarantined_sha256=quarantined_sha256,
+            quarantine_path=str(data_dest),
+            sidecar_quarantine_path=str(sidecar_dest) if sidecar_existed else None,
+        )
+        log.error(
+            "archive partition quarantined (digest/data mismatch): path=%s reason=%s evidence=%s",
+            path,
+            reason,
+            data_dest,
+        )
+        # Reset cached state: the file is gone; the caller republishes a fresh
+        # zero sidecar and the next append builds a new chain from scratch.
+        key = (source, date.fromisoformat(path.stem))
+        self._chains.pop(key, None)
+        self._pending_sidecars.discard(key)
+
     def _continue_seq_from_file_locked(self, key: tuple[str, date]) -> None:
         """Pick up the sequence baseline a previous run left in this partition."""
         path = self._partition_path(key)
@@ -403,16 +504,22 @@ class RawArchive:
         if sidecar is not None and size == sidecar["bytes"]:
             state = dict(sidecar)
         elif size:
-            chain, covered_bytes, lines = _scan_file_trail(path, sidecar)
-            state = {"chain": chain, "bytes": covered_bytes, "lines": lines}
-            self._log_recovery(
-                "checksum_rebuilt",
-                path=str(path),
-                file_bytes=size,
-                trail_bytes=covered_bytes,
-                sidecar_bytes=None if sidecar is None else sidecar.get("bytes"),
-                reason="sidecar missing or does not match file size",
-            )
+            try:
+                chain, covered_bytes, lines = _scan_file_trail(path, sidecar)
+            except ChecksumMismatch as exc:
+                self._quarantine_partition_locked(path, reason=str(exc), sidecar=sidecar)
+                state = {"chain": EMPTY_CHAIN, "bytes": 0, "lines": 0}
+                sidecar = None  # publish a fresh zero sidecar for the new file below
+            else:
+                state = {"chain": chain, "bytes": covered_bytes, "lines": lines}
+                self._log_recovery(
+                    "checksum_rebuilt",
+                    path=str(path),
+                    file_bytes=size,
+                    trail_bytes=covered_bytes,
+                    sidecar_bytes=None if sidecar is None else sidecar.get("bytes"),
+                    reason="sidecar missing or does not match file size",
+                )
         else:
             state = {"chain": EMPTY_CHAIN, "bytes": 0, "lines": 0}
         if sidecar is None:
@@ -449,16 +556,24 @@ class RawArchive:
             directory = self.root / key[0]
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / f"{key[1].isoformat()}.jsonl"
-            # Load the checksum state *before* this batch's bytes exist: the
-            # rebuild path hashes what is on disk, and after the write that
-            # would already include this batch - folding the batch on top
-            # would count it twice.
             payload = ("\n".join(lines) + "\n").encode("utf-8")
             # O_APPEND protects the line boundary even after a short write.
             # The collector lock guarantees this process is the sole writer.
             fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644)
             try:
+                # Load the checksum state *before* this batch's bytes exist: the
+                # rebuild path hashes what is on disk, and after the write that
+                # would already include this batch - folding the batch on top
+                # would count it twice.
+                quarantines = self.quarantined_partitions
                 chain_state = self._chain_state_locked(key, path)
+                if self.quarantined_partitions != quarantines:
+                    # A digest/data mismatch moved this partition - the very
+                    # inode ``fd`` points at - into quarantine. Writing through
+                    # that descriptor would corrupt the frozen evidence, so drop
+                    # it and reopen the fresh file that now owns this path.
+                    os.close(fd)
+                    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644)
                 original_size = os.fstat(fd).st_size
                 if original_size:
                     # lseek + read rather than `os.pread`: pread is
@@ -653,7 +768,9 @@ def _scan_file_trail(path: Path, prior: dict[str, Any] | None) -> tuple[str, int
         if prior is not None and covered == prior["bytes"]:
             matched = chain == prior["chain"] and lines == prior["lines"]
     if not matched:
-        raise ValueError(f"{path}: published checksum prefix does not match the file; cannot extend it")
+        raise ChecksumMismatch(
+            f"{path}: published checksum prefix does not match the file; cannot extend it"
+        )
     return chain, covered, lines
 
 
