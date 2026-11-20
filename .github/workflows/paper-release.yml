@@ -125,7 +125,13 @@ jobs:
           set -e
           echo "second instance exit code: $code"
           test "$code" -eq 4
-          docker stop -t 60 paper-rel || test "$(docker inspect -f '{{.State.ExitCode}}' paper-rel)" = "137"
+          # serve handles SIGTERM: a clean stop exits 0 and releases its lease.
+          # 137 would mean the grace period ran out and Docker had to SIGKILL.
+          docker stop -t 60 paper-rel
+          code="$(docker inspect -f '{{.State.ExitCode}}' paper-rel)"
+          echo "paper exit code after docker stop: $code"
+          test "$code" = "0"
+          test ! -e "$RUNNER_TEMP/paper-data/paper/.paper.lock"
           test -f "$RUNNER_TEMP/paper-data/paper/paper.duckdb"
 
       - name: Collect logs on failure

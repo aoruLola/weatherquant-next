@@ -90,6 +90,11 @@ docker compose --env-file .env -f compose.paper.unraid.yaml stop paper
 docker compose --env-file .env -f compose.paper.unraid.yaml start paper
 ```
 
+`stop` sends SIGTERM; `serve` handles it like Ctrl-C - the current tick's
+transaction rolls back, the run is closed and the lease released - and the
+container exits 0 within seconds. An exit code of 137 means the 60-second
+grace period ran out and Docker had to kill it; check the logs.
+
 Do not run these commands against `compose.unraid.yaml` or
 `compose.shadow.unraid.yaml`. A second Paper process against the same state is
 refused with exit code 4; that is single-instance protection, not a crash.
