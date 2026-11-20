@@ -361,51 +361,80 @@ def _gate(
     candidates: tuple[float, ...],
     join: str = "",
     reject_qualifier: str = "",
+    reasons: tuple[str, ...] = (),
+    has_reasons: bool = False,
+    positive_only: bool = False,
 ) -> dict[str, Any]:
-    """Distribution + near-miss + informational counts for one gate."""
+    """Distribution + near-miss + informational counts for one gate.
+
+    Every reject count is restricted to decisions that actually *failed this
+    gate* (carry one of its ``reasons``). ``would_pass_at`` is stricter still:
+    the gate's reasons must be the decision's only recorded reasons, so the
+    count is "rejects this threshold alone was blocking". Counting every reject
+    whose value clears the candidate - including ones refused for edge or fees
+    - would make loosening any gate look like it unlocks most rejects.
+    ``would_fail_at`` is the other direction: accepts a tighter value would
+    have refused. A blocking gate stops later gates from being evaluated, so
+    ``would_pass_at`` is an upper bound.
+    """
     distribution = _percentiles(con, table, column, flt, join=join)
     result: dict[str, Any] = {
         "threshold": threshold,
         "threshold_name": threshold_name,
         "direction": "lower_is_better" if lower_is_better else "higher_is_better",
+        "reasons": list(reasons),
         **distribution,
+        "gate_rejects": None,
         "rejects_within_10pct": None,
         "rejects_within_25pct": None,
         "would_pass_at": None,
+        "would_fail_at": None,
     }
     if threshold is None:
         result["note"] = NA_THRESHOLDS
         return result
+    if not has_reasons or not reasons:
+        result["note"] = NA_TABLE + " (rejection_reasons needed to attribute rejects to this gate)"
+        return result
 
+    decision_ref = f"{reject_qualifier}decision_id" if reject_qualifier else f"{table}.decision_id"
+    placeholders = ", ".join(f"'{reason}'" for reason in reasons)
+    failed_here = (
+        f"EXISTS (SELECT 1 FROM rejection_reasons rr WHERE rr.decision_id = {decision_ref} "
+        f"AND rr.reason IN ({placeholders}))"
+    )
+    only_here = (
+        f"NOT EXISTS (SELECT 1 FROM rejection_reasons rr WHERE rr.decision_id = {decision_ref} "
+        f"AND rr.reason NOT IN ({placeholders}))"
+    )
     reject = f"{reject_qualifier}state = 'REJECT'"
+    accept = f"{reject_qualifier}state = 'ACCEPT'"
     if lower_is_better:
-        near_10 = (threshold, threshold * 1.10)
-        near_25 = (threshold, threshold * 1.25)
+        near_10 = f"{column} > ? AND {column} <= ?", (threshold, threshold * 1.10)
+        near_25 = f"{column} > ? AND {column} <= ?", (threshold, threshold * 1.25)
         pass_clause = f"{column} <= ?"
+        fail_clause = f"{column} > ?"
     else:
-        near_10 = (threshold * 0.90, threshold)
-        near_25 = (threshold * 0.75, threshold)
-        pass_clause = f"{column} >= ?"
+        near_10 = f"{column} >= ? AND {column} < ?", (threshold * 0.90, threshold)
+        near_25 = f"{column} >= ? AND {column} < ?", (threshold * 0.75, threshold)
+        pass_clause = f"{column} >= ?" + (f" AND {column} > 0" if positive_only else "")
+        fail_clause = f"({column} < ?" + (f" OR {column} <= 0)" if positive_only else ")")
 
-    for key, (low, high) in (("rejects_within_10pct", near_10), ("rejects_within_25pct", near_25)):
-        result[key] = int(
-            _scalar(
-                con,
-                f"SELECT COUNT(*) FROM {table}{join}{flt.sql(f'{column} BETWEEN ? AND ?', reject)}",
-                flt.bind(low, high),
-            )
-            or 0
-        )
+    def count(*clauses: str, params: tuple = ()) -> int:
+        return int(_scalar(con, f"SELECT COUNT(*) FROM {table}{join}{flt.sql(*clauses)}", flt.bind(*params)) or 0)
+
+    result["gate_rejects"] = count(reject, failed_here)
+    for key, (clause, params) in (("rejects_within_10pct", near_10), ("rejects_within_25pct", near_25)):
+        result[key] = count(reject, failed_here, clause, params=params)
 
     result["would_pass_at"] = {}
+    result["would_fail_at"] = {}
     for candidate in candidates:
-        result["would_pass_at"][_number_key(candidate)] = int(
-            _scalar(
-                con,
-                f"SELECT COUNT(*) FROM {table}{join}{flt.sql(f'{column} IS NOT NULL AND {pass_clause}', reject)}",
-                flt.bind(candidate),
-            )
-            or 0
+        result["would_pass_at"][_number_key(candidate)] = count(
+            reject, failed_here, only_here, f"{column} IS NOT NULL", pass_clause, params=(candidate,)
+        )
+        result["would_fail_at"][_number_key(candidate)] = count(
+            accept, f"{column} IS NOT NULL", fail_clause, params=(candidate,)
         )
     return result
 
@@ -418,6 +447,8 @@ def _gates(con, schema: Schema, where: Filter, thresholds: Thresholds | None, jo
         "thresholds_source": None if thresholds is None else str(DEFAULT_THRESHOLDS_PATH),
     }
 
+    has_reasons = schema.has_columns("rejection_reasons", "decision_id", "reason")
+
     def simple(
         name: str,
         column: str,
@@ -425,6 +456,8 @@ def _gates(con, schema: Schema, where: Filter, thresholds: Thresholds | None, jo
         threshold_name: str,
         lower: bool,
         candidates: tuple[float, ...],
+        reasons: tuple[str, ...],
+        positive_only: bool = False,
     ) -> None:
         if not schema.has_columns("shadow_decisions", column):
             gates[name] = NA_COLUMN
@@ -438,6 +471,9 @@ def _gates(con, schema: Schema, where: Filter, thresholds: Thresholds | None, jo
             threshold_name=threshold_name,
             lower_is_better=lower,
             candidates=candidates,
+            reasons=reasons,
+            has_reasons=has_reasons,
+            positive_only=positive_only,
         )
 
     simple(
@@ -447,6 +483,7 @@ def _gates(con, schema: Schema, where: Filter, thresholds: Thresholds | None, jo
         "max_snapshot_age_ms",
         True,
         CANDIDATE_AGES_MS,
+        ("STALE_ORDERBOOK",),
     )
     simple(
         "depth",
@@ -455,6 +492,10 @@ def _gates(con, schema: Schema, where: Filter, thresholds: Thresholds | None, jo
         "min_depth_usd",
         False,
         CANDIDATE_DEPTHS_USD,
+        # Shared with the venue-minimum size floor; with v3's depth floor at 0
+        # every INSUFFICIENT_LIQUIDITY comes from size, so would_pass is 0 and
+        # would_fail_at is the useful figure ("what a dollar floor would cost").
+        ("INSUFFICIENT_LIQUIDITY",),
     )
     simple(
         "net_edge",
@@ -463,6 +504,8 @@ def _gates(con, schema: Schema, where: Filter, thresholds: Thresholds | None, jo
         "min_net_edge_usd_per_share",
         False,
         CANDIDATE_EDGES,
+        ("NEGATIVE_NET_EDGE", "EDGE_BELOW_THRESHOLD"),
+        positive_only=True,
     )
 
     # Clock skew lives on the snapshot, not the decision: latency_ms is
@@ -485,6 +528,8 @@ def _gates(con, schema: Schema, where: Filter, thresholds: Thresholds | None, jo
             candidates=CANDIDATE_LATENCIES_MS,
             join=" JOIN shadow_decisions d ON d.snapshot_id = s.snapshot_id",
             reject_qualifier="d.",
+            reasons=("TIME_MISMATCH",),
+            has_reasons=has_reasons,
         )
     else:
         gates["clock_skew"] = NA_COLUMN if schema.has_table("market_snapshots") else NA_TABLE
@@ -566,6 +611,11 @@ def _paper_stage(con, schema: Schema, since, until) -> dict[str, Any]:
         "signal_ids": set(),
         "accepted_ids": set(),
         "refused_ids": set(),
+        # Refused by the fill engine (evidence, pricing, risk), as opposed to
+        # at consumption. These were accepted signals: a fill refusal flips the
+        # outcome from ACCEPTED to REFUSED, and leaving them out of the
+        # signal->fill denominator would report every failed fill as success.
+        "fill_refused_ids": set(),
         "filled_ids": set(),
         "settled_ids": set(),
     }
@@ -594,6 +644,7 @@ def _paper_stage(con, schema: Schema, since, until) -> dict[str, Any]:
             stage["refusal_reasons"][reason] = stage["refusal_reasons"].get(reason, 0) + 1
             if reason not in CONSUMPTION_REFUSALS:
                 stage["no_fill_reasons"][reason] = stage["no_fill_reasons"].get(reason, 0) + 1
+                stage["fill_refused_ids"].add(decision_id)
 
     if not schema.has_table("paper_fills") or not schema.has_columns("paper_fills", "decision_id", "market_id"):
         stage["filled"] = NA_TABLE if not schema.has_table("paper_fills") else NA_COLUMN
@@ -658,8 +709,12 @@ def _funnel(shadow_accepts: set[str], exported: set[str] | None, paper: dict[str
     signal_ids = shadow_accepts & paper["signal_ids"]
     filled_ids = shadow_accepts & paper["filled_ids"]
     funnel["paper_signals"] = len(signal_ids)
-    funnel["paper_accepted"] = len(signal_ids & paper["accepted_ids"])
+    # Accepted at consumption = still ACCEPTED/FILLED, or later refused by the
+    # fill engine (which overwrites the outcome). Only consumption refusals
+    # were never trades.
+    funnel["paper_accepted"] = len(signal_ids & (paper["accepted_ids"] | paper["fill_refused_ids"]))
     funnel["paper_refused"] = len(signal_ids & paper["refused_ids"])
+    funnel["paper_fill_refused"] = len(signal_ids & paper["fill_refused_ids"])
     funnel["paper_filled"] = len(filled_ids)
     funnel["settled"] = len(filled_ids & paper["settled_ids"])
     funnel["paper_refusal_reasons"] = paper["refusal_reasons"]
@@ -931,7 +986,7 @@ def format_markdown(report: dict[str, Any]) -> str:
         for name in ("book_age", "depth", "net_edge", "clock_skew", "fee", "size"):
             gate = gates.get(name)
             if isinstance(gate, str):
-                rows.append([name, gate, "-", "-", "-", "-", "-"])
+                rows.append([name, gate, "-", "-", "-", "-", "-", "-"])
                 continue
             if name == "fee":
                 rows.append(
@@ -942,6 +997,7 @@ def format_markdown(report: dict[str, Any]) -> str:
                         gate.get("p90"),
                         gate.get("p99"),
                         f"known {gate['fee_known']} / {gate['decisions']}",
+                        "-",
                         "-",
                     ]
                 )
@@ -956,6 +1012,7 @@ def format_markdown(report: dict[str, Any]) -> str:
                         "-",
                         "-",
                         f"below minimum {gate['below_min_order_rejects']}",
+                        "-",
                     ]
                 )
                 continue
@@ -966,12 +1023,23 @@ def format_markdown(report: dict[str, Any]) -> str:
                     gate.get("p50"),
                     gate.get("p90"),
                     gate.get("p99"),
-                    f"10%: {gate.get('rejects_within_10pct')}, 25%: {gate.get('rejects_within_25pct')}",
+                    f"failed: {gate.get('gate_rejects')}; 10%: {gate.get('rejects_within_10pct')}, "
+                    f"25%: {gate.get('rejects_within_25pct')}",
                     ", ".join(f"{key}->{value}" for key, value in (gate.get("would_pass_at") or {}).items()) or "-",
+                    ", ".join(f"{key}->{value}" for key, value in (gate.get("would_fail_at") or {}).items()) or "-",
                 ]
             )
         lines += _md_table(
-            ["gate", "threshold", "p50", "p90", "p99", "rejects near threshold", "would pass at (rejects)"],
+            [
+                "gate",
+                "threshold",
+                "p50",
+                "p90",
+                "p99",
+                "rejects failing this gate",
+                "would pass at (rejects blocked only here)",
+                "would fail at (accepts)",
+            ],
             rows,
         )
         lines += ["", f"Threshold set: `{gates.get('thresholds_version')}`. Figures are informational only.", ""]
@@ -985,8 +1053,9 @@ def format_markdown(report: dict[str, Any]) -> str:
             ["Shadow LIVE ACCEPT", funnel["shadow_live_accept"], "-"],
             ["exported", funnel["exported"], conversion.get("accept_to_export")],
             ["paper signals", funnel["paper_signals"], conversion.get("export_to_signal")],
-            ["paper accepted", funnel["paper_accepted"], "-"],
-            ["paper refused", funnel["paper_refused"], "-"],
+            ["paper accepted (at consumption)", funnel["paper_accepted"], "-"],
+            ["paper refused (all)", funnel["paper_refused"], "-"],
+            ["  of which at fill", funnel.get("paper_fill_refused", "-"), "-"],
             ["paper filled", funnel["paper_filled"], conversion.get("signal_to_fill")],
             ["settled", funnel["settled"], conversion.get("fill_to_settled")],
         ],

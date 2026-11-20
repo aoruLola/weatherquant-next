@@ -524,25 +524,36 @@ def test_gate_margins(snapshots):
     assert gates["book_age"]["p50"] == 30_000
     assert gates["book_age"]["rejects_within_10pct"] == 1  # 95s vs the 90s gateway
     assert gates["book_age"]["rejects_within_25pct"] == 1
-    assert gates["book_age"]["would_pass_at"]["60000"] == 2
+    # D2 (95s) is also INSUFFICIENT_LIQUIDITY, so loosening book age alone would
+    # not have accepted it; D3/D4 never failed book age at all.
+    assert gates["book_age"]["gate_rejects"] == 1
+    assert gates["book_age"]["would_pass_at"]["60000"] == 0
+    assert gates["book_age"]["would_pass_at"]["180000"] == 0
 
     # v3 turned the dollar floor off (0); the venue minimum is the real floor.
     assert gates["depth"]["threshold"] == thresholds.min_depth_usd
     assert gates["depth"]["rejects_within_10pct"] == 0
     assert gates["depth"]["rejects_within_25pct"] == 0
-    assert gates["depth"]["would_pass_at"]["10"] == 3
-    assert gates["depth"]["would_pass_at"]["100"] == 1
+    # Both depth rejects (D2, D3) carry a second reason.
+    assert gates["depth"]["gate_rejects"] == 2
+    assert gates["depth"]["would_pass_at"]["10"] == 0
+    assert gates["depth"]["would_pass_at"]["100"] == 0
+    assert gates["depth"]["would_fail_at"]["10"] == 0
+    assert gates["depth"]["would_fail_at"]["100"] == 1  # D6 accepted at 60 USD
 
     assert gates["net_edge"]["threshold"] == thresholds.min_net_edge_usd_per_share
     assert gates["net_edge"]["rejects_within_10pct"] == 0
-    assert gates["net_edge"]["would_pass_at"]["0"] == 1
+    assert gates["net_edge"]["gate_rejects"] == 1  # D4
+    assert gates["net_edge"]["would_pass_at"]["0"] == 0  # D4's edge is negative
 
     # v3 measures negative skew (-latency); 2.1s against the 2s tolerance.
     assert gates["clock_skew"]["threshold"] == thresholds.max_clock_skew_ms
-    assert gates["clock_skew"]["rejects_within_10pct"] == 1
-    assert gates["clock_skew"]["rejects_within_25pct"] == 1
-    assert gates["clock_skew"]["would_pass_at"]["2500"] == 3
-    assert gates["clock_skew"]["would_pass_at"]["1000"] == 2
+    # D4 is 2.1s skewed but was rejected for edge, not TIME_MISMATCH.
+    assert gates["clock_skew"]["gate_rejects"] == 0
+    assert gates["clock_skew"]["rejects_within_10pct"] == 0
+    assert gates["clock_skew"]["rejects_within_25pct"] == 0
+    assert gates["clock_skew"]["would_pass_at"]["2500"] == 0
+    assert gates["clock_skew"]["would_pass_at"]["1000"] == 0
 
     assert gates["fee"]["decisions"] == 5
     assert gates["fee"]["fee_known"] == 4
@@ -551,6 +562,76 @@ def test_gate_margins(snapshots):
     # v3 removes require_complete_fill: a sized-down partial is not a refusal.
     assert gates["size"]["threshold"] == thresholds.min_order_size_shares
     assert gates["size"]["below_min_order_rejects"] == 0
+
+
+def _set_reasons(shadow: Path, reasons: dict[str, list[str]]) -> None:
+    con = duckdb.connect(str(shadow))
+    try:
+        for decision_id, codes in reasons.items():
+            con.execute("DELETE FROM rejection_reasons WHERE decision_id = ?", [decision_id])
+            for ordinal, code in enumerate(codes, start=1):
+                con.execute(
+                    "INSERT INTO rejection_reasons (decision_id, ordinal, reason, is_primary, detail) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [decision_id, ordinal, code, ordinal == 1, "test"],
+                )
+    finally:
+        con.close()
+
+
+def test_would_pass_counts_only_rejects_blocked_by_that_gate_alone(snapshots):
+    shadow, paper = snapshots
+    # Each LIVE reject now fails exactly one gate.
+    _set_reasons(shadow, {D2: ["STALE_ORDERBOOK"], D3: ["INSUFFICIENT_LIQUIDITY"], D4: ["TIME_MISMATCH"]})
+    gates = report_mod.build_report(shadow_db=shadow, paper_db=paper)["gates"]
+
+    assert gates["book_age"]["gate_rejects"] == 1
+    assert gates["book_age"]["would_pass_at"]["60000"] == 0  # 95s still too old
+    assert gates["book_age"]["would_pass_at"]["120000"] == 1  # D2 only, not D3/D4
+    assert gates["depth"]["gate_rejects"] == 1
+    assert gates["depth"]["would_pass_at"]["10"] == 1  # D3 (20 USD) only
+    assert gates["depth"]["would_pass_at"]["25"] == 0
+    assert gates["clock_skew"]["gate_rejects"] == 1
+    assert gates["clock_skew"]["rejects_within_10pct"] == 1  # 2.1s vs 2s
+    assert gates["clock_skew"]["would_pass_at"]["2500"] == 1  # D4 only
+    assert gates["clock_skew"]["would_pass_at"]["1000"] == 0
+    assert gates["net_edge"]["gate_rejects"] == 0
+    assert gates["net_edge"]["would_pass_at"]["0"] == 0
+
+    # Below the edge threshold but positive: a zero floor would have taken it.
+    _set_reasons(shadow, {D4: ["EDGE_BELOW_THRESHOLD"]})
+    con = duckdb.connect(str(shadow))
+    try:
+        con.execute("UPDATE shadow_decisions SET net_edge = 0.005 WHERE decision_id = ?", [D4])
+    finally:
+        con.close()
+    gates = report_mod.build_report(shadow_db=shadow, paper_db=paper)["gates"]
+    assert gates["net_edge"]["gate_rejects"] == 1
+    assert gates["net_edge"]["would_pass_at"]["0"] == 1  # not D3's 0.01, which failed liquidity
+    assert gates["net_edge"]["would_pass_at"]["0.01"] == 0
+    assert gates["clock_skew"]["would_pass_at"]["2500"] == 0
+
+
+def test_fill_refusals_stay_in_the_signal_to_fill_denominator(snapshots):
+    shadow, paper = snapshots
+    # The fill engine refused D6: the outcome flips from ACCEPTED to REFUSED.
+    con = duckdb.connect(str(paper))
+    try:
+        con.execute(
+            "UPDATE paper_signals SET outcome = 'REFUSED', refusal_reason = 'INSUFFICIENT_CAPACITY' "
+            "WHERE decision_id = ?",
+            [D6],
+        )
+    finally:
+        con.close()
+    funnel = report_mod.build_report(shadow_db=shadow, paper_db=paper)["funnel"]
+
+    assert funnel["paper_signals"] == 2
+    assert funnel["paper_accepted"] == 2
+    assert funnel["paper_refused"] == 1
+    assert funnel["paper_fill_refused"] == 1
+    assert funnel["paper_filled"] == 1
+    assert funnel["conversion_pct"]["signal_to_fill"] == 50.0  # not 1/1 = 100%
 
 
 def test_funnel_counts_and_reasons(snapshots):
@@ -562,6 +643,7 @@ def test_funnel_counts_and_reasons(snapshots):
     assert funnel["paper_signals"] == 2
     assert funnel["paper_accepted"] == 2
     assert funnel["paper_refused"] == 0
+    assert funnel["paper_fill_refused"] == 0
     assert funnel["paper_filled"] == 1
     assert funnel["settled"] == 1
     assert funnel["conversion_pct"] == {

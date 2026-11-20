@@ -88,12 +88,26 @@ state」表，保证总数能对上、没有被藏起来的桶。
 不修改。字段说明：
 
 - `p50 / p90 / p99`：本窗口内**全部决策**（不只拒绝）的观测分布。
-- `rejects_within_10pct / 25pct`：**拒绝侧**贴近阈值的数量。对「越小越好」
-  的闸门（book age、延迟）取阈值的 `100%~110%` / `100%~125%`；对「越大越好」
-  的闸门（深度、净边际）取阈值的 `90%~100%` / `75%~100%`。它回答「这些拒绝
+拒绝归因靠 `rejection_reasons`：一条 REJECT 只有带着该闸门的原因码才算
+「被这个闸门拒」——`book_age` ↔ `STALE_ORDERBOOK`，`depth` ↔
+`INSUFFICIENT_LIQUIDITY`，`net_edge` ↔ `NEGATIVE_NET_EDGE` /
+`EDGE_BELOW_THRESHOLD`，`clock_skew` ↔ `TIME_MISMATCH`。因别的原因被拒、
+只是观测值恰好落在附近的决策，不计入下面的拒绝侧数字（`rejection_reasons`
+表缺失时这些字段为 `n/a`）。
+
+- `gate_rejects`：带该闸门原因码的拒绝数。
+- `rejects_within_10pct / 25pct`：上述拒绝中**刚好越线**的数量。对「越小越好」
+  的闸门（book age、延迟）取 `(100%, 110%]` / `(100%, 125%]`；对「越大越好」
+  的闸门（深度、净边际）取 `[90%, 100%)` / `[75%, 100%)`。它回答「这些拒绝
   是刀锋之差，还是差得很远」。
-- `would_pass_at`：若阈值取该候选值时，会有多少**当前被拒**的决策通过。
-  **纯信息项**，用于回答「阈值是否过紧」，不改变任何配置。
+- `would_pass_at`：若阈值取该候选值，会有多少**只因这个闸门**被拒的决策
+  通过（该闸门是它唯一的拒绝原因，观测值又满足候选值）。同时还有别的原因的
+  拒绝，单放宽这一个闸门也不会通过，所以不计入。仍是上界：其它闸门没记录
+  原因码时无法排除。`net_edge` 只计正 edge。
+- `would_fail_at`：若阈值收紧到该候选值，会有多少**当前 ACCEPT** 被挡下。
+  与 `would_pass_at` 一起看，才能回答「阈值是太紧还是太松」。
+
+以上都是**纯信息项**，不改变任何配置。
 
 ### 3.4 Funnel
 
@@ -106,13 +120,15 @@ state」表，保证总数能对上、没有被藏起来的桶。
 | `shadow_live_accept` | `shadow_decisions.state = 'ACCEPT'` 且 `mode` 匹配 |
 | `exported` | 上述决策中 `export_seq IS NOT NULL` 的部分（列缺失时 `n/a`） |
 | `paper_signals` | 上述决策中出现在 `paper_signals` 的部分 |
-| `paper_accepted` | 其中 `outcome ∈ ACCEPTED / FILLED / PENDING` |
-| `paper_refused` | 其中 `outcome = REFUSED` |
+| `paper_accepted` | 其中通过消费检查的部分：`outcome ∈ ACCEPTED / FILLED / PENDING`，加上之后被成交侧拒绝的（成交侧拒绝会把 outcome 改写为 `REFUSED`） |
+| `paper_refused` | 其中 `outcome = REFUSED`（消费侧 + 成交侧） |
+| `paper_fill_refused` | 其中被**成交侧**拒绝的部分（`REFUSED` 且原因不在下文的消费侧列表里） |
 | `paper_filled` | 其中出现在 `paper_fills` 的部分 |
 | `settled` | 其中成交市场已有已应用结算（`paper_settlements.applied`，无该列时看 `status = 'RESOLVED'`） |
 
 `conversion_pct` 的分母是上一阶段：`accept→export`、`export→signal`、
-`signal→fill`（分母为 paper accepted）、`fill→settled`。若某一阶段大于 100%，
+`signal→fill`（分母为 paper accepted，含成交侧拒绝，所以失败的成交会拉低
+它，而不是从分母里消失）、`fill→settled`。若某一阶段大于 100%，
 那不是统计错误，而是数据不一致（例如有 signal 却没有 export 记录），值得
 当场查。
 
