@@ -50,6 +50,7 @@ from weatherquant.dashboard.producer import publish_detail_snapshots
 from weatherquant.data.archive import count_quarantined_partitions
 from weatherquant.data.http import ResilientHttp
 from weatherquant.data.lock import LockError, SingleInstanceLock
+from weatherquant.execution.fees import FEE_SOURCE_FALLBACK, load_fee_schedule
 from weatherquant.shadow.config import ShadowSettings, Thresholds
 from weatherquant.shadow.decision import Decision, Direction, Mode, evaluate
 from weatherquant.shadow.events import CatalogMarket
@@ -108,6 +109,7 @@ class CycleStats:
     forecasts_fetched: int = 0
     predictions: int = 0
     decisions: int = 0
+    fee_fallback_decisions: int = 0
     by_state: dict[str, int] = field(default_factory=dict)
     primary_reasons: dict[str, int] = field(default_factory=dict)
     edges: list[float] = field(default_factory=list)
@@ -123,6 +125,7 @@ class CycleStats:
             "forecasts_fetched": self.forecasts_fetched,
             "predictions": self.predictions,
             "decisions": self.decisions,
+            "fee_fallback_decisions": self.fee_fallback_decisions,
             "by_state": dict(self.by_state),
             "primary_reasons": dict(self.primary_reasons),
             "duration_ms": self.duration_ms,
@@ -153,6 +156,7 @@ class ShadowRunner:
         self.settings = config.settings
         self.shadow = config.shadow
         self.thresholds = config.thresholds
+        self.fee_schedule = load_fee_schedule(self.shadow.shadow_fee_schedule_path)
 
         self.db = ShadowDatabase(self.shadow.shadow_db_path)
         self.store: ShadowStore | None = None
@@ -949,7 +953,10 @@ class ShadowRunner:
                     closed_detail=closed_detail,
                     mode=mode,
                     mode_reason=mode_reason,
+                    fee_schedule=self.fee_schedule,
                 )
+                if decision.fee_source == FEE_SOURCE_FALLBACK:
+                    stats.fee_fallback_decisions += 1
                 # Latency is measured with the *same* clock as everything
                 # else. Mixing an injected clock with the wall clock would make
                 # this number mean nothing the moment either one moved.
@@ -1114,6 +1121,14 @@ class ShadowRunner:
             "fatal_error": fatal or self._fatal,
             "stop_reason": reason,
             "thresholds_version": self.thresholds.version,
+            "fee_schedule_version": self.fee_schedule.version,
+            # True means at least one decision in the last cycle priced its fee
+            # from the dated fallback because the venue reported none. The flag
+            # is visible rather than silent: a fallback that never clears is a
+            # metadata defect upstream, not a normal steady state.
+            "fee_fallback_active": bool(
+                self._last_cycle and self._last_cycle.fee_fallback_decisions
+            ),
             "mode": self._mode.value if self._mode else Mode.UNKNOWN.value,
             "configured_mode": self.shadow.shadow_mode,
             "primary_model": self.shadow.shadow_primary_model,

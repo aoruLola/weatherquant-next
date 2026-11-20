@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import queue
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +63,43 @@ class TimingHttp(FakeHttp):
         return super().get_json(
             url, params=params, limiter=limiter, allow_not_found=allow_not_found, **options
         )
+
+
+class BatchTimingHttp(TimingHttp):
+    """Opt-in batch fake; legacy fakes continue to exercise GET /book."""
+
+    supports_books_batch = True
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.batch_bodies: list[list[dict[str, str]]] = []
+        self.omit_tokens: set[str] = set()
+
+    def post_json(
+        self, url: str, *, json_body: Any = None, limiter: str | None = None, **options: Any
+    ) -> Any:
+        assert url.endswith("/books")
+        assert limiter == "clob_books_batch"
+        self.calls.append(url)
+        self.request_options.append(dict(options))
+        self.batch_bodies.append(list(json_body))
+        if self.delay:
+            time.sleep(self.delay)
+        self.last_contact_utc = datetime.now(tz=UTC)
+        self.requests_ok += 1
+        # Reverse the venue response to prove that matching uses asset_id, not
+        # response position. Omissions model the venue's no-book response.
+        return [
+            {
+                "market": "0xc1",
+                "asset_id": item["token_id"],
+                "timestamp": "1791605394391",
+                "bids": [{"price": "0.48", "size": "100"}],
+                "asks": [{"price": BOOK_PRICE, "size": "100"}],
+            }
+            for item in reversed(json_body)
+            if item["token_id"] not in self.omit_tokens
+        ]
 
 
 def _rest_lines(raw_dir: Path) -> list[dict]:
@@ -203,13 +240,13 @@ def test_a_tighter_budget_asks_for_fewer_attempts(settings) -> None:
 # --- 2. fair scheduling ---------------------------------------------------
 
 
-def test_the_sweep_rotates_so_the_tail_is_not_always_the_same_tokens(settings) -> None:
-    """Budget exhaustion must not permanently sacrifice the same tokens.
+def test_the_sweep_refreshes_the_stalest_books_first(settings) -> None:
+    """Budget exhaustion must not sacrifice the same tokens every cycle.
 
-    Iterating a dict from the head and breaking on the budget defers the tail
-    every single cycle: most tokens refresh on time while a handful never do,
-    and the aggregate looks healthy. Measured on a real archive before this
-    change: median gap 21 s, worst token's median 160 s - 7.7x.
+    Rotation spread truncation, but it still refreshed an arbitrary token
+    ahead of one that had waited longer. Ordering by last refresh makes the
+    gap itself the priority, so p90 age is bounded rather than merely fair on
+    average.
     """
     worker = _worker_with_books(settings, tokens=40)
     http = TimingHttp(delay=0.02)
@@ -225,11 +262,95 @@ def test_the_sweep_rotates_so_the_tail_is_not_always_the_same_tokens(settings) -
         worker._poll_books(http)
         polled.update(http.book_request_start)
 
-    # Without rotation every sweep restarts at the head and only ever reaches
-    # the first handful; with it, the start position steps forward each time.
+    # Without a staleness order only the same first handful would ever be
+    # reached; with it, twenty sweeps cover at least half the set.
     assert len(polled) >= 20, f"only {len(polled)}/40 tokens reached across 20 sweeps"
-    assert worker._poll_cursor != 0
     assert worker._poll_budget_exceeded >= 1, "the budget never actually expired"
+
+
+def test_sweep_order_is_never_polled_then_oldest_then_near_target(settings) -> None:
+    worker = _worker_with_books(settings, tokens=4)
+    now = datetime.now(tz=UTC)
+    worker._books = {"never-far": "m", "never-near": "m", "old": "m", "new": "m"}
+    worker._last_polled_at = {
+        "old": now - timedelta(seconds=120),
+        "new": now - timedelta(seconds=5),
+    }
+    worker._book_targets = {
+        "never-far": date(2026, 12, 1),
+        "never-near": date(2026, 11, 21),
+        "old": date(2026, 11, 21),
+        "new": date(2026, 11, 21),
+    }
+    assert [token for token, _ in worker._sweep_books()] == [
+        "never-near",
+        "never-far",
+        "old",
+        "new",
+    ]
+
+
+def test_one_bounded_batch_refreshes_and_archives_every_token(settings) -> None:
+    """The usual token set needs one HTTP round trip, not one per token."""
+    worker = _worker_with_books(settings, tokens=40)
+    http = BatchTimingHttp(delay=0.02)
+    worker.POLL_BUDGET_SECONDS = 45.0
+
+    worker._poll_books(http)
+
+    assert len(http.batch_bodies) == 1
+    assert len(http.batch_bodies[0]) == 40
+    assert not http.book_request_start, "batch-capable transport fell back to per-token GETs"
+    options = http.request_options[0]
+    assert 0 < options["timeout_seconds"] <= worker.POLL_BUDGET_SECONDS
+    assert options["retries"] <= 1
+
+    writer = worker._writer
+    archive = worker._archive
+    assert writer is not None and archive is not None
+    assert {row[2] for row in writer.books} == set(worker._books)
+    assert len(writer.prices) == 40
+    assert {record.payload["asset_id"] for record in archive.records} == set(worker._books)
+    assert worker._poll_budget_exceeded == 0
+
+
+def test_batch_omissions_follow_the_existing_no_book_path(settings) -> None:
+    worker = _worker_with_books(settings, tokens=3)
+    http = BatchTimingHttp()
+    http.omit_tokens = {"token-001"}
+
+    worker._poll_books(http)
+    worker._poll_books(http)
+
+    assert worker._no_book == {"token-001"}
+    assert "token-001" not in worker._last_polled_at
+    assert [len(body) for body in http.batch_bodies] == [3, 2]
+    writer = worker._writer
+    archive = worker._archive
+    assert writer is not None and archive is not None
+    assert len(writer.books) == 4
+    assert len(archive.records) == 4
+
+
+def test_refresh_gap_p90_uses_success_to_success_intervals(settings) -> None:
+    """Current age and refresh gap answer different operational questions."""
+    worker = _worker_with_books(settings, tokens=0)
+    received = datetime.now(tz=UTC)
+
+    assert worker._telemetry()["per_token_book_refresh_gap_ms"] == {"n": 0}
+    for index, seconds in enumerate((10, 20, 30, 40)):
+        token = f"token-{index}"
+        worker._mark_book_refreshed(token, received - timedelta(seconds=seconds))
+        # First observations establish a clock but do not invent a zero gap.
+        worker._mark_book_refreshed(token, received)
+
+    gaps = worker._telemetry()["per_token_book_refresh_gap_ms"]
+    assert gaps["n"] == 4
+    assert gaps["p50_ms"] == 25_000.0
+    assert gaps["p90_ms"] == 37_000.0
+    assert gaps["p95_ms"] == 38_500.0
+    assert gaps["max_ms"] == 40_000.0
+    assert worker._telemetry()["per_token_book_age_ms"]["p90_ms"] >= 0.0
 
 
 def test_budget_exhaustion_is_counted_and_logged_once_not_per_cycle(settings) -> None:
@@ -440,6 +561,8 @@ def test_budget_and_fairness_reach_the_heartbeat(settings) -> None:
 
     ages = telemetry["per_token_book_age_ms"]
     assert ages is None or ages["tokens"] > 0
+    if ages is not None:
+        assert ages["p90_ms"] <= ages["p95_ms"] <= ages["max_ms"]
 
 
 def test_rest_timeouts_are_counted_separately_from_transport_errors() -> None:
@@ -534,3 +657,23 @@ def test_the_heartbeat_still_reports_after_a_slow_sweep(settings) -> None:
     assert payload["status"]
     assert "telemetry" in payload
     assert "poll_budget" in payload["telemetry"]
+
+
+def test_a_no_book_answer_is_retried_after_the_retry_interval(settings) -> None:
+    """An omitted token used to be dropped from REST polling for the life of
+    the process; a market whose book appears later must come back."""
+    worker = _worker_with_books(settings, tokens=3)
+    http = BatchTimingHttp()
+    http.omit_tokens = {"token-001"}
+    worker._poll_books(http)
+    assert worker._no_book == {"token-001"}
+
+    http.omit_tokens = set()
+    worker._poll_books(http)
+    assert len(http.batch_bodies[-1]) == 2, "still inside the retry interval"
+
+    worker._no_book_since["token-001"] -= worker.NO_BOOK_RETRY_SECONDS + 1
+    worker._poll_books(http)
+    assert any(item.get("token_id") == "token-001" for item in http.batch_bodies[-1])
+    assert worker._no_book == set()
+    assert "token-001" in worker._last_polled_at

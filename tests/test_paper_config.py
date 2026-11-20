@@ -67,6 +67,16 @@ class TestAccountSettings:
         with pytest.raises(ValidationError):
             PaperSettings(_env_file=None)
 
+    def test_fill_uses_the_venue_share_minimum_not_a_complete_fill_gate(self):
+        settings = PaperSettings(_env_file=None)
+        assert settings.min_order_size_shares == 5.0
+        assert not hasattr(settings, "require_complete_fill")
+
+    def test_fee_fallback_schedule_is_configurable(self, monkeypatch, tmp_path):
+        path = tmp_path / "fees.json"
+        monkeypatch.setenv("WQ_PAPER_FEE_SCHEDULE_PATH", str(path))
+        assert PaperSettings(_env_file=None).fee_schedule_path == path
+
     def test_paths_default_inside_the_paper_directory(self):
         settings = PaperSettings(_env_file=None)
         assert settings.db_path.as_posix().startswith("data/paper/")
