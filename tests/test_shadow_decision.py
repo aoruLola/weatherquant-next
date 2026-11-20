@@ -8,7 +8,7 @@ unspecific, one of them fails.
 from __future__ import annotations
 
 import dataclasses
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -20,6 +20,7 @@ from shadow_helpers import (
     make_observation,
     make_prediction,
 )
+from weatherquant.execution.fees import load_fee_schedule
 from weatherquant.execution.pricing import build_fill_plan, execution_cost, taker_fee_usd
 from weatherquant.markets.models import Bracket, BracketKind, Side
 from weatherquant.shadow.config import load_thresholds
@@ -34,6 +35,8 @@ from weatherquant.shadow.decision import (
 )
 
 THRESHOLDS = load_thresholds("configs/shadow-thresholds.json")
+FEE_SCHEDULE = load_fee_schedule("configs/fee-schedule.json")
+FEE_CHANGE = datetime(2026, 11, 20, 23, 59, tzinfo=UTC)
 BUFFER = 0.005
 
 
@@ -224,7 +227,39 @@ def test_a_venue_timestamp_in_the_future_is_refused() -> None:
     assert Reason.TIME_MISMATCH in decision.reasons
 
 
-def test_collector_receipt_before_the_venue_timestamp_is_a_clock_disagreement() -> None:
+def test_small_negative_clock_skew_is_tolerated() -> None:
+    """Milliseconds of ordering jitter between two clocks is not a broken clock.
+
+    A zero-tolerance rule rejected healthy books for a millisecond of skew; the
+    tolerance is measured in THRESHOLDS, not hard-coded, so this test moves with
+    the gate.
+    """
+    skewed = make_observation(
+        venue_ts=NOW,
+        collector_received=NOW - timedelta(milliseconds=THRESHOLDS.max_clock_skew_ms - 500),
+        shadow_received=NOW - timedelta(milliseconds=THRESHOLDS.max_clock_skew_ms - 400),
+    )
+    decision = _evaluate(snapshot=skewed)
+    assert Reason.TIME_MISMATCH not in decision.reasons
+
+
+@pytest.mark.parametrize("skew_ms", [2000, 2001])
+def test_negative_clock_skew_boundary_is_exact(skew_ms: int) -> None:
+    snapshot = make_observation(
+        venue_ts=NOW,
+        collector_received=NOW - timedelta(milliseconds=skew_ms),
+        shadow_received=NOW - timedelta(milliseconds=skew_ms - 1),
+    )
+    decision = _evaluate(snapshot=snapshot)
+
+    if skew_ms <= THRESHOLDS.max_clock_skew_ms:
+        assert Reason.TIME_MISMATCH not in decision.reasons
+    else:
+        assert Reason.TIME_MISMATCH in decision.reasons
+        assert "beyond the 2000ms tolerance" in decision.details["TIME_MISMATCH"]
+
+
+def test_negative_clock_skew_beyond_the_tolerance_is_a_clock_disagreement() -> None:
     inverted = make_observation(
         venue_ts=NOW,
         collector_received=NOW - timedelta(seconds=10),
@@ -336,32 +371,106 @@ def test_stale_threshold_is_the_configured_one() -> None:
 # --- fees and liquidity ---------------------------------------------------
 
 
-def test_a_market_with_no_fee_schedule_is_refused_rather_than_assumed_free() -> None:
+def test_a_missing_fee_uses_the_dated_fallback_and_says_so() -> None:
+    decision = _evaluate(
+        market=make_catalog_market(fee_rate=None), fee_schedule=FEE_SCHEDULE
+    )
+    assert decision.state is State.ACCEPT
+    assert decision.fee_source == "fallback"
+    assert decision.fee_rate == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize(
+    ("instant", "expected_rate"),
+    [
+        (FEE_CHANGE - timedelta(seconds=1), 0.05),
+        (FEE_CHANGE, 0.01),
+        (FEE_CHANGE + timedelta(seconds=1), 0.01),
+    ],
+)
+def test_fee_fallback_changes_at_the_configured_instant(
+    instant: datetime, expected_rate: float, caplog: pytest.LogCaptureFixture
+) -> None:
+    forecast = make_forecast(run_time=instant - timedelta(hours=14))
+    snapshot = make_observation(
+        venue_ts=instant - timedelta(seconds=3),
+        collector_received=instant - timedelta(seconds=2),
+        shadow_received=instant - timedelta(seconds=1),
+    )
+    with caplog.at_level("WARNING"):
+        decision = _evaluate(
+            market=make_catalog_market(fee_rate=None),
+            forecast=forecast,
+            prediction=make_prediction(forecast=forecast),
+            snapshot=snapshot,
+            decision_time=instant,
+            collector_last_seen=instant - timedelta(seconds=5),
+            fee_schedule=FEE_SCHEDULE,
+        )
+
+    assert decision.state is State.ACCEPT
+    assert decision.fee_rate == expected_rate
+    assert decision.fee_source == "fallback"
+    assert decision.estimated_fees_usd is not None
+    assert "fee fallback used" in caplog.text
+
+
+def test_a_venue_reported_fee_always_wins_over_the_fallback() -> None:
+    decision = _evaluate(
+        market=make_catalog_market(fee_rate=0.01), fee_schedule=FEE_SCHEDULE
+    )
+    assert decision.fee_source == "venue"
+    assert decision.fee_rate == pytest.approx(0.01)
+
+
+def test_a_market_with_no_fee_and_no_fallback_is_refused_rather_than_assumed_free() -> None:
     decision = _evaluate(market=make_catalog_market(fee_rate=None))
     assert decision.primary_reason is Reason.UNKNOWN_FEE
     assert decision.net_edge is None  # without a schedule there is no net edge to state
     assert decision.estimated_fees_usd is None
+    assert decision.fee_source is None
 
 
-def test_depth_below_the_floor_is_insufficient_liquidity() -> None:
+def test_a_thin_but_venue_valid_book_is_sized_down_instead_of_refused() -> None:
+    # 10 shares is above the venue minimum (5), so this is a valid - if small -
+    # trade. The old $25 depth floor refused it for being worth $4.70.
     thin = make_observation(bids=[(0.45, 10.0)], asks=[(0.47, 10.0)])
     decision = _evaluate(snapshot=thin)
+    assert decision.state is State.ACCEPT
+    assert decision.estimated_fill_shares == 10.0
+    assert decision.proposed_shares == THRESHOLDS.proposed_shares
+
+
+def test_the_dollar_floor_remains_configurable() -> None:
+    thin = make_observation(bids=[(0.45, 10.0)], asks=[(0.47, 10.0)])
+    decision = _evaluate(
+        snapshot=thin,
+        thresholds=dataclasses.replace(THRESHOLDS, min_depth_usd=5.0),
+    )
     assert Reason.INSUFFICIENT_LIQUIDITY in decision.reasons
-    assert decision.state is State.REJECT
 
 
-def test_a_partial_fill_is_refused_when_the_threshold_requires_a_complete_one() -> None:
-    assert THRESHOLDS.require_complete_fill is True
+def test_a_partial_fill_is_sized_down_to_what_the_book_offers() -> None:
+    assert THRESHOLDS.min_order_size_shares == 5.0
     shallow = make_observation(bids=[(0.45, 400.0)], asks=[(0.47, 5.0)])
     decision = _evaluate(snapshot=shallow)
+    assert decision.state is State.ACCEPT
+    assert decision.estimated_fill_shares == 5.0
+    assert decision.proposed_shares == THRESHOLDS.proposed_shares
+    assert Reason.INSUFFICIENT_LIQUIDITY not in decision.reasons
+
+
+def test_a_fill_below_the_venue_minimum_is_not_executable() -> None:
+    shallow = make_observation(bids=[(0.45, 400.0)], asks=[(0.47, 3.0)])
+    decision = _evaluate(snapshot=shallow)
     assert Reason.INSUFFICIENT_LIQUIDITY in decision.reasons
-    assert "5.0 of 100.0 shares" in decision.details["INSUFFICIENT_LIQUIDITY"]
+    assert "below the venue minimum order size 5" in decision.details["INSUFFICIENT_LIQUIDITY"]
 
 
 def test_below_the_markets_own_minimum_order_size_is_not_executable() -> None:
     decision = _evaluate(market=make_catalog_market(min_order_size=500.0))
     assert Reason.INSUFFICIENT_LIQUIDITY in decision.reasons
-    assert "minimum order size" in decision.details["INSUFFICIENT_LIQUIDITY"]
+    assert "below the venue minimum order size 500" in decision.details["INSUFFICIENT_LIQUIDITY"]
 
 
 # --- edge -----------------------------------------------------------------
@@ -385,6 +494,22 @@ def test_a_positive_but_small_edge_is_below_threshold_not_negative() -> None:
     assert decision.state is State.REJECT
     assert decision.primary_reason is Reason.EDGE_BELOW_THRESHOLD
     assert decision.details["EDGE_BELOW_THRESHOLD"].startswith("net edge")
+
+
+def test_a_sized_down_fill_uses_its_actual_vwap_for_the_edge_gate() -> None:
+    snapshot = make_observation(
+        bids=[(0.10, 400.0)],
+        asks=[(0.40, 5.0), (0.90, 5.0)],
+    )
+    prediction = make_prediction(probabilities={"32-33 degF": 0.55, "Below 32 degF": 0.45})
+    decision = _evaluate(snapshot=snapshot, prediction=prediction)
+
+    fee = taker_fee_usd(filled_shares=10.0, price_usd_per_share=0.65, fee_rate=0.05)
+    expected_edge = (0.55 * 10.0 - 6.5 - fee - 6.5 * BUFFER) / 10.0
+    assert decision.estimated_fill_shares == pytest.approx(10.0)
+    assert decision.estimated_fill_price == pytest.approx(0.65)
+    assert decision.net_edge == pytest.approx(expected_edge)
+    assert decision.primary_reason is Reason.NEGATIVE_NET_EDGE
 
 
 def test_the_threshold_version_travels_with_the_decision() -> None:
@@ -435,7 +560,9 @@ def test_buy_and_sell_costs_match_hand_computed_values() -> None:
 
 def test_the_fee_used_is_the_markets_own_reported_rate() -> None:
     market = make_catalog_market(fee_rate=0.0)
-    decision = _evaluate(market=market)
+    decision = _evaluate(market=market, fee_schedule=FEE_SCHEDULE)
+    assert decision.fee_rate == 0.0
+    assert decision.fee_source == "venue"
     assert decision.estimated_fees_usd == pytest.approx(0.0)
     # A zero fee raises the edge, but the buffer and threshold still apply.
     assert decision.net_edge is not None

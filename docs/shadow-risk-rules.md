@@ -1,6 +1,6 @@
 # 影子交易引擎：风险闸门与决策状态机
 
-2026-10-11。实现：`src/weatherquant/shadow/decision.py`、
+2026-11-20（v3）。实现：`src/weatherquant/shadow/decision.py`、
 `src/weatherquant/shadow/config.py`、`configs/shadow-thresholds.json`。
 可执行版本：`tests/test_shadow_decision.py`（本文件中的每一条断言在测试里都有对应用例）。
 
@@ -131,17 +131,34 @@ MARKET_CLOSED → COLLECTOR_DISCONNECTED → DATA_QUALITY_FAILURE → NO_ORDERBO
 实测的**刷新周期，**没有一个**用本系统的决策结果拟合过。用同一批结果调参、
 再用同一批结果证明策略有效，是"发明"策略而不是"发现"策略。
 
-| 阈值 | **v2** | 依据 |
+| 阈值 | **v3** | 依据 |
 |---|---:|---|
 | `min_net_edge_usd_per_share` | 0.02 | 天气类 taker 费率峰值 0.05×0.25 = 0.0125/股（p=0.5），执行缓冲 0.5% 名义（p=1 时 0.005）。0.02 清掉最坏情形成本后余 0.0025 —— 尚未对模型技巧作任何假设。低于它，模型得比费率表本身吃掉的还要准。 |
-| `max_snapshot_age_ms` | **90000** | **两次采集器扫描。** 单 token 实测刷新间隔 p50 = 37.9s（真实归档，66 token / 387 观测 / 13 分钟），扫描按序进行且每周期有 45s 预算；90s 容得下采集器能产出的最新盘口，又拒掉落后两个周期以上的 —— 那意味着该 token 已经没人再看。 |
+| `max_snapshot_age_ms` | **90000** | **两次采集器扫描。** 单 token 实测刷新间隔 p50 = 37.9s（真实归档，66 token / 387 观测 / 13 分钟），扫描按序进行且每周期有 45s 预算；90s 容得下采集器能产出的最新盘口，又拒掉落后两个周期以上的 —— 那意味着该 token 已经没人再看。**本轮不放宽此值**，改用扫描顺序与 p90 指标改善刷新间隔。 |
 | `max_forecast_age_hours` | 30 | 运行初始化后 12 小时才可发布（`PUBLISHABLE_LAG_HOURS`），每 6 小时一次，健康时运行年龄 12–18h。30h 容忍两次上游中断，又不至于让 lead bucket 已经移位。 |
-| `proposed_shares` | 100 | 薄盘口会显式表现为部分成交，而不是瞬间成交把自己的空洞藏起来；同时又不至于让深度成为有量市场的约束。纯影子 —— 不下单，没有本金。 |
-| `require_complete_fill` | true | 部分成交不是"更小的单"，是**另一笔单**：未成交部分得重新对刚刚被我们扫穿的盘口定价。拒绝它，每一笔 ACCEPT 才可解释。 |
-| `min_depth_usd` | 25 | 独立的第二道流动性地板，以美元计 —— 否则一张全部挂在 1 分钱的盘口能通过股数检查，却几乎一文不值。 |
+| `proposed_shares` | 100 | **请求量，不是成交量。** 成交按盘口实际可承接量向下取整；100 只用于让薄盘口显式表现为 `estimated_fill_shares`，而不是瞬间成交把自己的空洞藏起来。纯影子 —— 不下单，没有本金。 |
+| `min_order_size_shares` | 5 | 场所自身的 `orderMinSize`（市场未报告时的默认值）。向下取整后的成交低于它就无法真正下单，因此这是唯一的股数地板。5 股 @ 0.50 仅 2.50 美元。 |
+| `min_depth_usd` | 0 | **默认关闭。** 美元地板永远不应高于场所自身的最小单：若设成 25 美元，它会拒绝场所接受的 5 股订单。只有研究更大账户时才需调高。 |
+| `max_clock_skew_ms` | 2000 | 采集器接收时刻允许早于场所时间戳的容差。两个独立时钟的毫秒级排序抖动是正常的；旧规则零容忍，会因 1ms 抖动拒绝健康盘口。超过 2s 则视为真正的时钟错误。 |
 | `max_decision_latency_ms` | 5000 | **仅用于报告，不是闸门。** 超过它，P95 指标标记本周期降级，让"评估器变慢"在变成准确性问题之前就可见。 |
 
-### 4.1 v1 → v2 修正（2026-10-11）
+### 4.1 v2 → v3 修正（2026-11-20）
+
+v2 的 `require_complete_fill = true` 与 `min_depth_usd = 25` 一起，拒绝了几乎所有
+本可成立的交易：5 股（场所最小单）@ 0.50 只有 2.50 美元，必然低于 25 美元的
+美元地板。两者互相矛盾，而矛盾的一侧是场所自己的规则。
+
+v3 用**向下取整（size-down）**取代这两道闸门：按盘口实际可承接量成交，
+只要求成交股数 ≥ 场所最小单，且**实际 VWAP 上的**净 edge 仍 ≥ 阈值。
+部分成交不再是"另一笔单"，而是这张盘口在当时真实能给出的全部。
+
+同时修正时钟闸门：`collector_received < venue_ts` 的负 skew 不再零容忍，
+小抖动放行，超过 `max_clock_skew_ms` 仍判 `TIME_MISMATCH`。
+
+变更记录在 `configs/shadow-thresholds.json` 的 `revised_from` 字段中，
+版本已递增、可评审、可回溯。
+
+### 4.2 v1 → v2 修正（2026-10-11）
 
 v1 把 `max_snapshot_age_ms` 设为 15000，依据写的是"采集器每 5 秒重询一次盘口"。
 **这个前提是错的**：5s 是轮询节拍，不是单 token 的刷新周期，采集器按序扫描
@@ -169,7 +186,7 @@ v1 把 `max_snapshot_age_ms` 设为 15000，依据写的是"采集器每 5 秒�
 | `venue_ts > decision_time` | TIME_MISMATCH —— 场所时间戳在未来 |
 | `collector_received_at > decision_time` | TIME_MISMATCH —— **采集器实际收到的时刻晚于决策时点，当时不可能知道** |
 | `shadow_received_at > decision_time` | TIME_MISMATCH —— 本进程读到它的时刻晚于决策时点 |
-| `collector_received < venue_ts` | TIME_MISMATCH —— 两个时钟不一致 |
+| `collector_received < venue_ts` 超过 `max_clock_skew_ms` | TIME_MISMATCH —— 两个时钟不一致（小抖动在容差内放行） |
 | `forecast.received_at > decision_time` | TIME_MISMATCH —— 预报是在决策之后才取得的 |
 | 盘口无 venue 时间戳 | STALE_ORDERBOOK —— 无法证明新鲜 |
 
@@ -243,11 +260,10 @@ E[net]       = net_proceeds − q × shares
 
 | 检查 | 原因 |
 |---|---|
-| `fee_rate is None` | UNKNOWN_FEE —— **未报告的费率表不等于零费率**，拒绝而不是假设免费 |
-| 请求量超出盘口 | INSUFFICIENT_LIQUIDITY |
-| 成交不完整（`require_complete_fill`） | INSUFFICIENT_LIQUIDITY |
-| 一侧深度 < `min_depth_usd` | INSUFFICIENT_LIQUIDITY |
-| `proposed_shares < market.min_order_size` | INSUFFICIENT_LIQUIDITY —— 下不了的单不能算 ACCEPT |
+| `fee_rate is None` 且日期化费率表也未覆盖决策时点 | UNKNOWN_FEE —— **未报告的费率表不等于零费率**；有日期化 fallback 时按该时点费率计价，并在决策上记 `fee_source = fallback` |
+| 请求量超出盘口 | 成交向下取整到盘口可承接量，不因"部分成交"拒绝 |
+| 成交股数 < 场所最小单（`min_order_size_shares`） | INSUFFICIENT_LIQUIDITY —— 下不了的单不能算 ACCEPT |
+| 一侧深度 < `min_depth_usd` | INSUFFICIENT_LIQUIDITY（默认 0，即不启用） |
 | `edge <= 0` | NEGATIVE_NET_EDGE |
 | `0 < edge < 阈值` | EDGE_BELOW_THRESHOLD |
 

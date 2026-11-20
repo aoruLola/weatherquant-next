@@ -53,10 +53,16 @@ and greppable, not a ``generic_error`` that says nothing and hides everything.
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+from weatherquant.execution.fees import (
+    FEE_SOURCE_FALLBACK,
+    DatedFeeSchedule,
+    resolve_fee_rate,
+)
 from weatherquant.execution.pricing import (
     ExecutionRefused,
     FeeStructureUnknown,
@@ -73,6 +79,8 @@ from weatherquant.shadow.config import Thresholds
 from weatherquant.shadow.events import BookObservation
 from weatherquant.shadow.forecast import ResolvedForecast
 from weatherquant.shadow.inference import ModelRefusal, PredictionResult
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "CAUSAL_ORDER",
@@ -242,6 +250,9 @@ class Decision:
     live_book: BookObservation | None = None
     fee_rate: float | None = None
     fee_exponent: float | None = None
+    # "venue" when the market reported the rate, "fallback" when the dated
+    # schedule supplied it. None when neither could price the trade.
+    fee_source: str | None = None
 
     @property
     def primary_reason(self) -> Reason | None:
@@ -279,6 +290,7 @@ def evaluate(
     # handed a row that claims to be contemporary. The runner always passes it.
     mode: Mode = Mode.UNKNOWN,
     mode_reason: str | None = None,
+    fee_schedule: DatedFeeSchedule | None = None,
 ) -> Decision:
     """Run every gate that can run and produce one verdict.
 
@@ -341,10 +353,22 @@ def evaluate(
 
     # --- 4. the book ------------------------------------------------------
     snapshot_age_ms: int | None = None
-    if market.fee_rate is None:
+    # A venue-reported rate always wins. Only when it is absent does the dated
+    # schedule supply one, and that is recorded on the decision as a fallback
+    # rather than being presented as a venue fact.
+    fee_rate, fee_source = resolve_fee_rate(market.fee_rate, decision_time, fee_schedule)
+    if fee_rate is None:
         # A market that never reported a schedule is recorded as such even when
         # no forecast exists yet, so an unknown fee can never pass unnoticed.
-        fail(Reason.UNKNOWN_FEE, "market did not report a fee schedule")
+        fail(Reason.UNKNOWN_FEE, "market did not report a fee schedule and no dated fallback covers it")
+    elif fee_source == FEE_SOURCE_FALLBACK:
+        logger.warning(
+            "fee fallback used for %s at %s: venue reported no fee_rate, dated schedule %s supplied %s",
+            market.market_id,
+            decision_time.isoformat(),
+            fee_schedule.version if fee_schedule else "?",
+            fee_rate,
+        )
 
     book = None
     if snapshot is None:
@@ -370,7 +394,7 @@ def evaluate(
                 "book carries no venue timestamp, so its age cannot be established "
                 "and it cannot be shown to be fresh",
             )
-        _check_clocks(snapshot, decision_time, fail, mode)
+        _check_clocks(snapshot, decision_time, fail, mode, thresholds.max_clock_skew_ms)
 
     # --- 5. the forecast --------------------------------------------------
     q: float | None = None
@@ -433,6 +457,7 @@ def evaluate(
                 q=q,
                 thresholds=thresholds,
                 buffer_fraction=buffer_fraction,
+                fee_rate=fee_rate,
             )
         except FeeStructureUnknown as exc:
             fail(Reason.UNKNOWN_FEE, str(exc))
@@ -441,20 +466,17 @@ def evaluate(
         except Exception as exc:
             fail(Reason.EVALUATION_ERROR, f"{type(exc).__name__}: {exc}")
 
-    if fill is not None and thresholds.require_complete_fill and not fill.complete:
+    # Size down, never refuse for being partial: the fill is what the book
+    # actually offers up to the proposal, priced at its own VWAP. The only size
+    # floor is the venue's minimum order - a smaller fill could never have been
+    # placed, so an ACCEPT for it would misdescribe the world.
+    min_order_shares = market.min_order_size or thresholds.min_order_size_shares
+    if fill is not None and fill.filled_shares + 1e-9 < min_order_shares:
         fail(
             Reason.INSUFFICIENT_LIQUIDITY,
-            f"only {fill.filled_shares:.1f} of {fill.requested_shares:.1f} shares "
-            f"fillable across {fill.levels_consumed} level(s)",
-        )
-
-    if market.min_order_size and thresholds.proposed_shares < market.min_order_size:
-        # An ACCEPT that could not have been placed is a lie about what the
-        # system observed, so the venue's own minimum is a gate.
-        fail(
-            Reason.INSUFFICIENT_LIQUIDITY,
-            f"proposed {thresholds.proposed_shares:g} shares is below the market's "
-            f"minimum order size {market.min_order_size:g}",
+            f"only {fill.filled_shares:.2f} shares fillable across "
+            f"{fill.levels_consumed} level(s), below the venue minimum order size "
+            f"{min_order_shares:g}",
         )
 
     depth = _side_depth(snapshot, direction)
@@ -510,8 +532,9 @@ def evaluate(
         shadow_received_at_utc=snapshot.shadow_received_at_utc if snapshot else None,
         snapshot_age_ms=snapshot_age_ms,
         live_book=snapshot if mode is Mode.LIVE else None,
-        fee_rate=market.fee_rate,
+        fee_rate=fee_rate,
         fee_exponent=market.fee_exponent,
+        fee_source=fee_source,
         model_probability=q,
         market_price=_market_price(book, direction),
         best_bid=book.best_bid_usd_per_share if book else None,
@@ -532,10 +555,10 @@ def evaluate(
 # --- pricing ---------------------------------------------------------------
 
 
-def _price(*, market, snapshot, direction, q, thresholds, buffer_fraction):
+def _price(*, market, snapshot, direction, q, thresholds, buffer_fraction, fee_rate):
     """Walk the book and cost the fill. Every figure comes from pricing."""
     fill = build_fill_plan(snapshot.book, side=direction.side, shares=thresholds.proposed_shares)
-    cost = execution_cost(fill, fee_rate=market.fee_rate, buffer_fraction=buffer_fraction)
+    cost = execution_cost(fill, fee_rate=fee_rate, buffer_fraction=buffer_fraction)
     if direction is Direction.BUY_YES:
         profit = expected_net_profit_usd(q=q, filled_shares=fill.filled_shares, cost=cost)
         edge = edge_usd_per_share(q=q, filled_shares=fill.filled_shares, cost=cost)
@@ -579,7 +602,13 @@ def _blocking_defect(snapshot, direction: Direction) -> str | None:
     return "+".join(sorted(found)) if found else None
 
 
-def _check_clocks(snapshot, decision_time: datetime, fail, mode: Mode = Mode.UNKNOWN) -> None:
+def _check_clocks(
+    snapshot,
+    decision_time: datetime,
+    fail,
+    mode: Mode = Mode.UNKNOWN,
+    max_clock_skew_ms: float = 0.0,
+) -> None:
     """No input may originate after the decision instant, and no delta may invert.
 
     In ``REPLAY`` our own two receipt stamps are excluded: this process read
@@ -587,6 +616,11 @@ def _check_clocks(snapshot, decision_time: datetime, fail, mode: Mode = Mode.UNK
     stays - a venue timestamp ahead of the decision instant is a clock problem
     in either mode - and the negative-latency check stays, because it compares
     the collector's clock against the venue's and never involves ours.
+
+    A negative latency smaller than ``max_clock_skew_ms`` is tolerated: two
+    independent clocks routinely differ by milliseconds of ordering jitter, and
+    rejecting that was rejecting healthy books. Beyond the tolerance the two
+    clocks genuinely disagree and the book cannot be trusted.
     """
     if snapshot.venue_ts is not None and snapshot.venue_ts > decision_time:
         fail(
@@ -613,11 +647,11 @@ def _check_clocks(snapshot, decision_time: datetime, fail, mode: Mode = Mode.UNK
         )
     if snapshot.venue_ts is not None:
         latency = (snapshot.collector_received_at_utc - snapshot.venue_ts).total_seconds()
-        if latency < 0:
+        if latency < -(max_clock_skew_ms / 1000.0):
             fail(
                 Reason.TIME_MISMATCH,
-                f"collector receipt precedes the venue timestamp by {-latency:.3f}s; "
-                "the clocks disagree",
+                f"collector receipt precedes the venue timestamp by {-latency:.3f}s, "
+                f"beyond the {max_clock_skew_ms:.0f}ms tolerance; the clocks disagree",
             )
 
 

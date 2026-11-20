@@ -288,8 +288,11 @@ def test_an_artifact_fitted_after_the_decision_is_refused_by_the_gate() -> None:
 
 def test_the_threshold_file_is_what_the_runner_actually_uses(tmp_path) -> None:
     """Gates come from the versioned file, not from a module-level constant."""
-    assert THRESHOLDS.version == "v2"
+    assert THRESHOLDS.version == "v3"
     assert THRESHOLDS.max_snapshot_age_ms == 90000.0
+    assert THRESHOLDS.max_clock_skew_ms == 2000.0
+    assert THRESHOLDS.min_order_size_shares == 5.0
+    assert THRESHOLDS.min_depth_usd == 0.0
     assert THRESHOLDS.as_dict()["version"] == THRESHOLDS.version
     assert load_thresholds(THRESHOLDS_PATH).as_dict() == THRESHOLDS.as_dict()
 

@@ -41,7 +41,7 @@ from typing import Any
 from weatherquant import __version__
 from weatherquant.config import Settings
 from weatherquant.data.archive import ArchiveRecord, RawArchive, extract_venue_ts
-from weatherquant.data.books import CLOB_BASE, parse_book_payload
+from weatherquant.data.books import CLOB_BASE, fetch_books, parse_book_payload
 from weatherquant.data.discovery import GammaDiscovery
 from weatherquant.data.heartbeat import (
     UPSTREAM_STALL_SOFT_SECONDS,
@@ -193,10 +193,6 @@ class CollectorWorker:
         self._ws_endpoint = ""
 
         # --- polling fairness and cost -----------------------------------
-        # Where the last sweep stopped. Without this the budget always cuts
-        # the tail of the same list, and the same handful of tokens are
-        # deferred forever while the aggregate looks healthy.
-        self._poll_cursor = 0
         self._poll_budget_exceeded = 0
         self._poll_deferred = 0
         self._last_poll_budget_note = -1e18
@@ -207,6 +203,10 @@ class CollectorWorker:
         # When each token was last seen. Answers "which token is being starved"
         # without re-reading the archive.
         self._last_polled_at: dict[str, datetime] = {}
+        # Actual successful-refresh intervals, excluding each token's first
+        # observation. This is deliberately separate from the current-age view.
+        self._book_refresh_gaps_ms: deque[float] = deque(maxlen=1000)
+        self._book_targets: dict[str, date] = {}
         # High-water mark of the stream queue, sampled by the consumer.
         self._ws_queue_high_water = 0
         self._frames_dropped = 0
@@ -644,6 +644,15 @@ class CollectorWorker:
                 problems.extend(found.problems)
                 for token in _tokens_of(found.market_rows):
                     self._books[token[0]] = token[1]
+                # Target dates let the sweep put near-dated markets first when
+                # two books are equally stale; they never outrank staleness, so
+                # a far-dated book cannot be starved by a nearer one.
+                for row in found.market_rows:
+                    for token in (row[12], row[13]):
+                        # date.min is discovery's unknown-date sentinel, not an
+                        # especially urgent market. Only known dates rank here.
+                        if token in self._books and row[14] != date.min:
+                            self._book_targets[token] = row[14]
             self._writer.flush_if_due()
             self.stats.events_upserted += events
             self.stats.markets_upserted += markets
@@ -683,6 +692,9 @@ class CollectorWorker:
     # first occurrence and then one every five minutes, with the running total
     # in both the log line and the collector_events row.
     POLL_BUDGET_NOTE_INTERVAL_SECONDS = 300.0
+    # The venue accepts up to 500 books per POST. A smaller request bounds
+    # payload size while still collapsing the usual weather set into one call.
+    BOOK_BATCH_SIZE = 100
 
     def _book_request_budget(self, deadline: float) -> tuple[float, int]:
         """``(timeout_seconds, retries)`` for one fetch inside the sweep.
@@ -708,24 +720,28 @@ class CollectorWorker:
         retries = 1 if remaining >= 2 * timeout + 1.0 else 0
         return timeout, retries
 
-    def _rotated_books(self) -> list[tuple[str, str]]:
-        """Start each sweep where the last one stopped.
+    def _sweep_books(self) -> list[tuple[str, str]]:
+        """Refresh the stalest books first, nearest target date breaking ties.
 
-        ``self._books`` is a dict, so a budget cut always drops the *tail* -
-        the same tokens, in the same order, every cycle. That is starvation
-        with a perfectly healthy-looking aggregate: most tokens refresh on
-        time while a handful never do. Rotating the start position by one each
-        sweep spreads the truncation across the whole set instead.
+        Rotation spread budget truncation across the set, but it still served
+        tokens in an arbitrary order: a book could wait two full sweeps while a
+        fresher one was refreshed again. Ordering by last refresh makes the
+        refresh *gap* itself the priority, which is what keeps the p90 age
+        bounded rather than merely fair on average. When two books are equally
+        stale, the market that settles sooner is polled first.
+
+        Never-polled tokens sort first: an unknown age is the most stale state
+        there is, not a fresh one.
         """
-        items = list(self._books.items())
-        if not items:
-            return items
-        start = self._poll_cursor % len(items)
-        # Advance by one, not to the end: successive sweeps then step through
-        # the list, and every token eventually sits at the front when the
-        # budget is still open.
-        self._poll_cursor = (start + 1) % len(items)
-        return items[start:] + items[:start]
+        now = datetime.now(tz=UTC)
+
+        def key(item: tuple[str, str]) -> tuple[float, date, str]:
+            token = item[0]
+            seen = self._last_polled_at.get(token)
+            age = float("inf") if seen is None else (now - seen).total_seconds()
+            return (-age, self._book_targets.get(token, date.max), token)
+
+        return sorted(self._books.items(), key=key)
 
     def _poll_books(self, http: ResilientHttp | None) -> None:
         if self._writer is None or self._archive is None or http is None or not self._books:
@@ -735,116 +751,136 @@ class CollectorWorker:
         deadline = cycle_started + self.POLL_BUDGET_SECONDS
         attempted = 0
         latencies: list[float] = []
+        eligible = [(token, market) for token, market in self._sweep_books() if token not in self._no_book]
+        use_batch = bool(getattr(http, "supports_books_batch", False))
+        batch_size = self.BOOK_BATCH_SIZE if use_batch else 1
+        position = 0
 
-        for token_id, market_id in self._rotated_books():
-            if token_id in self._no_book:
-                continue
+        while position < len(eligible):
             if self.shutdown.requested():
                 break
             if time.monotonic() >= deadline:
                 # Defer the remainder to the next tick rather than blocking the
-                # heartbeat. Nothing is lost: the rotated start means the next
-                # sweep picks up here instead of starting over from the head.
-                eligible = sum(1 for t, _ in self._books.items() if t not in self._no_book)
-                deferred = max(0, eligible - attempted)
+                # heartbeat. Unsuccessful and never-polled tokens remain stale,
+                # so the next sweep serves them before fresher books.
+                deferred = max(0, len(eligible) - attempted)
                 self._poll_budget_exceeded += 1
                 self._poll_deferred += deferred
                 self._note_poll_budget(time.monotonic() - cycle_started, deferred)
                 break
 
+            chunk = eligible[position : position + batch_size]
+            position += len(chunk)
             timeout_seconds, retries = self._book_request_budget(deadline)
-            # Marked before the request: this is when we *asked*. The value
-            # that goes into the archive and the row is taken after the
-            # response, and the difference is the latency this sweep records.
+            # One clock pair per HTTP request. Every book in a batch shares the
+            # response-arrival time, while retaining its own raw payload and row.
             request_started = datetime.now(tz=UTC)
             try:
-                # Fetch the raw payload first: the archive stores it verbatim,
-                # and only then is it parsed into a row.
-                payload = http.get_json(
-                    f"{CLOB_BASE}/book",
-                    params={"token_id": token_id},
-                    limiter="clob_book",
-                    allow_not_found=True,
-                    timeout_seconds=timeout_seconds,
-                    retries=retries,
-                )
-                received_at = datetime.now(tz=UTC)
-                attempted += 1
+                if use_batch:
+                    token_ids = [token for token, _ in chunk]
+                    books = fetch_books(
+                        http,
+                        token_ids=token_ids,
+                        timeout_seconds=timeout_seconds,
+                        retries=retries,
+                    )
+                    received_at = datetime.now(tz=UTC)
+                    payloads = [books.get(token_id) for token_id in token_ids]
+                else:
+                    token_id = chunk[0][0]
+                    payload = http.get_json(
+                        f"{CLOB_BASE}/book",
+                        params={"token_id": token_id},
+                        limiter="clob_book",
+                        allow_not_found=True,
+                        timeout_seconds=timeout_seconds,
+                        retries=retries,
+                    )
+                    received_at = datetime.now(tz=UTC)
+                    payloads = [payload]
+            except Exception as exc:
+                attempted += len(chunk)
+                failed += len(chunk)
+                self.stats.rest_requests_failed += len(chunk)
+                label = f"books batch of {len(chunk)}" if use_batch else f"book {chunk[0][0][:12]}"
+                self._note_error(f"{label}: {exc}")
+                log.debug("book fetch failed for %s: %s", label, exc)
+                continue
+
+            attempted += len(chunk)
+            latency_ms = (received_at - request_started).total_seconds() * 1000.0
+            latencies.append(latency_ms)
+            self._rest_latencies.append(latency_ms)
+
+            for (token_id, market_id), payload in zip(chunk, payloads, strict=True):
                 if payload is None:
-                    # "No orderbook exists for this token" - a definitive answer
-                    # about an archived market, not an upstream failure. Remember
-                    # it so the collector stops re-asking every cycle.
+                    # GET reports this as a 404; POST /books omits the entry.
+                    # Both are definitive no-book answers, not transport errors.
                     self._no_book.add(token_id)
                     self.stats.rest_requests_ok += 1
                     self._rest_consecutive_failures = 0
                     log.debug("no orderbook for token %s; skipping it from now on", token_id[:12])
                     continue
-                snapshot = parse_book_payload(
-                    payload,
-                    token_id=token_id,
-                    market_id=market_id,
-                    fetched_at_utc=received_at,
-                    run_id=self.run_id,
-                )
-            except Exception as exc:
-                failed += 1
-                attempted += 1
-                self.stats.rest_requests_failed += 1
-                self._note_error(f"book {token_id[:12]}: {exc}")
-                log.debug("book fetch failed for %s: %s", token_id[:12], exc)
-                continue
+                try:
+                    snapshot = parse_book_payload(
+                        payload,
+                        token_id=token_id,
+                        market_id=market_id,
+                        fetched_at_utc=received_at,
+                        run_id=self.run_id,
+                    )
+                except Exception as exc:
+                    failed += 1
+                    self.stats.rest_requests_failed += 1
+                    self._note_error(f"book {token_id[:12]}: {exc}")
+                    log.debug("book parse failed for %s: %s", token_id[:12], exc)
+                    continue
 
-            latency_ms = (received_at - request_started).total_seconds() * 1000.0
-            latencies.append(latency_ms)
-            self._rest_latencies.append(latency_ms)
-            # Per-token so "which token has not been seen lately" is answerable
-            # from the heartbeat rather than only from the archive.
-            self._last_polled_at[token_id] = received_at
-
-            self._archive.append(
-                ArchiveRecord(
-                    source="rest",
-                    payload=payload,
-                    received_at_utc=received_at,
-                    venue_ts_utc=snapshot.venue_ts,
-                    quality=snapshot.quality,
-                    run_id=self.run_id,
-                )
-            )
-            self._writer.stage_book(snapshot.row)
-            if snapshot.quality != "ok":
-                self._last_defect = snapshot.quality
-                if _is_one_sided(snapshot.quality):
-                    # An extreme bracket routinely has no bid or no ask: that is
-                    # the market being empty, not the payload being corrupt.
-                    self.stats.one_sided_books += 1
-                else:
-                    self.stats.integrity_failures += 1
-            ok += 1
-            self.stats.rest_requests_ok += 1
-            self._rest_consecutive_failures = 0
-
-            mid = _midpoint(snapshot.bids, snapshot.asks)
-            if mid is not None:
-                self._writer.stage_price(
-                    (
-                        market_id,
-                        token_id,
-                        received_at,
-                        mid,
-                        "rest",
-                        received_at,
-                        snapshot.venue_ts_origin,
-                        self.run_id,
+                self._mark_book_refreshed(token_id, received_at)
+                self._archive.append(
+                    ArchiveRecord(
+                        source="rest",
+                        payload=payload,
+                        received_at_utc=received_at,
+                        venue_ts_utc=snapshot.venue_ts,
+                        quality=snapshot.quality,
+                        run_id=self.run_id,
                     )
                 )
-                self.stats.price_points_inserted += 1
-                self._last_data_change = received_at
-                # The REST poll is the authoritative snapshot. Keeping its
-                # midpoint gives every stream update something to be checked
-                # against, which is what turns "two sources" into "two sources
-                # that agree".
-                self._last_rest_mid[token_id] = (received_at, mid)
+                self._writer.stage_book(snapshot.row)
+                if snapshot.quality != "ok":
+                    self._last_defect = snapshot.quality
+                    if _is_one_sided(snapshot.quality):
+                        # An extreme bracket routinely has no bid or no ask: that is
+                        # the market being empty, not the payload being corrupt.
+                        self.stats.one_sided_books += 1
+                    else:
+                        self.stats.integrity_failures += 1
+                ok += 1
+                self.stats.rest_requests_ok += 1
+                self._rest_consecutive_failures = 0
+
+                mid = _midpoint(snapshot.bids, snapshot.asks)
+                if mid is not None:
+                    self._writer.stage_price(
+                        (
+                            market_id,
+                            token_id,
+                            received_at,
+                            mid,
+                            "rest",
+                            received_at,
+                            snapshot.venue_ts_origin,
+                            self.run_id,
+                        )
+                    )
+                    self.stats.price_points_inserted += 1
+                    self._last_data_change = received_at
+                    # The REST poll is the authoritative snapshot. Keeping its
+                    # midpoint gives every stream update something to be checked
+                    # against, which is what turns "two sources" into "two sources
+                    # that agree".
+                    self._last_rest_mid[token_id] = (received_at, mid)
 
         if failed:
             self._rest_consecutive_failures = max(self._rest_consecutive_failures, failed)
@@ -853,12 +889,20 @@ class CollectorWorker:
         self._writer.flush_if_due()
         log.debug("book poll: %d ok, %d failed", ok, failed)
 
+    def _mark_book_refreshed(self, token_id: str, received_at: datetime) -> None:
+        """Record a successful parse and its interval from the prior success."""
+        previous = self._last_polled_at.get(token_id)
+        if previous is not None:
+            gap_ms = max(0.0, (received_at - previous).total_seconds() * 1000.0)
+            self._book_refresh_gaps_ms.append(gap_ms)
+        self._last_polled_at[token_id] = received_at
+
     def _note_poll_budget(self, elapsed: float, deferred: int) -> None:
         """Record that the sweep ran out of budget, without a log storm.
 
         Budget exhaustion is a *normal* outcome of a full token set and is the
-        thing the rotation exists to spread around, so it is a counter first
-        and a log line second - the first, and then one every five minutes.
+        thing stalest-first ordering addresses, so it is a counter first and a
+        log line second - the first, and then one every five minutes.
         """
         now = time.monotonic()
         if (
@@ -1257,13 +1301,14 @@ class CollectorWorker:
                 "frames_dropped": self._frames_dropped,
             },
             "per_token_book_age_ms": self._per_token_book_age(),
+            "per_token_book_refresh_gap_ms": _latency_summary(list(self._book_refresh_gaps_ms)),
         }
 
     def _per_token_book_age(self) -> dict[str, Any] | None:
         """How stale each token's newest book is, right now.
 
-        Rotation is meant to make the *refresh gap* uniform; this shows whether
-        the *age* actually converged. The oldest token is named, because a
+        Stalest-first scheduling is meant to make the *refresh gap* uniform;
+        this shows whether the *age* actually converged. The oldest token is named, because a
         uniform p95 with one token an hour behind is still starvation.
         """
         if not self._last_polled_at:
@@ -1275,6 +1320,7 @@ class CollectorWorker:
         return {
             "tokens": len(values),
             "max_ms": round(max(values), 1),
+            "p90_ms": round(_percentile(values, 90), 1),
             "p95_ms": round(_percentile(values, 95), 1),
             "median_ms": round(_percentile(values, 50), 1),
             "oldest_token": oldest[:24],
@@ -1477,6 +1523,7 @@ def _latency_summary(values: list[float]) -> dict[str, Any]:
     return {
         "n": len(values),
         "p50_ms": round(_percentile(values, 50), 1),
+        "p90_ms": round(_percentile(values, 90), 1),
         "p95_ms": round(_percentile(values, 95), 1),
         "p99_ms": round(_percentile(values, 99), 1),
         "max_ms": round(max(values), 1),

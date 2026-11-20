@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+import weatherquant.shadow.export as shadow_export
 from weatherquant.shadow.export import DecisionExporter, export_watermark, read_export
 from weatherquant.storage.shadow import ShadowDatabase
 
@@ -139,6 +140,14 @@ def test_indexed_database_upgrades_with_live_cursor_and_late_legacy_row(tmp_path
     db_path = tmp_path / "shadow.duckdb"
     with monkeypatch.context() as patch:
         patch.setattr(shadow, "SHADOW_MIGRATIONS_DIR", old_migrations)
+        # This exporter is establishing the *old* cursor before the upgrade.
+        # Match its projection to the old schema; the new fee_source column is
+        # added by 0010 only when the real migration runs below.
+        old_columns = tuple(
+            column for column in shadow_export.EXPORT_COLUMNS if column != "d.fee_source"
+        )
+        patch.setattr(shadow_export, "EXPORT_COLUMNS", old_columns)
+        patch.setattr(shadow_export, "_SEQ_INDEX", old_columns.index("d.export_seq"))
         with ShadowDatabase(db_path) as old:
             seq = old.execute("SELECT nextval('seq_shadow_decision_export')").fetchone()[0]
             live_id = _insert(old, i=1, when=NOW, seq=seq)

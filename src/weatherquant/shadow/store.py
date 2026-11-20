@@ -317,7 +317,7 @@ class ShadowStore:
             "estimated_fees_usd, estimated_buffer_usd, estimated_cost_usd, "
             "expected_net_profit_usd, net_edge, market_closed, forecast_age_hours, "
             "thresholds_version, mode, mode_reason, decision_latency_ms, created_at_utc, "
-            "evidence_version, fee_rate, fee_exponent, book_source_event_id, book_source, export_seq) "
+            "evidence_version, fee_rate, fee_exponent, fee_source, book_source_event_id, book_source, export_seq) "
             "VALUES {values} "
             "ON CONFLICT (cycle_id, market_id, direction) DO UPDATE SET "
             "state = excluded.state, primary_reason = excluded.primary_reason, "
@@ -392,13 +392,14 @@ class ShadowStore:
                 1 if d.mode is Mode.LIVE else None,
                 d.fee_rate,
                 d.fee_exponent,
+                d.fee_source,
                 d.live_book.source_event_id if d.live_book else None,
                 d.book_source,
             )
             for d in decisions
         ]
         latest = {row[0]: decision for row, decision in zip(decision_rows, decisions, strict=True)}
-        values = "(" + ", ".join(["?"] * 49) + ", nextval('seq_shadow_decision_export'))"
+        values = "(" + ", ".join(["?"] * 50) + ", nextval('seq_shadow_decision_export'))"
         if len(latest) == len(decision_rows):
             self.db.execute(
                 decision_sql.format(values=", ".join([values] * len(decision_rows))),

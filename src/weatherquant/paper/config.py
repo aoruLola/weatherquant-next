@@ -141,11 +141,12 @@ class PaperSettings(BaseSettings):
     )
 
     # --- fill gates -------------------------------------------------------------
-    require_complete_fill: bool = Field(
-        default=True,
-        description="A partial fill is not a smaller trade, it is a different "
-        "trade: the unfilled remainder would have to be repriced against a "
-        "book we just drove through. Refusing keeps every fill interpretable.",
+    min_order_size_shares: float = Field(
+        default=5.0,
+        gt=0.0,
+        description="The venue's minimum order size, used as the fill floor. "
+        "A sized-down fill below this could never have been placed. "
+        "Polymarket weather markets default to 5 shares.",
     )
     execution_buffer_fraction: float = Field(
         default=0.005,
@@ -200,6 +201,11 @@ class PaperSettings(BaseSettings):
         "per-market exposure). A file, not environment variables: a cap that "
         "can be widened on the box producing the results cannot be audited "
         "afterwards. Missing keys are errors, never permissive defaults.",
+    )
+    fee_schedule_path: Path = Field(
+        default=Path("configs/fee-schedule.json"),
+        description="Dated fallback fee schedule, used only when an exported "
+        "event carries no fee rate. A venue-reported rate always wins.",
     )
 
     @field_validator("enabled", mode="before")
