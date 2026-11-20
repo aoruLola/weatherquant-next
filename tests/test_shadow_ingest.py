@@ -541,3 +541,60 @@ def test_a_quarantined_partition_is_recorded_and_the_tail_restarts_on_the_fresh_
     again = tailer.poll()
     assert "archive_partition_quarantined" not in {q.kind for q in again.quality}
     assert again.stats.lines_read == 0
+
+
+def test_a_quarantine_is_detected_even_after_the_fresh_file_outgrows_the_checkpoint(tmp_path):
+    """The fresh partition can be longer than the committed offset by the time
+    the shadow polls (shadow down for a while, or the quarantine happened early
+    in the UTC day). Size alone then says nothing; reading the fresh file from
+    the old offset would silently skip its first records and start mid-line."""
+    from weatherquant.data.archive import ArchiveRecord, RawArchive
+
+    def event(second: int, run_id: str) -> ArchiveRecord:
+        return ArchiveRecord("gamma", gamma_event(), NOW + timedelta(seconds=second), None, "ok", run_id)
+
+    with RawArchive(tmp_path, run_id="collector") as writer:
+        for i in range(3):
+            writer.append(event(i, "collector"))
+    path = tmp_path / "gamma" / f"{TARGET_DATE}.jsonl"
+    tailer = _tailer(tmp_path)
+    _commit(tailer, tailer.poll())
+    committed = tailer.checkpoints[str(path)].offset_bytes
+
+    tampered = path.read_bytes().replace(b'"source":"gamma"', b'"source":"gammA"') + b'{"archive_seq":99}\n'
+    path.write_bytes(tampered)
+    with RawArchive(tmp_path, run_id="collector2") as writer:
+        for i in range(6):
+            writer.append(event(10 + i, "collector2"))
+    assert list((tmp_path / "quarantine" / "gamma").glob("*.quarantine"))
+    assert path.stat().st_size > committed  # the fresh file already outgrew the checkpoint
+
+    result = tailer.poll()
+    assert [q.kind for q in result.quality if q.kind == "archive_partition_quarantined"] == [
+        "archive_partition_quarantined"
+    ]
+    assert result.stats.lines_read == 6  # every fresh record, none skipped
+
+    _commit(tailer, result)
+    assert tailer.checkpoints[str(path)].offset_bytes == path.stat().st_size
+    again = tailer.poll()
+    assert "archive_partition_quarantined" not in {q.kind for q in again.quality}
+    assert again.stats.lines_read == 0
+    # A restarted shadow, reloading checkpoints from the store, does not rewind either.
+    reloaded = _reload(tailer)
+    after_restart = reloaded.poll()
+    assert "archive_partition_quarantined" not in {q.kind for q in after_restart.quality}
+    assert after_restart.stats.lines_read == 0
+
+
+def test_a_quarantine_started_line_alone_marks_the_path_replaced(tmp_path) -> None:
+    import json as _json
+
+    from weatherquant.shadow.ingest import ArchiveTailer
+
+    live = tmp_path / "rest" / "2026-10-10.jsonl"
+    (tmp_path / "recovery.jsonl").write_text(
+        _json.dumps({"event": "partition_quarantine_started", "path": str(live)}) + "\n"
+    )
+    tailer = ArchiveTailer(tmp_path, station="KLGA")
+    assert str(live) in tailer._quarantined_paths()

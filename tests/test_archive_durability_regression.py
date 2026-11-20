@@ -736,3 +736,110 @@ def test_a_quarantine_write_failure_leaves_the_fragment_and_the_batch_retryable(
     restarted.close()
     assert [row["payload"]["n"] for row in _lines(root)] == [0, 1]
     assert _all_ok(root)
+
+
+def _tamper(path: Path) -> bytes:
+    tampered = path.read_bytes().replace(b'"n":0', b'"n":9') + b'{"archive_seq":2}\n'
+    path.write_bytes(tampered)
+    return tampered
+
+
+def test_a_crash_between_the_two_quarantine_moves_does_not_wedge_startup(tmp_path, monkeypatch):
+    """The data file is moved first, the sidecar second. Dying in between
+    left a live sidecar with no data, which every later start refused as a
+    truncation: the collector could never start again."""
+    import weatherquant.data.archive as archive_mod
+
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    path = next(tmp_path.glob("rest/*.jsonl"))
+    receipt = path.with_suffix(".jsonl.sha256")
+    original_receipt = receipt.read_bytes()
+    tampered = _tamper(path)
+
+    real_replace = os.replace
+    moves: list[Any] = []
+
+    def die_on_second_move(src, dst):
+        moves.append(src)
+        if len(moves) == 2:
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(archive_mod.os, "replace", die_on_second_move)
+    with pytest.raises(OSError):
+        RawArchive(tmp_path, run_id="dies").recover_pending_partitions()
+    monkeypatch.setattr(archive_mod.os, "replace", real_replace)
+    assert not path.exists() and receipt.exists(), "the window this test is about"
+
+    writer = RawArchive(tmp_path, run_id="restart")
+    writer.recover_pending_partitions()  # must not raise
+
+    evidence = sorted((tmp_path / "quarantine" / "rest").glob("*.quarantine"))
+    assert [p.read_bytes() for p in evidence if ".sha256." not in p.name] == [tampered]
+    assert [p.read_bytes() for p in evidence if ".sha256." in p.name] == [original_receipt]
+    assert not receipt.exists()
+    event = _recovery_events(tmp_path)[-1]
+    assert event["event"] == "partition_quarantined"
+    assert event["path"] == str(path)
+    assert writer.quarantined_partitions == 1
+
+    writer.append(_record(run_id="restart"))
+    assert writer.flush() == 1
+    writer.close()
+    assert _all_ok(tmp_path)
+
+
+def test_a_missing_partition_without_quarantine_evidence_is_still_refused(tmp_path):
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    path = next(tmp_path.glob("rest/*.jsonl"))
+    path.unlink()
+    with pytest.raises(OSError):
+        RawArchive(tmp_path, run_id="restart").recover_pending_partitions()
+    assert path.with_suffix(".jsonl.sha256").exists()
+
+
+def test_the_quarantine_alert_survives_a_restart_until_the_evidence_is_reviewed(tmp_path):
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    path = next(tmp_path.glob("rest/*.jsonl"))
+    _tamper(path)
+    first = RawArchive(tmp_path, run_id="restart")
+    first.recover_pending_partitions()
+    first.close()
+    assert first.quarantined_partitions == 1
+
+    # A plain restart must not quietly clear the integrity alert.
+    second = RawArchive(tmp_path, run_id="again")
+    second.recover_pending_partitions()
+    assert second.quarantined_partitions == 1
+    second.close()
+
+    # Moving the reviewed evidence out of quarantine/ is the acknowledgement.
+    (tmp_path / "quarantine").rename(tmp_path / "quarantine-reviewed")
+    third = RawArchive(tmp_path, run_id="reviewed")
+    assert third.quarantined_partitions == 0
+    third.close()
+
+
+def test_the_quarantine_intent_is_durable_before_the_evidence_moves(tmp_path, monkeypatch):
+    """A crash after the moves but before ``partition_quarantined`` must
+    still leave a line naming the replaced path for the shadow."""
+    import weatherquant.data.archive as archive_mod
+
+    with RawArchive(tmp_path, run_id="wqn-21") as writer:
+        writer.append(_record())
+    path = next(tmp_path.glob("rest/*.jsonl"))
+    _tamper(path)
+
+    real_replace = os.replace
+    seen: list[list[str]] = []
+
+    def record_log_then_move(src, dst):
+        seen.append([e["event"] for e in _recovery_events(tmp_path)])
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(archive_mod.os, "replace", record_log_then_move)
+    RawArchive(tmp_path, run_id="restart").recover_pending_partitions()
+    assert seen and "partition_quarantine_started" in seen[0]

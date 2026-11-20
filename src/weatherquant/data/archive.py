@@ -74,7 +74,13 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-__all__ = ["ArchiveRecord", "RawArchive", "read_archive_sidecar", "verify_archive_tree"]
+__all__ = [
+    "ArchiveRecord",
+    "RawArchive",
+    "count_quarantined_partitions",
+    "read_archive_sidecar",
+    "verify_archive_tree",
+]
 
 log = logging.getLogger(__name__)
 
@@ -185,7 +191,11 @@ class RawArchive:
         # Digest/data mismatches that were quarantined rather than fatal-exiting
         # the collector. Surfaced on the heartbeat so an operator is alerted
         # even though collection continues into a fresh file.
-        self.quarantined_partitions: int = 0
+        # Counted from the evidence on disk, not from this process's memory:
+        # a restart must not quietly turn the alert off while the frozen
+        # partition is still waiting for an operator. Moving the evidence out
+        # of ``quarantine/`` after review is the explicit acknowledgement.
+        self.quarantined_partitions: int = count_quarantined_partitions(self.root)
         self.last_quarantine: dict[str, Any] | None = None
 
     # -- writing -----------------------------------------------------------
@@ -198,6 +208,8 @@ class RawArchive:
         """
         for receipt in sorted(self.root.glob("*/*.jsonl.sha256")):
             path = receipt.with_suffix("")
+            if not path.exists() and self._finish_interrupted_quarantine_locked(path):
+                continue
             try:
                 state = read_archive_sidecar(path)
                 if state is None:
@@ -378,12 +390,22 @@ class RawArchive:
         quarantine_dir.mkdir(parents=True, exist_ok=True)
         data_dest = quarantine_dir / f"{path.name}.{stamp}.quarantine"
         sidecar_dest = quarantine_dir / f"{path.name}.sha256.{stamp}.quarantine"
+        # Durable intent before the first rename: if the process dies after
+        # the moves but before ``partition_quarantined`` below, the shadow
+        # still learns from this line that the live path is a fresh file.
+        self._log_recovery(
+            "partition_quarantine_started",
+            path=str(path),
+            reason=reason,
+            quarantine_path=str(data_dest),
+        )
         try:
             if path.exists():
                 os.replace(path, data_dest)
             if sidecar_existed:
                 os.replace(sidecar_path, sidecar_dest)
             _fsync_dir(quarantine_dir)
+            _fsync_dir(path.parent)
         except OSError:
             self._log_recovery(
                 "partition_quarantine_failed",
@@ -423,6 +445,52 @@ class RawArchive:
         key = (source, date.fromisoformat(path.stem))
         self._chains.pop(key, None)
         self._pending_sidecars.discard(key)
+
+    def _finish_interrupted_quarantine_locked(self, path: Path) -> bool:
+        """Complete a quarantine that died between moving the data and its sidecar.
+
+        :meth:`_quarantine_partition_locked` moves the data file first, then the
+        sidecar. A crash between the two leaves the live path with a sidecar
+        and no data, which every later start would refuse as a truncation -
+        a collector that can never start again over a move it had already
+        half made. The signature is exact: frozen data in ``quarantine/``
+        whose sidecar never arrived. Only then is the move finished; a data
+        file that is simply gone, with no evidence, is still refused.
+        """
+        quarantine_dir = self.root / "quarantine" / path.parent.name
+        prefix = f"{path.name}."
+        orphans = []
+        for candidate in quarantine_dir.glob(f"{path.name}.*.quarantine"):
+            stamp = candidate.name[len(prefix) : -len(".quarantine")]
+            if stamp.startswith("sha256."):
+                continue
+            if not (quarantine_dir / f"{path.name}.sha256.{stamp}.quarantine").exists():
+                orphans.append((stamp, candidate))
+        if not orphans:
+            return False
+        stamp, data_dest = max(orphans)
+        sidecar_path = _sidecar_path(path)
+        sidecar_dest = quarantine_dir / f"{path.name}.sha256.{stamp}.quarantine"
+        os.replace(sidecar_path, sidecar_dest)
+        _fsync_dir(quarantine_dir)
+        _fsync_dir(path.parent)
+        self.last_quarantine = {
+            "path": str(path),
+            "reason": "completing a quarantine interrupted before its sidecar was moved",
+            "quarantine_path": str(data_dest),
+        }
+        # The same event the uninterrupted path writes, so the shadow learns
+        # this live path was replaced; the evidence was already counted.
+        self._log_recovery(
+            "partition_quarantined",
+            path=str(path),
+            reason=self.last_quarantine["reason"],
+            quarantine_path=str(data_dest),
+            sidecar_quarantine_path=str(sidecar_dest),
+            completed_after_restart=True,
+        )
+        log.error("archive quarantine completed after restart: path=%s evidence=%s", path, data_dest)
+        return True
 
     def _continue_seq_from_file_locked(self, key: tuple[str, date]) -> None:
         """Pick up the sequence baseline a previous run left in this partition."""
@@ -665,6 +733,20 @@ def _chain_digest(previous_hex: str, payload: bytes) -> str:
     :func:`verify_archive_tree` possible without knowing flush boundaries.
     """
     return hashlib.sha256(bytes.fromhex(previous_hex) + payload).hexdigest()
+
+
+def count_quarantined_partitions(root: str | Path) -> int:
+    """Partitions frozen in ``<root>/quarantine/`` after a digest/data mismatch.
+
+    One per quarantine event: a data file and its sidecar share a timestamp
+    and count once. Torn-tail fragments (``*.torn``) are routine crash
+    recovery, not integrity alerts, and are not counted.
+    """
+    events: set[tuple[str, str]] = set()
+    for evidence in Path(root, "quarantine").glob("*/*.quarantine"):
+        name = evidence.name[: -len(".quarantine")].replace(".jsonl.sha256.", ".jsonl.", 1)
+        events.add((evidence.parent.name, name))
+    return len(events)
 
 
 def _sidecar_path(path: Path) -> Path:

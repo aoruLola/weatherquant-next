@@ -430,6 +430,7 @@ def _data_quality(con) -> dict[str, Any]:
         "archive_file_unreadable",
         "archive_trail_ahead_of_file",
         "archive_trail_behind_checkpoint",
+        "archive_partition_quarantined",
     }
     gaps = sum(v["count"] for k, v in by_kind.items() if k in gap_kinds)
     errors = sum(v["count"] for v in by_kind.values() if v["severity"] == "error")

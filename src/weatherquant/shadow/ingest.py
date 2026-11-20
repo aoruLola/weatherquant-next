@@ -67,6 +67,11 @@ __all__ = [
 ]
 
 
+# ``partition_quarantine_started`` is written before the evidence is moved,
+# so a crash between the move and ``partition_quarantined`` is still seen.
+_QUARANTINE_EVENTS = frozenset({"partition_quarantine_started", "partition_quarantined"})
+
+
 class _ChecksumDisagreement(Exception):
     """The sidecar and the bytes a reader can see do not describe the same file.
 
@@ -182,6 +187,10 @@ class ArchiveTailer:
         # poll does not re-parse it when nothing changed.
         self._quarantine_cache_key: tuple[int, int] | None = None
         self._quarantine_cache: set[str] = set()
+        # Inode of the handle the last read went through, so a checkpoint
+        # names the file its offset was measured in, not whatever the path
+        # points at a moment later.
+        self._read_inode: int | None = None
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -257,7 +266,11 @@ class ArchiveTailer:
 
             offset = existing.offset_bytes if existing else 0
             was_truncated = False
-            restart = self._partition_restart(path, offset) if existing is not None else None
+            restart = (
+                self._partition_restart(path, offset, existing.file_identity)
+                if existing is not None
+                else None
+            )
             if restart is not None:
                 was_truncated = True
                 quarantined = restart == "quarantine"
@@ -287,6 +300,7 @@ class ArchiveTailer:
                 )
                 offset = 0
 
+            self._read_inode = None
             try:
                 read = self._read_complete_lines(path, offset)
             except _ChecksumDisagreement as exc:
@@ -359,6 +373,7 @@ class ArchiveTailer:
                     last_envelope,
                     path,
                     self.clock(),
+                    inode=self._read_inode,
                 )
                 parsed_date = _parse_date(path.name)
                 if parsed_date is not None:
@@ -426,6 +441,7 @@ class ArchiveTailer:
     def _read_complete_lines(self, path: Path, offset: int) -> tuple[bytes, int, bool]:
         """Return complete lines, their end offset, and whether the next line exceeds the cap."""
         with path.open("rb") as handle:
+            self._read_inode = os.fstat(handle.fileno()).st_ino
             # Snapshot the file size before reading the boundary: legacy files
             # receive their first sidecar before the collector appends new bytes.
             # Without a sidecar this snapshot is also the read boundary: growing
@@ -471,7 +487,7 @@ class ArchiveTailer:
             return b"", offset, False
         return data[: cut + 1], offset + cut + 1, False
 
-    def _partition_restart(self, path: Path, offset: int) -> str | None:
+    def _partition_restart(self, path: Path, offset: int, identity: str | None = None) -> str | None:
         """Whether the committed offset no longer fits this file, and why.
 
         Returns ``"quarantine"`` when the collector froze this partition after
@@ -493,6 +509,17 @@ class ArchiveTailer:
         if size < offset:
             return "quarantine" if quarantined else "truncated"
         if quarantined:
+            # The fresh partition may already be longer than the old offset
+            # (the shadow was down, or the quarantine came early in the day),
+            # so size cannot tell. The checkpoint's inode can: quarantine moves
+            # the old file away and a new inode takes the path.
+            stored_inode = _identity_inode(identity)
+            if stored_inode is not None:
+                try:
+                    if path.stat().st_ino != stored_inode:
+                        return "quarantine"
+                except OSError:
+                    return None
             try:
                 sidecar = read_archive_sidecar(path)
             except ValueError:
@@ -526,7 +553,7 @@ class ArchiveTailer:
                         entry = json.loads(line)
                     except ValueError:
                         continue
-                    if entry.get("event") == "partition_quarantined" and entry.get("path"):
+                    if entry.get("event") in _QUARANTINE_EVENTS and entry.get("path"):
                         paths.add(str(entry["path"]))
         except OSError:
             return set()
@@ -726,12 +753,27 @@ class ArchiveTailer:
             pending[source] = day
 
 
-def _identity(path: Path) -> str:
+def _identity(path: Path, inode: int | None = None) -> str:
+    """``size:mtime_ns:inode``. The inode is what tells a replaced partition
+    (quarantine moves the old file away) from one that merely grew."""
     try:
         stat = path.stat()
     except OSError:
         return "missing"
-    return f"{stat.st_size}:{stat.st_mtime_ns}"
+    return f"{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ino if inode is None else inode}"
+
+
+def _identity_inode(identity: str | None) -> int | None:
+    """The inode a checkpoint was taken against; ``None`` for legacy ``size:mtime`` identities."""
+    if not identity:
+        return None
+    parts = identity.split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        return int(parts[2])
+    except ValueError:
+        return None
 
 
 def _checkpoint_for(
@@ -742,6 +784,8 @@ def _checkpoint_for(
     envelope: Envelope | None,
     path: Path,
     now: datetime,
+    *,
+    inode: int | None = None,
 ) -> Checkpoint:
     return Checkpoint(
         file_path=key,
@@ -751,7 +795,7 @@ def _checkpoint_for(
         last_run_id=envelope.run_id if envelope else None,
         last_archive_seq=envelope.archive_seq if envelope else None,
         last_received_at_utc=envelope.received_at_utc if envelope else None,
-        file_identity=_identity(path),
+        file_identity=_identity(path, inode),
         updated_at_utc=now,
     )
 

@@ -1069,3 +1069,30 @@ def test_paper_fills_a_live_decision_from_its_own_exported_book(make_runner, arc
         assert stored_book_id == event.book_id
         assert fill["book_source_event_id"] == hashlib.sha256(original_line).hexdigest()
         assert fill["book_source_event_id"] != hashlib.sha256(late_line.encode("utf-8")).hexdigest()
+
+
+def test_the_shadow_quarantine_alert_survives_a_restart(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from weatherquant.shadow.runner import ShadowRunner
+
+    evidence = tmp_path / "quarantine" / "rest"
+    evidence.mkdir(parents=True)
+    (evidence / "2026-10-10.jsonl.20261011T000000000000Z.quarantine").write_bytes(b"x")
+    (evidence / "2026-10-10.jsonl.sha256.20261011T000000000000Z.quarantine").write_bytes(b"{}")
+    (evidence / "2026-10-10.jsonl.20261011T000000000001Z.torn").write_bytes(b"y")
+    runner = object.__new__(ShadowRunner)
+    runner._quarantined_partitions = 0  # a fresh process saw nothing yet
+    runner.tailer = SimpleNamespace(raw_dir=tmp_path)
+    assert runner._quarantine_count() == 1
+
+
+def test_the_report_counts_a_quarantined_partition_as_a_data_gap() -> None:
+    import duckdb
+
+    from weatherquant.shadow.report import _data_quality
+
+    con = duckdb.connect()
+    con.execute("CREATE TABLE data_quality_events (kind VARCHAR, severity VARCHAR)")
+    con.execute("INSERT INTO data_quality_events VALUES ('archive_partition_quarantined', 'error')")
+    assert _data_quality(con)["data_gaps"] == 1

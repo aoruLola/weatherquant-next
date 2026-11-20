@@ -47,6 +47,7 @@ import duckdb
 
 from weatherquant.config import Settings
 from weatherquant.dashboard.producer import publish_detail_snapshots
+from weatherquant.data.archive import count_quarantined_partitions
 from weatherquant.data.http import ResilientHttp
 from weatherquant.data.lock import LockError, SingleInstanceLock
 from weatherquant.shadow.config import ShadowSettings, Thresholds
@@ -1079,6 +1080,22 @@ class ShadowRunner:
             "equity_curve": None,
         }
 
+
+    def _quarantine_count(self) -> int:
+        """Quarantined partitions still awaiting review.
+
+        The poll counter only knows what this process saw; the evidence in
+        ``quarantine/`` survives restarts, so the alert stays up until an
+        operator moves the reviewed evidence out.
+        """
+        tailer = getattr(self, "tailer", None)
+        evidence = 0
+        if tailer is not None:
+            try:
+                evidence = count_quarantined_partitions(tailer.raw_dir)
+            except OSError:
+                evidence = 0
+        return max(self._quarantined_partitions, evidence)
     def _write_heartbeat(self, *, status: str, fatal: str | None = None, reason: str | None = None) -> None:
         path = self.shadow.shadow_health_dir / "heartbeat.json"
         now = self.clock()
@@ -1102,7 +1119,7 @@ class ShadowRunner:
             "primary_model": self.shadow.shadow_primary_model,
             "disk": {"free_percent": disk},
             "last_cycle": self._last_cycle.as_dict() if self._last_cycle else None,
-            "quarantined_partitions": self._quarantined_partitions,
+            "quarantined_partitions": self._quarantine_count(),
             "report_duration_ms": self._report_duration_ms,
             "rss_mb": _rss_mb(),
             # Identity and size, so an operator can answer "which build is
