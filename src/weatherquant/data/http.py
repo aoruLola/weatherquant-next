@@ -46,6 +46,11 @@ class HttpStatusError(RuntimeError):
 class ResilientHttp:
     """Rate-limited, retrying JSON transport."""
 
+    # Alternate clients can opt in when they implement the same POST contract.
+    # Older collector fakes deliberately support only GET /book and stay on that
+    # path rather than receiving a request they cannot model.
+    supports_books_batch = True
+
     def __init__(
         self,
         *,
@@ -121,8 +126,18 @@ class ResilientHttp:
         *,
         json_body: Any = None,
         limiter: str | None = None,
+        timeout_seconds: float | None = None,
+        retries: int | None = None,
     ) -> Any:
-        return self._request_json("POST", url, json=json_body, limiter=limiter)
+        """POST a JSON body, with the same per-call budget overrides as GET."""
+        return self._request_json(
+            "POST",
+            url,
+            json_body=json_body,
+            limiter=limiter,
+            timeout_seconds=timeout_seconds,
+            retries=retries,
+        )
 
     def touch(self) -> None:
         """Record that we successfully reached the upstream right now."""

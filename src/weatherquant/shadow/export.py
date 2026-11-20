@@ -117,6 +117,7 @@ EXPORT_COLUMNS = (
     "d.mode_reason",
     "c.fee_rate",
     "c.fee_exponent",
+    "d.fee_source",
     "d.export_seq",
     "d.evidence_version",
     "d.book_source_event_id",
