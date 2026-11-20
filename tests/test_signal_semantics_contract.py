@@ -213,16 +213,18 @@ def test_net_edge_is_per_filled_share_for_partial_fills() -> None:
     assert sell_edge == pytest.approx(sell_profit / 40.0)
 
 
-def test_partial_fill_is_rejected_but_edge_recorded_per_filled_share() -> None:
+def test_partial_fill_is_sized_down_but_edge_recorded_per_filled_share() -> None:
     decision = _evaluate(
         probabilities=_probabilities(0.6),
         asks=[(0.48, 60.0)],
     )
-    assert decision.state is State.REJECT
-    assert decision.primary_reason is Reason.INSUFFICIENT_LIQUIDITY
+    # 60 shares is above the venue minimum, so this is a valid sized-down
+    # trade rather than a refusal. The edge is still computed against the
+    # shares that would actually fill, not the 100 requested.
+    assert decision.state is State.ACCEPT
+    assert Reason.INSUFFICIENT_LIQUIDITY not in decision.reasons
     assert decision.proposed_shares == pytest.approx(100.0)
     assert decision.estimated_fill_shares == pytest.approx(60.0)
-    # The rejected row still carries the per-filled-share edge as evidence.
     assert decision.net_edge == pytest.approx(0.10512)
 
 

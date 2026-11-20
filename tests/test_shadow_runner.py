@@ -428,6 +428,27 @@ def test_the_health_file_is_written_so_the_probe_never_opens_the_database(tmp_pa
     assert verdict.status in {"healthy", "degraded"}
 
 
+def test_fee_fallback_is_stored_counted_and_visible_in_health(archive, make_runner) -> None:
+    write_lines(
+        archive,
+        "gamma",
+        TARGET_DATE,
+        [archive_line(2, "gamma", gamma_event(fee_rate=None))],
+    )
+    runner, stats = _run_one_cycle(make_runner)
+
+    assert stats.decisions == 8
+    assert stats.fee_fallback_decisions == stats.decisions
+    assert runner.db.con.execute(
+        "SELECT DISTINCT fee_rate, fee_source FROM shadow_decisions"
+    ).fetchall() == [(0.05, "fallback")]
+    heartbeat = json.loads(
+        (runner.shadow.shadow_health_dir / "heartbeat.json").read_text(encoding="utf-8")
+    )
+    assert heartbeat["fee_schedule_version"] == "fee-v1"
+    assert heartbeat["fee_fallback_active"] is True
+
+
 def test_starting_alone_publishes_a_heartbeat(tmp_path, archive, models_dir, monkeypatch) -> None:
     """Liveness must not wait on the first cycle's network I/O.
 

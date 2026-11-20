@@ -23,6 +23,7 @@ import uuid
 from datetime import UTC, datetime
 
 from weatherquant.data.lock import LockError, SingleInstanceLock
+from weatherquant.execution.fees import load_fee_schedule
 from weatherquant.paper.api import ENDPOINTS
 from weatherquant.paper.books import ArchiveBookSource
 from weatherquant.paper.config import PaperSettings
@@ -199,12 +200,15 @@ def _fill_engine(store: PaperStore, settings: PaperSettings) -> FillEngine:
             timeout_seconds=settings.book_resolve_timeout_seconds,
         ),
         buffer_fraction=settings.execution_buffer_fraction,
-        require_complete_fill=settings.require_complete_fill,
+        min_order_size_shares=settings.min_order_size_shares,
         max_book_age_seconds=settings.max_book_age_seconds,
+        max_clock_skew_ms=settings.max_clock_skew_ms,
+        fee_schedule=load_fee_schedule(settings.fee_schedule_path),
         risk=RiskGate(
             Ledger(store),
             load_risk_rules(settings.risk_rules_path),
             initial_capital_usdc=float(store.account()["initial_capital_usdc"]),
+            min_order_shares=settings.min_order_size_shares,
         ),
     )
 
