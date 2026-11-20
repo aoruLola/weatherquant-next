@@ -55,7 +55,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 
 from weatherquant.execution.fees import (
@@ -622,11 +622,17 @@ def _check_clocks(
     rejecting that was rejecting healthy books. Beyond the tolerance the two
     clocks genuinely disagree and the book cannot be trusted.
     """
-    if snapshot.venue_ts is not None and snapshot.venue_ts > decision_time:
+    # The same tolerance applies here: a venue clock running ahead of ours by
+    # less than the skew budget puts a freshly received book's venue stamp a
+    # moment "after" the decision. The collector receipt check below still
+    # guarantees the book was actually in hand at the decision instant.
+    skew = timedelta(milliseconds=max_clock_skew_ms)
+    if snapshot.venue_ts is not None and snapshot.venue_ts > decision_time + skew:
         fail(
             Reason.TIME_MISMATCH,
             f"venue timestamp {snapshot.venue_ts.isoformat()} is after the decision "
-            f"instant {decision_time.isoformat()}",
+            f"instant {decision_time.isoformat()} by more than the "
+            f"{max_clock_skew_ms:.0f}ms tolerance",
         )
     if mode is not Mode.REPLAY and snapshot.collector_received_at_utc > decision_time:
         fail(

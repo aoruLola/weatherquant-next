@@ -202,6 +202,14 @@ class PaperSettings(BaseSettings):
         "can be widened on the box producing the results cannot be audited "
         "afterwards. Missing keys are errors, never permissive defaults.",
     )
+    max_clock_skew_ms: float = Field(
+        default=2000.0,
+        ge=0.0,
+        description="How far a book's venue timestamp may run ahead of the "
+        "decision instant before the clocks are judged to disagree. Matches the "
+        "shadow's max_clock_skew_ms so paper never refuses a book the shadow "
+        "accepted for the same skew.",
+    )
     fee_schedule_path: Path = Field(
         default=Path("configs/fee-schedule.json"),
         description="Dated fallback fee schedule, used only when an exported "

@@ -806,3 +806,27 @@ def test_the_mode_changes_nothing_about_the_pricing() -> None:
     assert live.state is replay.state
     assert live.net_edge == pytest.approx(replay.net_edge, abs=1e-12)
     assert live.estimated_fees_usd == pytest.approx(replay.estimated_fees_usd, abs=1e-12)
+
+
+def test_a_venue_clock_slightly_ahead_does_not_refuse_a_fresh_book() -> None:
+    """The skew tolerance must cover both venue-clock checks. A venue clock
+    600ms ahead puts a just-received book's venue stamp after the decision
+    instant; the book was in hand (collector receipt is before the decision),
+    so refusing it would block exactly the freshest books."""
+    ahead = make_observation(
+        venue_ts=NOW + timedelta(milliseconds=500),
+        collector_received=NOW - timedelta(milliseconds=100),
+        shadow_received=NOW - timedelta(milliseconds=50),
+    )
+    decision = _evaluate(snapshot=ahead)
+    assert Reason.TIME_MISMATCH not in decision.reasons
+
+
+def test_a_venue_clock_ahead_beyond_the_tolerance_is_still_refused() -> None:
+    ahead = make_observation(
+        venue_ts=NOW + timedelta(milliseconds=THRESHOLDS.max_clock_skew_ms + 1),
+        collector_received=NOW - timedelta(milliseconds=100),
+        shadow_received=NOW - timedelta(milliseconds=50),
+    )
+    decision = _evaluate(snapshot=ahead)
+    assert Reason.TIME_MISMATCH in decision.reasons

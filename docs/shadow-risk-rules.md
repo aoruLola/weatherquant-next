@@ -183,7 +183,7 @@ v1 把 `max_snapshot_age_ms` 设为 15000，依据写的是"采集器每 5 秒�
 
 | 检查 | 原因 |
 |---|---|
-| `venue_ts > decision_time` | TIME_MISMATCH —— 场所时间戳在未来 |
+| `venue_ts > decision_time` 超过 `max_clock_skew_ms` | TIME_MISMATCH —— 场所时间戳在未来（同一容差：场所时钟略快时，刚收到的盘口时间戳会稍晚于决策时点，但采集器接收时刻检查仍保证它当时已在手；Paper 成交闸门用相同容差 `max_clock_skew_ms`，不会拒绝 Shadow 已接受的盘口） |
 | `collector_received_at > decision_time` | TIME_MISMATCH —— **采集器实际收到的时刻晚于决策时点，当时不可能知道** |
 | `shadow_received_at > decision_time` | TIME_MISMATCH —— 本进程读到它的时刻晚于决策时点 |
 | `collector_received < venue_ts` 超过 `max_clock_skew_ms` | TIME_MISMATCH —— 两个时钟不一致（小抖动在容差内放行） |

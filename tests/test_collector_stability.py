@@ -657,3 +657,23 @@ def test_the_heartbeat_still_reports_after_a_slow_sweep(settings) -> None:
     assert payload["status"]
     assert "telemetry" in payload
     assert "poll_budget" in payload["telemetry"]
+
+
+def test_a_no_book_answer_is_retried_after_the_retry_interval(settings) -> None:
+    """An omitted token used to be dropped from REST polling for the life of
+    the process; a market whose book appears later must come back."""
+    worker = _worker_with_books(settings, tokens=3)
+    http = BatchTimingHttp()
+    http.omit_tokens = {"token-001"}
+    worker._poll_books(http)
+    assert worker._no_book == {"token-001"}
+
+    http.omit_tokens = set()
+    worker._poll_books(http)
+    assert len(http.batch_bodies[-1]) == 2, "still inside the retry interval"
+
+    worker._no_book_since["token-001"] -= worker.NO_BOOK_RETRY_SECONDS + 1
+    worker._poll_books(http)
+    assert any(item.get("token_id") == "token-001" for item in http.batch_bodies[-1])
+    assert worker._no_book == set()
+    assert "token-001" in worker._last_polled_at

@@ -546,3 +546,25 @@ class TestEndToEnd:
         assert store.signal_counts() == {"FILLED": 1}
         fill = store.fill_of(event.decision_id)
         assert fill["avg_price_usd_per_share"] == pytest.approx(0.558)
+
+
+class TestVenueClockSkew:
+    """Paper must not refuse a book the shadow accepted for the same skew."""
+
+    def _seed(self, store, raw_dir, venue_ts: str):
+        frame = book_payload(bids=[(0.52, 500.0)], asks=[(0.55, 60.0), (0.57, 200.0)], timestamp=venue_ts)
+        event = accept_signal(raw_dir, decision_id="d" * 32, book=frame)
+        store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
+        return event
+
+    def test_a_venue_stamp_one_second_ahead_still_fills(self, engine_env):
+        store, _events, raw_dir, _db = engine_env
+        self._seed(store, raw_dir, "2026-10-26T12:00:01Z")
+        result = make_engine(store, raw_dir).fill_pending()
+        assert result.filled == 1, result.by_reason
+
+    def test_a_venue_stamp_beyond_the_tolerance_is_refused(self, engine_env):
+        store, _events, raw_dir, _db = engine_env
+        self._seed(store, raw_dir, "2026-10-26T12:00:03Z")
+        result = make_engine(store, raw_dir).fill_pending()
+        assert result.by_reason == {"NOT_EXECUTABLE": 1}

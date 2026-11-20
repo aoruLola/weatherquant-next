@@ -202,6 +202,7 @@ def _fill_engine(store: PaperStore, settings: PaperSettings) -> FillEngine:
         buffer_fraction=settings.execution_buffer_fraction,
         min_order_size_shares=settings.min_order_size_shares,
         max_book_age_seconds=settings.max_book_age_seconds,
+        max_clock_skew_ms=settings.max_clock_skew_ms,
         fee_schedule=load_fee_schedule(settings.fee_schedule_path),
         risk=RiskGate(
             Ledger(store),

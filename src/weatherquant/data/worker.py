@@ -187,6 +187,11 @@ class CollectorWorker:
         # Tokens the venue says have no orderbook (archived markets). Re-asking
         # every cycle would turn a correct 404 into permanent request noise.
         self._no_book: set[str] = set()
+        # When each no-book token was marked. A no-book answer is retried after
+        # NO_BOOK_RETRY_SECONDS: a market whose book did not exist yet, or a
+        # batch response that dropped an entry, must not blind REST polling on
+        # that token for the rest of the process's life.
+        self._no_book_since: dict[str, float] = {}
         self._ws_queue: queue.Queue = queue.Queue(maxsize=20_000)
         self._ws_connected = False
         self._ws_last_message: datetime | None = None
@@ -696,6 +701,7 @@ class CollectorWorker:
     # The venue accepts up to 500 books per POST. A smaller request bounds
     # payload size while still collapsing the usual weather set into one call.
     BOOK_BATCH_SIZE = 100
+    NO_BOOK_RETRY_SECONDS = 600.0
 
     def _book_request_budget(self, deadline: float) -> tuple[float, int]:
         """``(timeout_seconds, retries)`` for one fetch inside the sweep.
@@ -752,6 +758,7 @@ class CollectorWorker:
         deadline = cycle_started + self.POLL_BUDGET_SECONDS
         attempted = 0
         latencies: list[float] = []
+        self._release_no_book(time.monotonic())
         eligible = [(token, market) for token, market in self._sweep_books() if token not in self._no_book]
         use_batch = bool(getattr(http, "supports_books_batch", False))
         batch_size = self.BOOK_BATCH_SIZE if use_batch else 1
@@ -818,6 +825,7 @@ class CollectorWorker:
                     # GET reports this as a 404; POST /books omits the entry.
                     # Both are definitive no-book answers, not transport errors.
                     self._no_book.add(token_id)
+                    self._no_book_since[token_id] = time.monotonic()
                     self.stats.rest_requests_ok += 1
                     self._rest_consecutive_failures = 0
                     log.debug("no orderbook for token %s; skipping it from now on", token_id[:12])
@@ -889,6 +897,12 @@ class CollectorWorker:
             self._last_sweep_latency_ms = _latency_summary(latencies)
         self._writer.flush_if_due()
         log.debug("book poll: %d ok, %d failed", ok, failed)
+
+    def _release_no_book(self, now: float) -> None:
+        """Let no-book tokens be asked again once the retry interval has passed."""
+        for token in [t for t in self._no_book if now - self._no_book_since.get(t, now) >= self.NO_BOOK_RETRY_SECONDS]:
+            self._no_book.discard(token)
+            self._no_book_since.pop(token, None)
 
     def _mark_book_refreshed(self, token_id: str, received_at: datetime) -> None:
         """Record a successful parse and its interval from the prior success."""

@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from weatherquant.execution.fees import (
@@ -161,6 +161,7 @@ class FillEngine:
         ledger: Ledger | None = None,
         risk: RiskGate | None = None,
         fee_schedule: DatedFeeSchedule | None = None,
+        max_clock_skew_ms: float = 2000.0,
     ) -> None:
         if buffer_fraction < 0.0:
             raise ValueError("buffer_fraction must be >= 0")
@@ -173,6 +174,9 @@ class FillEngine:
         self.buffer_fraction = float(buffer_fraction)
         self.min_order_size_shares = float(min_order_size_shares)
         self.max_book_age_seconds = float(max_book_age_seconds)
+        if max_clock_skew_ms < 0:
+            raise ValueError("max_clock_skew_ms must be >= 0")
+        self.max_clock_skew_ms = float(max_clock_skew_ms)
         self.clock = clock or (lambda: datetime.now(tz=UTC))
         self.batch_signals = int(batch_signals)
         self.ledger = ledger if ledger is not None else Ledger(store)
@@ -459,11 +463,16 @@ class FillEngine:
                 "the resolved book carries no venue timestamp, so its age cannot "
                 "be established and it cannot be shown to be fresh",
             )
-        if evidence.venue_ts_utc > event.decision_time_utc:
+        # Same skew tolerance as the shadow's gate: a venue clock slightly
+        # ahead of ours must not refuse the very book the decision accepted.
+        if evidence.venue_ts_utc > event.decision_time_utc + timedelta(
+            milliseconds=self.max_clock_skew_ms
+        ):
             return (
                 RefusalReason.NOT_EXECUTABLE.value,
                 f"the resolved book's venue timestamp {evidence.venue_ts_utc.isoformat()} "
-                "is after the decision instant; it is not evidence for this trade",
+                f"is after the decision instant by more than the "
+                f"{self.max_clock_skew_ms:.0f}ms tolerance; it is not evidence for this trade",
             )
         age_ms = _book_age_ms(evidence, event.decision_time_utc)
         if age_ms > self.max_book_age_seconds * 1000.0:
