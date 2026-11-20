@@ -41,6 +41,8 @@ class ShadowSettings(BaseSettings):
     shadow_db_path: Path = Path("data/shadow/shadow.duckdb")
     shadow_health_dir: Path = Path("data/shadow/health")
     shadow_thresholds_path: Path = Path("configs/shadow-thresholds.json")
+    # Used only when a market reports no fee_rate; a venue rate always wins.
+    shadow_fee_schedule_path: Path = Path("configs/fee-schedule.json")
 
     # Where the engine publishes the report it computes from its OWN connection.
     # Readers take this snapshot instead of opening DuckDB: the engine holds an
@@ -203,8 +205,9 @@ _REQUIRED_THRESHOLDS = (
     "max_snapshot_age_ms",
     "max_forecast_age_hours",
     "proposed_shares",
-    "require_complete_fill",
+    "min_order_size_shares",
     "min_depth_usd",
+    "max_clock_skew_ms",
     "max_decision_latency_ms",
 )
 
@@ -219,8 +222,9 @@ class Thresholds:
     max_snapshot_age_ms: float
     max_forecast_age_hours: float
     proposed_shares: float
-    require_complete_fill: bool
+    min_order_size_shares: float
     min_depth_usd: float
+    max_clock_skew_ms: float
     max_decision_latency_ms: float
 
     def as_dict(self) -> dict[str, Any]:
@@ -231,8 +235,9 @@ class Thresholds:
             "max_snapshot_age_ms": self.max_snapshot_age_ms,
             "max_forecast_age_hours": self.max_forecast_age_hours,
             "proposed_shares": self.proposed_shares,
-            "require_complete_fill": self.require_complete_fill,
+            "min_order_size_shares": self.min_order_size_shares,
             "min_depth_usd": self.min_depth_usd,
+            "max_clock_skew_ms": self.max_clock_skew_ms,
             "max_decision_latency_ms": self.max_decision_latency_ms,
         }
 
@@ -277,7 +282,11 @@ def _validate(t: Thresholds, path: Path) -> None:
         problems.append("max_forecast_age_hours must be > 0")
     if t.proposed_shares <= 0:
         problems.append("proposed_shares must be > 0")
+    if t.min_order_size_shares <= 0:
+        problems.append("min_order_size_shares must be > 0")
     if t.min_depth_usd < 0:
         problems.append("min_depth_usd must be >= 0")
+    if t.max_clock_skew_ms < 0:
+        problems.append("max_clock_skew_ms must be >= 0")
     if problems:
         raise ValueError(f"{path} contains invalid gate value(s): {problems}")

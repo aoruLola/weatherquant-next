@@ -85,8 +85,8 @@ class TestParsing:
         event = parse_signal_event(export_row(book_id=None, fee_rate=None))
         assert event.book_id is None
         assert event.fee_rate is None
-        # A missing fee schedule is evidence the fill layer must refuse on,
-        # not a zero. The contract only carries it.
+        # A missing venue rate stays missing in the contract. The fill layer
+        # resolves it through the dated fallback; it is never assumed zero.
         assert not hasattr(event, "fee_rate_assumed")
 
     def test_raw_row_is_carried_verbatim(self):

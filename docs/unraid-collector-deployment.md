@@ -668,7 +668,7 @@ target dates: 2025-07-15(7) 2026-10-09(11) 2026-10-10(11) 2026-10-11(11)
 1. **404 被当成上游故障** —— 关键词搜索带回 2025 年的历史市场，其 `/book`
    返回 `No orderbook exists`。修复：`allow_not_found=True` 把 404 视为
    **确定性回答**（推进接触时钟，不计入连续失败），并把该 token 加入
-   `_no_book` 不再重复询问；同时只对 `active && accepting_orders && !closed`
+   `_no_book`，`NO_BOOK_RETRY_SECONDS`（600s）内不再重复询问，之后重新询问一次（盘口晚于市场创建、或批量 `POST /books` 偶然漏掉某个 token，都不会让它在进程生命周期内永久失明）；同时只对 `active && accepting_orders && !closed`
    的市场轮询盘口。
 2. **`integrity_failures` 被单边盘污染** —— 极端温度桶没有对手盘是**正常市场状态**，
    不是数据损坏。拆分为 `one_sided_books` 与 `integrity_failures`。

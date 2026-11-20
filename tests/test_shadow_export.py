@@ -29,16 +29,19 @@ NOW = datetime(2026, 10, 14, 8, 0, tzinfo=UTC)
 
 COLUMNS = (
     "decision_id,run_id,cycle_id,market_id,station,direction,state,"
-    "decision_time_utc,model_probability,net_edge,mode,created_at_utc"
+    "decision_time_utc,model_probability,net_edge,mode,created_at_utc,fee_source"
 )
-PLACEHOLDERS = ",".join(["?"] * 12)
+PLACEHOLDERS = ",".join(["?"] * 13)
 
 
 def _insert(db, *, i: int, when: datetime, market: str = "m-0", state: str = "ACCEPT") -> None:
     """One decision. `i` is unique because the table keys on cycle+market+direction."""
     db.con.execute(
         f"INSERT INTO shadow_decisions ({COLUMNS}) VALUES ({PLACEHOLDERS})",
-        [f"id-{i:04d}", "run-1", f"cycle-{i}", market, "KLGA", "buy_yes", state, when, 0.6, 0.05, "LIVE", when],
+        [
+            f"id-{i:04d}", "run-1", f"cycle-{i}", market, "KLGA", "buy_yes",
+            state, when, 0.6, 0.05, "LIVE", when, "venue",
+        ],
     )
 
 
@@ -74,7 +77,7 @@ def test_every_field_the_downstream_statistics_need_is_exported() -> None:
         "decision_id", "run_id", "market_id", "target_date", "station",
         "direction", "state", "mode", "model_name", "model_version",
         "decision_time_utc", "model_probability", "market_price",
-        "available_depth_usd", "net_edge", "fee_rate", "fee_exponent",
+        "available_depth_usd", "net_edge", "fee_rate", "fee_exponent", "fee_source",
         "snapshot_age_ms", "forecast_run_time_utc", "thresholds_version",
     ):
         assert f"d.{column}" in EXPORT_COLUMNS or f"c.{column}" in EXPORT_COLUMNS, column
@@ -90,6 +93,7 @@ def test_rows_carry_the_values_not_just_the_keys(db, tmp_path) -> None:
     assert row["state"] == "ACCEPT"
     assert row["mode"] == "LIVE"
     assert row["net_edge"] == pytest.approx(0.05)
+    assert row["fee_source"] == "venue"
     # Timestamps are serialised, not left as datetime objects.
     assert row["decision_time_utc"].startswith("2026-10-14")
 

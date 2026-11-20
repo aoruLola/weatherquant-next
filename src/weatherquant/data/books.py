@@ -38,7 +38,7 @@ from weatherquant.markets.models import BookLevel, OrderBook
 
 log = logging.getLogger(__name__)
 
-__all__ = ["CLOB_BASE", "BookSnapshot", "book_from_levels_json", "fetch_book", "parse_book_payload"]
+__all__ = ["CLOB_BASE", "BookSnapshot", "book_from_levels_json", "fetch_book", "fetch_books", "parse_book_payload"]
 
 CLOB_BASE = "https://clob.polymarket.com"
 
@@ -204,3 +204,37 @@ def fetch_book(
         fetched_at_utc=fetched_at_utc,
         run_id=run_id,
     )
+
+
+def fetch_books(
+    http: ResilientHttp,
+    *,
+    token_ids: list[str],
+    timeout_seconds: float | None = None,
+    retries: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Fetch raw books in one POST, keyed by the requested token id.
+
+    The venue omits tokens with no orderbook. Those omissions are left out of
+    the result so the worker can apply the same no-book handling as a GET 404;
+    every returned payload remains verbatim for the per-token raw archive.
+    """
+    if len(token_ids) > 500:
+        raise ValueError("POST /books accepts at most 500 token ids")
+    payload = http.post_json(
+        f"{CLOB_BASE}/books",
+        json_body=[{"token_id": token_id} for token_id in token_ids],
+        limiter="clob_books_batch",
+        timeout_seconds=timeout_seconds,
+        retries=retries,
+    )
+    if not isinstance(payload, list):
+        raise ValueError(f"books payload is {type(payload).__name__}, expected a list")
+
+    by_token: dict[str, dict[str, Any]] = {}
+    for item in payload:
+        if not isinstance(item, dict) or item.get("asset_id") is None:
+            raise ValueError("books response item has no asset_id")
+        by_token[str(item["asset_id"])] = item
+    requested = set(token_ids)
+    return {token: book for token, book in by_token.items() if token in requested}

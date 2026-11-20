@@ -210,7 +210,7 @@ class RiskGate:
         if event.direction.value == "sell_yes":
             held = self.ledger.held_shares(event.market_id, event.token_id)
             shares = min(event.proposed_shares, held)
-            if shares < self.min_order_shares:
+            if shares < self.min_order_shares - _EPS:
                 return 0.0, GateVerdict.refuse(
                     RefusalReason.NO_INVENTORY,
                     f"holding {held:g} shares sizes this sell to {shares:.2f}, below the "
@@ -265,7 +265,7 @@ class RiskGate:
             )
         affordable = cap_usdc / cost_per_share
         shares = min(event.proposed_shares, affordable)
-        if shares < self.min_order_shares:
+        if shares < self.min_order_shares - _EPS:
             # Cash and market headroom were already shown to afford a minimum
             # order, so the per-opportunity budget itself is the binding cap.
             return 0.0, GateVerdict.refuse(

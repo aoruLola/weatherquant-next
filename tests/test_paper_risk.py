@@ -113,6 +113,26 @@ class TestSizing:
         assert verdict.allowed
         assert shares == 30.0
 
+    def test_budget_exactly_funding_the_venue_minimum_is_allowed(self, env):
+        _store, ledger, _gate, _db = env
+        # Five shares at the best ask, including the sizing fee reserve. A
+        # dollar cap at exactly this valid venue order must not reject it.
+        minimum_cost = 5.0 * (0.55 + 0.05 / 4.0)
+        gate = RiskGate(
+            ledger,
+            RiskRules(
+                version="t",
+                basis="",
+                max_opportunity_fraction=1.0,
+                max_market_exposure_fraction=1.0,
+            ),
+            initial_capital_usdc=minimum_cost,
+        )
+        event = parse_signal_event(export_row(token_id=TOKEN, proposed_shares=100.0))
+        shares, verdict = gate.size(event, _evidence())
+        assert verdict.allowed, verdict.detail
+        assert shares == pytest.approx(5.0)
+
     def test_zero_headroom_refuses_with_the_exposure_reason(self, env):
         _store, ledger, gate, db = env
         # Fill the market's exposure cap with an existing position.

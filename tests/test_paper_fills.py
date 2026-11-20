@@ -1,8 +1,9 @@
 """WQN-41: the simulated taker fill.
 
-Every acceptance criterion is a test: a missing, stale or too-thin book
-never becomes a trade, future data is refused, and the fill row carries the
-full evidence (consumed levels, average price, fee, identity).
+Every acceptance criterion is a test: a missing or stale book never becomes
+a trade, a thin book is sized down only to the venue minimum, future data is
+refused, and the fill row carries the full evidence (consumed levels, average
+price, fee, identity).
 """
 
 from __future__ import annotations
@@ -15,12 +16,14 @@ import pytest
 from paper_book_helpers import TOKEN, book_payload, two_level_book, write_archive, ws_line
 from paper_fills_support import make_risk
 from paper_helpers import export_row
-from weatherquant.execution.pricing import taker_fee_usd
+from weatherquant.execution.fees import DatedFeeSchedule, FeeScheduleEntry
+from weatherquant.execution.pricing import ExecutionCost, edge_usd_per_share, taker_fee_usd
 from weatherquant.paper.books import ArchiveBookSource
 from weatherquant.paper.consumer import SignalConsumer
 from weatherquant.paper.events import parse_signal_event
 from weatherquant.paper.fills import FillEngine
 from weatherquant.paper.ledger import Ledger
+from weatherquant.paper.risk import RiskGate, RiskRules
 from weatherquant.paper.store import PaperStore
 from weatherquant.storage.paper import PaperDatabase
 
@@ -57,27 +60,36 @@ def real_book_id(payload=None) -> str:
     return snapshot.content_hash
 
 
-def accept_signal(raw_dir, *, decision_id="d" * 32, token_id=TOKEN, direction="buy_yes", **row_overrides):
+def accept_signal(
+    raw_dir,
+    *,
+    decision_id="d" * 32,
+    token_id=TOKEN,
+    direction="buy_yes",
+    book=None,
+    **row_overrides,
+):
     """An ACCEPTED signal whose book evidence exists in the archive.
 
     The event's book_id is the frame's real content hash, exactly as the
     shadow would have recorded it for the same levels.
     """
-    row_overrides.setdefault("book_id", real_book_id())
+    book = book if book is not None else two_level_book()
+    row_overrides.setdefault("book_id", real_book_id(book))
+    row_overrides.setdefault("proposed_shares", 100.0)
+    row_overrides.setdefault("estimated_fill_shares", 100.0)
     row = export_row(
         decision_id=decision_id,
         token_id=token_id,
         direction=direction,
-        proposed_shares=100.0,
-        estimated_fill_shares=100.0,
         **row_overrides,
     )
     event = parse_signal_event(row)
     write_archive(
         raw_dir,
         source="ws",
-        day="2026-10-26",
-        lines=[ws_line(two_level_book(), received=event.decision_time_utc - timedelta(seconds=20))],
+        day=event.decision_time_utc.date().isoformat(),
+        lines=[ws_line(book, received=event.decision_time_utc - timedelta(seconds=20))],
     )
     return event
 
@@ -259,7 +271,7 @@ class TestEvidenceGates:
 
 
 class TestCapacityAndFees:
-    def test_thin_book_is_refused_not_partially_filled(self, engine_env):
+    def test_a_thin_book_is_sized_down_to_what_it_offers(self, engine_env):
         store, _events, raw_dir, _db = engine_env
         thin = book_payload(bids=[(0.52, 500.0)], asks=[(0.55, 40.0)])
         event = parse_signal_event(
@@ -279,50 +291,200 @@ class TestCapacityAndFees:
             ],
         )
         store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
-        result = make_engine(store, raw_dir, require_complete_fill=True).fill_pending()
-        assert result.by_reason == {"INSUFFICIENT_CAPACITY": 1}
-        assert "40.0 of 100.0" in (store.signal(event.decision_id)["refusal_detail"] or "")
-        assert store.fill_of(event.decision_id) is None
-
-    def test_partial_allowed_when_the_gate_is_off(self, engine_env):
-        store, _events, raw_dir, _db = engine_env
-        thin = book_payload(bids=[(0.52, 500.0)], asks=[(0.55, 40.0)])
-        event = parse_signal_event(
-            export_row(
-                decision_id="d" * 32,
-                token_id=TOKEN,
-                proposed_shares=100.0,
-                book_id=real_book_id(thin),
-            )
-        )
-        write_archive(
-            raw_dir,
-            source="ws",
-            day="2026-10-26",
-            lines=[
-                ws_line(thin, received=event.decision_time_utc - timedelta(seconds=20))
-            ],
-        )
-        store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
-        result = make_engine(store, raw_dir, require_complete_fill=False).fill_pending()
+        result = make_engine(store, raw_dir).fill_pending()
         assert result.filled == 1
         fill = store.fill_of(event.decision_id)
         assert fill["complete"] is False
         assert fill["filled_shares"] == pytest.approx(40.0)
+        assert store.db.execute(
+            "SELECT requested_shares FROM paper_fills WHERE decision_id = ?",
+            [event.decision_id],
+        ).fetchone()[0] == pytest.approx(100.0)
 
-    def test_unknown_fee_schedule_is_refused(self, engine_env):
+    def test_partial_fill_uses_its_actual_vwap_for_net_edge(self, engine_env):
         store, _events, raw_dir, _db = engine_env
+        # The book cannot complete the proposal. Its actual 60-share VWAP,
+        # rather than the proposed size or top-of-book price, carries the edge.
+        thin = book_payload(
+            bids=[(0.52, 500.0)],
+            asks=[(0.55, 40.0), (0.57, 20.0)],
+        )
+        event = seed_accepted(
+            store,
+            raw_dir,
+            book=thin,
+            estimated_fill_shares=60.0,
+            estimated_fill_price=33.4 / 60.0,
+        )
+        result = make_engine(store, raw_dir).fill_pending()
+        assert result.filled == 1
+        fill = store.fill_of(event.decision_id)
+        assert fill["complete"] is False
+        assert fill["filled_shares"] == pytest.approx(60.0)
+        assert fill["avg_price_usd_per_share"] == pytest.approx(33.4 / 60.0)
+        cost = ExecutionCost(
+            filled_shares=fill["filled_shares"],
+            fill_cost_usd=fill["filled_shares"] * fill["avg_price_usd_per_share"],
+            fees_usd=fill["fees_usd"],
+            execution_buffer_usd=fill["execution_buffer_usd"],
+        )
+        assert edge_usd_per_share(
+            q=event.model_probability,
+            filled_shares=fill["filled_shares"],
+            cost=cost,
+        ) >= 0.02
+
+    def test_partial_fill_is_capped_by_risk_size_before_book_depth(self, engine_env):
+        store, _events, raw_dir, _db = engine_env
+        risk = RiskGate(
+            Ledger(store),
+            RiskRules(
+                version="test-sized",
+                basis="",
+                max_opportunity_fraction=0.10,
+                max_market_exposure_fraction=0.20,
+            ),
+            initial_capital_usdc=100.0,
+        )
+        thin = book_payload(bids=[(0.52, 500.0)], asks=[(0.55, 10.0)])
+        event = seed_accepted(store, raw_dir, book=thin)
+        result = make_engine(store, raw_dir, risk=risk).fill_pending()
+        assert result.filled == 1
+        row = store.db.execute(
+            "SELECT requested_shares, filled_shares, complete FROM paper_fills WHERE decision_id = ?",
+            [event.decision_id],
+        ).fetchone()
+        assert 5.0 < row[1] == 10.0
+        assert 10.0 < row[0] < 100.0
+        assert row[2] is False
+
+    @pytest.mark.parametrize(("depth", "fills"), [(5.0, True), (4.99, False)])
+    def test_venue_minimum_boundary_is_inclusive(self, engine_env, depth, fills):
+        store, _events, raw_dir, _db = engine_env
+        boundary = book_payload(bids=[(0.52, 500.0)], asks=[(0.55, depth)])
+        event = seed_accepted(store, raw_dir, book=boundary)
+        result = make_engine(store, raw_dir).fill_pending()
+        assert (result.filled == 1) is fills
+        if fills:
+            assert store.fill_of(event.decision_id)["filled_shares"] == pytest.approx(5.0)
+        else:
+            assert result.by_reason == {"INSUFFICIENT_CAPACITY": 1}
+            assert store.fill_of(event.decision_id) is None
+
+    def test_a_fill_below_the_venue_minimum_is_refused(self, engine_env):
+        store, _events, raw_dir, _db = engine_env
+        dust = book_payload(bids=[(0.52, 500.0)], asks=[(0.55, 3.0)])
         event = parse_signal_event(
-            export_row(decision_id="d" * 32, token_id=TOKEN, proposed_shares=100.0, fee_rate=None)
+            export_row(
+                decision_id="d" * 32,
+                token_id=TOKEN,
+                proposed_shares=100.0,
+                book_id=real_book_id(dust),
+            )
         )
         write_archive(
             raw_dir,
             source="ws",
             day="2026-10-26",
-            lines=[ws_line(two_level_book(), received=event.decision_time_utc - timedelta(seconds=20))],
+            lines=[
+                ws_line(dust, received=event.decision_time_utc - timedelta(seconds=20))
+            ],
         )
         store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
         result = make_engine(store, raw_dir).fill_pending()
+        assert result.by_reason == {"INSUFFICIENT_CAPACITY": 1}
+        assert "below the venue minimum order of 5" in (
+            store.signal(event.decision_id)["refusal_detail"] or ""
+        )
+        assert store.fill_of(event.decision_id) is None
+
+    @pytest.mark.parametrize(
+        ("decision_time", "expected_rate"),
+        [
+            ("2026-11-20T23:58:59+00:00", 0.05),
+            ("2026-11-20T23:59:00+00:00", 0.01),
+        ],
+    )
+    def test_a_missing_fee_uses_the_dated_fallback_and_warns(
+        self, engine_env, caplog, decision_time, expected_rate
+    ):
+        store, _events, raw_dir, _db = engine_env
+        decision = datetime.fromisoformat(decision_time)
+        book = book_payload(
+            bids=[(0.52, 500.0)],
+            asks=[(0.55, 60.0), (0.57, 200.0)],
+            timestamp=(decision - timedelta(seconds=20)).isoformat(),
+        )
+        event = seed_accepted(
+            store,
+            raw_dir,
+            book=book,
+            decision_time_utc=decision_time,
+            fee_rate=None,
+        )
+        with caplog.at_level("WARNING", logger="weatherquant.paper"):
+            result = make_engine(store, raw_dir).fill_pending()
+        assert result.filled == 1
+        fill = store.fill_of(event.decision_id)
+        assert fill["fees_usd"] == pytest.approx(
+            taker_fee_usd(
+                filled_shares=fill["filled_shares"],
+                price_usd_per_share=fill["avg_price_usd_per_share"],
+                fee_rate=expected_rate,
+            )
+        )
+        stored_rate = store.db.execute(
+            "SELECT fee_rate FROM paper_fills WHERE decision_id = ?", [event.decision_id]
+        ).fetchone()[0]
+        assert stored_rate == pytest.approx(expected_rate)
+        assert "fee fallback used" in caplog.text
+        assert event.decision_id in caplog.text
+        # The fallback prices the fill without rewriting the published event.
+        original = store.db.execute(
+            "SELECT fee_rate, event_json FROM paper_signals WHERE decision_id = ?",
+            [event.decision_id],
+        ).fetchone()
+        assert original[0] is None
+        assert json.loads(original[1])["fee_rate"] is None
+
+    def test_a_venue_zero_fee_wins_over_the_fallback_without_warning(
+        self, engine_env, caplog
+    ):
+        store, _events, raw_dir, _db = engine_env
+        decision = datetime(2026, 11, 20, 23, 59, tzinfo=UTC)
+        book = book_payload(
+            bids=[(0.52, 500.0)],
+            asks=[(0.55, 60.0), (0.57, 200.0)],
+            timestamp=(decision - timedelta(seconds=20)).isoformat(),
+        )
+        event = seed_accepted(
+            store,
+            raw_dir,
+            book=book,
+            decision_time_utc=decision.isoformat(),
+            fee_rate=0.0,
+        )
+        with caplog.at_level("WARNING", logger="weatherquant.paper"):
+            result = make_engine(store, raw_dir).fill_pending()
+        assert result.filled == 1
+        assert store.fill_of(event.decision_id)["fees_usd"] == 0.0
+        assert store.db.execute(
+            "SELECT fee_rate FROM paper_fills WHERE decision_id = ?", [event.decision_id]
+        ).fetchone()[0] == 0.0
+        assert "fee fallback used" not in caplog.text
+
+    def test_a_missing_fee_without_a_covering_schedule_is_refused(self, engine_env):
+        store, _events, raw_dir, _db = engine_env
+        event = accept_signal(raw_dir, fee_rate=None)
+        store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
+        future_only = DatedFeeSchedule(
+            version="test-future",
+            venue="polymarket",
+            category="weather",
+            role="taker",
+            entries=(FeeScheduleEntry(effective_from_utc=datetime(2027, 1, 1, tzinfo=UTC), rate=0.01),),
+        )
+        result = make_engine(store, raw_dir, fee_schedule=future_only).fill_pending()
         assert result.by_reason == {"UNPRICABLE_EVENT": 1}
         assert store.fill_of(event.decision_id) is None
 
@@ -384,3 +546,25 @@ class TestEndToEnd:
         assert store.signal_counts() == {"FILLED": 1}
         fill = store.fill_of(event.decision_id)
         assert fill["avg_price_usd_per_share"] == pytest.approx(0.558)
+
+
+class TestVenueClockSkew:
+    """Paper must not refuse a book the shadow accepted for the same skew."""
+
+    def _seed(self, store, raw_dir, venue_ts: str):
+        frame = book_payload(bids=[(0.52, 500.0)], asks=[(0.55, 60.0), (0.57, 200.0)], timestamp=venue_ts)
+        event = accept_signal(raw_dir, decision_id="d" * 32, book=frame)
+        store.record_signal(event, tradeable=True, outcome="ACCEPTED", consumed_at_utc=NOW)
+        return event
+
+    def test_a_venue_stamp_one_second_ahead_still_fills(self, engine_env):
+        store, _events, raw_dir, _db = engine_env
+        self._seed(store, raw_dir, "2026-10-26T12:00:01Z")
+        result = make_engine(store, raw_dir).fill_pending()
+        assert result.filled == 1, result.by_reason
+
+    def test_a_venue_stamp_beyond_the_tolerance_is_refused(self, engine_env):
+        store, _events, raw_dir, _db = engine_env
+        self._seed(store, raw_dir, "2026-10-26T12:00:03Z")
+        result = make_engine(store, raw_dir).fill_pending()
+        assert result.by_reason == {"NOT_EXECUTABLE": 1}
