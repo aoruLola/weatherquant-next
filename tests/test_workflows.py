@@ -94,8 +94,7 @@ def test_python_commands_override_the_entrypoint(workflow: Path) -> None:
     ]
     message = (
         f"{workflow.name}: these docker run commands invoke python but keep the "
-        "image ENTRYPOINT, so python becomes the collector's argv:\n  "
-        + "\n  ".join(offenders)
+        "image ENTRYPOINT, so python becomes the collector's argv:\n  " + "\n  ".join(offenders)
     )
     assert not offenders, message
 
@@ -112,9 +111,7 @@ def test_data_checks_run_after_the_collector_stops(workflow: Path) -> None:
     if not any("SELECT COUNT(*)" in command for command in commands):
         pytest.skip("workflow performs no database verification")
 
-    stop_index = next(
-        (i for i, c in enumerate(commands) if c.strip().startswith("docker stop")), None
-    )
+    stop_index = next((i for i, c in enumerate(commands) if c.strip().startswith("docker stop")), None)
     query_index = next((i for i, c in enumerate(commands) if "SELECT COUNT(*)" in c), None)
     assert stop_index is not None, f"{workflow.name}: no `docker stop` found"
     assert query_index is not None
@@ -171,7 +168,8 @@ def test_disk_overrides_reach_the_healthcheck_from_the_environment() -> None:
     assert "WQ_DISK_CRITICAL_PERCENT" in source
     for workflow in WORKFLOWS:
         text = workflow.read_text(encoding="utf-8")
-        if "docker run -d" not in text:
+        if "docker run -d" not in text or workflow.name.startswith("paper-"):
+            # Paper's probe checks heartbeat freshness, not disk thresholds.
             continue
         assert "WQ_DISK_WARN_PERCENT" in text, (
             f"{workflow.name} starts a container without declaring its disk "
@@ -184,6 +182,7 @@ def test_disk_overrides_reach_the_healthcheck_from_the_environment() -> None:
 
 RELEASE_TAG_GUARDS = (
     "shadow-release.yml",
+    "paper-release.yml",
     "dashboard-release.yml",
     "mcp-release.yml",
 )
@@ -256,9 +255,7 @@ SHADOW_COMPOSE = REPO_ROOT / "docker" / "compose.shadow.unraid.yaml"
 def _active_lines(path: Path) -> str:
     """Config as written, with comments stripped - judge what runs, not what is said."""
     return "\n".join(
-        line.split("#")[0]
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if not line.strip().startswith("#")
+        line.split("#")[0] for line in path.read_text(encoding="utf-8").splitlines() if not line.strip().startswith("#")
     )
 
 
@@ -318,9 +315,9 @@ def test_shadow_stack_still_refuses_the_properties_it_needs() -> None:
     """The pin is a change to two lines, not a licence to reopen the others."""
     text = _active_lines(SHADOW_COMPOSE)
     assert "ports:" not in text, "the shadow serves nothing and must publish no port"
-    assert "/collector-raw:ro" in text or "/collector-raw\":ro" in text.replace("'", '"')
+    assert "/collector-raw:ro" in text or '/collector-raw":ro' in text.replace("'", '"')
     assert "stop_grace_period: 60s" in text
-    assert "user: \"1000:1000\"" in text
+    assert 'user: "1000:1000"' in text
 
 
 # --- the MCP container must stay the least privileged one --------------------
@@ -383,7 +380,7 @@ def test_the_mcp_container_has_no_order_tool_imported() -> None:
 
 # --- WQN-55 CI dedup: dev triggers, concurrency, and the image gate --------
 
-DEV_CI_WORKFLOWS = ("ci.yml", "dashboard-ci.yml", "shadow-ci.yml")
+DEV_CI_WORKFLOWS = ("ci.yml", "dashboard-ci.yml", "shadow-ci.yml", "paper-ci.yml")
 
 
 @pytest.mark.parametrize("name", DEV_CI_WORKFLOWS)
@@ -393,9 +390,7 @@ def test_dev_ci_triggers_only_main_pr_and_dispatch(name: str) -> None:
     assert "workflow_dispatch:" in text, f"{name} must have workflow_dispatch"
     # push.branches must be [main], not ["**"] or anything broader
     assert "branches: [main]" in text, f"{name} must push to main only"
-    assert 'branches: ["**"]' not in text, (
-        f"{name} triggers on every branch push - same commit runs twice"
-    )
+    assert 'branches: ["**"]' not in text, f"{name} triggers on every branch push - same commit runs twice"
 
 
 @pytest.mark.parametrize("name", DEV_CI_WORKFLOWS)
@@ -438,7 +433,7 @@ def test_dev_ci_build_job_is_gated_on_output(name: str) -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ("release.yml", "dashboard-release.yml", "shadow-release.yml", "mcp-release.yml"),
+    ("release.yml", "dashboard-release.yml", "shadow-release.yml", "paper-release.yml", "mcp-release.yml"),
 )
 def test_release_workflows_not_weakened_by_dedup(name: str) -> None:
     """WQN-55 touched only dev CI - release workflows must still trigger and run full gates."""

@@ -1,0 +1,146 @@
+# Development CI for Paper: tests and an image build/acceptance, never a push.
+
+name: paper-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  paper-tests:
+    outputs:
+      build_image: ${{ steps.image.outputs.build_image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check image inputs on the PR merge commit
+        id: image
+        run: bash scripts/ci_image_gate.sh paper >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Pytest (Paper modules and container contract)
+        run: uv run pytest -q tests/test_paper*.py
+
+  build-paper-image:
+    if: needs.paper-tests.outputs.build_image == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: paper-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.paper
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: weatherquant-paper:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Container starts, initializes its account, and reports fresh health
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/paper-data" "$RUNNER_TEMP/shadow-export/parts" "$RUNNER_TEMP/collector-raw/ws"
+          sudo chown -R 1000:1000 "$RUNNER_TEMP/paper-data" "$RUNNER_TEMP/shadow-export" "$RUNNER_TEMP/collector-raw"
+          common=(
+            -v "$RUNNER_TEMP/paper-data:/data"
+            -v "$RUNNER_TEMP/shadow-export:/shadow-decisions:ro"
+            -v "$RUNNER_TEMP/collector-raw:/collector-raw:ro"
+            -e WQ_PAPER_ENABLED=true
+          )
+          docker run --rm "${common[@]}" weatherquant-paper:ci init
+          docker run -d --name paper-ci "${common[@]}" weatherquant-paper:ci
+          for i in $(seq 1 60); do
+            if docker exec paper-ci test -f /data/paper/.paper.lock; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec paper-ci python /usr/local/bin/healthcheck.py
+          test "$(docker exec paper-ci id -u)" = "1000"
+          docker exec paper-ci sh -c 'touch /data/.write-probe && rm /data/.write-probe'
+          test -f "$RUNNER_TEMP/paper-data/paper/paper.duckdb"
+
+      - name: Read-only inputs reject writes
+        run: |
+          set -euo pipefail
+          if docker exec paper-ci sh -c 'touch /shadow-decisions/nope' 2>/dev/null; then
+            exit 1
+          fi
+          if docker exec paper-ci sh -c 'touch /collector-raw/nope' 2>/dev/null; then
+            exit 1
+          fi
+
+      - name: Single-instance lease refuses a second writer
+        run: |
+          set -euo pipefail
+          set +e
+          docker run --rm \
+            -v "$RUNNER_TEMP/paper-data:/data" \
+            -v "$RUNNER_TEMP/shadow-export:/shadow-decisions:ro" \
+            -v "$RUNNER_TEMP/collector-raw:/collector-raw:ro" \
+            -e WQ_PAPER_ENABLED=true \
+            weatherquant-paper:ci serve
+          code=$?
+          set -e
+          test "$code" -eq 4
+
+      - name: Stop Paper and verify its own state remains
+        run: |
+          set -euo pipefail
+          docker stop -t 60 paper-ci || test "$(docker inspect -f '{{.State.ExitCode}}' paper-ci)" = "137"
+          test -f "$RUNNER_TEMP/paper-data/paper/paper.duckdb"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker logs paper-ci || true
+
+  paper-ci-never-publishes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: No registry login in the development workflow
+        run: |
+          set -euo pipefail
+          hits=$(grep -nE "uses: docker/login-action|push: true|packages: write|imagetools create" \
+                   .github/workflows/paper-ci.yml | grep -v "grep -nE" || true)
+          if [ -n "$hits" ]; then
+            echo "paper-ci must not publish anything:" >&2
+            echo "$hits" >&2
+            exit 1
+          fi
