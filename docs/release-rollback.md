@@ -6,7 +6,7 @@ Every production stack runs an **immutable** image:
 |---|---|---|
 | collector | `docker/compose.unraid.yaml` | `COLLECTOR_SHA` |
 | shadow | `docker/compose.shadow.unraid.yaml` | `SHADOW_SHA` |
-| paper | `docker/compose.paper.unraid.yaml` | `PAPER_SHA` |
+| paper | `docker/compose.paper.unraid.yaml` (not in the repo yet; it must follow the same rule when it lands) | `PAPER_SHA` |
 | dashboard | `docker/compose.dashboard.unraid.yaml` | `DASHBOARD_SHA` |
 | MCP gateway | `docker/compose.mcp.unraid.yaml` | `MCP_SHA` |
 
@@ -52,10 +52,13 @@ uv run python scripts/stack_snapshot.py \
   --performance /mnt/user/appdata/weatherquant-next/performance
 ```
 
-`--inspect` is optional and repeatable:
+`--inspect` is optional and repeatable. A container document records the
+local image id; only an **image** document carries the registry content digest
+(`RepoDigests`), so pass both if you want the digest in the snapshot:
 
 ```bash
 docker inspect weatherquant-collector > /tmp/collector-inspect.json
+docker image inspect "ghcr.io/aorulola/weatherquant-next:sha-$COLLECTOR_SHA" > /tmp/collector-image.json
 docker inspect weatherquant-shadow    > /tmp/shadow-inspect.json
 ```
 
@@ -90,6 +93,16 @@ cd /mnt/user/appdata/compose-manager/weatherquant-next && docker compose up -d
 `--apply` never touches a compose file, a database, a WAL file or an archive.
 If a stack directory no longer exists, the command fails before writing
 anything, so a partial rollback cannot happen.
+
+If the restored `.env` would lack a variable the stack's **current** compose
+file requires (for example a snapshot taken before the stack was pinned, which
+has no `COLLECTOR_SHA`), the dry run prints `BLOCKER` and `--apply` exits 1
+without writing: compose would refuse to start on that `.env`. Either add the
+variable to the snapshot's `.env` copy, restore that snapshot's `compose.yaml`
+by hand, or pass `--allow-unresolved` if you intend to do the latter. The dry
+run also notes when a compose file changed since the snapshot. For the first
+rollback across this pin change, the simplest path is the manual one: set
+`COLLECTOR_SHA` in `.env` to the previous release's full sha.
 
 ### Paired Dashboard + Legacy generation rollback
 
@@ -170,9 +183,19 @@ curl -fsS http://127.0.0.1:8787/healthz              # dashboard sees its source
 docker exec weatherquant-collector cat /data/health/heartbeat.json
 ```
 
-The heartbeat's `git_sha` / `image_tag` must equal the pinned variable. If
-they do not, the container is running a cached image - `docker compose pull`
-then `docker compose up -d --force-recreate`.
+The heartbeat's `git_sha` / `image_tag` must equal the pinned variable; if
+not, the container was not recreated after the `.env` change -
+`docker compose up -d --force-recreate`. Note what this does and does not
+prove: `GIT_SHA` / `IMAGE_TAG` are set by compose from the same variable as
+the tag, so they confirm the container was created from the pinned *tag*, not
+the image's content. The `sha-<commit>` tags are never re-pushed by the
+release workflows; to confirm content as well, compare the container's image
+id with the pulled tag's:
+
+```bash
+docker inspect -f '{{.Image}}' weatherquant-collector
+docker image inspect -f '{{.Id}} {{index .RepoDigests 0}}' "ghcr.io/aorulola/weatherquant-next:sha-$COLLECTOR_SHA"
+```
 
 ## What rollback does not do
 

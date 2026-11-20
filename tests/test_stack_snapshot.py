@@ -196,3 +196,37 @@ def test_snapshot_cli_writes_a_snapshot(tmp_path: Path, snapshot, capsys) -> Non
     assert "snapshot written:" in output
     assert f"COLLECTOR_SHA={SHA}" in output
     assert "data directories were not read, copied or modified." in output
+
+
+def test_real_docker_inspect_documents_record_the_image_identity(tmp_path: Path, snapshot) -> None:
+    """`docker inspect <container>` has no RepoDigests - only the local image
+    id in its top-level `Image`. `docker image inspect <ref>` has the digest.
+    Both must land in the snapshot; the old code recorded neither."""
+    collector = _stack_dir(tmp_path / "stacks", "collector", "COLLECTOR_SHA", SHA, "ghcr.io/aorulola/weatherquant-next")
+    ref = f"ghcr.io/aorulola/weatherquant-next:sha-{SHA}"
+    image_id = "sha256:" + "b" * 64
+    container_doc = {
+        "Name": "/weatherquant-collector",
+        "Image": image_id,
+        "Config": {"Image": ref, "Env": [f"GIT_SHA={SHA}", f"IMAGE_TAG={SHA}"]},
+    }
+    image_doc = {
+        "Id": image_id,
+        "RepoTags": [ref],
+        "RepoDigests": [f"ghcr.io/aorulola/weatherquant-next@sha256:{'c' * 64}"],
+        "Config": {"Env": []},
+    }
+    destination = snapshot.write_snapshot(
+        tmp_path / "snapshots",
+        [snapshot.parse_stack_spec(f"collector={collector}")],
+        inspect_documents=[container_doc, image_doc],
+        performance=None,
+        created_at=datetime(2026, 11, 20, 12, 0, tzinfo=UTC),
+    )
+    payload = json.loads((destination / "snapshot.json").read_text(encoding="utf-8"))
+    containers = payload["stacks"]["collector"]["containers"]
+    assert payload["unmatched_containers"] == []
+    by_kind = {entry["kind"]: entry for entry in containers}
+    assert by_kind["container"]["image_id"] == image_id
+    assert by_kind["image"]["image_id"] == image_id
+    assert by_kind["image"]["repo_digests"] == [f"ghcr.io/aorulola/weatherquant-next@sha256:{'c' * 64}"]

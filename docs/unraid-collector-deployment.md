@@ -230,7 +230,7 @@ stack 详情页能看到）。脚本只确保当前 pin 的镜像在本机，**�
 ```bash
 #!/bin/bash
 STACK_DIR=/mnt/user/appdata/compose-manager/weatherquant-next   # 按实际路径改
-SHA="$(grep -E '^COLLECTOR_SHA=' "$STACK_DIR/.env" | cut -d= -f2)"
+SHA="$(grep -E '^COLLECTOR_SHA=' "$STACK_DIR/.env" | tail -n1 | cut -d= -f2- | tr -d "\"' \r")"
 [ -n "$SHA" ] || { echo "COLLECTOR_SHA is not set in $STACK_DIR/.env" >&2; exit 1; }
 docker pull "ghcr.io/<owner>/<repo>:sha-${SHA}" || exit 1
 docker compose -f "$STACK_DIR/docker-compose.yml" up -d
@@ -437,7 +437,7 @@ set -euo pipefail
 SRC=/mnt/user/appdata/weatherquant-next/backups
 DST=/mnt/user/backup/weatherquant-next          # 或用 rclone 到 S3 / 另一台机器
 # 用当前 pin 的版本校验，而不是浮动标签
-COLLECTOR_SHA="$(grep -E '^COLLECTOR_SHA=' /mnt/user/appdata/compose-manager/weatherquant-next/.env | cut -d= -f2)"
+COLLECTOR_SHA="$(grep -E '^COLLECTOR_SHA=' /mnt/user/appdata/compose-manager/weatherquant-next/.env | tail -n1 | cut -d= -f2- | tr -d "\"' \r")"
 IMAGE="ghcr.io/<owner>/<repo>:sha-${COLLECTOR_SHA}"
 mkdir -p "$DST"
 
@@ -556,7 +556,7 @@ docker compose -f compose.yaml up -d
 # 5. 验证：镜像标签、GIT_SHA、IMAGE_TAG 必须与 COLLECTOR_SHA 一致
 docker inspect weatherquant-collector > /tmp/collector-inspect.json
 uv run python scripts/verify_running_image.py \
-  --inspect /tmp/collector-inspect.json --sha "$(grep '^COLLECTOR_SHA=' .env | cut -d= -f2)"
+  --inspect /tmp/collector-inspect.json --sha "$(grep '^COLLECTOR_SHA=' .env | tail -n1 | cut -d= -f2- | tr -d "\"' \r")"
 docker inspect --format '{{.State.Health.Status}}' weatherquant-collector
 ```
 

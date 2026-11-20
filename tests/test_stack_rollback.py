@@ -175,3 +175,36 @@ def test_a_snapshot_without_snapshot_json_is_rejected(tmp_path: Path, rollback) 
     snapshot_dir = tmp_path / "snapshots" / "empty"
     snapshot_dir.mkdir(parents=True)
     assert rollback.main(["--snapshot", str(snapshot_dir)]) == 2
+
+
+def test_a_snapshot_from_before_the_pin_cannot_silently_break_the_stack(
+    tmp_path: Path, snapshot, rollback, capsys
+) -> None:
+    """A snapshot taken while the stack still tracked `stable` has no
+    COLLECTOR_SHA. Restoring that .env under the pinned compose file would
+    leave compose refusing to start, so --apply stops before writing."""
+    directory = tmp_path / "stacks" / "collector"
+    directory.mkdir(parents=True)
+    (directory / "compose.yaml").write_text(
+        "x-common: &common\n  image: ghcr.io/aorulola/weatherquant-next:stable\n", encoding="utf-8"
+    )
+    (directory / ".env").write_text("WQ_LOG_LEVEL=INFO\n", encoding="utf-8")
+    snapshot_dir = _snapshot(tmp_path, snapshot, [directory])
+    # The upgrade: pinned compose, COLLECTOR_SHA added.
+    (directory / "compose.yaml").write_text(
+        "x-common: &common\n  image: ghcr.io/aorulola/weatherquant-next:sha-${COLLECTOR_SHA:?set it}\n",
+        encoding="utf-8",
+    )
+    (directory / ".env").write_text(f"COLLECTOR_SHA={NEW_SHA}\nWQ_LOG_LEVEL=INFO\n", encoding="utf-8")
+    upgraded = (directory / ".env").read_bytes()
+
+    assert rollback.main(["--snapshot", str(snapshot_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "BLOCKER" in out and "COLLECTOR_SHA" in out
+    assert "compose file changed since the snapshot" in out
+
+    assert rollback.main(["--snapshot", str(snapshot_dir), "--apply"]) == 1
+    assert (directory / ".env").read_bytes() == upgraded, "nothing may be written"
+
+    assert rollback.main(["--snapshot", str(snapshot_dir), "--apply", "--allow-unresolved"]) == 0
+    assert (directory / ".env").read_bytes() == b"WQ_LOG_LEVEL=INFO\n"

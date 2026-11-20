@@ -30,14 +30,32 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 SNAPSHOT_FILE = "snapshot.json"
+
+
+_REQUIRED_VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):\?[^}]*\}")
+_ENV_KEY = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+
+def _defined(env: bytes) -> set[str]:
+    """Keys the ``.env`` gives a non-empty value (what ``${VAR:?}`` accepts)."""
+    names: set[str] = set()
+    for line in env.decode("utf-8", errors="replace").splitlines():
+        if line.strip().startswith("#"):
+            continue
+        match = _ENV_KEY.match(line)
+        if match and match.group(2).strip().strip("\"'"):
+            names.add(match.group(1))
+    return names
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +67,12 @@ class StackPlan:
     snapshot_env: Path
     current: bytes
     target: bytes
+    # Variables the stack's *current* compose file requires (``${VAR:?}``)
+    # that the snapshot's .env does not define. Restoring it as-is would leave
+    # compose refusing to start - typically a snapshot taken before the stack
+    # was pinned. Empty when the restore is consistent.
+    unresolved: tuple[str, ...] = ()
+    compose_changed: bool = False
 
     @property
     def changed(self) -> bool:
@@ -87,13 +111,27 @@ def plan_rollback(snapshot_dir: Path, snapshot: dict) -> list[StackPlan]:
             raise FileNotFoundError(f"{name}: .env not found: {env_path}")
         if not snapshot_env.is_file():
             raise FileNotFoundError(f"{name}: snapshot has no .env: {snapshot_env}")
+        target = snapshot_env.read_bytes()
+        compose_path = directory / entry.get("compose_file", "compose.yaml")
+        required: list[str] = []
+        compose_changed = False
+        if compose_path.is_file():
+            compose_bytes = compose_path.read_bytes()
+            text = compose_bytes.decode("utf-8", errors="replace")
+            active = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+            required = sorted(set(_REQUIRED_VARIABLE.findall(active)))
+            recorded = entry.get("compose_sha256")
+            compose_changed = bool(recorded) and hashlib.sha256(compose_bytes).hexdigest() != recorded
+        defined = _defined(target)
         plans.append(
             StackPlan(
                 name=name,
                 env_path=env_path,
                 snapshot_env=snapshot_env,
                 current=env_path.read_bytes(),
-                target=snapshot_env.read_bytes(),
+                target=target,
+                unresolved=tuple(v for v in required if v not in defined),
+                compose_changed=compose_changed,
             )
         )
     return plans
@@ -135,6 +173,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--snapshot", type=Path, required=True, help="a directory written by stack_snapshot.py")
     parser.add_argument("--apply", action="store_true", help="rewrite the .env files (default: dry run)")
+    parser.add_argument(
+        "--allow-unresolved",
+        action="store_true",
+        help="apply even when the restored .env lacks a variable the current compose file requires",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -149,6 +192,18 @@ def main(argv: list[str] | None = None) -> int:
     for plan in plans:
         print(f"\nstack {plan.name}")
         print(f"  .env: {plan.env_path}")
+        if plan.compose_changed:
+            print(
+                f"  NOTE: the compose file changed since the snapshot; its snapshot copy is "
+                f"{args.snapshot / plan.name / 'compose.yaml'}"
+            )
+        if plan.unresolved:
+            print(
+                f"  BLOCKER: the restored .env does not define {', '.join(plan.unresolved)}, which "
+                "the current compose file requires - compose would refuse to start. Add the "
+                "variable(s) to the snapshot's .env copy (or restore the snapshot's compose file "
+                "by hand), or pass --allow-unresolved."
+            )
         if not plan.changed:
             print("  unchanged - the pinned SHAs already match the snapshot")
             continue
@@ -163,6 +218,14 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         print("\ndry run: nothing was written. Re-run with --apply to restore the .env files.")
         return 0
+    blocked = [plan.name for plan in changed if plan.unresolved]
+    if blocked and not args.allow_unresolved:
+        print(
+            f"\nnot applied: {', '.join(blocked)} would be left unable to start (see BLOCKER above). "
+            "Nothing was written.",
+            file=sys.stderr,
+        )
+        return 1
 
     for plan in changed:
         _atomic_write(plan.env_path, plan.target)

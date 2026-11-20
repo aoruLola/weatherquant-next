@@ -184,10 +184,27 @@ def _inspect_documents(payload: object) -> list[dict]:
 
 
 def _container_facts(document: dict) -> dict:
-    """The fields that answer 'which build is this container running'."""
+    """The fields that answer 'which build is this container running'.
+
+    Accepts both ``docker inspect <container>`` and ``docker image inspect
+    <ref>`` documents. Only the image document carries ``RepoDigests`` - the
+    content digest a rollback can pin to; a container document carries the
+    local image id in its top-level ``Image`` field instead. Both are recorded.
+    """
     config = document.get("Config")
     config = config if isinstance(config, dict) else {}
-    image = config.get("Image") or document.get("Image") or ""
+    if "RepoTags" in document:
+        tags = [tag for tag in document.get("RepoTags") or [] if isinstance(tag, str)]
+        image = tags[0] if tags else ""
+        image_id = document.get("Id")
+        kind = "image"
+    else:
+        image = config.get("Image") or ""
+        top = document.get("Image")
+        image_id = top if isinstance(top, str) and top.startswith("sha256:") else None
+        if not image and isinstance(top, str) and not top.startswith("sha256:"):
+            image = top
+        kind = "container"
     environment: dict[str, str] = {}
     for item in config.get("Env") or []:
         if isinstance(item, str) and "=" in item:
@@ -196,6 +213,8 @@ def _container_facts(document: dict) -> dict:
     return {
         "container": str(document.get("Name") or "").lstrip("/") or None,
         "image": image,
+        "kind": kind,
+        "image_id": image_id,
         "repo_digests": [item for item in document.get("RepoDigests") or [] if isinstance(item, str)],
         "git_sha": environment.get("GIT_SHA"),
         "image_tag": environment.get("IMAGE_TAG"),
@@ -354,7 +373,11 @@ def main(argv: list[str] | None = None) -> int:
         pinned = ", ".join(f"{key}={value}" for key, value in entry["pinned"].items()) or "(none resolved)"
         print(f"  {name:<10} {entry['image']}  ({pinned})")
         for container in entry["containers"]:
-            digests = ", ".join(container["repo_digests"]) or "(no RepoDigests)"
+            digests = ", ".join(container["repo_digests"]) or (
+                f"image id {container['image_id']} (pass `docker image inspect <ref>` for RepoDigests)"
+                if container.get("image_id")
+                else "(no RepoDigests)"
+            )
             print(f"             container {container['container']}: {digests}")
         if entry["missing_variables"]:
             print(f"             MISSING in .env: {', '.join(entry['missing_variables'])}")
