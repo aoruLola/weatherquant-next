@@ -16,7 +16,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 GATE = ROOT / "scripts" / "ci_image_gate.sh"
-MODULES = {"collector", "dashboard", "shadow"}
+MODULES = {"collector", "dashboard", "paper", "shadow"}
 
 
 def run_gate(repo: Path, event: str, module: str) -> subprocess.CompletedProcess[str]:
@@ -48,6 +48,13 @@ def run_gate(repo: Path, event: str, module: str) -> subprocess.CompletedProcess
         ("models/manifest.json", {"shadow"}),
         ("Dockerfile.shadow.dockerignore", {"shadow"}),
         ("configs/shadow-thresholds.json", {"shadow"}),
+        # Paper-only paths
+        ("docker/healthcheck_paper.py", {"paper"}),
+        # Shadow deliberately treats the shared configs directory as an input.
+        ("configs/paper-risk.json", {"paper", "shadow"}),
+        ("configs/fee-schedule.json", {"paper", "shadow"}),
+        ("Dockerfile.paper", {"paper"}),
+        (".github/workflows/paper-ci.yml", {"paper"}),
         # Dashboard-only paths
         ("dashboard/tests/helpers.py", {"dashboard"}),
         ("scripts/dashboard_docker_accept.sh", {"dashboard"}),
@@ -93,8 +100,7 @@ def test_pr_images(tmp_path: Path, changed: str, expected: set[str]) -> None:
         result.check_returncode()
         want = "build_image=true" if module in expected else "build_image=false"
         assert result.stdout.strip() == want, (
-            f"{module} got {result.stdout.strip()!r}, wanted {want} "
-            f"(stderr={result.stderr.strip()!r})"
+            f"{module} got {result.stdout.strip()!r}, wanted {want} (stderr={result.stderr.strip()!r})"
         )
 
 

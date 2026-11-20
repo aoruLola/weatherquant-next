@@ -10,6 +10,7 @@
 # Usage:
 #   bash scripts/ci_image_gate.sh collector
 #   bash scripts/ci_image_gate.sh shadow
+#   bash scripts/ci_image_gate.sh paper
 #   bash scripts/ci_image_gate.sh dashboard
 #
 # Output (for GitHub Actions `>> "$GITHUB_OUTPUT"`):
@@ -51,6 +52,15 @@ case "$1" in
     dockerfile=Dockerfile.shadow
     inputs+=(docker/healthcheck_shadow.py configs models .github/workflows/shadow-ci.yml)
     ;;
+  paper)
+    dockerfile=Dockerfile.paper
+    inputs+=(
+      docker/healthcheck_paper.py
+      configs/paper-risk.json
+      configs/fee-schedule.json
+      .github/workflows/paper-ci.yml
+    )
+    ;;
   dashboard)
     dockerfile=Dockerfile.dashboard
     inputs+=(
@@ -61,7 +71,7 @@ case "$1" in
     )
     ;;
   *)
-    echo "usage: $0 {collector|shadow|dashboard}" >&2
+    echo "usage: $0 {collector|shadow|paper|dashboard}" >&2
     exit 2
     ;;
 esac
