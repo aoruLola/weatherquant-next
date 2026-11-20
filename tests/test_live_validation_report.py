@@ -252,7 +252,7 @@ def _build_shadow(path: Path) -> None:
                     DAY.replace(hour=11, minute=19, second=1),
                     DAY.replace(hour=11, minute=19, second=1),
                     DAY.replace(hour=11, minute=20),
-                    3_000,
+                    -2_100,
                     3,
                     3,
                     "",
@@ -513,31 +513,44 @@ def test_decisions_and_reject_histogram(snapshots):
 def test_gate_margins(snapshots):
     shadow, paper = snapshots
     gates = report_mod.build_report(shadow_db=shadow, paper_db=paper)["gates"]
+    # The version and every threshold come from the shipped config; a v4 bump
+    # must not require editing this test.
+    thresholds = report_mod.load_thresholds(ROOT / "configs" / "shadow-thresholds.json")
 
-    assert gates["thresholds_version"] == "v2"
-    assert gates["book_age"]["threshold"] == 90_000
+    assert gates["thresholds_version"] == thresholds.version
+    assert gates["thresholds_source"] == str(ROOT / "configs" / "shadow-thresholds.json")
+    assert gates["book_age"]["threshold"] == thresholds.max_snapshot_age_ms
     assert gates["book_age"]["n"] == 5
     assert gates["book_age"]["p50"] == 30_000
     assert gates["book_age"]["rejects_within_10pct"] == 1  # 95s vs the 90s gateway
     assert gates["book_age"]["rejects_within_25pct"] == 1
     assert gates["book_age"]["would_pass_at"]["60000"] == 2
 
-    assert gates["depth"]["threshold"] == 25.0
+    # v3 turned the dollar floor off (0); the venue minimum is the real floor.
+    assert gates["depth"]["threshold"] == thresholds.min_depth_usd
     assert gates["depth"]["rejects_within_10pct"] == 0
-    assert gates["depth"]["rejects_within_25pct"] == 1  # 20 USD against a 25 USD floor
+    assert gates["depth"]["rejects_within_25pct"] == 0
+    assert gates["depth"]["would_pass_at"]["10"] == 3
     assert gates["depth"]["would_pass_at"]["100"] == 1
 
+    assert gates["net_edge"]["threshold"] == thresholds.min_net_edge_usd_per_share
     assert gates["net_edge"]["rejects_within_10pct"] == 0
     assert gates["net_edge"]["would_pass_at"]["0"] == 1
 
-    assert gates["clock_skew"]["threshold"] == 5_000
-    assert gates["clock_skew"]["rejects_within_10pct"] == 1  # 5.2s vs the 5s gate
+    # v3 measures negative skew (-latency); 2.1s against the 2s tolerance.
+    assert gates["clock_skew"]["threshold"] == thresholds.max_clock_skew_ms
+    assert gates["clock_skew"]["rejects_within_10pct"] == 1
     assert gates["clock_skew"]["rejects_within_25pct"] == 1
+    assert gates["clock_skew"]["would_pass_at"]["2500"] == 3
+    assert gates["clock_skew"]["would_pass_at"]["1000"] == 2
 
     assert gates["fee"]["decisions"] == 5
     assert gates["fee"]["fee_known"] == 4
     assert gates["fee"]["fee_missing"] == 1
-    assert gates["size"]["partial_fill_rejects"] == 1
+
+    # v3 removes require_complete_fill: a sized-down partial is not a refusal.
+    assert gates["size"]["threshold"] == thresholds.min_order_size_shares
+    assert gates["size"]["below_min_order_rejects"] == 0
 
 
 def test_funnel_counts_and_reasons(snapshots):

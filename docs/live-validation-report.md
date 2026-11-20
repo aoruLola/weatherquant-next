@@ -78,11 +78,11 @@ state」表，保证总数能对上、没有被藏起来的桶。
 | 闸门 | 观测值 | 阈值来源 |
 |---|---|---|
 | `book_age` | `snapshot_age_ms` | `max_snapshot_age_ms` |
-| `depth` | `available_depth_usd` | `min_depth_usd` |
+| `depth` | `available_depth_usd` | `min_depth_usd`（v3 默认 0，即关闭；venue 最小单量才是真正的下限） |
 | `net_edge` | `net_edge` | `min_net_edge_usd_per_share` |
-| `clock_skew` | `market_snapshots.latency_ms`（收到的时刻 − 交易所时刻） | `max_decision_latency_ms`，**仅报告阈值，不是闸门** |
+| `clock_skew` | `-market_snapshots.latency_ms`（负向偏斜） | `max_clock_skew_ms`（v3 起只惩罚负向偏斜；正向延迟属于陈旧，由 book age 管） |
 | `fee` | `fee_rate` 是否存在 | 未知费率即拒绝，故看「present / missing」 |
-| `size` | `estimated_fill_shares < proposed_shares` 的拒绝数 | `require_complete_fill` |
+| `size` | `estimated_fill_shares` | `min_order_size_shares`（v3 取消 complete-fill，部分成交按书缩量，不再因此拒绝） |
 
 阈值只**读取** `configs/shadow-thresholds.json`（引擎运行时用的同一份），
 不修改。字段说明：
@@ -143,7 +143,7 @@ state」表，保证总数能对上、没有被藏起来的桶。
 uv run pytest tests/test_live_validation_report.py -q
 ```
 
-覆盖：拒绝原因与 primary 占比、按小时/日期分组、五个闸门的分布与近阈值计数、
+覆盖：拒绝原因与 primary 占比、按小时/日期分组、六个闸门的分布与近阈值计数、
 按 `decision_id` 求交集的漏斗与各阶段转化率、消费侧与成交侧拒绝的区分、
 `--since/--until` 与 `--mode` 的过滤、旧 schema 的缺列/缺表降级、输入文件
 前后哈希不变、被占用库与 `.wal` 旁路文件的拒绝、CLI 的 JSON/Markdown 输出。

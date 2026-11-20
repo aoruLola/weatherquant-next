@@ -466,8 +466,9 @@ def _gates(con, schema: Schema, where: Filter, thresholds: Thresholds | None, jo
     )
 
     # Clock skew lives on the snapshot, not the decision: latency_ms is
-    # shadow-received minus the venue's own timestamp. It is the one clock
-    # quantity the schema stores; TIME_MISMATCH itself is only a reason code.
+    # shadow-received minus the venue's own timestamp. v3 only punishes the
+    # negative direction, so the measured skew is -latency_ms and the gate is
+    # max_clock_skew_ms; positive latency is staleness, handled by book age.
     if (
         schema.has_table("market_snapshots")
         and schema.has_columns("market_snapshots", "latency_ms", "snapshot_id")
@@ -476,10 +477,10 @@ def _gates(con, schema: Schema, where: Filter, thresholds: Thresholds | None, jo
         gates["clock_skew"] = _gate(
             con,
             table="market_snapshots s",
-            column="s.latency_ms",
+            column="-s.latency_ms",
             flt=join_where,
-            threshold=None if thresholds is None else thresholds.max_decision_latency_ms,
-            threshold_name="max_decision_latency_ms (reporting threshold)",
+            threshold=None if thresholds is None else thresholds.max_clock_skew_ms,
+            threshold_name="max_clock_skew_ms",
             lower_is_better=True,
             candidates=CANDIDATE_LATENCIES_MS,
             join=" JOIN shadow_decisions d ON d.snapshot_id = s.snapshot_id",
@@ -510,26 +511,32 @@ def _gates(con, schema: Schema, where: Filter, thresholds: Thresholds | None, jo
     else:
         gates["fee"] = NA_COLUMN
 
-    # Size: a complete-fill gate. A REJECT whose plan could not cover the
-    # requested shares is the size version of the depth refusal.
-    if schema.has_columns("shadow_decisions", "proposed_shares", "estimated_fill_shares"):
-        gates["size"] = {
-            "threshold_name": "require_complete_fill",
-            "partial_fill_rejects": int(
+    # Size: v3 sizes a fill down instead of refusing a partial one, so the only
+    # size gate left is the venue minimum. A REJECT whose estimated fill is
+    # below it could never have been placed.
+    if schema.has_columns("shadow_decisions", "estimated_fill_shares"):
+        size: dict[str, Any] = {
+            "threshold": None if thresholds is None else thresholds.min_order_size_shares,
+            "threshold_name": "min_order_size_shares",
+            "below_min_order_rejects": None,
+        }
+        if thresholds is not None:
+            size["below_min_order_rejects"] = int(
                 _scalar(
                     con,
                     "SELECT COUNT(*) FROM shadow_decisions"
                     + where.sql(
                         "state = 'REJECT'",
                         "estimated_fill_shares IS NOT NULL",
-                        "proposed_shares IS NOT NULL",
-                        "estimated_fill_shares < proposed_shares",
+                        "estimated_fill_shares < ?",
                     ),
-                    where.bind(),
+                    where.bind(thresholds.min_order_size_shares),
                 )
                 or 0
-            ),
-        }
+            )
+        else:
+            size["note"] = NA_THRESHOLDS
+        gates["size"] = size
     else:
         gates["size"] = NA_COLUMN
 
@@ -941,7 +948,15 @@ def format_markdown(report: dict[str, Any]) -> str:
                 continue
             if name == "size":
                 rows.append(
-                    [name, gate["threshold_name"], "-", "-", "-", "-", f"partial {gate['partial_fill_rejects']}"]
+                    [
+                        name,
+                        gate["threshold_name"],
+                        gate["threshold"],
+                        "-",
+                        "-",
+                        "-",
+                        f"below minimum {gate['below_min_order_rejects']}",
+                    ]
                 )
                 continue
             rows.append(
