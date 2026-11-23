@@ -99,6 +99,14 @@ reads it as `/data/settlements/feed.jsonl` (its default
 `WQ_PAPER_SETTLEMENT_FEED_PATH`) and applies it whenever the file changes.
 Only records where the data-api resolution and Gamma's final outcome prices
 agree are `VERIFIED`; anything else is stored for audit and moves no money.
+A disputed market stays `DISPUTED` (no payout) while the dispute is open, and
+is published `VERIFIED` once both endpoints show the same final 0/1 answer
+(`was_disputed: true` is kept in the record). A 50/50 (void) resolution is not
+a 0/1 payout, so it is never paid automatically: that position stays open
+until handled by hand. Markets already in the feed but not yet final keep
+being re-checked even after they leave the 7-day archive window, and an
+unterminated last line left by a crash mid-append is dropped and re-published
+on the next pass, so the feed never becomes unreadable for Paper.
 
 ## 4. Routine start and stop
 

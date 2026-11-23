@@ -22,7 +22,12 @@ reads are compared:
 Only when both say the same 0 or 1 for YES is the record published as
 ``RESOLVED`` with ``verification_status=VERIFIED`` - the one combination the
 ledger pays out on. A disagreement is published as ``RESOLVED`` +
-``UNCONFIRMED`` (stored for audit, moves nothing); a dispute is ``DISPUTED``.
+``UNCONFIRMED`` (stored for audit, moves nothing); a dispute is ``DISPUTED``
+while it is open. ``was_disputed`` stays true on the resolution forever, so a
+market whose dispute has since been resolved - data-api ``resolved`` with a
+0/1 price *and* Gamma final with the same price - is published ``VERIFIED``
+(with ``was_disputed`` kept in the record); otherwise its capital would stay
+occupied for good.
 A transport failure publishes nothing: an outage is not a settlement fact.
 
 A new revision is appended only when ``(status, yes_payout,
@@ -146,6 +151,46 @@ class SettlementPublisher:
 
     # -- feed state ---------------------------------------------------------
 
+    def repair_torn_tail(self) -> bool:
+        """Drop an unterminated last line left by a crash mid-append.
+
+        This process is the feed's only writer and every record is written as
+        one ``...\n`` line, so bytes after the last newline can only be an
+        interrupted append. Left in place, the paper reader refuses the whole
+        file (``MALFORMED_LINE``) and no settlement would ever apply again; the
+        next append would also be glued onto it. The dropped record is simply
+        re-published by the next pass.
+        """
+        if not self.feed_path.is_file():
+            return False
+        with self.feed_path.open("r+b") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if size == 0:
+                return False
+            handle.seek(size - 1)
+            if handle.read(1) == b"\n":
+                return False
+            keep = 0
+            position = size
+            while position > 0:
+                step = min(65536, position)
+                position -= step
+                handle.seek(position)
+                chunk = handle.read(step)
+                index = chunk.rfind(b"\n")
+                if index >= 0:
+                    keep = position + index + 1
+                    break
+            handle.truncate(keep)
+            handle.flush()
+            os.fsync(handle.fileno())
+        log.warning("settlement feed: dropped %d bytes of an interrupted append", size - keep)
+        return True
+
+    def pending_markets(self) -> list[str]:
+        """Markets already published whose latest record is not final yet."""
+        return sorted(m for m, row in self.latest_records().items() if not self._is_final(row))
+
     def latest_records(self) -> dict[str, dict[str, Any]]:
         """The highest-revision record already published, per market."""
         latest: dict[str, dict[str, Any]] = {}
@@ -176,6 +221,7 @@ class SettlementPublisher:
 
     def sync(self, market_ids: Iterable[str]) -> SyncResult:
         result = SyncResult()
+        self.repair_torn_tail()
         latest = self.latest_records()
         for market_id in sorted({str(m) for m in market_ids if m}):
             if self._is_final(latest.get(market_id)):
@@ -224,6 +270,16 @@ class SettlementPublisher:
             None,
         )
         status = classify(resolution)
+        gamma = gamma_yes_payout(market)
+        if (
+            status == SettlementStatus.DISPUTED
+            and resolution is not None
+            and resolution.status == "resolved"
+            and resolution.price is not None
+            and gamma == resolution.price
+        ):
+            # The dispute is over: both platform reads give the same final answer.
+            status = SettlementStatus.RESOLVED
         now = self.clock()
         record: dict[str, Any] = {
             "market_id": market_id,
@@ -233,6 +289,7 @@ class SettlementPublisher:
             "retrieved_at_utc": now.isoformat(),
         }
         if resolution is not None:
+            record["was_disputed"] = resolution.was_disputed
             record["question_id"] = resolution.question_id
             record["transaction_hash"] = resolution.transaction_hash
             ts = resolution.last_update_timestamp
@@ -241,7 +298,6 @@ class SettlementPublisher:
         if status == SettlementStatus.RESOLVED:
             assert resolution is not None and resolution.price is not None
             record["yes_payout"] = resolution.price
-            gamma = gamma_yes_payout(market)
             record["verification_status"] = "VERIFIED" if gamma == resolution.price else "UNCONFIRMED"
             record["gamma_yes_payout"] = gamma
         return {k: v for k, v in record.items() if v is not None or k == "gamma_yes_payout"}
@@ -308,7 +364,10 @@ def due_markets(markets: dict[str, datetime | None], now: datetime) -> list[str]
 
 
 def run_once(publisher: SettlementPublisher, raw_dir: str | Path, *, days: int = 7) -> SyncResult:
-    return publisher.sync(due_markets(archived_markets(raw_dir, days=days), publisher.clock()))
+    # Markets already in the feed but not final stay on the work list after they
+    # age out of the archive window (a dispute can outlast it).
+    due = due_markets(archived_markets(raw_dir, days=days), publisher.clock())
+    return publisher.sync([*due, *publisher.pending_markets()])
 
 
 def main(argv: list[str] | None = None) -> int:

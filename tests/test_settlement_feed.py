@@ -15,7 +15,7 @@ import pytest
 
 from paper_fills_support import make_fill
 from weatherquant.paper.ledger import Ledger
-from weatherquant.paper.settlements import read_settlement_feed
+from weatherquant.paper.settlements import SettlementParseError, read_settlement_feed
 from weatherquant.paper.store import PaperStore
 from weatherquant.settlement_feed import (
     GAMMA_API_BASE,
@@ -133,13 +133,51 @@ class TestPublisher:
         assert [(r["revision"], r["verification_status"]) for r in rows] == [(1, "UNCONFIRMED"), (2, "VERIFIED")]
 
     def test_dispute_and_pending_carry_no_payout(self, tmp_path):
-        pub = publisher(tmp_path, FakeApi(gamma_market(), resolution(disputed=True)))
+        # An open dispute: no final answer on either side yet.
+        open_dispute = FakeApi(gamma_market(uma="disputed"), resolution(price="69", status="disputed", disputed=True))
+        pub = publisher(tmp_path, open_dispute)
         pub.sync(["mkt-1"])
         (row,) = lines(pub)
         assert row["status"] == "DISPUTED" and "yes_payout" not in row
+        # Data-api resolved after a dispute but Gamma not final yet: still disputed.
+        pub_half = publisher(tmp_path / "half", FakeApi(gamma_market(uma="proposed"), resolution(disputed=True)))
+        pub_half.sync(["mkt-1"])
+        assert lines(pub_half)[0]["status"] == "DISPUTED" and "yes_payout" not in lines(pub_half)[0]
         pub2 = publisher(tmp_path / "b", FakeApi(gamma_market(), resolution(price="69", status="proposed")))
         pub2.sync(["mkt-1"])
         assert lines(pub2)[0]["status"] == "PENDING"
+
+    def test_a_resolved_dispute_settles_once_both_reads_agree(self, tmp_path):
+        # was_disputed never resets; without this the position would stay open forever.
+        api = FakeApi(gamma_market(uma="disputed"), resolution(price="69", status="disputed", disputed=True))
+        pub = publisher(tmp_path, api)
+        pub.sync(["mkt-1"])
+        api.market, api.res = gamma_market(prices=("0", "1")), resolution(price="0", disputed=True)
+        pub.sync(["mkt-1"])
+        rows = lines(pub)
+        assert [(r["revision"], r["status"]) for r in rows] == [(1, "DISPUTED"), (2, "RESOLVED")]
+        assert rows[1]["verification_status"] == "VERIFIED" and rows[1]["yes_payout"] == 0.0
+        assert rows[1]["was_disputed"] is True
+        events = read_settlement_feed(pub.feed_path)
+        assert events[-1].is_payout and events[-1].yes_payout == 0.0
+
+    def test_a_resolved_dispute_with_disagreeing_gamma_is_not_paid(self, tmp_path):
+        pub = publisher(tmp_path, FakeApi(gamma_market(prices=("0", "1")), resolution(disputed=True)))
+        pub.sync(["mkt-1"])
+        (row,) = lines(pub)
+        assert row["status"] == "DISPUTED" and "yes_payout" not in row
+
+    def test_a_torn_tail_is_repaired_so_the_feed_stays_readable(self, tmp_path):
+        pub = publisher(tmp_path, FakeApi(gamma_market(), resolution()))
+        pub.sync(["mkt-1"])
+        good = pub.feed_path.read_bytes()
+        # A crash mid-append: half a record (or zero fill) and no newline.
+        pub.feed_path.write_bytes(good + b'{"market_id":"mkt-2","rev\x00\x00')
+        with pytest.raises(SettlementParseError, match="not JSON"):
+            read_settlement_feed(pub.feed_path)
+        assert pub.sync([]).published == 0
+        assert pub.feed_path.read_bytes() == good
+        assert len(read_settlement_feed(pub.feed_path)) == 1
 
     def test_transport_failure_is_not_a_settlement_fact(self, tmp_path):
         pub = publisher(tmp_path, FakeApi(gamma_market(), resolution(), fail=True))
@@ -196,6 +234,21 @@ def test_work_list_comes_from_the_collector_gamma_archive(tmp_path):
     pub = publisher(tmp_path, api)
     assert run_once(pub, tmp_path / "raw").published == 1
     assert lines(pub)[0]["market_id"] == "past"
+
+
+def test_unfinished_markets_are_rechecked_after_leaving_the_archive_window(tmp_path):
+    (tmp_path / "raw" / "gamma").mkdir(parents=True)  # the market has aged out
+    api = FakeApi(gamma_market(uma="proposed"), resolution(price="69", status="proposed"))
+    pub = publisher(tmp_path, api)
+    pub.sync(["mkt-1"])
+    assert lines(pub)[0]["status"] == "PENDING"
+    api.market, api.res = gamma_market(), resolution()
+    assert run_once(pub, tmp_path / "raw").published == 1
+    assert lines(pub)[-1]["verification_status"] == "VERIFIED"
+    # Final markets drop off the work list again.
+    api.calls.clear()
+    run_once(pub, tmp_path / "raw")
+    assert api.calls == []
 
 
 def test_sidecar_compose_mounts_only_the_feed_writable():
