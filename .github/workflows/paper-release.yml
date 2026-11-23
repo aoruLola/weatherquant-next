@@ -1,0 +1,193 @@
+# Publish only ghcr.io/aorulola/weatherquant-next-paper. Paper has its own
+# paper-v* tags and paper-stable pointer; no other image namespace is touched.
+
+name: paper-release
+
+on:
+  push:
+    tags: ["paper-v*"]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why is this being released manually?"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  actions: write
+
+concurrency:
+  group: paper-release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}-paper
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release tag must match pyproject version
+        if: startsWith(github.ref, 'refs/tags/paper-v')
+        run: |
+          set -euo pipefail
+          tagged="${GITHUB_REF_NAME#paper-v}"
+          declared="$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)"
+          echo "tag paper-v${tagged} vs pyproject ${declared}"
+          if [ "${tagged}" != "${declared}" ]; then
+            echo "::error::paper-v${tagged} is tagged on pyproject version ${declared}."
+            echo "::error::Set version = \"${tagged}\" and commit before tagging."
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Pytest
+        run: uv run pytest -q
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.paper
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: weatherquant-paper:release-candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Container is non-root, writable only in its own state, and healthy
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/paper-data" "$RUNNER_TEMP/shadow-export/parts" "$RUNNER_TEMP/collector-raw/ws"
+          sudo chown -R 1000:1000 "$RUNNER_TEMP/paper-data" "$RUNNER_TEMP/shadow-export" "$RUNNER_TEMP/collector-raw"
+          common=(
+            -v "$RUNNER_TEMP/paper-data:/data"
+            -v "$RUNNER_TEMP/shadow-export:/shadow-decisions:ro"
+            -v "$RUNNER_TEMP/collector-raw:/collector-raw:ro"
+            -e WQ_PAPER_ENABLED=true
+          )
+          docker run --rm "${common[@]}" weatherquant-paper:release-candidate init
+          docker run -d --name paper-rel "${common[@]}" weatherquant-paper:release-candidate
+
+          # The current engine heartbeats its lease. The probe prefers the
+          # native health file when the engine starts publishing one.
+          for i in $(seq 1 60); do
+            if docker exec paper-rel test -f /data/paper/.paper.lock; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec paper-rel python /usr/local/bin/healthcheck.py
+          test "$(docker exec paper-rel id -u)" = "1000"
+          docker exec paper-rel sh -c 'touch /data/.write-probe && rm /data/.write-probe'
+          if docker exec paper-rel sh -c 'touch /shadow-decisions/nope' 2>/dev/null; then
+            echo "Shadow export mount is writable" >&2
+            exit 1
+          fi
+          if docker exec paper-rel sh -c 'touch /collector-raw/nope' 2>/dev/null; then
+            echo "collector raw mount is writable" >&2
+            exit 1
+          fi
+
+      - name: Second writer is refused and state survives stop
+        run: |
+          set -euo pipefail
+          set +e
+          docker run --rm \
+            -v "$RUNNER_TEMP/paper-data:/data" \
+            -v "$RUNNER_TEMP/shadow-export:/shadow-decisions:ro" \
+            -v "$RUNNER_TEMP/collector-raw:/collector-raw:ro" \
+            -e WQ_PAPER_ENABLED=true \
+            weatherquant-paper:release-candidate serve
+          code=$?
+          set -e
+          echo "second instance exit code: $code"
+          test "$code" -eq 4
+          # serve handles SIGTERM: a clean stop exits 0 and releases its lease.
+          # 137 would mean the grace period ran out and Docker had to SIGKILL.
+          docker stop -t 60 paper-rel
+          code="$(docker inspect -f '{{.State.ExitCode}}' paper-rel)"
+          echo "paper exit code after docker stop: $code"
+          test "$code" = "0"
+          test ! -e "$RUNNER_TEMP/paper-data/paper/.paper.lock"
+          test -f "$RUNNER_TEMP/paper-data/paper/paper.duckdb"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker logs paper-rel || true
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase the image name
+        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=ref,event=tag
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.paper
+          platforms: linux/amd64
+          push: true
+          provenance: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Move the paper-stable pointer
+        run: |
+          set -euo pipefail
+          sha="sha-${GITHUB_SHA}"
+          docker buildx imagetools create \
+            -t "${REGISTRY}/${IMAGE_NAME}:paper-stable" \
+            "${REGISTRY}/${IMAGE_NAME}:${sha}"
+          echo "paper-stable -> ${sha} (released as ${GITHUB_REF_NAME})"

@@ -24,6 +24,7 @@ every latency and staleness figure downstream meaningless.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from dataclasses import dataclass
@@ -37,7 +38,7 @@ from weatherquant.markets.models import BookLevel, OrderBook
 
 log = logging.getLogger(__name__)
 
-__all__ = ["CLOB_BASE", "BookSnapshot", "fetch_book", "parse_book_payload"]
+__all__ = ["CLOB_BASE", "BookSnapshot", "book_from_levels_json", "fetch_book", "fetch_books", "parse_book_payload"]
 
 CLOB_BASE = "https://clob.polymarket.com"
 
@@ -56,6 +57,31 @@ class BookSnapshot:
     @property
     def content_hash(self) -> str:
         return self.row[0]
+
+
+def book_from_levels_json(
+    *, market_id: str, token_id: str, bids_json: str, asks_json: str,
+    venue_ts: datetime | None, collector_received: datetime,
+) -> OrderBook:
+    """Rehydrate the canonical levels persisted by the collector and Shadow."""
+
+    def levels(raw: str) -> tuple[BookLevel, ...]:
+        return tuple(
+            BookLevel(
+                price_usd_per_share=float(item["price_usd_per_share"]),
+                size_shares=float(item["size_shares"]),
+            )
+            for item in json.loads(raw)
+        )
+
+    return OrderBook(
+        market_id=market_id,
+        token_id=token_id,
+        bids=levels(bids_json),
+        asks=levels(asks_json),
+        venue_ts=venue_ts,
+        fetched_at_utc=collector_received,
+    )
 
 
 def _sorted_levels(payload: Any, *, descending: bool) -> list[tuple[float, float]]:
@@ -178,3 +204,37 @@ def fetch_book(
         fetched_at_utc=fetched_at_utc,
         run_id=run_id,
     )
+
+
+def fetch_books(
+    http: ResilientHttp,
+    *,
+    token_ids: list[str],
+    timeout_seconds: float | None = None,
+    retries: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Fetch raw books in one POST, keyed by the requested token id.
+
+    The venue omits tokens with no orderbook. Those omissions are left out of
+    the result so the worker can apply the same no-book handling as a GET 404;
+    every returned payload remains verbatim for the per-token raw archive.
+    """
+    if len(token_ids) > 500:
+        raise ValueError("POST /books accepts at most 500 token ids")
+    payload = http.post_json(
+        f"{CLOB_BASE}/books",
+        json_body=[{"token_id": token_id} for token_id in token_ids],
+        limiter="clob_books_batch",
+        timeout_seconds=timeout_seconds,
+        retries=retries,
+    )
+    if not isinstance(payload, list):
+        raise ValueError(f"books payload is {type(payload).__name__}, expected a list")
+
+    by_token: dict[str, dict[str, Any]] = {}
+    for item in payload:
+        if not isinstance(item, dict) or item.get("asset_id") is None:
+            raise ValueError("books response item has no asset_id")
+        by_token[str(item["asset_id"])] = item
+    requested = set(token_ids)
+    return {token: book for token, book in by_token.items() if token in requested}

@@ -10,9 +10,20 @@
     "invented rather than found, so a change here must bump `version` and be",
     "reviewed against docs/shadow-risk-rules.md."
   ],
-  "version": "v2",
-  "set_at_utc": "2026-10-11T15:40:00+00:00",
+  "version": "v3",
+  "set_at_utc": "2026-11-20T00:00:00+00:00",
   "basis": "a priori: Polymarket published fee schedule + the collector's MEASURED per-token refresh cadence; never fitted to observed decisions",
+  "revised_from": {
+    "version": "v2",
+    "why": "v2's complete-fill rule plus a $25 depth floor refused almost every valid trade: a 5-share venue-minimum order at 0.50 is only $2.50, so the dollar floor contradicted the venue's own minimum. Size-down replaces both gates: fill what the book supports up to the proposal, require only the venue minimum and the edge at the actual VWAP. A negative clock skew also no longer rejects any skew at all - small, expected skew is tolerated up to max_clock_skew_ms.",
+    "changes": {
+      "require_complete_fill": "removed (a partial fill is now sized down, never refused for being partial)",
+      "min_depth_usd": "25.0 -> 0.0 (dollar floor off by default; the venue minimum order is the floor)",
+      "min_order_size_shares": "added, 5.0 (fallback when the venue does not report orderMinSize)",
+      "max_clock_skew_ms": "added, 2000 (collector-vs-venue negative skew tolerated up to 2s)"
+    },
+    "measured_at_utc": "2026-11-20T00:00:00+00:00"
+  },
   "corrected_from": {
     "version": "v1",
     "what_changed": "max_snapshot_age_ms 15000 -> 90000",
@@ -37,18 +48,23 @@
     },
     "proposed_shares": {
       "value": 100.0,
-      "unit": "shares",
-      "rationale": "Large enough that a thin book shows up as a partial fill rather than filling instantly and hiding its own emptiness; small enough that depth is never the binding constraint on a market that has any. Shadow only - no order is ever placed and no capital exists."
+      "unit": "shares (maximum size)",
+      "rationale": "The size the decision asks the book for, not a size it insists on. The fill is sized down to what the book actually offers; 100 is large enough that a thin book is visible in estimated_fill_shares while never being the reason a valid small trade is refused. Shadow only - no order is ever placed and no capital exists."
     },
-    "require_complete_fill": {
-      "value": true,
-      "unit": "boolean",
-      "rationale": "A partial fill is not a smaller trade, it is a different trade: the unfilled remainder would have to be repriced against a book we just drove through. Refusing it keeps every ACCEPT interpretable."
+    "min_order_size_shares": {
+      "value": 5.0,
+      "unit": "shares",
+      "rationale": "The venue's own orderMinSize, used when a market does not report it. A sized-down fill below this could never have been placed, so it is the only size floor. Polymarket weather markets default to 5 shares."
     },
     "min_depth_usd": {
-      "value": 25.0,
+      "value": 0.0,
       "unit": "USD notional on the traded side",
-      "rationale": "A second, independent liquidity floor expressed in dollars rather than shares, so that a book resting entirely at 1c cannot pass a share-count check while being worth almost nothing."
+      "rationale": "Optional dollar floor, off by default. It must never sit above the venue's own minimum: 5 shares at 0.50 is $2.50, so a $25 floor would refuse an order the venue accepts. Set it above zero only to study a deliberately larger account."
+    },
+    "max_clock_skew_ms": {
+      "value": 2000,
+      "unit": "ms",
+      "rationale": "Collector receipt may precede the venue timestamp by this much before the two clocks are judged to disagree. Small negative skew is ordinary ordering jitter between two independent clocks; the old zero-tolerance rule rejected healthy books for a millisecond of it. Two seconds still catches a clock that is genuinely wrong."
     },
     "max_decision_latency_ms": {
       "value": 5000,

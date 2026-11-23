@@ -24,7 +24,8 @@ The four rules:
   door, because the ledger's is the one that cannot be forgotten.
 * **No naked shorts**: a SELL YES without inventory is refused
   (``NO_INVENTORY``) before anything is priced. A sell is sized down to what
-  is actually held; only an empty position is a refusal.
+  is actually held; only an empty position - or a holding whose sized-down
+  quantity falls below the venue's minimum order - is a refusal.
 
 BUY NO is deliberately absent: pricing NO off the YES book (or a midpoint)
 would fabricate a price nobody quoted. The shadow's vocabulary cannot yet
@@ -44,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from weatherquant.execution.pricing import FeeStructureUnknown, max_fee_usd_per_share
 from weatherquant.paper.books import BookEvidence
 from weatherquant.paper.events import RefusalReason, SignalEvent
 from weatherquant.paper.ledger import Ledger
@@ -52,13 +54,6 @@ __all__ = ["RiskGate", "RiskRules", "load_risk_rules"]
 
 # Money comparisons carry a tolerance; the ledger's own checks are exact.
 _EPS = 1e-9
-
-#: Polymarket's taker fee per share is ``rate * p * (1 - p)``, bounded above
-#: by ``rate * 0.25`` per share (the concave maximum at p=0.5) - in absolute
-#: per-share terms, not as a fraction of price. Reserving that margin before
-#: sizing keeps the first estimate on the safe side of the cap; the priced
-#: fill is checked against the real number afterwards.
-_FEE_MARGIN_PER_SHARE = 0.25
 
 _REQUIRED_THRESHOLDS = (
     "max_opportunity_fraction",
@@ -215,7 +210,7 @@ class RiskGate:
         if event.direction.value == "sell_yes":
             held = self.ledger.held_shares(event.market_id, event.token_id)
             shares = min(event.proposed_shares, held)
-            if shares < self.min_order_shares:
+            if shares < self.min_order_shares - _EPS:
                 return 0.0, GateVerdict.refuse(
                     RefusalReason.NO_INVENTORY,
                     f"holding {held:g} shares sizes this sell to {shares:.2f}, below the "
@@ -226,8 +221,15 @@ class RiskGate:
         if evidence is None or evidence.book.best_ask_usd_per_share is None:
             return 0.0, GateVerdict()  # the book gate reports the real reason
         price = evidence.book.best_ask_usd_per_share
-        fee_rate = event.fee_rate or 0.0
-        cost_per_share = price + fee_rate * _FEE_MARGIN_PER_SHARE
+        # Reserve the concave maximum of the per-share taker fee (rate / 4) so
+        # the first size estimate is on the safe side of the cap. The priced
+        # fill is checked against the real fee afterwards. An unreported
+        # schedule refuses rather than silently reserving zero.
+        try:
+            fee_margin = max_fee_usd_per_share(fee_rate=event.fee_rate)
+        except FeeStructureUnknown as exc:
+            return 0.0, GateVerdict.refuse(RefusalReason.UNPRICABLE_EVENT, str(exc))
+        cost_per_share = price + fee_margin
 
         available = (self.ledger.balances() or {}).get("available_usdc") or 0.0
         headroom = self.market_cap_usdc - self.market_exposure_usdc(event.market_id)
@@ -263,7 +265,7 @@ class RiskGate:
             )
         affordable = cap_usdc / cost_per_share
         shares = min(event.proposed_shares, affordable)
-        if shares < self.min_order_shares:
+        if shares < self.min_order_shares - _EPS:
             # Cash and market headroom were already shown to afford a minimum
             # order, so the per-opportunity budget itself is the binding cap.
             return 0.0, GateVerdict.refuse(

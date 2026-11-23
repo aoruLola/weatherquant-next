@@ -90,16 +90,12 @@ def build_report(con, *, now: datetime | None = None, horizon_days: int = 7) -> 
 
     by_mode = _by_mode(con)
     edge = _edge_stats(con)
-    latency = _percentile(
-        [
-            r[0]
-            for r in con.execute(
-                "SELECT decision_latency_ms FROM shadow_decisions "
-                "WHERE decision_latency_ms IS NOT NULL"
-            ).fetchall()
-        ],
-        95,
+    latency_row = _one(
+        con,
+        "SELECT quantile_cont(decision_latency_ms, 0.95) "
+        "FROM shadow_decisions WHERE decision_latency_ms IS NOT NULL",
     )
+    latency = float(latency_row) if latency_row is not None else None
 
     return {
         "generated_at_utc": now.isoformat(),
@@ -432,6 +428,9 @@ def _data_quality(con) -> dict[str, Any]:
         "archive_line_malformed",
         "archive_line_oversized",
         "archive_file_unreadable",
+        "archive_trail_ahead_of_file",
+        "archive_trail_behind_checkpoint",
+        "archive_partition_quarantined",
     }
     gaps = sum(v["count"] for k, v in by_kind.items() if k in gap_kinds)
     errors = sum(v["count"] for v in by_kind.values() if v["severity"] == "error")

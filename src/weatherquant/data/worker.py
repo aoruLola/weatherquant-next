@@ -6,9 +6,8 @@ Responsibilities, in the order they matter:
    database is opened, so two containers sharing a data directory cannot fight
    over DuckDB. Exit code 4 means "someone else owns this data directory" and
    is deliberately distinct from a crash.
-2. **Nothing is lost across restarts.** Any gap a previous run left open is
-   closed with a reason, and this run opens its own gap that it closes on exit -
-   an interruption that leaves no trace would silently overstate coverage.
+2. **Restart gaps.** The last known collection or clean stop dates the
+   interruption. A new run closes it when upstream communication resumes.
 3. **Graceful shutdown.** SIGTERM stops intake, flushes the batch, checkpoints,
    records the run's exit, publishes a final heartbeat and releases the lock, in
    that order. A container that exits without doing this leaves an open gap and
@@ -42,7 +41,7 @@ from typing import Any
 from weatherquant import __version__
 from weatherquant.config import Settings
 from weatherquant.data.archive import ArchiveRecord, RawArchive, extract_venue_ts
-from weatherquant.data.books import CLOB_BASE, parse_book_payload
+from weatherquant.data.books import CLOB_BASE, fetch_books, parse_book_payload
 from weatherquant.data.discovery import GammaDiscovery
 from weatherquant.data.heartbeat import (
     UPSTREAM_STALL_SOFT_SECONDS,
@@ -50,6 +49,7 @@ from weatherquant.data.heartbeat import (
     HealthStatus,
     Heartbeat,
     HeartbeatWriter,
+    read_heartbeat,
 )
 from weatherquant.data.http import ResilientHttp
 from weatherquant.data.lock import LockError, SingleInstanceLock
@@ -158,6 +158,7 @@ class CollectorWorker:
         # CollectorWriter.start_backup); the loop only ever *polls* it here,
         # so a backup stuck on FUSE can no longer stall collection.
         self._backup_job: BackupJob | None = None
+        self._backup_attempt_id: str | None = None
         self._backup_attempts_day: date | None = None
         self._backup_attempts_today = 0
         self._last_backup_attempt_mono = -1e18
@@ -174,6 +175,7 @@ class CollectorWorker:
         self._rest_consecutive_failures = 0
         # Cached transport counters so the *final* heartbeat (published after
         # http is closed) still reports what the run achieved rather than zero.
+        self._restart_gap_pending = True
         self._last_contact: datetime | None = None
         self._last_rest_ok = 0
         self._last_rest_failed = 0
@@ -185,16 +187,17 @@ class CollectorWorker:
         # Tokens the venue says have no orderbook (archived markets). Re-asking
         # every cycle would turn a correct 404 into permanent request noise.
         self._no_book: set[str] = set()
+        # When each no-book token was marked. A no-book answer is retried after
+        # NO_BOOK_RETRY_SECONDS: a market whose book did not exist yet, or a
+        # batch response that dropped an entry, must not blind REST polling on
+        # that token for the rest of the process's life.
+        self._no_book_since: dict[str, float] = {}
         self._ws_queue: queue.Queue = queue.Queue(maxsize=20_000)
         self._ws_connected = False
         self._ws_last_message: datetime | None = None
         self._ws_endpoint = ""
 
         # --- polling fairness and cost -----------------------------------
-        # Where the last sweep stopped. Without this the budget always cuts
-        # the tail of the same list, and the same handful of tokens are
-        # deferred forever while the aggregate looks healthy.
-        self._poll_cursor = 0
         self._poll_budget_exceeded = 0
         self._poll_deferred = 0
         self._last_poll_budget_note = -1e18
@@ -205,12 +208,15 @@ class CollectorWorker:
         # When each token was last seen. Answers "which token is being starved"
         # without re-reading the archive.
         self._last_polled_at: dict[str, datetime] = {}
+        # Actual successful-refresh intervals, excluding each token's first
+        # observation. This is deliberately separate from the current-age view.
+        self._book_refresh_gaps_ms: deque[float] = deque(maxlen=1000)
+        self._book_targets: dict[str, date] = {}
         # High-water mark of the stream queue, sampled by the consumer.
         self._ws_queue_high_water = 0
         self._frames_dropped = 0
         self._stream: Any = None
         self._status = HealthStatus.STARTING
-
 
     @staticmethod
     def _data_dir_writable(directory: Path) -> bool:
@@ -323,14 +329,14 @@ class CollectorWorker:
                 hostname=self.hostname,
                 pid=os.getpid(),
             )
-            # A previous run that was killed leaves its gap open. Close it now,
-            # with the reason, so the hole in the data is dated rather than
-            # merely implied.
-            reopened = self._writer.close_open_gaps(detail="previous run ended uncleanly")
-            if reopened:
-                self._event("warning", "restart", f"closed {reopened} open gap(s) from a prior run")
+            previous = read_heartbeat(heartbeat_path)
+            self._writer.begin_restart_gap(
+                previous.run_id if previous else None,
+                previous.last_upstream_contact_utc if previous and previous.stats.rest_requests_ok else None,
+            )
 
             self._archive = archive = RawArchive(settings.raw_dir, run_id=self.run_id)
+            archive.recover_pending_partitions()
             self._http = http = ResilientHttp(
                 timeout_seconds=settings.http_timeout_seconds,
                 retries=settings.http_retries,
@@ -357,14 +363,6 @@ class CollectorWorker:
             self._install_signal_handlers()
             self._status = HealthStatus.HEALTHY
             self._publish(publisher, http)
-
-            # This run's own gap: everything between now and a clean exit is
-            # uncollected time and must be visible as such.
-            self._writer.record_gap(
-                reason="start_after_restart",
-                started_at_utc=self.started_at,
-                detail=f"run={self.run_id} pid={os.getpid()} host={self.hostname}",
-            )
 
             self._start_watchdog()
             self._maybe_inject_fault_block()
@@ -420,7 +418,7 @@ class CollectorWorker:
                     status = HealthStatus.FATAL
                 finally:
                     self._archive_records = archive.records_written
-            if self._backup_job is not None:
+            if self._backup_job is not None and not self._backup_job.abandoned:
                 # The copy runs on its own connection, so it survives the
                 # archive close above. SIGTERM arriving mid-backup is exactly
                 # when a verified copy is worth a bounded wait - but never
@@ -428,29 +426,44 @@ class CollectorWorker:
                 # daemon thread is killed and the next run's backup sweeps
                 # the .incomplete- file.
                 job = self._backup_job
-                if not job.done:
-                    job.join(30.0)
-                report = job.poll()
-                if report is not None:
-                    # Recorded before the writer closes, so the run's exit
-                    # includes the backup outcome it was still holding.
-                    if report.ok:
-                        self._event(
-                            "info", "backup", f"verified backup {report.destination.name} (shutdown)"
+                try:
+                    if not job.join(30.0) and job.abandon("shutdown wait expired"):
+                        self._backup_event(
+                            "error",
+                            "backup_timeout",
+                            f"shutdown wait expired for {job.final.name}",
+                            {"outcome": "timeout", "elapsed_seconds": round(job.elapsed_seconds(), 3)},
                         )
                     else:
-                        self._event(
-                            "error", "backup_failed", report.error or "unknown (shutdown)"
-                        )
+                        report = job.poll()
+                        if report.ok:
+                            self._backup_event(
+                                "info",
+                                "backup",
+                                f"verified backup {job.final.name} (shutdown)",
+                                {
+                                    "outcome": "ok",
+                                    "elapsed_seconds": round(job.elapsed_seconds(), 3),
+                                    "bytes": report.bytes_written,
+                                    "destination": job.final.name,
+                                },
+                            )
+                        else:
+                            self._backup_event(
+                                "error",
+                                "backup_failed",
+                                report.error or "unknown (shutdown)",
+                                {
+                                    "outcome": "failed",
+                                    "elapsed_seconds": round(job.elapsed_seconds(), 3),
+                                    "error": report.error or "unknown (shutdown)",
+                                },
+                            )
+                except Exception as exc:
+                    log.exception("could not finalize backup audit")
+                    self._fatal = reason = f"backup_audit_failed: {exc}"
+                    status = HealthStatus.FATAL
             if self._writer is not None:
-                # Close this run's own gap before the writer goes away. A run
-                # that opened a gap at start must close it at exit whatever the
-                # exit reason, or every *clean* shutdown would leave a phantom
-                # "collection gap" that later research would read as an outage.
-                try:
-                    self._writer.close_open_gaps(detail=f"run ended: {reason}")
-                except Exception:
-                    log.exception("could not close this run's collection gap")
                 try:
                     self._writer.close(
                         status="failed" if status is HealthStatus.FATAL else "stopped",
@@ -460,9 +473,7 @@ class CollectorWorker:
                     log.exception("error closing writer")
             if http is not None:
                 http.close()
-            self._status = (
-                HealthStatus.FATAL if status is HealthStatus.FATAL else HealthStatus.STOPPED
-            )
+            self._status = HealthStatus.FATAL if status is HealthStatus.FATAL else HealthStatus.STOPPED
             try:
                 self._publish(publisher, None)
             except Exception:
@@ -527,6 +538,20 @@ class CollectorWorker:
                 self._writer.checkpoint_if_due()
             if time.monotonic() - self._last_heartbeat_mono >= self.heartbeat_seconds:
                 self._publish(publisher, http)
+            if self._restart_gap_pending and self._writer is not None:
+                contact = http.last_contact_utc if http.requests_ok else None
+                if contact is None and self.stats.ws_messages_received:
+                    contact = self._last_data_change
+                if contact is not None:
+                    try:
+                        self._writer.close_open_gaps(detail=f"contact resumed in {self.run_id}", ended_at_utc=contact)
+                    except Exception:
+                        # Losing the gap's end timestamp is bad; losing the
+                        # collection because the audit write failed is worse.
+                        # Retry on the next tick.
+                        log.exception("could not close the restart collection gap")
+                    else:
+                        self._restart_gap_pending = False
             self._maybe_daily_jobs()
 
             if self.once and cycles >= 3:
@@ -549,9 +574,7 @@ class CollectorWorker:
         # fraction of its budget at any scale - including the compressed
         # thresholds tests use.
         check_interval = min(5.0, max(0.02, self.loop_stuck_seconds / 4.0))
-        self._watchdog = LoopWatchdog(
-            self, stuck_seconds=self.loop_stuck_seconds, check_interval=check_interval
-        )
+        self._watchdog = LoopWatchdog(self, stuck_seconds=self.loop_stuck_seconds, check_interval=check_interval)
         self._watchdog.start()
         log.info(
             "loop watchdog armed: a silent main loop will exit the process after %.0fs",
@@ -584,11 +607,9 @@ class CollectorWorker:
         )
         log.warning("%s", message)
         self._event("warning", "fault_injection", message)
-        if self._watchdog is not None:
-            # The block itself is the stuck state under test: no allowance.
-            time.sleep(seconds)
-        else:
-            log.warning("watchdog disabled; sleeping the fault block out instead")
+        # The independent health probe must observe the same block even when
+        # the watchdog is disabled for a diagnostic run.
+        time.sleep(seconds)
 
     def publish_stuck_heartbeat(self, message: str) -> None:
         """A last heartbeat that names the stuck loop, written by the watchdog.
@@ -598,9 +619,7 @@ class CollectorWorker:
         """
         self._status = HealthStatus.UNHEALTHY
         self._fatal = message
-        publisher = HeartbeatWriter(
-            self.settings.db_path.parent / "health" / "heartbeat.json"
-        )
+        publisher = HeartbeatWriter(self.settings.db_path.parent / "health" / "heartbeat.json")
         self._publish(publisher, None)
 
     def _run_discovery(self, discovery: GammaDiscovery, archive: RawArchive | None) -> None:
@@ -631,6 +650,15 @@ class CollectorWorker:
                 problems.extend(found.problems)
                 for token in _tokens_of(found.market_rows):
                     self._books[token[0]] = token[1]
+                # Target dates let the sweep put near-dated markets first when
+                # two books are equally stale; they never outrank staleness, so
+                # a far-dated book cannot be starved by a nearer one.
+                for row in found.market_rows:
+                    for token in (row[12], row[13]):
+                        # date.min is discovery's unknown-date sentinel, not an
+                        # especially urgent market. Only known dates rank here.
+                        if token in self._books and row[14] != date.min:
+                            self._book_targets[token] = row[14]
             self._writer.flush_if_due()
             self.stats.events_upserted += events
             self.stats.markets_upserted += markets
@@ -670,6 +698,10 @@ class CollectorWorker:
     # first occurrence and then one every five minutes, with the running total
     # in both the log line and the collector_events row.
     POLL_BUDGET_NOTE_INTERVAL_SECONDS = 300.0
+    # The venue accepts up to 500 books per POST. A smaller request bounds
+    # payload size while still collapsing the usual weather set into one call.
+    BOOK_BATCH_SIZE = 100
+    NO_BOOK_RETRY_SECONDS = 600.0
 
     def _book_request_budget(self, deadline: float) -> tuple[float, int]:
         """``(timeout_seconds, retries)`` for one fetch inside the sweep.
@@ -695,24 +727,28 @@ class CollectorWorker:
         retries = 1 if remaining >= 2 * timeout + 1.0 else 0
         return timeout, retries
 
-    def _rotated_books(self) -> list[tuple[str, str]]:
-        """Start each sweep where the last one stopped.
+    def _sweep_books(self) -> list[tuple[str, str]]:
+        """Refresh the stalest books first, nearest target date breaking ties.
 
-        ``self._books`` is a dict, so a budget cut always drops the *tail* -
-        the same tokens, in the same order, every cycle. That is starvation
-        with a perfectly healthy-looking aggregate: most tokens refresh on
-        time while a handful never do. Rotating the start position by one each
-        sweep spreads the truncation across the whole set instead.
+        Rotation spread budget truncation across the set, but it still served
+        tokens in an arbitrary order: a book could wait two full sweeps while a
+        fresher one was refreshed again. Ordering by last refresh makes the
+        refresh *gap* itself the priority, which is what keeps the p90 age
+        bounded rather than merely fair on average. When two books are equally
+        stale, the market that settles sooner is polled first.
+
+        Never-polled tokens sort first: an unknown age is the most stale state
+        there is, not a fresh one.
         """
-        items = list(self._books.items())
-        if not items:
-            return items
-        start = self._poll_cursor % len(items)
-        # Advance by one, not to the end: successive sweeps then step through
-        # the list, and every token eventually sits at the front when the
-        # budget is still open.
-        self._poll_cursor = (start + 1) % len(items)
-        return items[start:] + items[:start]
+        now = datetime.now(tz=UTC)
+
+        def key(item: tuple[str, str]) -> tuple[float, date, str]:
+            token = item[0]
+            seen = self._last_polled_at.get(token)
+            age = float("inf") if seen is None else (now - seen).total_seconds()
+            return (-age, self._book_targets.get(token, date.max), token)
+
+        return sorted(self._books.items(), key=key)
 
     def _poll_books(self, http: ResilientHttp | None) -> None:
         if self._writer is None or self._archive is None or http is None or not self._books:
@@ -722,116 +758,138 @@ class CollectorWorker:
         deadline = cycle_started + self.POLL_BUDGET_SECONDS
         attempted = 0
         latencies: list[float] = []
+        self._release_no_book(time.monotonic())
+        eligible = [(token, market) for token, market in self._sweep_books() if token not in self._no_book]
+        use_batch = bool(getattr(http, "supports_books_batch", False))
+        batch_size = self.BOOK_BATCH_SIZE if use_batch else 1
+        position = 0
 
-        for token_id, market_id in self._rotated_books():
-            if token_id in self._no_book:
-                continue
+        while position < len(eligible):
             if self.shutdown.requested():
                 break
             if time.monotonic() >= deadline:
                 # Defer the remainder to the next tick rather than blocking the
-                # heartbeat. Nothing is lost: the rotated start means the next
-                # sweep picks up here instead of starting over from the head.
-                eligible = sum(1 for t, _ in self._books.items() if t not in self._no_book)
-                deferred = max(0, eligible - attempted)
+                # heartbeat. Unsuccessful and never-polled tokens remain stale,
+                # so the next sweep serves them before fresher books.
+                deferred = max(0, len(eligible) - attempted)
                 self._poll_budget_exceeded += 1
                 self._poll_deferred += deferred
                 self._note_poll_budget(time.monotonic() - cycle_started, deferred)
                 break
 
+            chunk = eligible[position : position + batch_size]
+            position += len(chunk)
             timeout_seconds, retries = self._book_request_budget(deadline)
-            # Marked before the request: this is when we *asked*. The value
-            # that goes into the archive and the row is taken after the
-            # response, and the difference is the latency this sweep records.
+            # One clock pair per HTTP request. Every book in a batch shares the
+            # response-arrival time, while retaining its own raw payload and row.
             request_started = datetime.now(tz=UTC)
             try:
-                # Fetch the raw payload first: the archive stores it verbatim,
-                # and only then is it parsed into a row.
-                payload = http.get_json(
-                    f"{CLOB_BASE}/book",
-                    params={"token_id": token_id},
-                    limiter="clob_book",
-                    allow_not_found=True,
-                    timeout_seconds=timeout_seconds,
-                    retries=retries,
-                )
-                received_at = datetime.now(tz=UTC)
-                attempted += 1
+                if use_batch:
+                    token_ids = [token for token, _ in chunk]
+                    books = fetch_books(
+                        http,
+                        token_ids=token_ids,
+                        timeout_seconds=timeout_seconds,
+                        retries=retries,
+                    )
+                    received_at = datetime.now(tz=UTC)
+                    payloads = [books.get(token_id) for token_id in token_ids]
+                else:
+                    token_id = chunk[0][0]
+                    payload = http.get_json(
+                        f"{CLOB_BASE}/book",
+                        params={"token_id": token_id},
+                        limiter="clob_book",
+                        allow_not_found=True,
+                        timeout_seconds=timeout_seconds,
+                        retries=retries,
+                    )
+                    received_at = datetime.now(tz=UTC)
+                    payloads = [payload]
+            except Exception as exc:
+                attempted += len(chunk)
+                failed += len(chunk)
+                self.stats.rest_requests_failed += len(chunk)
+                label = f"books batch of {len(chunk)}" if use_batch else f"book {chunk[0][0][:12]}"
+                self._note_error(f"{label}: {exc}")
+                log.debug("book fetch failed for %s: %s", label, exc)
+                continue
+
+            attempted += len(chunk)
+            latency_ms = (received_at - request_started).total_seconds() * 1000.0
+            latencies.append(latency_ms)
+            self._rest_latencies.append(latency_ms)
+
+            for (token_id, market_id), payload in zip(chunk, payloads, strict=True):
                 if payload is None:
-                    # "No orderbook exists for this token" - a definitive answer
-                    # about an archived market, not an upstream failure. Remember
-                    # it so the collector stops re-asking every cycle.
+                    # GET reports this as a 404; POST /books omits the entry.
+                    # Both are definitive no-book answers, not transport errors.
                     self._no_book.add(token_id)
+                    self._no_book_since[token_id] = time.monotonic()
                     self.stats.rest_requests_ok += 1
                     self._rest_consecutive_failures = 0
                     log.debug("no orderbook for token %s; skipping it from now on", token_id[:12])
                     continue
-                snapshot = parse_book_payload(
-                    payload,
-                    token_id=token_id,
-                    market_id=market_id,
-                    fetched_at_utc=received_at,
-                    run_id=self.run_id,
-                )
-            except Exception as exc:
-                failed += 1
-                attempted += 1
-                self.stats.rest_requests_failed += 1
-                self._note_error(f"book {token_id[:12]}: {exc}")
-                log.debug("book fetch failed for %s: %s", token_id[:12], exc)
-                continue
+                try:
+                    snapshot = parse_book_payload(
+                        payload,
+                        token_id=token_id,
+                        market_id=market_id,
+                        fetched_at_utc=received_at,
+                        run_id=self.run_id,
+                    )
+                except Exception as exc:
+                    failed += 1
+                    self.stats.rest_requests_failed += 1
+                    self._note_error(f"book {token_id[:12]}: {exc}")
+                    log.debug("book parse failed for %s: %s", token_id[:12], exc)
+                    continue
 
-            latency_ms = (received_at - request_started).total_seconds() * 1000.0
-            latencies.append(latency_ms)
-            self._rest_latencies.append(latency_ms)
-            # Per-token so "which token has not been seen lately" is answerable
-            # from the heartbeat rather than only from the archive.
-            self._last_polled_at[token_id] = received_at
-
-            self._archive.append(
-                ArchiveRecord(
-                    source="rest",
-                    payload=payload,
-                    received_at_utc=received_at,
-                    venue_ts_utc=snapshot.venue_ts,
-                    quality=snapshot.quality,
-                    run_id=self.run_id,
-                )
-            )
-            self._writer.stage_book(snapshot.row)
-            if snapshot.quality != "ok":
-                self._last_defect = snapshot.quality
-                if _is_one_sided(snapshot.quality):
-                    # An extreme bracket routinely has no bid or no ask: that is
-                    # the market being empty, not the payload being corrupt.
-                    self.stats.one_sided_books += 1
-                else:
-                    self.stats.integrity_failures += 1
-            ok += 1
-            self.stats.rest_requests_ok += 1
-            self._rest_consecutive_failures = 0
-
-            mid = _midpoint(snapshot.bids, snapshot.asks)
-            if mid is not None:
-                self._writer.stage_price(
-                    (
-                        market_id,
-                        token_id,
-                        received_at,
-                        mid,
-                        "rest",
-                        received_at,
-                        snapshot.venue_ts_origin,
-                        self.run_id,
+                self._mark_book_refreshed(token_id, received_at)
+                self._archive.append(
+                    ArchiveRecord(
+                        source="rest",
+                        payload=payload,
+                        received_at_utc=received_at,
+                        venue_ts_utc=snapshot.venue_ts,
+                        quality=snapshot.quality,
+                        run_id=self.run_id,
                     )
                 )
-                self.stats.price_points_inserted += 1
-                self._last_data_change = received_at
-                # The REST poll is the authoritative snapshot. Keeping its
-                # midpoint gives every stream update something to be checked
-                # against, which is what turns "two sources" into "two sources
-                # that agree".
-                self._last_rest_mid[token_id] = (received_at, mid)
+                self._writer.stage_book(snapshot.row)
+                if snapshot.quality != "ok":
+                    self._last_defect = snapshot.quality
+                    if _is_one_sided(snapshot.quality):
+                        # An extreme bracket routinely has no bid or no ask: that is
+                        # the market being empty, not the payload being corrupt.
+                        self.stats.one_sided_books += 1
+                    else:
+                        self.stats.integrity_failures += 1
+                ok += 1
+                self.stats.rest_requests_ok += 1
+                self._rest_consecutive_failures = 0
+
+                mid = _midpoint(snapshot.bids, snapshot.asks)
+                if mid is not None:
+                    self._writer.stage_price(
+                        (
+                            market_id,
+                            token_id,
+                            received_at,
+                            mid,
+                            "rest",
+                            received_at,
+                            snapshot.venue_ts_origin,
+                            self.run_id,
+                        )
+                    )
+                    self.stats.price_points_inserted += 1
+                    self._last_data_change = received_at
+                    # The REST poll is the authoritative snapshot. Keeping its
+                    # midpoint gives every stream update something to be checked
+                    # against, which is what turns "two sources" into "two sources
+                    # that agree".
+                    self._last_rest_mid[token_id] = (received_at, mid)
 
         if failed:
             self._rest_consecutive_failures = max(self._rest_consecutive_failures, failed)
@@ -840,12 +898,26 @@ class CollectorWorker:
         self._writer.flush_if_due()
         log.debug("book poll: %d ok, %d failed", ok, failed)
 
+    def _release_no_book(self, now: float) -> None:
+        """Let no-book tokens be asked again once the retry interval has passed."""
+        for token in [t for t in self._no_book if now - self._no_book_since.get(t, now) >= self.NO_BOOK_RETRY_SECONDS]:
+            self._no_book.discard(token)
+            self._no_book_since.pop(token, None)
+
+    def _mark_book_refreshed(self, token_id: str, received_at: datetime) -> None:
+        """Record a successful parse and its interval from the prior success."""
+        previous = self._last_polled_at.get(token_id)
+        if previous is not None:
+            gap_ms = max(0.0, (received_at - previous).total_seconds() * 1000.0)
+            self._book_refresh_gaps_ms.append(gap_ms)
+        self._last_polled_at[token_id] = received_at
+
     def _note_poll_budget(self, elapsed: float, deferred: int) -> None:
         """Record that the sweep ran out of budget, without a log storm.
 
         Budget exhaustion is a *normal* outcome of a full token set and is the
-        thing the rotation exists to spread around, so it is a counter first
-        and a log line second - the first, and then one every five minutes.
+        thing stalest-first ordering addresses, so it is a counter first and a
+        log line second - the first, and then one every five minutes.
         """
         now = time.monotonic()
         if (
@@ -854,8 +926,7 @@ class CollectorWorker:
         ):
             self._last_poll_budget_note = now
             log.warning(
-                "book poll budget exhausted after %.1fs; %d token(s) deferred "
-                "(total %d sweep(s), %d deferral(s))",
+                "book poll budget exhausted after %.1fs; %d token(s) deferred (total %d sweep(s), %d deferral(s))",
                 elapsed,
                 deferred,
                 self._poll_budget_exceeded,
@@ -866,7 +937,6 @@ class CollectorWorker:
                 "poll_budget",
                 f"budget exhausted after {elapsed:.1f}s; {deferred} token(s) deferred",
             )
-
 
     # How far apart the stream and the poll may be before we call it a
     # discrepancy. Half a cent in probability terms is far wider than normal
@@ -908,8 +978,7 @@ class CollectorWorker:
         self._event(
             "warning",
             "ws_rest_mismatch",
-            f"stream mid {stream_mid:.4f} vs poll mid {rest_mid:.4f} "
-            f"(gap {gap:.4f}, {age:.0f}s since poll)",
+            f"stream mid {stream_mid:.4f} vs poll mid {rest_mid:.4f} (gap {gap:.4f}, {age:.0f}s since poll)",
             {"token_id": token_id[:16], "stream_mid": stream_mid, "rest_mid": rest_mid, "age_s": age},
         )
         self._last_defect = f"ws_rest_mismatch:{token_id[:12]}"
@@ -969,7 +1038,7 @@ class CollectorWorker:
                 self._last_parquet_day = today
             except Exception as exc:
                 log.warning("parquet export failed: %s", exc)
-        if self.backup_daily and self._last_backup_day != today:
+        if self.backup_daily and (self._backup_job is not None or self._last_backup_day != today):
             self._advance_daily_backup(today)
 
     # A clean backup failure (bad destination, verification mismatch, ENOSPC)
@@ -994,11 +1063,14 @@ class CollectorWorker:
 
         job = self._backup_job
         if job is not None:
+            if job.abandoned:
+                if job.done:
+                    self._backup_job = None
+                return
             report = job.poll()
             if report is None:
                 if job.expired() and job.abandon(
-                    f"no finished backup after {job.elapsed_seconds():.0f}s "
-                    f"(limit {self.backup_timeout_seconds:.0f}s)"
+                    f"no finished backup after {job.elapsed_seconds():.0f}s (limit {self.backup_timeout_seconds:.0f}s)"
                 ):
                     message = (
                         f"backup {job.final.name} abandoned after "
@@ -1006,23 +1078,23 @@ class CollectorWorker:
                         "on its own thread and will discard its file"
                     )
                     log.error("%s", message)
-                    self._event("error", "backup_timeout", message)
+                    self._backup_event(
+                        "error",
+                        "backup_timeout",
+                        message,
+                        {"outcome": "timeout", "elapsed_seconds": round(job.elapsed_seconds(), 3)},
+                    )
                     self._last_backup_error = "backup_timeout"
-                    self._backup_attempts_today += 1
                     self._last_backup_attempt_mono = time.monotonic()
                     # No same-day retry after a timeout: the stuck copy is
                     # still holding its private connection, and a second
                     # one would only double the I/O it is stuck on.
                     self._last_backup_day = today
-                    # Detached, not forgotten: the thread discards its own
-                    # file when (if) it completes. Keeping the handle would
-                    # re-enter this branch every tick and storm the log.
-                    self._backup_job = None
+                    # Keep ownership until it exits, including across UTC midnight.
                 # Either still running or just abandoned: nothing to start.
                 return
 
             self._backup_job = None
-            self._backup_attempts_today += 1
             self._last_backup_attempt_mono = time.monotonic()
             if report.ok:
                 self._last_backup_ok = report.destination.name
@@ -1033,11 +1105,30 @@ class CollectorWorker:
                     report.bytes_written,
                     len(report.row_counts),
                 )
-                self._event("info", "backup", f"verified backup {report.destination.name}")
+                self._backup_event(
+                    "info",
+                    "backup",
+                    f"verified backup {report.destination.name}",
+                    {
+                        "outcome": "ok",
+                        "elapsed_seconds": round(job.elapsed_seconds(), 3),
+                        "bytes": report.bytes_written,
+                        "destination": report.destination.name,
+                    },
+                )
                 self._last_backup_day = today
             else:
                 log.error("backup failed: %s", report.error)
-                self._event("error", "backup_failed", report.error or "unknown")
+                self._backup_event(
+                    "error",
+                    "backup_failed",
+                    report.error or "unknown",
+                    {
+                        "outcome": "failed",
+                        "elapsed_seconds": round(job.elapsed_seconds(), 3),
+                        "error": report.error or "unknown",
+                    },
+                )
                 self._last_backup_error = (report.error or "unknown")[:200]
                 if self._backup_attempts_today >= self.BACKUP_MAX_ATTEMPTS_PER_DAY:
                     self._last_backup_day = today
@@ -1051,11 +1142,18 @@ class CollectorWorker:
             time.monotonic() - self._last_backup_attempt_mono < self.backup_retry_seconds
         ):
             return
+        self._backup_attempt_id = f"{self.run_id}/{today.isoformat()}/{self._backup_attempts_today + 1}"
+        destination = self.settings.db_path.parent / "backups"
+        self._backup_event(
+            "info",
+            "backup_started",
+            "starting daily backup",
+            {"outcome": "started", "destination": str(destination)},
+        )
         try:
-            # The flush + checkpoint inside are the only synchronous part and
-            # are bounded by the pending batch, not by the database size.
+            # Only the pending writer batch is committed on the loop thread.
             job = self._writer.start_backup(
-                self.settings.db_path.parent / "backups",
+                destination,
                 timeout_seconds=self.backup_timeout_seconds,
             )
         except Exception as exc:
@@ -1064,7 +1162,8 @@ class CollectorWorker:
             # audit trail, not just a log line on a rotating container.
             # (WQN-5; subsumed into the job-based flow of WQN-1.)
             log.warning("backup could not start: %s", exc)
-            self._event("error", "backup_failed", f"start: {type(exc).__name__}: {exc}")
+            error = f"{type(exc).__name__}: {exc}"
+            self._backup_event("error", "backup_failed", f"start: {error}", {"outcome": "failed", "error": error})
             self._last_backup_error = f"start: {exc}"[:200]
             self._backup_attempts_today += 1
             self._last_backup_attempt_mono = time.monotonic()
@@ -1074,7 +1173,23 @@ class CollectorWorker:
         self._backup_job = job
         self._backup_attempts_today += 1
         self._last_backup_attempt_mono = time.monotonic()
-        self._event("info", "backup_started", str(job.final.name))
+
+    def _backup_event(self, level: str, kind: str, message: str, details: dict[str, Any] | None = None) -> None:
+        """Persist one backup lifecycle event immediately.
+
+        The audit write is best-effort on purpose: a full disk or a rejected
+        insert must cost a log line, never the collection run the record exists
+        to describe. Every event carries the attempt id so start and outcome can
+        be paired, plus the outcome itself, its duration and (for a published
+        copy) its size or error.
+        """
+        if self._writer is None:
+            return
+        payload = {"attempt_id": self._backup_attempt_id, **(details or {})}
+        try:
+            self._writer.log_event(level, kind, message, payload, immediate=True)
+        except Exception:
+            log.exception("could not persist backup event %s", kind)
 
     def _drain_stream(self, archive: RawArchive | None) -> None:
         # Sampled *before* the writer guard: queue depth is a property of the
@@ -1201,27 +1316,32 @@ class CollectorWorker:
                 "frames_dropped": self._frames_dropped,
             },
             "per_token_book_age_ms": self._per_token_book_age(),
+            "per_token_book_refresh_gap_ms": _latency_summary(list(self._book_refresh_gaps_ms)),
+            "archive_quarantine": {
+                "count": self._archive.quarantined_partitions if self._archive is not None else 0,
+                "last": dict(self._archive.last_quarantine)
+                if self._archive is not None and self._archive.last_quarantine
+                else None,
+            },
         }
 
     def _per_token_book_age(self) -> dict[str, Any] | None:
         """How stale each token's newest book is, right now.
 
-        Rotation is meant to make the *refresh gap* uniform; this shows whether
-        the *age* actually converged. The oldest token is named, because a
+        Stalest-first scheduling is meant to make the *refresh gap* uniform;
+        this shows whether the *age* actually converged. The oldest token is named, because a
         uniform p95 with one token an hour behind is still starvation.
         """
         if not self._last_polled_at:
             return None
         now = datetime.now(tz=UTC)
-        ages = {
-            token: (now - seen).total_seconds() * 1000.0
-            for token, seen in self._last_polled_at.items()
-        }
+        ages = {token: (now - seen).total_seconds() * 1000.0 for token, seen in self._last_polled_at.items()}
         values = list(ages.values())
         oldest = max(ages, key=ages.get)
         return {
             "tokens": len(values),
             "max_ms": round(max(values), 1),
+            "p90_ms": round(_percentile(values, 90), 1),
             "p95_ms": round(_percentile(values, 95), 1),
             "median_ms": round(_percentile(values, 50), 1),
             "oldest_token": oldest[:24],
@@ -1243,9 +1363,7 @@ class CollectorWorker:
             with contextlib.suppress(ValueError, OSError):
                 signal.signal(sig, handler)
 
-    def note_stream_state(
-        self, *, connected: bool, last_message: datetime | None, endpoint: str
-    ) -> None:
+    def note_stream_state(self, *, connected: bool, last_message: datetime | None, endpoint: str) -> None:
         self._ws_connected = connected
         self._ws_last_message = last_message
         self._ws_endpoint = endpoint
@@ -1303,6 +1421,16 @@ class CollectorWorker:
             if (wall - contact).total_seconds() <= UPSTREAM_STALL_SOFT_SECONDS:
                 self._status = HealthStatus.HEALTHY
 
+        # A quarantined partition is an operator-visible integrity alert even
+        # though collection carried on. Keep the published file honest: never
+        # let it read `healthy` on a run that had to freeze evidence.
+        if (
+            self._archive is not None
+            and self._archive.quarantined_partitions > 0
+            and self._status is HealthStatus.HEALTHY
+        ):
+            self._status = HealthStatus.DEGRADED
+
         heartbeat = Heartbeat(
             status=self._status,
             run_id=self.run_id,
@@ -1341,6 +1469,7 @@ class CollectorWorker:
                 dedupe_hits_total=writer_stats.get("books_deduplicated", 0)
                 + writer_stats.get("prices_deduplicated", 0),
                 errors_total=self.stats.errors_total,
+                archive_quarantined=self._archive.quarantined_partitions if self._archive is not None else 0,
             ),
             db_bytes=int(disk.get("db_bytes", 0)),
             raw_bytes=raw_bytes,
@@ -1426,6 +1555,7 @@ def _latency_summary(values: list[float]) -> dict[str, Any]:
     return {
         "n": len(values),
         "p50_ms": round(_percentile(values, 50), 1),
+        "p90_ms": round(_percentile(values, 90), 1),
         "p95_ms": round(_percentile(values, 95), 1),
         "p99_ms": round(_percentile(values, 99), 1),
         "max_ms": round(max(values), 1),
@@ -1480,9 +1610,7 @@ def _book_midpoint(event: dict) -> float | None:
     return (best_bid + best_ask) / 2.0
 
 
-def stream_price_rows(
-    payload: Any, received_at: datetime, run_id: str, books: dict[str, str]
-) -> list[tuple]:
+def stream_price_rows(payload: Any, received_at: datetime, run_id: str, books: dict[str, str]) -> list[tuple]:
     """Extract price points from a stream frame.
 
     Only a *midpoint* is written to ``price_history``. The venue also sends

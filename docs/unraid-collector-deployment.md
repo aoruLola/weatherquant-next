@@ -13,6 +13,16 @@ WeatherQuant Next 采集器 · Compose Manager Plus · GHCR
 > | GitHub Actions `release.yml` | ✅ **`v0.1.1` 已执行并发布成功**（run `38063764541`：verify + publish 双绿） |
 > | **Unraid 上的真实部署** | ❌ **未部署 —— 我没有 NAS 访问权限** |
 >
+> **WQN-2 当前分支状态（2026-11-15）**
+>
+> | 阶段 | 状态 |
+> |---|---|
+> | 代码已合并 | PR #27 已合入 `main`；PR #40 及本次补强仅在当前分支验收，本地提交不等于已合入 `main`。 |
+> | 镜像已发布 | 现有 GHCR Release 记录不证明其包含本次修复；包含本次修复的新镜像尚未发布。 |
+> | 生产已部署 | **未执行**。本次未访问 NAS、生产数据或生产容器。 |
+> | 生产已验收 | **未执行**。NAS 上的 `restart=unless-stopped`、退出码 4 后自动重启及独立健康探针仍待实测记录。 |
+> | 本机验收 | Linux 单元测试与 spawn/WAL 恢复测试已执行；容器验收脚本仅做语法检查，未启动 Docker。 |
+>
 > 下面标 `[待NAS验证]` 的步骤是给你执行的，不是我做过的。§11 会把"我验证了什么"
 > 和"你需要验证什么"分开列清楚。
 
@@ -169,9 +179,22 @@ echo '<PAT>' | docker login ghcr.io -u '<你的GitHub用户名>' --password-stdi
 1. Unraid Web UI → **Apps → Compose Manager Plus → Add Compose Stack**
 2. **Name**: `weatherquant-next`
 3. 把 `docker/compose.unraid.yaml` 的内容粘进编辑器。
-   `image:` **已经填好**，指向已发布的镜像：
-   `ghcr.io/aorulola/weatherquant-next:stable`
-   （不可变版本用 `sha-5410c75d584771b4477de07f4b1d7b83b764bfe1`，回滚见 §10）
+   镜像行是 **不可变 SHA 标签**，由 stack 目录里的 `.env` 决定：
+
+   ```yaml
+   image: ghcr.io/aorulola/weatherquant-next:sha-${COLLECTOR_SHA:?...}
+   ```
+
+   在同一个 stack 目录新建/编辑 `.env`，写入要运行的**完整 40 位 commit sha**：
+
+   ```bash
+   COLLECTOR_SHA=5410c75d584771b4477de07f4b1d7b83b764bfe1
+   ```
+
+   `GIT_SHA` 与 `IMAGE_TAG` 也从这同一个变量读取，容器上报的版本不可能与
+   实际运行的镜像不一致。变量未设置时 compose **拒绝启动**，不会退回
+   `stable` 这种浮动标签（回滚见 §10，完整流程见
+   `docs/release-rollback.md`）。
 4. 确认 `volumes` 指向你的 appdata 路径
 5. **Apply / Start**
 
@@ -197,15 +220,19 @@ Unraid → **Settings → User Utilities → User Scripts**，新建脚本 `wq-u
 
 **最省事的做法：用 Compose Manager Plus 自带的 "Check for updates / Update" 按钮。**
 它会重新拉取 `image:` 指向的标签并重建容器，路径由它自己管理，不必手写。
+注意 `image:` 现在指向 `sha-${COLLECTOR_SHA}`：**升级 = 修改 `.env` 里的
+`COLLECTOR_SHA`**，不是 `pull stable`。
 
 若要走定时脚本（User Scripts → Schedule，例如 `0 4 * * 0` 每周日 04:00），把
 `<STACK_DIR>` 换成 Compose Manager Plus 给这个 stack 的实际目录（在其 UI 的
-stack 详情页能看到）：
+stack 详情页能看到）。脚本只确保当前 pin 的镜像在本机，**不改变** pin：
 
 ```bash
 #!/bin/bash
 STACK_DIR=/mnt/user/appdata/compose-manager/weatherquant-next   # 按实际路径改
-docker pull ghcr.io/<owner>/<repo>:stable || exit 1
+SHA="$(grep -E '^COLLECTOR_SHA=' "$STACK_DIR/.env" | tail -n1 | cut -d= -f2- | tr -d "\"' \r")"
+[ -n "$SHA" ] || { echo "COLLECTOR_SHA is not set in $STACK_DIR/.env" >&2; exit 1; }
+docker pull "ghcr.io/<owner>/<repo>:sha-${SHA}" || exit 1
 docker compose -f "$STACK_DIR/docker-compose.yml" up -d
 ```
 
@@ -213,9 +240,9 @@ docker compose -f "$STACK_DIR/docker-compose.yml" up -d
 > `reason='start_after_restart'` 的一行。**缺口是可见的，不是无声丢失** ——
 > 这正是"更新期间的数据缺口会被记录"这一验收项的含义。
 
-**为什么默认不自动更新**：`stable` 一变，容器就会被重建。无人值守的自动更新在
-你睡觉时引入回归，而这个采集器的产出是**不可再生的历史数据**。更新应是你主动
-选择的时刻——或者至少是你设的时间窗。
+**为什么默认不自动更新**：改 `.env` 里的 SHA 就是一次版本切换，容器会被重建。
+无人值守的自动更新在你睡觉时引入回归，而这个采集器的产出是**不可再生的历史数据**。
+更新应是你主动选择的时刻——或者至少是你设的时间窗。
 
 `[待NAS验证]` 手动执行一次该脚本，确认容器被重建且数据仍在。
 
@@ -409,7 +436,9 @@ Unraid **User Scripts**，每日 01:00：
 set -euo pipefail
 SRC=/mnt/user/appdata/weatherquant-next/backups
 DST=/mnt/user/backup/weatherquant-next          # 或用 rclone 到 S3 / 另一台机器
-IMAGE=ghcr.io/<owner>/<repo>:stable
+# 用当前 pin 的版本校验，而不是浮动标签
+COLLECTOR_SHA="$(grep -E '^COLLECTOR_SHA=' /mnt/user/appdata/compose-manager/weatherquant-next/.env | tail -n1 | cut -d= -f2- | tr -d "\"' \r")"
+IMAGE="ghcr.io/<owner>/<repo>:sha-${COLLECTOR_SHA}"
 mkdir -p "$DST"
 
 # 1) 只保留最近 7 份，避免无限增长（采集器自己不会删备份——自动删历史太危险）
@@ -443,11 +472,11 @@ docker start weatherquant-collector
 
 恢复后采集器会：
 - 读 `schema_migrations`，**只**应用缺失的迁移，**绝不**重建已有表
-- 把上一次遗留的 `collection_gaps` 全部关闭并注明原因
+- 恢复上游通信后为遗留的启动缺口写入结束时间和恢复运行 ID
 - 从当前时刻继续采集，中断期间记为一条 gap
 
 `[待NAS验证]` 做一次恢复演练：停容器 → 换备份 → 启容器 → `SELECT COUNT(*)`
-确认数据回到备份时点，且 `collection_gaps` 里多了一条 `start_after_restart`。
+核对数据恢复点，并检查 `start_after_restart` 的起止时间。连续失败的启动共用同一条未关闭记录。
 
 ### 9.5 raw 归档的校验和与恢复日志(WQN-21)
 
@@ -466,6 +495,24 @@ docker start weatherquant-collector
 `archive_seq` 在单个文件内跨重启严格递增(重启会先读该文件最后一条持久
 行的序号再继续,回扫不受超长撕裂片段影响),重放不会铸造死掉的运行已经用过的序号。
 
+采集器在新分区首次写入前发布零字节摘要。每批 JSONL 完成 `fsync` 后，采集器才更新摘要中的字节数。Shadow 只处理这个位置之前的完整记录。尚无摘要的旧分区仍按完整换行读取。
+
+采集器重启时也检查之前日期的分区。若文件比摘要长，会先核对摘要已覆盖的字节，再发布完整的后续记录并隔离末尾残片。若已覆盖的数据与摘要不符(摘要无法由文件字节复算,即损坏或篡改),采集器**不再 FATAL 退出**:它把整个分区(数据文件 + `.sha256`)原样移进 `quarantine/<source>/` 作为证据(摘要**绝不**改写去"迁就"坏数据),移动前先在恢复日志写一条 `partition_quarantine_started`(意图先落盘),移动并 fsync 两个目录后再写 `partition_quarantined`,然后在该路径以新摘要、空文件继续采集——采集不中断,但事件必须被看到。只有"隔离证据本身失败"(例如磁盘满、无法 rename)时才回退为 FATAL 退出,以免静默丢弃或掩盖数据。若进程恰好死在"数据文件已移走、摘要还没移"之间,下次启动会识别这个特征(`quarantine/` 里有数据证据却没有对应摘要证据),补完摘要的移动并照常启动；没有任何隔离证据而数据文件凭空消失的情况仍按截断拒绝启动。
+
+隔离会同时体现在告警面上,复用现有健康机制而非新增通道:
+
+- 日志:`log.error("archive partition quarantined (digest/data mismatch) …")` 一行,带路径与证据目录。
+- 心跳:`stats.archive_quarantined`(按 `quarantine/*/` 里的隔离证据计数,数据文件与其摘要同一时间戳算一次,`*.torn` 撕裂片段不计;仪表盘与探针都能读)与 `telemetry.archive_quarantine`(`count` + 最近一次的 `path`/`reason`/`quarantined_sha256`/`quarantine_path`)。只要 `quarantine/` 里还有未处理的隔离证据,心跳 `status` 至少为 `degraded`——**重启不会清除告警**。人工复核后把证据移出 `quarantine/`(例如移到 `<raw>/quarantine-reviewed/`)即视为确认,下次重启采集器后告警解除。
+- 探针:`evaluate_health` 将 `archive_quarantined > 0` 判为 **degraded(exit 0)**——这是要人看的数据完整性告警,但采集已继续,不应重启容器把它刷掉。采集器真正退出(FATAL)时仍是 `unhealthy`(exit 1)。
+
+升级/回滚注意:
+
+- **升级到本版本**：旧版本写的分区没有 `*.sha256`，不会被启动恢复改写。采集器第一次向该分区追加时补发零字节摘要，再由每批 `fsync` 推进；Shadow 在摘要发布前仍按完整换行读取，所以升级时不必停机对齐，也不会重读整段历史。
+- **回滚到本版本之前的镜像**：数据文件格式未变，旧代码忽略 `*.sha256`、`recovery.jsonl` 与 `quarantine/`，可直接回滚；回滚期间新写入的批次没有摘要，再次升级后按"旧分区无摘要"补发。`quarantine/` 里的内容是证据(撕裂片段与已隔离的损坏分区)，回滚不要删除。
+- **人工修复前先停采集器**：摘要与数据不符时，采集器已把原文件与摘要冻结进 `quarantine/<source>/` 并继续写新文件，因此**不需要**人工立即介入即可维持采集。不要手工改 `.sha256` 让它"对上"——那会把一次可证实的损坏洗成静默通过。确需回溯时，用上面的只读校验命令确认范围，再从 `quarantine/` 里取回证据或从备份恢复。
+- Shadow 遇到摘要落后于自己的 checkpoint、或摘要声明的字节数超过文件时，停在该位置并记一条 error 级质量事件（`archive_trail_behind_checkpoint` / `archive_trail_ahead_of_file`），不会越过不确定的字节继续消费。
+- 若 Shadow 读到某分区已被隔离(`recovery.jsonl` 里有对应的 `partition_quarantined`)，它**不在旧偏移上继续**：记一条 error 级 `archive_partition_quarantined`(带上丢失的字节范围),把该分区 checkpoint 归零,只消费替换后新文件中已认证的字节；`partition_quarantine_started` 同样算数,所以即使采集器在移动后、写 `partition_quarantined` 前崩溃,Shadow 也能识别；判断依据是 checkpoint 记录的文件 inode 变化,因此新文件即便已经比旧偏移更长也不会被跳读。该事件计入 data gap 统计,Shadow 心跳的 `quarantined_partitions` 取本进程计数与 `quarantine/` 证据数的较大值(同样重启不清除),探针判为 degraded(exit 0),不会重启 Shadow。
+
 在 NAS 上验收(只读操作,随时可跑):
 
 ```bash
@@ -482,29 +529,43 @@ docker run --rm -v /mnt/user/appdata/weatherquant-next:/data:ro \
 ## 10. 回滚到上一个 SHA 版本
 
 镜像按 **不可变 SHA** 发布：`ghcr.io/<owner>/<repo>:sha-<git sha>`。
-SHA 标签**永不被重写**，`stable` 只是它的移动指针。
+SHA 标签**永不被重写**，`stable` 只是它的移动指针。生产 stack 运行哪个
+版本，只由 stack 目录 `.env` 里的 `COLLECTOR_SHA` 决定。
 
 ### 步骤
 
 ```bash
-# 1. 找出历史版本（GitHub → Packages → 本镜像 → Tags）
-#    或在 Unraid 上：
-docker pull ghcr.io/<owner>/<repo>:stable
-docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/<owner>/<repo>:stable
+STACK_DIR=/mnt/user/appdata/compose-manager/weatherquant-next
 
-# 2. 改 compose 的 image: 为具体 SHA
-#    image: ghcr.io/<owner>/<repo>:sha-0123456789abcdef0123456789abcdef01234567
+# 1. 变更前先快照（compose + .env + 当前 SHA；数据目录只读，不复制数据库）
+uv run python scripts/stack_snapshot.py \
+  --out /mnt/user/backups/wq-snapshots \
+  --stack collector="$STACK_DIR" \
+  --performance /mnt/user/appdata/weatherquant-next/performance
 
-# 3. 重建
-cd /mnt/user/appdata/weatherquant-next   # 或你的 stack 目录
+# 2. 干跑：只打印要恢复的 .env diff，什么都不写
+uv run python scripts/stack_rollback.py --snapshot /mnt/user/backups/wq-snapshots/<时间戳>
+
+# 3. 确认 diff 只改 COLLECTOR_SHA 后应用：只重写 .env，不碰数据
+uv run python scripts/stack_rollback.py --snapshot /mnt/user/backups/wq-snapshots/<时间戳> --apply
+
+# 4. 让 compose 读取恢复后的变量并重建
+cd "$STACK_DIR"
 docker compose -f compose.yaml up -d
 
-# 4. 验证
+# 5. 验证：镜像标签、GIT_SHA、IMAGE_TAG 必须与 COLLECTOR_SHA 一致
+docker inspect weatherquant-collector > /tmp/collector-inspect.json
+uv run python scripts/verify_running_image.py \
+  --inspect /tmp/collector-inspect.json --sha "$(grep '^COLLECTOR_SHA=' .env | tail -n1 | cut -d= -f2- | tr -d "\"' \r")"
 docker inspect --format '{{.State.Health.Status}}' weatherquant-collector
-docker exec weatherquant-collector python -c "import weatherquant; print(weatherquant.__version__)"
 ```
 
+也可以手工回滚：把 `.env` 里的 `COLLECTOR_SHA` 改回上一个已验证的完整
+commit sha，再 `docker compose up -d`。无论哪种方式，**只改 `.env`**，
+不要改 compose 里的 `image:` 行——那行的变量名是 pin 的契约。
+
 **回滚不会动数据。** 镜像里没有数据库；升级/降级只换代码层，`/data` 原封不动。
+`stack_rollback.py --apply` 也只重写 `.env`，不会读写任何 DuckDB/WAL/归档文件。
 迁移是**只前进**的：如果新版本加过迁移而你回滚到旧版本，旧版本会读到
 `schema_migrations` 里它不认识的更高版本——它会跳过已知校验和一致的迁移，
 不会删表。**只有当前进到的 schema 版本 ≤ 代码支持的版本时回滚才是安全的**；
@@ -520,6 +581,7 @@ print('code supports  :', __import__('glob').glob('/app/.venv/lib/python3.12/sit
 ```
 
 `[待NAS验证]` 做一次真实回滚演练并确认 §10 的 schema 版本对照输出合理。
+完整的部署顺序、快照内容和演练时间线模板见 `docs/release-rollback.md`。
 
 ---
 
@@ -550,7 +612,7 @@ print('code supports  :', __import__('glob').glob('/app/.venv/lib/python3.12/sit
 | 15 | 无对外端口 | `docker port weatherquant-collector` → 空 |
 | 16 | SIGTERM 优雅退出 | `docker stop -t 60` → 日志显示 flush/checkpoint，`collector_runs.status='stopped'` |
 | 17 | 备份自校验 | `backups/` 内文件可只读打开且行数 = 主库 |
-| 18 | watchdog 自动恢复(WQN-2) | `echo 130 > /mnt/user/appdata/weatherquant-next/.fault-block-main && docker restart weatherquant-collector` → ~2 分钟后 `RestartCount` +1、容器回 `healthy`、`collector_runs` 多一行非 `stopped` 的记录、`collection_gaps` 无未关闭行 |
+| 18 | watchdog 自动恢复 | `bash scripts/wqn2_container_recovery_test.sh` 使用独立测试卷，验证约 120 秒后自动重启一次、恢复采集并关闭遗留缺口。 |
 | 18 | 30 分钟浸泡（含断网+重启） | 在 NAS 上跑 `python scripts/soak_test.py --minutes 30 --data /tmp/wq-soak` |
 
 ### 11.3 需要 GitHub Actions 执行的
@@ -606,7 +668,7 @@ target dates: 2025-07-15(7) 2026-10-09(11) 2026-10-10(11) 2026-10-11(11)
 1. **404 被当成上游故障** —— 关键词搜索带回 2025 年的历史市场，其 `/book`
    返回 `No orderbook exists`。修复：`allow_not_found=True` 把 404 视为
    **确定性回答**（推进接触时钟，不计入连续失败），并把该 token 加入
-   `_no_book` 不再重复询问；同时只对 `active && accepting_orders && !closed`
+   `_no_book`，`NO_BOOK_RETRY_SECONDS`（600s）内不再重复询问，之后重新询问一次（盘口晚于市场创建、或批量 `POST /books` 偶然漏掉某个 token，都不会让它在进程生命周期内永久失明）；同时只对 `active && accepting_orders && !closed`
    的市场轮询盘口。
 2. **`integrity_failures` 被单边盘污染** —— 极端温度桶没有对手盘是**正常市场状态**，
    不是数据损坏。拆分为 `one_sided_books` 与 `integrity_failures`。
@@ -697,34 +759,45 @@ B 不重复: 优雅停止后开库断言——runs≥2、恰好 1 个 run 非 st
 配套单测 `tests/test_collector_watchdog.py`：探针 119s/121s 边界、watchdog 对
 阻塞循环触发并写出诊断心跳、健康循环不误触发、`allow()` 预算超支仍触发、
 故障标记一次性消费、被杀后重启无重复写入。
-### 12.6 运行、缺口与备份的审计查询(WQN-5)
 
-异常退出(被 kill、OOM、watchdog 退出——容器全程可能是 Up 的)会留下
-`status='running'` 的 run 行;**下一次启动**会把它标为 `failed` 并写明原因
-(`run did not exit cleanly (crash, kill, or watchdog exit)`),同时关闭其
-未关闭的 collection gap。所以下面这些审计问题都只是一条 SQL:
+当前版本重启后会把上次运行记为 `failed`，并在 `stop_reason` 记录异常退出，详见 §12.6。
+复验脚本默认从当前工作区构建镜像，也支持通过 `IMAGE` 指定本地待验收镜像。它会记录镜像 ID、
+实际重启策略和过期心跳的探针输出。恢复场景要求有可访问的上游市场，在确认新进程写入盘口和价格后才停止容器核对数据库。
 
-```bash
-# 1) 哪些 run 异常结束?(stopped=正常;failed=未正常退出,看 stop_reason)
-docker exec weatherquant-collector python -c "
-import duckdb; c = duckdb.connect('/data/weatherquant.duckdb', read_only=True)
-print(c.execute(\"SELECT run_id, started_at_utc, stopped_at_utc, stop_reason
-                 FROM collector_runs WHERE status != 'stopped' ORDER BY started_at_utc\").fetchall())"
+#### 2026-11-15 当前分支 Linux 复验（非 Docker / 非 NAS）
 
-# 2) 哪些时段没有采集?每条 gap 的起止;ended 为空说明还在停摆中:
-#    SELECT * FROM collection_gaps WHERE ended_at_utc IS NULL
+- 本机 DuckDB 为 **1.5.6**。新增计数测试实际写入两条 open gap，首次关闭返回 `2`、两条均写入结束时间，再次关闭返回 `0`。
+- `uv run pytest tests/test_collector_watchdog.py -q` 连续运行 **5 次**，每次均为 **8 passed**；pytest 耗时为 **6.73–7.02s**，未见间歇性失败或超时。
+- 临时把 `close_open_gaps` 回退为 `UPDATE ... RETURNING` 后，spawn + WAL 恢复测试稳定复现 `Failed to delete all rows from index`，重启退出码为 1；恢复 affected-row 实现后上述 5 次复验全部通过。普通两条 gap 的计数测试不能单独暴露该 WAL 问题。
+- 临时恢复旧的 probe-only 故障注入分支后，`test_probe_only_fault_blocks_once_without_a_watchdog` 因未执行睡眠而失败（`[] != [150]`）；恢复修复后通过，且故障标记只消费一次。
+- Windows 分支通过注入的 `_winapi` 测试已退出但句柄可打开、错误 87、错误 5 和 `WAIT_TIMEOUT` 四种情况；Linux 测试不会导入真实 `_winapi`，实际 Windows 隔离环境证据仍以 PR 记录为准。
+- 全量 `uv run pytest -q` 完成到 100%，结果为 **1511 passed, 6 skipped**；`uv run ruff check .` 无告警。
+- `bash -n scripts/wqn2_container_recovery_test.sh` 通过；本机没有 `shellcheck`。本次未启动 Docker，以上记录不构成 NAS 重启策略或容器健康探针的生产验收。
 
-# 3) 备份生命周期时间线(每次尝试的开始/验证/失败/超时):
-docker exec weatherquant-collector python -c "
-import duckdb; c = duckdb.connect('/data/weatherquant.duckdb', read_only=True)
-print(c.execute(\"SELECT ts_utc, level, kind, message FROM collector_events
-                 WHERE kind LIKE 'backup%' ORDER BY ts_utc\").fetchall())"
+### 12.6 运行、缺口与备份审计
+
+正常停机的缺口从上一次停止时间算起。异常退出时，下次启动会把遗留的运行标为 `failed`。缺口取同一运行的上游心跳联系时间与已落库盘口、价点时间中较晚的一项。缺少这两类证据时使用运行起点，并在 `detail` 注明。缺口在主循环再次确认上游通信时关闭。连续离线重启期间可以一直查询到同一条未关闭记录。**首次启动没有上一次运行可比，因此不会记录缺口**——一个全新部署不会凭空出现"采集中断"。
+
+以下 SQL 适用于已恢复到独立目录的采集数据库。第一条列出异常运行，第二条显示缺口边界及判断依据，第三条可按同一个 `attempt_id` 配对备份事件。
+
+```sql
+SELECT run_id, started_at_utc, stopped_at_utc, stop_reason
+FROM collector_runs WHERE status = 'failed' ORDER BY started_at_utc;
+
+SELECT run_id, started_at_utc, ended_at_utc, detail
+FROM collection_gaps ORDER BY started_at_utc;
+
+SELECT ts_utc, run_id, kind,
+       details_json->>'attempt_id' AS attempt_id,
+       details_json->>'outcome'    AS outcome,
+       details_json->>'elapsed_seconds' AS elapsed_s,
+       details_json->>'bytes'      AS bytes,
+       details_json->>'error'      AS error,
+       message
+FROM collector_events WHERE kind LIKE 'backup%' ORDER BY ts_utc;
 ```
 
-配套单测 `tests/test_run_gap_audit.py`:被杀 run 由下一次启动标 failed、
-gap 覆盖整个停摆时段(停摆+死亡+重启间隙都落在 `[started, ended]` 内)、
-干净退出的 run 不被误标、备份失败(含异常路径)必留 `backup_failed` 事件
-且不影响 run 本身以 `stopped` 收尾。
+备份事件的 `details_json` 携带 `attempt_id`（配对开始/结束）、`outcome`（`started`/`ok`/`failed`/`timeout`/`interrupted`）、`elapsed_seconds`，以及成功时的 `bytes` 与失败/超时时的 `error`。写记录本身失败（盘满、约束冲突等）只会记一条错误日志，**不会终止采集**——审计失败不影响采集本身。`backup_interrupted` 表示上一次运行退出前没有记下备份结果。文件是否可恢复仍须校验。旧版本事件缺少 `attempt_id`，查询时保留原记录。若上一次运行遗留的旧缺口覆盖了已证实有采集的时段，更正后的行会在 `detail` 中保留原缺口 ID 和说明。已关闭的历史缺口不作重估。
 
 ---
 

@@ -9,6 +9,7 @@ Nothing here writes to the collector's database or to the legacy database.
     weatherquant-research crosscheck
     weatherquant-research rules [--event-id ID] [--source NAME]
     weatherquant-research fit-models --cutoff YYYY-MM-DD [--pin]
+    weatherquant-research models oos-compare [--json]
     weatherquant-research report [--json]
 """
 
@@ -225,6 +226,63 @@ def cmd_fit_models(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_model_oos_compare(settings: Settings, args: argparse.Namespace) -> int:
+    """Compare models without opening a writable database connection."""
+
+    from weatherquant.models.oos_compare import MODEL_NAMES, run_oos_comparison
+    from weatherquant.storage.db import connect
+
+    if args.reference not in MODEL_NAMES:
+        print(f"unknown reference model {args.reference!r}; known: {list(MODEL_NAMES)}", file=sys.stderr)
+        return 2
+    path = settings.research_db_path
+    if not path.exists():
+        print(f"research database not found: {path}", file=sys.stderr)
+        return 2
+
+    con = connect(path, read_only=True)
+    try:
+        report = run_oos_comparison(
+            con,
+            observation_rule=args.observation_rule,
+            min_train_dates=args.min_train_dates,
+            min_samples_per_bucket=args.min_samples_per_bucket,
+            bootstrap_samples=args.bootstrap_samples,
+            seed=args.seed,
+            reference_model=args.reference,
+        )
+    except (ValueError, RuntimeError) as exc:
+        print(f"model OOS comparison failed: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        con.close()
+
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+        return 0
+
+    print("Four-model chronological out-of-sample comparison")
+    print("Cutoff: start of target New York day; calibration: strictly earlier folds only")
+    print("Ranking uses Brier/Log Loss and paired date-bootstrap CIs (never theoretical Edge).")
+
+    def interval(name: str, metric: str) -> str:
+        value = report["models"][name]["metrics"][metric]
+        ci = value["ci95"]
+        bounds = "n/a" if ci is None else f"{ci[0]:.4f}, {ci[1]:.4f}"
+        return f"{value['value']:.4f} [{bounds}]"
+
+    print("\nmodel        dates  events  Brier [95% CI]              Log Loss [95% CI]")
+    for item in report["ranking"]:
+        name = item["model"]
+        counts = report["models"][name]
+        print(
+            f"{name:12} {counts['n_dates']:5d} {counts['n_events']:7d}  "
+            f"{interval(name, 'brier'):28} {interval(name, 'log_loss')}"
+        )
+    print("\nBreakdowns by month and observed-temperature tercile are available with --json.")
+    return 0
+
+
 def cmd_report(settings: Settings, args: argparse.Namespace) -> int:
     with _db(settings) as db:
         db.open()
@@ -391,6 +449,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--observation-rule", default="max of all readings")
     p.add_argument("--pin", action="store_true", help="write manifest.json so the shadow loads these")
 
+    models_parser = sub.add_parser("models", help="read-only model evaluation")
+    models_sub = models_parser.add_subparsers(dest="models_command", required=True)
+    p = models_sub.add_parser("oos-compare", help="compare four models on chronological out-of-sample rows")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--observation-rule", default="max of all readings")
+    p.add_argument("--min-train-dates", type=int, default=5)
+    p.add_argument("--min-samples-per-bucket", type=int, default=3)
+    p.add_argument("--bootstrap-samples", type=int, default=1000)
+    p.add_argument("--seed", type=int, default=36)
+    p.add_argument("--reference", default="ecmwf_raw", help="reference for paired metric differences")
+
     p = sub.add_parser("report", help="data-quality report")
     p.add_argument("--json", action="store_true")
 
@@ -405,7 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--verified",
-        help="optional JSON list of {market_id, target_date} that passed observation cross-check",
+        help="verified market/date/condition/payout records from verify-market --out",
     )
     p.add_argument("--out", required=True, help="where to write the settlement index (JSON)")
     p.add_argument(
@@ -453,7 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
         "verify-market",
         help=(
             "verify station observations against a market's own settlement "
-            "terms, two-way, and emit the verified (market, date) pairs"
+            "terms, two-way, and emit the verified market payouts"
         ),
     )
     p.add_argument(
@@ -474,14 +543,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     obs_src.add_argument(
         "--observations-file",
-        help="JSON list of readings: {obs_time_utc, temp_f/temp_c, report_type, source}",
+        help="JSON readings with station, obs_time_utc, temp_f/temp_c, report_type and source",
     )
     p.add_argument("--persist", help="research DB to write market_rule_verification rows into")
-    p.add_argument("--out", help="write the verified (market_id, target_date) pairs here")
+    p.add_argument("--out", help="write the verified market/date/condition/payout records here")
 
     p = sub.add_parser(
         "build-performance",
-        help="build the six performance snapshots from a decisions export",
+        help="build the seven performance snapshots from a decisions export",
     )
     p.add_argument(
         "--export",
@@ -491,8 +560,13 @@ def build_parser() -> argparse.ArgumentParser:
             ".json / .jsonl / .parquet file for the in-memory builder"
         ),
     )
-    p.add_argument("--settlements", help="settlement index written by backfill-settlements")
-    p.add_argument("--out", required=True, help="directory to publish the six snapshots into")
+    settlement_input = p.add_mutually_exclusive_group()
+    settlement_input.add_argument("--settlements", help="settlement index written by backfill-settlements")
+    settlement_input.add_argument(
+        "--restore-settlements-backup",
+        help="restore the complete streaming settlement layer from a retraction backup",
+    )
+    p.add_argument("--out", required=True, help="directory to publish the seven snapshots into")
     p.add_argument(
         "--dataset",
         required=True,
@@ -726,6 +800,7 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
     import duckdb
 
     from weatherquant.markets.settlement_rules import parse_rules_text
+    from weatherquant.performance.settlement_queue import latest_settlement_rows
     from weatherquant.truth.observation_verify import (
         persist_verification_results,
         verify_market_rules,
@@ -743,7 +818,7 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
             params.append(args.event_id)
         rows = con.execute(
             "SELECT market_id, event_id, bracket_label, bracket_low, bracket_high, "
-            "bracket_low_inclusive, bracket_high_inclusive, rules_text "
+            "bracket_low_inclusive, bracket_high_inclusive, rules_text, condition_id, bracket_kind "
             f"FROM markets WHERE target_date = ?{event_filter} ORDER BY market_id",
             params,
         ).fetchall()
@@ -753,15 +828,21 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
         print(f"no markets for {args.date} in {args.collector_copy}", file=sys.stderr)
         return 2
 
+    if len({row[1] for row in rows}) > 1:
+        print(f"multiple events for {args.date}; select one with --event-id", file=sys.stderr)
+        return 2
+
     markets = [
         {
             "market_id": r[0],
             "event_id": r[1],
             "bracket_label": r[2],
+            "bracket_kind": r[-1],
             "bracket_low": r[3],
             "bracket_high": r[4],
             "bracket_low_inclusive": r[5],
             "bracket_high_inclusive": r[6],
+            "condition_id": r[8],
         }
         for r in rows
     ]
@@ -782,17 +863,16 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
     if args.settlements:
         with Path(args.settlements).open(encoding="utf-8") as handle:
             index = _json.load(handle)
-        wanted = {str(m["market_id"]) for m in markets}
-        for record in index:
-            if str(record.get("market_id")) in wanted and record.get("resolved_outcome") is not None:
-                payout = float(record["resolved_outcome"])
-                outcomes.append(
-                    {
-                        "market_id": str(record["market_id"]),
-                        "is_winner": payout == 1.0,
-                        "yes_price": payout,
-                    }
-                )
+        wanted = {str(m["market_id"]): str(m["condition_id"] or "").lower() for m in markets}
+        for (market_id, target_date), record in latest_settlement_rows(index).items():
+            condition = (record.get("raw_source_reference") or {}).get("condition_id")
+            payout = record.get("resolved_outcome")
+            if (
+                condition and str(condition).lower() == wanted.get(market_id)
+                and target_date == args.date and record.get("settlement_status") == "RESOLVED"
+                and type(payout) in (int, float) and payout in (0, 1)
+            ):
+                outcomes.append({"market_id": market_id, "is_winner": payout == 1, "yes_price": payout})
     else:
         print(
             "no --settlements given: the venue side will be empty and the verdict will be no_outcome",
@@ -815,9 +895,10 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
                     "temp_c": r[2],
                     "report_type": r[3],
                     "source": r[4],
+                    "station": r[5],
                 }
                 for r in odb.execute(
-                    "SELECT obs_time_utc, temp_f, temp_c, report_type, source "
+                    "SELECT obs_time_utc, temp_f, temp_c, report_type, source, station "
                     "FROM klga_observations WHERE obs_time_utc >= ? AND obs_time_utc < ?",
                     [start, end],
                 ).fetchall()
@@ -861,14 +942,17 @@ def cmd_verify_market(settings: Settings, args: argparse.Namespace) -> int:
         # The queue's contract: only a two-way MATCH marks the pair verified.
         pairs = []
         if result.verdict == "match":
-            checked = {o["market_id"] for o in outcomes if o["yes_price"] in (0.0, 1.0)}
+            checked = {o["market_id"]: o["yes_price"] for o in outcomes}
             pairs = [
-                {"market_id": str(m["market_id"]), "target_date": args.date}
+                {
+                    "market_id": str(m["market_id"]), "target_date": args.date,
+                    "condition_id": m["condition_id"], "resolved_outcome": checked[str(m["market_id"])],
+                }
                 for m in markets
                 if str(m["market_id"]) in checked
             ]
         _atomic_write_json(Path(args.out), pairs)
-        print(f"  verified pairs: {len(pairs)} -> {args.out}")
+        print(f"  verified payouts: {len(pairs)} -> {args.out}")
     return 0
 
 
@@ -957,7 +1041,7 @@ def _atomic_write_json(path: Path, payload) -> None:
 
 
 def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
-    """Turn a decisions export plus settlements into the six snapshots.
+    """Turn a decisions export plus settlements into the seven snapshots.
 
     Two engines, chosen by what the input is:
 
@@ -977,10 +1061,11 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
         load_settlements,
     )
 
-    if args.confirm_empty_retraction and not args.settlements_replace:
+    if args.confirm_empty_retraction and not (args.settlements_replace or args.restore_settlements_backup):
         print(
             "--confirm-empty-retraction only means something together with "
-            "--settlements-replace: on its own it confirms nothing. Refusing it "
+            "--settlements-replace or --restore-settlements-backup: on its own "
+            "it confirms nothing. Refusing it "
             "keeps the two flags from looking interchangeable, because one of "
             "them can delete every settlement answer and the other cannot.",
             file=sys.stderr,
@@ -1012,6 +1097,9 @@ def cmd_build_performance(settings: Settings, args: argparse.Namespace) -> int:
             return 2
 
     streaming = export.is_dir() and not args.in_memory
+    if args.restore_settlements_backup and not streaming:
+        print("settlement backup restore requires a streaming export directory", file=sys.stderr)
+        return 2
     if streaming:
         return _build_performance_streaming(settings, args, settlements)
     if args.state_db and not export.is_dir():
@@ -1079,6 +1167,7 @@ def _build_performance_streaming(settings: Settings, args: argparse.Namespace, s
             dataset=args.dataset,
             settlements=settlements,
             settlements_replace=args.settlements_replace,
+            restore_settlements_backup=args.restore_settlements_backup,
             confirm_empty_retraction=args.confirm_empty_retraction,
             settlements_source=args.settlements,
             retraction_reason=args.retraction_reason,
@@ -1100,7 +1189,7 @@ def _build_performance_streaming(settings: Settings, args: argparse.Namespace, s
     except StateMismatch as exc:
         print(f"the state store does not match this run: {exc}", file=sys.stderr)
         return 2
-    except (PerformanceStateError, ValueError, RuntimeError) as exc:
+    except (OSError, PerformanceStateError, ValueError, RuntimeError) as exc:
         print(f"could not build performance snapshots: {exc}", file=sys.stderr)
         return 2
 
@@ -1134,6 +1223,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if getattr(args, "db", None):
         settings = settings.model_copy(update={"research_db_path": Path(args.db)})
+
+    if args.command == "models":
+        if args.models_command == "oos-compare":
+            return cmd_model_oos_compare(settings, args)
+        raise AssertionError(f"unhandled models command: {args.models_command}")
 
     handlers = {
         "init": cmd_init,

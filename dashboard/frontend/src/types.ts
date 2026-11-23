@@ -170,6 +170,23 @@ export interface MarketSummary {
   event_id?: string | null
   question: string
   target_date?: string | null
+  target_date_reason?: string | null
+  /** Gamma rules / resolution metadata, when the archive tail carries it. */
+  rules_text?: string | null
+  resolution_source?: string | null
+  rules_source?: string | null
+  rules_reason?: string | null
+  start_time_utc?: string | null
+  end_time_utc?: string | null
+  schedule_source?: string | null
+  schedule_reason?: string | null
+  /**
+   * Server-derived from timezone-aware start/end plus venue flags.
+   * `null` means the inputs were insufficient - never treat it as open.
+   */
+  open_now?: boolean | null
+  open_now_source?: string | null
+  open_now_reason?: string | null
   bracket_label: string
   bracket_low?: number | null
   bracket_high?: number | null
@@ -230,10 +247,19 @@ export interface ForecastBucket {
 export interface ForecastDistribution {
   model: string
   version?: string | null
+  version_reason?: string | null
   target_date?: string | null
+  target_date_reason?: string | null
   forecast_run_time_utc?: string | null
+  /** Issued / run time, as distinct from publishable and received times. */
+  forecast_issued_at_utc?: string | null
+  forecast_issued_reason?: string | null
+  forecast_publishable_at_utc?: string | null
+  forecast_publishable_basis?: string | null
+  forecast_publishable_reason?: string | null
   training_cutoff_utc?: string | null
   forecast_received_at_utc?: string | null
+  forecast_received_reason?: string | null
   predicted_max_f?: number | null
   station?: string | null
   buckets: ForecastBucket[]
@@ -279,6 +305,20 @@ export interface DecisionRow {
   available_depth_usd?: number | null
   thresholds_version?: string | null
   run_id?: string | null
+  /** Forecast run stored on the decision row at decision time. */
+  forecast_run_time_utc?: string | null
+  snapshot_id?: string | null
+  book_id?: string | null
+  book_venue_ts_utc?: string | null
+  book_collector_received_at_utc?: string | null
+  book_shadow_received_at_utc?: string | null
+  spread?: number | null
+  mode_reason?: string | null
+  evidence_version?: number | null
+  book_source?: string | null
+  book_source_event_id?: string | null
+  evidence_source?: string
+  evidence_reason?: string | null
 }
 
 export interface DecisionsData {
@@ -328,6 +368,43 @@ export interface SystemData {
   unavailable: string[]
 }
 
+// --- layered health -------------------------------------------------------
+
+/** One pipeline layer's verdict. LAGGING is within its limit but blocked upstream. */
+export type LayerStatus = 'OK' | 'LAGGING' | 'STALE' | 'UNKNOWN'
+
+export type HealthLayerName = 'export' | 'performance_consume' | 'publish' | 'snapshot'
+
+export interface HealthLayer {
+  name: HealthLayerName
+  watermark_utc?: string | null
+  source: string
+  age_seconds?: number | null
+  lag_seconds?: number | null
+  threshold_seconds?: number | null
+  status: LayerStatus
+  reason?: string | null
+}
+
+export interface ServiceHealth {
+  name: string
+  status: LayerStatus
+  age_seconds?: number | null
+  reason?: string | null
+}
+
+export interface LayeredHealthData {
+  generation_id?: string | null
+  generation_source?: string | null
+  lagging_layer?: HealthLayerName | null
+  lagging_basis?: string | null
+  layers: HealthLayer[]
+  services: Record<string, ServiceHealth>
+  thresholds: Record<string, number>
+  dataset?: string | null
+  reason?: string | null
+}
+
 /**
  * A performance snapshot as the API serves it.
  *
@@ -336,7 +413,7 @@ export interface SystemData {
  * being read as a return. Typing the body tightly would drop the caveat
  * that travels with the number.
  */
-export interface PerformancePayload {
+export interface PerformancePayload<TData = Record<string, any>> {
   reason?: string | null
   statistical_scope: string[]
   warnings: string[]
@@ -345,7 +422,7 @@ export interface PerformancePayload {
   generated_at_utc?: string | null
   as_of_utc?: string | null
   dataset?: string | null
-  data?: Record<string, any>
+  data?: TData
   items?: Record<string, any>[]
   total?: number
   // A cursor belongs to one published generation, so it is opaque: the API
@@ -367,6 +444,207 @@ export interface PerformancePayload {
   not_backtestable_reasons?: string[]
   source_endpoint?: string
   [k: string]: any
+}
+
+// --- calibration and market-pricing drift ---------------------------------
+
+export type ResearchDriftGranularity = 'iso_week' | 'month' | 'target_date'
+
+export interface ResearchDriftCalibrationBin {
+  lower: number
+  upper: number
+  predicted_mean: number
+  observed_frequency: number
+  count: number
+  gap: number
+}
+
+export interface ResearchDriftCalibration {
+  n: number
+  brier: number | null
+  ece: number | null
+  bins: ResearchDriftCalibrationBin[]
+}
+
+export interface ResearchDriftMarketBias {
+  n: number
+  mean_market_minus_outcome: number | null
+  mean_market_probability: number | null
+  mean_outcome: number | null
+}
+
+export interface ResearchDriftMarketBaseline extends ResearchDriftCalibration {
+  mean_market_minus_outcome: number | null
+}
+
+export interface ResearchDriftBaselineComparison {
+  market: ResearchDriftMarketBaseline
+  climatology: {
+    available: boolean
+    n: number
+    brier: number | null
+    ece: number | null
+    reason: string
+  }
+}
+
+export interface ResearchDriftBucket {
+  period: string
+  start_date: string
+  observation_count: number
+  episode_count: number
+  executable_count: number
+  not_executable_count: number
+  fee_unknown_count: number
+  no_book_count: number
+  not_executable_reason_counts: Record<string, number>
+  fee_assumption: {
+    source: string
+    known_count: number
+    unknown_count: number
+    rates: { fee_rate: number; episode_count: number }[]
+  }
+  calibration: ResearchDriftCalibration
+  market_bias: ResearchDriftMarketBias
+  baseline_comparison: ResearchDriftBaselineComparison
+  edge_tiers: {
+    theoretical_observation_edge_per_share: ResearchDriftEdgeTier
+    executable_expected_net_usd: ResearchDriftEdgeTier
+    verified_realised_net_usd: ResearchDriftEdgeTier
+  }
+  small_sample: boolean
+  source_episode_ids: string[]
+  anomaly_metrics: string[]
+}
+
+export interface ResearchDriftEdgeTier {
+  n: number
+  sum: number | null
+  mean: number | null
+  unit: string
+}
+
+export interface ResearchDriftAnomaly {
+  granularity: ResearchDriftGranularity
+  period: string
+  metric: string
+  value: number
+  trailing_median: number
+  trailing_mad: number
+  deviation: number
+  threshold: number
+  trailing_bucket_count: number
+  source_episode_ids: string[]
+}
+
+export interface ResearchDriftPayload {
+  totals: {
+    observation_count: number
+    episode_count: number
+    target_date_missing_episode_count: number
+  }
+  reference_capital_usdc: number
+  fee_assumption: {
+    source: string
+    unknown_fee_policy: string
+    missing_book_policy: string
+  } | null
+  calibration_bin_count: number
+  small_sample_threshold_episodes: number
+  anomaly_rule: {
+    statistic: string
+    threshold_mad: number
+    minimum_trailing_buckets: number
+    comparison: string
+    metrics: string[]
+  } | null
+  buckets: Record<ResearchDriftGranularity, ResearchDriftBucket[]>
+  anomalies: ResearchDriftAnomaly[]
+  statistical_scope: string[]
+  warnings: string[]
+}
+
+/** Null data means unpublished; it is never replaced by a zero-filled payload. */
+export type ResearchDriftData = PerformancePayload<ResearchDriftPayload | null>
+
+// --- Paper Trading (virtual simulation, isolated from reference capital) ---
+
+export interface PaperPosition {
+  market_id: string
+  token_id: string
+  shares: number
+  avg_cost_usd_per_share: number
+  cost_basis_usdc: number
+  mark_usd_per_share: number | null
+  market_value_usdc: number | null
+  unrealized_pnl_usdc: number | null
+  mark_status: 'OK' | 'MARK_UNAVAILABLE'
+}
+
+export interface PaperRejection {
+  decision_id: string
+  market_id: string
+  token_id?: string | null
+  direction?: string | null
+  refusal_reason?: string | null
+  refusal_detail?: string | null
+  decision_time_utc?: string | null
+  net_edge?: number | null
+}
+
+export interface PaperSummary {
+  status: 'ok' | 'unavailable'
+  mode: 'PAPER'
+  reason?: string | null
+  initial_capital_usdc: number | null
+  available_usdc: number | null
+  occupied_usdc: number | null
+  cost_equity_usdc: number | null
+  equity_usdc: number | null
+  realized_pnl_usdc: number | null
+  unrealized_pnl_usdc: number | null
+  roi: number | null
+  max_drawdown: number | null
+  drawdown_basis: 'ledger_cost'
+  equity_curve: {
+    basis: 'ledger_cost'
+    points: { t: string; v: number; seq: number }[]
+  }
+  positions: PaperPosition[]
+  marks_status: 'fresh' | 'unavailable' | 'not_required'
+  marks_reason?: string | null
+  rejection_summary: { reason: string; count: number }[]
+  rejections: PaperRejection[]
+  ledger_consistent?: boolean | null
+  conservation_ok?: boolean | null
+  fill_count?: number | null
+}
+
+export interface PaperFill {
+  decision_id: string
+  market_id: string
+  token_id: string
+  direction: string
+  side: 'BUY' | 'SELL'
+  requested_shares: number
+  filled_shares: number
+  avg_price_usd_per_share: number
+  fill_cost_usd: number
+  fees_usd: number
+  net_proceeds_usd?: number | null
+  complete: boolean
+  decision_time_utc?: string | null
+  filled_at_utc?: string | null
+}
+
+export interface PaperFills {
+  status: 'ok' | 'unavailable'
+  mode: 'PAPER'
+  reason?: string | null
+  fills: PaperFill[]
+  limit: number
+  next_cursor: string | null
+  has_more: boolean
 }
 
 export interface Healthz {

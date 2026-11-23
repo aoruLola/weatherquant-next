@@ -88,6 +88,10 @@ class CollectionStats:
     archive_records: int = 0
     dedupe_hits_total: int = 0
     errors_total: int = 0
+    # Partitions the collector had to freeze after a digest/data mismatch this
+    # run (see ``RawArchive``). Non-zero is a loud, dashboard-visible alert even
+    # though collection continued into a fresh file.
+    archive_quarantined: int = 0
 
 
 @dataclass
@@ -377,6 +381,16 @@ def evaluate_health(
         # REST failing while the WebSocket still talks is recoverable; if both
         # are dead the upstream-contact clock above will escalate this anyway.
         warning.append(f"{heartbeat.rest_consecutive_failures} consecutive REST failures")
+
+    # --- archive integrity ------------------------------------------------
+    if heartbeat.stats.archive_quarantined > 0:
+        # A digest/data mismatch was quarantined and collection resumed on a
+        # fresh partition. Loud, but not fatal: restarting would not recover
+        # the frozen bytes, and the operator must inspect the evidence.
+        warning.append(
+            f"{heartbeat.stats.archive_quarantined} archive partition(s) quarantined "
+            "after a digest/data mismatch (see the archive quarantine/ directory)"
+        )
 
     if critical:
         return HealthVerdict(HealthStatus.UNHEALTHY, 1, tuple(critical + warning))

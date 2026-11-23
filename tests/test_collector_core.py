@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from weatherquant.data import lock as lock_module
 from weatherquant.data.archive import ArchiveRecord, RawArchive, extract_venue_ts
 from weatherquant.data.heartbeat import (
     CollectionStats,
@@ -35,6 +36,61 @@ NOW = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
 # ---------------------------------------------------------------------------
 # Single-instance lock
 # ---------------------------------------------------------------------------
+
+
+class _FakeWinapi:
+    SYNCHRONIZE = 0x00100000
+    WAIT_TIMEOUT = 0x00000102
+
+    def __init__(self, *, wait_result: int = WAIT_TIMEOUT, open_error: OSError | None = None) -> None:
+        self.wait_result = wait_result
+        self.open_error = open_error
+        self.closed_handles: list[int] = []
+
+    def OpenProcess(self, _access: int, _inherit: bool, _pid: int) -> int:
+        if self.open_error is not None:
+            raise self.open_error
+        return 123
+
+    def WaitForSingleObject(self, _handle: int, _timeout_ms: int) -> int:
+        return self.wait_result
+
+    def CloseHandle(self, handle: int) -> None:
+        self.closed_handles.append(handle)
+
+
+def _windows_error(winerror: int) -> OSError:
+    error = OSError(f"Windows error {winerror}")
+    error.winerror = winerror
+    return error
+
+
+def _pid_alive_on_windows(monkeypatch: pytest.MonkeyPatch, winapi: _FakeWinapi) -> bool:
+    monkeypatch.setattr(lock_module.os, "name", "nt")
+    monkeypatch.setattr(lock_module, "_load_winapi", lambda: winapi)
+    return lock_module._pid_alive(456)
+
+
+def test_windows_exited_process_with_an_open_handle_is_not_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+    winapi = _FakeWinapi(wait_result=0)  # WAIT_OBJECT_0: the process handle is signaled.
+    assert _pid_alive_on_windows(monkeypatch, winapi) is False
+    assert winapi.closed_handles == [123]
+
+
+def test_windows_invalid_parameter_means_the_pid_is_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    winapi = _FakeWinapi(open_error=_windows_error(87))
+    assert _pid_alive_on_windows(monkeypatch, winapi) is False
+
+
+def test_windows_access_denied_does_not_prove_the_pid_is_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    winapi = _FakeWinapi(open_error=_windows_error(5))
+    assert _pid_alive_on_windows(monkeypatch, winapi) is True
+
+
+def test_windows_wait_timeout_means_the_process_is_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+    winapi = _FakeWinapi(wait_result=_FakeWinapi.WAIT_TIMEOUT)
+    assert _pid_alive_on_windows(monkeypatch, winapi) is True
+    assert winapi.closed_handles == [123]
 
 
 def test_lock_acquires_and_releases(tmp_path: Path) -> None:
@@ -355,6 +411,7 @@ def _beat(
     disk_total_bytes: int = 100_000_000_000,
     rest_failures: int = 0,
     fatal: str | None = None,
+    archive_quarantined: int = 0,
 ) -> Heartbeat:
     return Heartbeat(
         status=status,
@@ -370,7 +427,7 @@ def _beat(
         rest_consecutive_failures=rest_failures,
         disk_free_percent=disk_free_percent,
         disk_total_bytes=disk_total_bytes,
-        stats=CollectionStats(),
+        stats=CollectionStats(archive_quarantined=archive_quarantined),
         fatal_error=fatal,
     )
 
@@ -487,9 +544,7 @@ def test_a_quiet_market_stays_healthy(tmp_path: Path) -> None:
 
     # Same situation, but contact within the soft limit: healthy even though
     # `last_data_change` is older still.
-    HeartbeatWriter(path).write(
-        _beat(updated_at=NOW, contact=NOW - timedelta(minutes=5), status=HealthStatus.HEALTHY)
-    )
+    HeartbeatWriter(path).write(_beat(updated_at=NOW, contact=NOW - timedelta(minutes=5), status=HealthStatus.HEALTHY))
     verdict2 = evaluate_health(path, now=NOW, upstream_stall_soft_seconds=900.0, upstream_stall_hard_seconds=1800.0)
     assert verdict2.exit_code == 0
     assert verdict2.status is HealthStatus.HEALTHY
@@ -511,10 +566,22 @@ def test_soft_silence_is_degraded_but_does_not_restart_the_container(tmp_path: P
 def test_hard_silence_is_unhealthy(tmp_path: Path) -> None:
     path = tmp_path / "heartbeat.json"
     HeartbeatWriter(path).write(_beat(updated_at=NOW, contact=NOW - timedelta(seconds=2000)))
-    verdict = evaluate_health(
-        path, now=NOW, upstream_stall_soft_seconds=900.0, upstream_stall_hard_seconds=1800.0
-    )
+    verdict = evaluate_health(path, now=NOW, upstream_stall_soft_seconds=900.0, upstream_stall_hard_seconds=1800.0)
     assert verdict.exit_code == 1
+
+
+def test_a_quarantined_partition_is_degraded_and_visible(tmp_path: Path) -> None:
+    """A frozen partition must surface in the probe (and dashboard) as a
+    non-healthy state, but not restart the collector - collection resumed."""
+    path = tmp_path / "heartbeat.json"
+    HeartbeatWriter(path).write(_beat(archive_quarantined=1))
+    verdict = evaluate_health(path, now=NOW)
+    assert verdict.status is HealthStatus.DEGRADED
+    assert verdict.exit_code == 0
+    assert any("quarantined" in reason for reason in verdict.reasons)
+
+    # Reading the file back preserves the counter the dashboard renders.
+    assert read_heartbeat(path).stats.archive_quarantined == 1
 
 
 def test_low_disk_warns_without_failing(tmp_path: Path) -> None:

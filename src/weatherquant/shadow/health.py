@@ -110,10 +110,22 @@ def evaluate_shadow_health(
         or (now - last_decision).total_seconds() > decision_silence_seconds
     )
 
+    quarantined = payload.get("quarantined_partitions")
+    if isinstance(quarantined, int) and quarantined > 0:
+        # The collector froze a corrupt partition and this process resumed on a
+        # fresh one. Ingestion is healthy, but the gap must stay visible until
+        # an operator inspects the evidence - a warning, not a restart trigger.
+        reasons.append(
+            f"{quarantined} archive partition(s) quarantined after a digest/data mismatch"
+        )
+
     if reasons:
         # A disk or staleness problem is unhealthy; the "no decisions lately"
-        # condition is handled separately below because it is often benign.
-        unhealthy = [r for r in reasons if not r.startswith("disk at")]
+        # and a quarantined archive are handled separately because they are
+        # often benign to keep running through.
+        unhealthy = [
+            r for r in reasons if not r.startswith("disk at") and "quarantined" not in r
+        ]
         if not unhealthy:
             return HealthVerdict("degraded", tuple(reasons), 0)
         return HealthVerdict("unhealthy", tuple(reasons), 1)

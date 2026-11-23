@@ -1,0 +1,640 @@
+"""Regression tests for the Shadow OOM-fix changes.
+
+WQN-3 touches three hot paths in the Shadow. Each fix has a correctness
+property this file pins down so future refactors cannot silently re-break it:
+
+1. ``quantile_cont`` on DuckDB matches the old Python-side linear-interpolation
+   percentile down to floating-point noise.
+2. Market/forecast snapshots truly stop scanning rows older than the configured
+   window bounds - no full ROW_NUMBER() over 60 days when only the last 30
+   are meaningful.
+3. Retention stays off by default: the runner's ``_maybe_retention`` no-ops
+   when ``shadow_retention_days`` is ``None``.
+"""
+
+from __future__ import annotations
+
+import random
+from datetime import UTC, datetime, timedelta
+
+import duckdb
+import pytest
+
+from weatherquant.dashboard.producer import (
+    FORECAST_LOOKBACK_DAYS,
+    MARKET_DECISION_WINDOW_DAYS,
+    build_markets_snapshot,
+)
+from weatherquant.shadow.report import _percentile
+from weatherquant.storage.retention import apply_retention
+
+NOW = datetime(2026, 11, 11, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def con():
+    c = duckdb.connect(":memory:")
+    c.execute("SET TimeZone='UTC'")
+    c.execute(
+        """
+        CREATE TABLE shadow_decisions (
+            decision_id VARCHAR PRIMARY KEY,
+            market_id VARCHAR NOT NULL,
+            state VARCHAR NOT NULL,
+            decision_time_utc TIMESTAMPTZ NOT NULL,
+            net_edge DOUBLE,
+            mode VARCHAR,
+            primary_reason VARCHAR,
+            decision_latency_ms BIGINT,
+            export_seq BIGINT,
+            event_id VARCHAR,
+            station VARCHAR,
+            model_name VARCHAR,
+            model_version VARCHAR,
+            forecast_run_time_utc TIMESTAMPTZ
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE rejection_reasons (
+            decision_id VARCHAR NOT NULL,
+            ordinal INTEGER NOT NULL,
+            reason VARCHAR NOT NULL,
+            is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+            detail VARCHAR,
+            PRIMARY KEY (decision_id, reason)
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE market_catalog (
+            market_id VARCHAR PRIMARY KEY,
+            event_id VARCHAR NOT NULL,
+            question VARCHAR,
+            bracket_label VARCHAR,
+            bracket_low DOUBLE,
+            bracket_high DOUBLE,
+            target_date DATE,
+            station VARCHAR NOT NULL,
+            token_yes VARCHAR NOT NULL,
+            closed BOOLEAN NOT NULL DEFAULT FALSE,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            accepting_orders BOOLEAN NOT NULL DEFAULT TRUE,
+            first_seen_utc TIMESTAMPTZ NOT NULL,
+            last_seen_utc TIMESTAMPTZ NOT NULL
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE model_predictions (
+            model_name VARCHAR NOT NULL,
+            model_version VARCHAR NOT NULL,
+            station VARCHAR NOT NULL,
+            target_date DATE NOT NULL,
+            event_id VARCHAR NOT NULL,
+            forecast_run_time_utc TIMESTAMPTZ NOT NULL,
+            forecast_publishable_at_utc TIMESTAMPTZ,
+            forecast_publishable_basis VARCHAR,
+            probabilities_json VARCHAR NOT NULL,
+            predicted_max_f DOUBLE,
+            lead_hours DOUBLE,
+            training_cutoff_utc TIMESTAMPTZ,
+            forecast_received_at_utc TIMESTAMPTZ
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE token_books (
+            token_id VARCHAR PRIMARY KEY,
+            market_id VARCHAR NOT NULL,
+            bids_json VARCHAR,
+            asks_json VARCHAR,
+            venue_ts_utc TIMESTAMPTZ,
+            shadow_received_at_utc TIMESTAMPTZ,
+            quality VARCHAR,
+            defects VARCHAR
+        )
+        """
+    )
+    return c
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: quantile_cont must match the old Python percentile
+# ---------------------------------------------------------------------------
+
+def _seed_latency(con, n=500, seed=7):
+    rng = random.Random(seed)
+    values = [max(1, int(rng.gauss(200, 60))) for _ in range(n)]
+    con.executemany(
+        "INSERT INTO shadow_decisions (decision_id, market_id, state, "
+        "decision_time_utc, decision_latency_ms) VALUES (?,?,?,?,?)",
+        [(f"D{i:04d}", "M0001", "ACCEPT", NOW, v) for i, v in enumerate(values)],
+    )
+    return values
+
+
+@pytest.mark.parametrize("n", [500, 1000, 5000])
+def test_quantile_cont_matches_python_percentile(con, n):
+    values = _seed_latency(con, n=n)
+    old = _percentile(values, 95)
+    row = con.execute(
+        "SELECT quantile_cont(decision_latency_ms, 0.95) "
+        "FROM shadow_decisions WHERE decision_latency_ms IS NOT NULL"
+    ).fetchone()
+    new = float(row[0])
+
+    assert abs(old - new) < 1e-6, (
+        f"quantile_cont={new} differs from Python _percentile={old} "
+        f"by {abs(old - new)}"
+    )
+
+
+def test_quantile_cont_empty_is_none(con):
+    row = con.execute(
+        "SELECT quantile_cont(decision_latency_ms, 0.95) "
+        "FROM shadow_decisions WHERE decision_latency_ms IS NOT NULL"
+    ).fetchone()
+    assert row[0] is None
+
+
+def test_quantile_cont_single_row(con):
+    con.execute(
+        "INSERT INTO shadow_decisions (decision_id, market_id, state, "
+        "decision_time_utc, decision_latency_ms) "
+        "VALUES ('D1','M1','ACCEPT', ?, 42)",
+        [NOW],
+    )
+    row = con.execute(
+        "SELECT quantile_cont(decision_latency_ms, 0.95) FROM shadow_decisions"
+    ).fetchone()
+    assert float(row[0]) == 42.0
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: market snapshot window truly stops at MARKET_DECISION_WINDOW_DAYS
+# ---------------------------------------------------------------------------
+
+def _seed_market_decisions(con, now):
+    """Create a world where every market has a *fresh* decision inside the
+    window AND an *ancient* decision 90 days ago. The snapshot must pick the
+    fresh one, never the ancient one."""
+    n = 50
+    con.executemany(
+        "INSERT INTO market_catalog "
+        "(market_id, event_id, question, bracket_label, bracket_low, bracket_high, "
+        "target_date, station, token_yes, closed, first_seen_utc, last_seen_utc) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (f"M{i:04d}", f"E{i:04d}", f"Q{i}", f"{30 + i}mm", 30.0 + i, 40.0 + i,
+             (now - timedelta(days=3)).date(),
+             f"S{i % 5:02d}", f"T{i:04d}", False,
+             now - timedelta(days=40), now)
+            for i in range(n)
+        ],
+    )
+    con.execute(
+        "INSERT INTO token_books "
+        "SELECT token_yes, market_id, '[0.5]', '[0.5]', NULL, ?, 'ok', '' "
+        "FROM market_catalog",
+        [now],
+    )
+    rows = []
+    for i in range(n):
+        rows.append((
+            f"D_A{i:04d}", f"M{i:04d}", "ACCEPT",
+            now - timedelta(days=35),  # OUTSIDE the 30-day window
+            0.1, "LIVE", "edge_too_low",
+        ))
+        rows.append((
+            f"D_F{i:04d}", f"M{i:04d}", "ACCEPT",
+            now - timedelta(days=5),  # INSIDE
+            0.25, "LIVE", "candidate",
+        ))
+    con.executemany(
+        "INSERT INTO shadow_decisions (decision_id, market_id, state, "
+        "decision_time_utc, net_edge, mode, primary_reason) VALUES (?,?,?,?,?,?,?)",
+        rows,
+    )
+    return n
+
+
+def test_market_snapshot_window_filters_old_decisions(con):
+    _seed_market_decisions(con, NOW)
+    snap = build_markets_snapshot(
+        con, now=NOW, run_id="r", source_version="t", primary_model="ecmwf_raw",
+    )
+
+    markets = snap["data"]["markets"]
+    assert markets, "snapshot returned no markets"
+    window_start = NOW - timedelta(days=MARKET_DECISION_WINDOW_DAYS)
+
+    for mk in markets:
+        last_dec = mk.get("last_decision")
+        if not last_dec:
+            continue
+        last_ts = last_dec.get("decided_at_utc")
+        if last_ts is None:
+            continue
+        last_decision = datetime.fromisoformat(last_ts)
+        assert last_decision >= window_start, (
+            f"market {mk['market_id']} last_decision_time_utc={last_decision} "
+            f"is outside the {MARKET_DECISION_WINDOW_DAYS}-day window "
+            f"(window starts at {window_start}) - the WHERE clause was dropped!"
+        )
+
+
+def test_market_snapshot_window_boundary(con):
+    """A decision *exactly* at the window bound must count as IN."""
+    con.execute(
+        """
+        INSERT INTO market_catalog
+            (market_id, event_id, question, bracket_label, bracket_low, bracket_high,
+             target_date, station, token_yes, closed, first_seen_utc, last_seen_utc)
+        VALUES ('MX','EX','QMX','30mm',30.0,40.0,?,'S00','TX',false,?,?)
+        """,
+        [(NOW - timedelta(days=3)).date(), NOW - timedelta(days=40), NOW],
+    )
+    con.execute(
+        "INSERT INTO token_books (token_id, market_id, bids_json, asks_json, "
+        "venue_ts_utc, shadow_received_at_utc, quality, defects) "
+        "VALUES ('TX','MX','[0.5]','[0.5]',NULL,?,'ok','')",
+        [NOW],
+    )
+    boundary_ts = NOW - timedelta(days=MARKET_DECISION_WINDOW_DAYS)
+    con.execute(
+        "INSERT INTO shadow_decisions "
+        "(decision_id, market_id, state, decision_time_utc, net_edge, mode, primary_reason) "
+        "VALUES ('DBOUND','MX','ACCEPT',?,?,?,?)",
+        [boundary_ts, 0.05, "LIVE", "edge_ok"],
+    )
+    snap = build_markets_snapshot(
+        con, now=NOW, run_id="r", source_version="t", primary_model="ecmwf_raw",
+    )
+    mx = next((m for m in snap["data"]["markets"] if m["market_id"] == "MX"), None)
+    assert mx is not None, "market MX must be present in the snapshot"
+    last_dec = mx.get("last_decision")
+    assert last_dec is not None, "MX must have a last_decision"
+    assert datetime.fromisoformat(last_dec["decided_at_utc"]) == boundary_ts
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 continued: forecast snapshot LOOKBACK_DAYS lower bound
+# ---------------------------------------------------------------------------
+
+def test_forecast_snapshot_lookback_filters_old_predictions(con):
+    now = NOW
+    con.execute(
+        """
+        INSERT INTO model_predictions
+            (model_name, model_version, station, target_date, event_id,
+             forecast_run_time_utc, forecast_publishable_at_utc,
+             forecast_publishable_basis, probabilities_json, predicted_max_f)
+        VALUES
+            ('ecmwf_raw','v1','S01',?, 'EV1', ?, ?,
+             'forecast_run_time_utc', '{}', 32.0),
+            ('ecmwf_raw','v1','S01',?, 'EV1', ?, ?,
+             'forecast_run_time_utc', '{}', 33.0)
+        """,
+        [
+            (now - timedelta(days=3)).date(), now - timedelta(hours=2), now - timedelta(hours=2),
+            (now - timedelta(days=FORECAST_LOOKBACK_DAYS + 2)).date(),
+            now - timedelta(hours=1), now - timedelta(hours=1),
+        ],
+    )
+    from weatherquant.dashboard.producer import build_forecasts_snapshot
+    snap = build_forecasts_snapshot(
+        con, now=now, run_id="r", source_version="t",
+        primary_model="ecmwf_raw", horizon_days=7,
+    )
+    horizons = [p["target_date"] for p in snap.get("forecasts", [])]
+    if horizons:
+        lb = (now.date() - timedelta(days=FORECAST_LOOKBACK_DAYS))
+        for hd in horizons:
+            assert hd >= lb, (
+                f"forecast target_date={hd} is below "
+                f"FORECAST_LOOKBACK_DAYS={FORECAST_LOOKBACK_DAYS} bound ({lb})"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: retention must never delete unexported decisions and must be atomic
+# ---------------------------------------------------------------------------
+
+def _decision_ids(con):
+    return {row[0] for row in con.execute("SELECT decision_id FROM shadow_decisions ORDER BY decision_id").fetchall()}
+
+
+def _reason_ids(con):
+    return {row[0] for row in con.execute("SELECT decision_id FROM rejection_reasons ORDER BY decision_id").fetchall()}
+
+
+def _prediction_runs(con):
+    return {
+        row[0]
+        for row in con.execute(
+            "SELECT forecast_run_time_utc FROM model_predictions ORDER BY forecast_run_time_utc"
+        ).fetchall()
+    }
+
+
+def _seed_retention_scenario(con, *, now=NOW):
+    old = now - timedelta(days=40)
+    new = now - timedelta(days=1)
+    con.executemany(
+        "INSERT INTO shadow_decisions "
+        "(decision_id, market_id, state, decision_time_utc, primary_reason, export_seq) "
+        "VALUES (?,?,?,?,?,?)",
+        [
+            ("D_EXPORTED", "M1", "REJECT", old, "edge", 1),
+            ("D_PENDING", "M2", "REJECT", old, "edge", 2),
+            ("D_NULL_SEQ", "M3", "REJECT", old, "edge", None),
+            ("D_FRESH", "M4", "REJECT", new, "edge", 3),
+        ],
+    )
+    con.executemany(
+        "INSERT INTO rejection_reasons (decision_id, ordinal, reason) VALUES (?,?,?)",
+        [
+            ("D_EXPORTED", 0, "edge"),
+            ("D_EXPORTED", 1, "liquidity"),
+            ("D_PENDING", 0, "edge"),
+            ("D_NULL_SEQ", 0, "edge"),
+            ("D_FRESH", 0, "edge"),
+        ],
+    )
+    con.execute(
+        """
+        INSERT INTO model_predictions
+            (model_name, model_version, station, target_date, event_id,
+             forecast_run_time_utc, forecast_publishable_at_utc,
+             forecast_publishable_basis, probabilities_json, predicted_max_f)
+        VALUES
+            ('ecmwf_raw','v1','S01',?, 'EV1', ?, ?,
+             'forecast_run_time_utc', '{}', 31.0),
+            ('ecmwf_raw','v1','S01',?, 'EV1', ?, ?,
+             'forecast_run_time_utc', '{}', 32.0)
+        """,
+        [
+            old.date(), old, old,
+            new.date(), new, new,
+        ],
+    )
+    return old, new
+
+
+def _parquet_ids(con, path):
+    return {row[0] for row in con.execute("SELECT decision_id FROM read_parquet(?)", [str(path)]).fetchall()}
+
+
+def test_retention_archives_only_exported_old_decisions_and_reasons(con, tmp_path):
+    old, new = _seed_retention_scenario(con)
+
+    result = apply_retention(
+        con,
+        days=30,
+        archive_dir=tmp_path,
+        exported_through_seq=1,
+        now=NOW,
+    )
+
+    assert result.deleted_decisions == 1
+    assert result.deleted_predictions == 1
+    assert _decision_ids(con) == {"D_PENDING", "D_NULL_SEQ", "D_FRESH"}
+    assert _reason_ids(con) == {"D_PENDING", "D_NULL_SEQ", "D_FRESH"}
+    assert _prediction_runs(con) == {new}
+
+    decision_archive = next(tmp_path.glob("shadow_decisions_*.parquet"))
+    reason_archive = next(tmp_path.glob("rejection_reasons_*.parquet"))
+    prediction_archive = next(tmp_path.glob("model_predictions_*.parquet"))
+    assert _parquet_ids(con, decision_archive) == {"D_EXPORTED"}
+    assert [
+        row[0]
+        for row in con.execute("SELECT decision_id FROM read_parquet(?)", [str(reason_archive)]).fetchall()
+    ] == ["D_EXPORTED", "D_EXPORTED"]
+    assert {
+        row[0]
+        for row in con.execute(
+            "SELECT forecast_run_time_utc FROM read_parquet(?)", [str(prediction_archive)]
+        ).fetchall()
+    } == {old}
+
+
+def test_retention_without_export_cursor_keeps_decisions_but_prunes_predictions(con, tmp_path):
+    _old, new = _seed_retention_scenario(con)
+
+    result = apply_retention(con, days=30, archive_dir=tmp_path, now=NOW)
+
+    assert result.ran is True
+    assert result.deleted_decisions == 0
+    assert result.deleted_predictions == 1
+    assert _decision_ids(con) == {"D_EXPORTED", "D_PENDING", "D_NULL_SEQ", "D_FRESH"}
+    assert _reason_ids(con) == {"D_EXPORTED", "D_PENDING", "D_NULL_SEQ", "D_FRESH"}
+    assert _prediction_runs(con) == {new}
+    assert not list(tmp_path.glob("shadow_decisions_*.parquet"))
+    assert not list(tmp_path.glob("rejection_reasons_*.parquet"))
+    assert list(tmp_path.glob("model_predictions_*.parquet"))
+
+
+class _FailingPredictionCopyCon:
+    def __init__(self, con):
+        self._con = con
+
+    def execute(self, sql, params=None):
+        if sql.startswith("COPY (SELECT * FROM model_predictions"):
+            raise RuntimeError("prediction archive disk full")
+        return self._con.execute(sql, params) if params is not None else self._con.execute(sql)
+
+
+def test_retention_failure_rolls_back_database_and_removes_uncommitted_archives(con, tmp_path):
+    _seed_retention_scenario(con)
+    before_decisions = _decision_ids(con)
+    before_reasons = _reason_ids(con)
+    before_predictions = _prediction_runs(con)
+
+    with pytest.raises(RuntimeError, match="prediction archive disk full"):
+        apply_retention(
+            _FailingPredictionCopyCon(con),
+            days=30,
+            archive_dir=tmp_path,
+            exported_through_seq=1,
+            now=NOW,
+        )
+
+    assert _decision_ids(con) == before_decisions
+    assert _reason_ids(con) == before_reasons
+    assert _prediction_runs(con) == before_predictions
+    assert list(tmp_path.glob("*.parquet")) == []
+
+
+def test_runner_passes_confirmed_export_cursor_to_retention(con, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from weatherquant.shadow import runner as runner_module
+
+    captured = {}
+
+    class FakeExporter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def state(self):
+            return {"version": 2, "cursor_seq": 1}
+
+    def fake_apply_retention(_con, **kwargs):
+        captured.update(kwargs)
+        return runner_module.RetentionResult()
+
+    monkeypatch.setattr(runner_module, "DecisionExporter", FakeExporter)
+    monkeypatch.setattr(runner_module, "apply_retention", fake_apply_retention)
+
+    r = object.__new__(runner_module.ShadowRunner)
+    r.clock = lambda: NOW
+    r._next_retention = NOW - timedelta(seconds=1)
+    r.shadow = SimpleNamespace(
+        shadow_retention_days=30,
+        shadow_retention_archive_dir=tmp_path,
+        shadow_report_path=tmp_path / "report.json",
+    )
+    r.db = SimpleNamespace(con=con)
+    r.store = None
+
+    r._maybe_retention()
+
+    assert captured["exported_through_seq"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Retention on the real migrated schema: predictions a retained decision
+# still traces to, and archive durability before any delete
+# ---------------------------------------------------------------------------
+
+def _real_shadow_db(tmp_path):
+    from weatherquant.storage.shadow import ShadowDatabase
+
+    db = ShadowDatabase(tmp_path / "shadow.duckdb")
+    db.open()
+    return db
+
+
+def _insert_prediction(con, *, run, target):
+    con.execute(
+        """
+        INSERT INTO model_predictions (
+            model_name, model_version, station, target_date, event_id,
+            forecast_run_time_utc, probabilities_json, lead_hours, model_run_id,
+            training_cutoff_utc, forecast_publishable_at_utc, forecast_publishable_basis,
+            forecast_received_at_utc, decision_time_utc, calibration_version,
+            source_data_hash, computed_at_utc)
+        VALUES ('ecmwf_raw', 'v1', 'KNYC', ?, 'EV1', ?, '{}', 12, 'mr', ?, ?,
+                'estimated', ?, ?, 'c1', 'h', ?)
+        """,
+        [target, run, run, run, run, run, run],
+    )
+
+
+def _insert_decision(con, decision_id, *, run, at, seq):
+    con.execute(
+        """
+        INSERT INTO shadow_decisions (
+            decision_id, run_id, cycle_id, market_id, event_id, target_date, station,
+            direction, state, model_name, model_version, forecast_run_time_utc,
+            decision_time_utc, created_at_utc, export_seq)
+        VALUES (?, 'r', ?, 'M1', 'EV1', ?, 'KNYC', 'buy_yes', 'REJECT',
+                'ecmwf_raw', 'v1', ?, ?, ?, ?)
+        """,
+        [decision_id, decision_id, at.date(), run, at, at, seq],
+    )
+
+
+def test_retention_keeps_a_prediction_a_retained_decision_still_traces_to(tmp_path):
+    """A decision just inside the window routinely uses a forecast run
+    initialised hours before the cutoff. Deleting that run's prediction
+    leaves the retained decision untraceable in the alignment audit."""
+    from weatherquant.shadow.alignment import audit_alignment
+
+    db = _real_shadow_db(tmp_path)
+    con = db.con
+    cutoff = NOW - timedelta(days=30)
+    shared_run = cutoff - timedelta(hours=6)
+    _insert_prediction(con, run=shared_run, target=(cutoff + timedelta(hours=1)).date())
+    _insert_decision(con, "D_INSIDE", run=shared_run, at=cutoff + timedelta(hours=1), seq=2)
+    # A run used only by an exported decision that retires in the same pass.
+    retired_run = cutoff - timedelta(days=5)
+    _insert_prediction(con, run=retired_run, target=retired_run.date())
+    _insert_decision(con, "D_RETIRED", run=retired_run, at=retired_run + timedelta(hours=1), seq=1)
+    # An old run nothing references.
+    orphan_run = cutoff - timedelta(days=10)
+    _insert_prediction(con, run=orphan_run, target=orphan_run.date())
+    assert audit_alignment(con).violations == []
+
+    result = apply_retention(
+        con, days=30, archive_dir=tmp_path / "archive", exported_through_seq=2, now=NOW
+    )
+
+    assert _decision_ids(con) == {"D_INSIDE"}
+    assert _prediction_runs(con) == {shared_run}
+    assert result.deleted_predictions == 2
+    assert [v.kind for v in audit_alignment(con).violations] == []
+    archived = next((tmp_path / "archive").glob("model_predictions_*.parquet"))
+    assert {
+        row[0]
+        for row in con.execute(
+            "SELECT forecast_run_time_utc FROM read_parquet(?)", [str(archived)]
+        ).fetchall()
+    } == {retired_run, orphan_run}
+    db.close()
+
+
+def test_retention_fsyncs_every_archive_before_the_first_delete(con, tmp_path, monkeypatch):
+    import os
+
+    _seed_retention_scenario(con)
+    events: list[str] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd):
+        events.append("fsync:" + os.path.basename(os.readlink(f"/proc/self/fd/{fd}")))
+        return real_fsync(fd)
+
+    class RecordingCon:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=None):
+            if sql.lstrip().upper().startswith("DELETE"):
+                events.append("delete")
+            return self._inner.execute(sql, params) if params is not None else self._inner.execute(sql)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    apply_retention(RecordingCon(con), days=30, archive_dir=tmp_path, exported_through_seq=1, now=NOW)
+
+    archives = sorted(p.name for p in tmp_path.glob("*.parquet"))
+    assert len(archives) == 3
+    first_delete = events.index("delete")
+    synced_before_first_delete = {e.split(":", 1)[1] for e in events[:first_delete] if e.startswith("fsync:")}
+    # Decisions and reasons are deleted first; both archives must be on disk by then.
+    assert {a for a in archives if not a.startswith("model_predictions")} <= synced_before_first_delete
+    # The prediction archive is synced before the prediction delete.
+    pred = next(a for a in archives if a.startswith("model_predictions"))
+    pred_sync = events.index(f"fsync:{pred}")
+    assert "delete" in events[pred_sync + 1:]
+
+
+def test_retention_never_overwrites_or_unlinks_an_existing_archive(con, tmp_path):
+    """Archives are named by the second. A pass that lands on an existing
+    name must not overwrite it, nor remove it in its failure cleanup: it may
+    be the only copy of rows an earlier pass already deleted."""
+    _seed_retention_scenario(con)
+    earlier = tmp_path / f"shadow_decisions_{NOW.strftime('%Y%m%dT%H%M%SZ')}.parquet"
+    earlier.write_bytes(b"earlier committed archive")
+    before = _decision_ids(con)
+
+    with pytest.raises(FileExistsError):
+        apply_retention(con, days=30, archive_dir=tmp_path, exported_through_seq=1, now=NOW)
+
+    assert earlier.read_bytes() == b"earlier committed archive"
+    assert _decision_ids(con) == before

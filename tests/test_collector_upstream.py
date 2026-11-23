@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 import httpx
 import pytest
 
-from weatherquant.data.books import parse_book_payload
+from weatherquant.data.books import fetch_books, parse_book_payload
 from weatherquant.data.discovery import (
     build_event_row,
     build_market_rows,
@@ -156,6 +157,33 @@ def _raw_book() -> dict:
         "asks": [{"price": "0.57", "size": "400"}, {"price": "0.52", "size": "100"}],
         "tick_size": "0.001",
     }
+
+
+def test_fetch_books_posts_bounded_batch_and_matches_asset_ids() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        seen["timeout"] = request.extensions["timeout"]
+        return httpx.Response(
+            200,
+            json=[{**_raw_book(), "asset_id": "tok2"}, {**_raw_book(), "asset_id": "tok1"}],
+        )
+
+    http = _client(handler)
+    books = fetch_books(
+        http,
+        token_ids=["tok1", "tok2", "missing"],
+        timeout_seconds=3.0,
+        retries=0,
+    )
+    http.close()
+
+    assert seen["body"] == [{"token_id": "tok1"}, {"token_id": "tok2"}, {"token_id": "missing"}]
+    assert set(seen["timeout"].values()) == {3.0}
+    assert set(books) == {"tok1", "tok2"}
+    assert books["tok1"]["asset_id"] == "tok1"
+    assert books["tok2"]["asset_id"] == "tok2"
 
 
 def test_book_levels_are_stored_best_first_regardless_of_wire_order() -> None:

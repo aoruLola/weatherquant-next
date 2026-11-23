@@ -16,10 +16,10 @@ What a fill may never do, each enforced before any arithmetic:
   venue timestamp is ahead of it.
 * **Fill a stale book.** Age is judged on the venue's own clock; a book with
   no venue timestamp cannot be shown to be fresh and is refused.
-* **Fake capacity.** A partial fill under ``require_complete_fill`` is a
-  refusal, not a smaller trade (the shadow's own gate, for the same reason:
-  the unfilled remainder would have to be repriced against a book we just
-  drove through).
+* **Fake capacity.** A fill is sized down to what the book actually offers up
+  to the risk-sized order, priced at its own VWAP. The only size floor is the
+  venue's minimum order: a smaller fill could never have been placed, so it is
+  refused rather than recorded as a trade.
 
 Evidence over convenience: ``consumed_levels`` records the price and taken
 size of every level the plan consumed, so ``fill_cost_usd`` is recomputable
@@ -32,13 +32,20 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from weatherquant.execution.fees import (
+    FEE_SOURCE_FALLBACK,
+    DatedFeeSchedule,
+    load_fee_schedule,
+    resolve_fee_rate,
+)
 from weatherquant.execution.pricing import (
     ExecutionRefused,
     FeeStructureUnknown,
+    adverse_slippage_usd_per_share,
     build_fill_plan,
     execution_cost,
 )
@@ -147,25 +154,35 @@ class FillEngine:
         *,
         book_source: ArchiveBookSource,
         buffer_fraction: float,
-        require_complete_fill: bool = True,
+        min_order_size_shares: float = 5.0,
         max_book_age_seconds: float = 90.0,
         clock: Any = None,
         batch_signals: int = 100,
         ledger: Ledger | None = None,
         risk: RiskGate | None = None,
+        fee_schedule: DatedFeeSchedule | None = None,
+        max_clock_skew_ms: float = 2000.0,
     ) -> None:
         if buffer_fraction < 0.0:
             raise ValueError("buffer_fraction must be >= 0")
+        if min_order_size_shares <= 0:
+            raise ValueError("min_order_size_shares must be > 0")
         if max_book_age_seconds <= 0:
             raise ValueError("max_book_age_seconds must be > 0")
         self.store = store
         self.books = book_source
         self.buffer_fraction = float(buffer_fraction)
-        self.require_complete_fill = bool(require_complete_fill)
+        self.min_order_size_shares = float(min_order_size_shares)
         self.max_book_age_seconds = float(max_book_age_seconds)
+        if max_clock_skew_ms < 0:
+            raise ValueError("max_clock_skew_ms must be >= 0")
+        self.max_clock_skew_ms = float(max_clock_skew_ms)
         self.clock = clock or (lambda: datetime.now(tz=UTC))
         self.batch_signals = int(batch_signals)
         self.ledger = ledger if ledger is not None else Ledger(store)
+        self.fee_schedule = (
+            fee_schedule if fee_schedule is not None else load_fee_schedule()
+        )
         # Deliberately not optional-with-a-permissive-default: a fill engine
         # constructed without a gate must be told so explicitly, by a caller
         # that passes an explicit unrestricted gate.
@@ -219,7 +236,7 @@ class FillEngine:
                     key = outcome.reason or "UNKNOWN"
                     result.by_reason[key] = result.by_reason.get(key, 0) + 1
         except Exception as exc:  # a side channel must not raise
-            result.notes.append(f"fill pass failed: {type(exc).__name__}: {exc}")
+            return FillResult(attempted=result.attempted, notes=[f"fill pass failed: {type(exc).__name__}: {exc}"])
         return result
 
     def _settle(self, fill: PaperFill, now: datetime) -> tuple[bool, tuple[str, str] | None]:
@@ -279,12 +296,30 @@ class FillEngine:
             outcome.detail = "the signal's published event row is missing; nothing to price"
             return outcome
 
-        if event.fee_rate is None:
-            # An unknown schedule is refused, never priced as free - the same
-            # rule the shadow's decision layer applies before us.
+        # A venue-reported rate always wins. When the exported event carries
+        # none, the dated schedule prices it at the decision instant - the same
+        # rule the shadow applies - and the assumption is logged rather than
+        # silently treated as a venue fact.
+        fee_rate, fee_source = resolve_fee_rate(
+            event.fee_rate, event.decision_time_utc, self.fee_schedule
+        )
+        if fee_rate is None:
             outcome.reason = RefusalReason.UNPRICABLE_EVENT.value
-            outcome.detail = "the market did not report a fee schedule; refusing to assume zero"
+            outcome.detail = (
+                "the market did not report a fee schedule and no dated fallback "
+                "covers this decision instant; refusing to assume zero"
+            )
             return outcome
+        if fee_source == FEE_SOURCE_FALLBACK:
+            log.warning(
+                "fee fallback used for %s at %s: exported event has no fee_rate, "
+                "dated schedule %s supplied %s",
+                event.decision_id,
+                event.decision_time_utc.isoformat(),
+                self.fee_schedule.version,
+                fee_rate,
+            )
+            event = replace(event, fee_rate=fee_rate)
         if not event.token_id:
             outcome.reason = RefusalReason.NOT_EXECUTABLE.value
             outcome.detail = "signal names no token; its book cannot be resolved"
@@ -298,7 +333,10 @@ class FillEngine:
             outcome.reason, outcome.detail = verdict.reason, verdict.detail
             return outcome
 
-        evidence = self.books.resolve(token_id=event.token_id, decision_time=event.decision_time_utc)
+        if event.evidence_version is not None:
+            evidence = BookEvidence.from_signal(event)
+        else:
+            evidence = self.books.resolve(token_id=event.token_id, decision_time=event.decision_time_utc)
         gate = self._gate_book(event, evidence)
         if gate is not None:
             outcome.reason, outcome.detail = gate
@@ -336,12 +374,15 @@ class FillEngine:
             outcome.detail = str(exc)
             return outcome
 
-        if self.require_complete_fill and not plan.complete:
+        if plan.filled_shares < self.min_order_size_shares - _EPS:
+            # Size down, but not below what the venue would accept: a
+            # sub-minimum fill could never have been placed, so recording it
+            # would invent a trade the world could not produce.
             outcome.reason = RefusalReason.INSUFFICIENT_CAPACITY.value
             outcome.detail = (
-                f"only {plan.filled_shares:.1f} of {plan.requested_shares:.1f} shares "
-                f"fillable across {plan.levels_consumed} level(s); a partial fill is a "
-                "different trade, so none is recorded"
+                f"only {plan.filled_shares:.2f} of {plan.requested_shares:.1f} shares "
+                f"fillable across {plan.levels_consumed} level(s), below the venue "
+                f"minimum order of {self.min_order_size_shares:g} shares"
             )
             return outcome
 
@@ -368,7 +409,9 @@ class FillEngine:
             filled_shares=plan.filled_shares,
             avg_price_usd_per_share=avg,
             best_price_usd_per_share=best,
-            slippage_usd_per_share=max(avg - best, 0.0),
+            slippage_usd_per_share=adverse_slippage_usd_per_share(
+                side=side, vwap_usd_per_share=avg, top_of_book_usd_per_share=best
+            ),
             fill_cost_usd=plan.fill_cost_usd,
             fees_usd=cost.fees_usd,
             execution_buffer_usd=cost.execution_buffer_usd,
@@ -420,11 +463,16 @@ class FillEngine:
                 "the resolved book carries no venue timestamp, so its age cannot "
                 "be established and it cannot be shown to be fresh",
             )
-        if evidence.venue_ts_utc > event.decision_time_utc:
+        # Same skew tolerance as the shadow's gate: a venue clock slightly
+        # ahead of ours must not refuse the very book the decision accepted.
+        if evidence.venue_ts_utc > event.decision_time_utc + timedelta(
+            milliseconds=self.max_clock_skew_ms
+        ):
             return (
                 RefusalReason.NOT_EXECUTABLE.value,
                 f"the resolved book's venue timestamp {evidence.venue_ts_utc.isoformat()} "
-                "is after the decision instant; it is not evidence for this trade",
+                f"is after the decision instant by more than the "
+                f"{self.max_clock_skew_ms:.0f}ms tolerance; it is not evidence for this trade",
             )
         age_ms = _book_age_ms(evidence, event.decision_time_utc)
         if age_ms > self.max_book_age_seconds * 1000.0:
