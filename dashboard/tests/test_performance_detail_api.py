@@ -461,6 +461,89 @@ def test_reference_capital_answers_over_the_window_and_says_so(tmp_path, app_for
         assert body["source_endpoint"] == "weatherquant.performance.capital.simulate_portfolio"
 
 
+@pytest.mark.parametrize("builder", ["materialized", "streaming"])
+def test_reference_stakes_report_the_observations_each_actually_covers(tmp_path, app_for, builder):
+    from weatherquant.performance.streaming import build_performance_streaming
+
+    base = NOW - timedelta(hours=2)
+    rows = []
+    for i, (minute, market, edge) in enumerate([(0, "old", .1), (60, "a", .2), (70, "b", .3), (73, "a", .4)]):
+        rows.append(dict(
+            _decisions(1)[0], decision_id=f"d{i}", decided_at_utc=(base + timedelta(minutes=minute)).isoformat(),
+            decision_time_utc=(base + timedelta(minutes=minute)).isoformat(), market_id=market,
+            mode="LIVE", direction="buy_yes", net_edge_usd=edge, net_edge=edge,
+        ))
+    settlements = _settlements(rows)
+    for item in settlements:
+        item["verification_status"] = "VERIFIED" if item["market_id"] == "old" else "UNVERIFIED"
+        item["resolved_outcome"] = 1.0
+    out = tmp_path / "performance"
+    if builder == "materialized":
+        _publish(out, rows, settlements=settlements, detail_max_episodes=2)
+    else:
+        parts = tmp_path / "export" / "parts"
+        parts.mkdir(parents=True)
+        (parts / "part-000000001.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        build_performance_streaming(export=parts.parent, out_dir=out, state_db=tmp_path / "state.duckdb",
+                                    dataset="fixture", settlements=settlements, now=NOW, detail_max_episodes=2)
+    descriptor = resolve_generation(out).directory / "opportunities.json"
+    published_window = json.loads(descriptor.read_text(encoding="utf-8"))["data"]["window"]
+    assert published_window["first_seen_utc_from"] == (base + timedelta(minutes=60)).isoformat()
+    assert published_window["last_seen_utc_to"] == (base + timedelta(minutes=73)).isoformat()
+    with app_for() as client:
+        summary = client.get("/api/v1/performance/summary").json()["data"]["data"]
+        window = client.get("/api/v1/performance/reference-capital").json()["data"]
+
+    lifetime = summary["reference_capital"]
+    assert lifetime["scope"] == "lifetime" and window["scope"] == "window"
+    assert lifetime["statistical_window"] == {
+        "episodes": 3, "episodes_simulated": 3, "first_seen_utc_from": base.isoformat(),
+        "last_seen_utc_to": (base + timedelta(minutes=73)).isoformat(),
+    }
+    assert window["sample_size"] == 2 and window["window_completeness"] == "truncated"
+    assert window["window_start"] == (base + timedelta(minutes=60)).isoformat()
+    assert window["window_end"] == (base + timedelta(minutes=73)).isoformat()
+    assert summary["observation_edge_sum"] == pytest.approx(1.0)
+    assert summary["unique_opportunity_edge_sum"] == pytest.approx(.6)
+    assert summary["counts"]["WIN"] == 1 and summary["counts"]["LOSS"] == 0
+    assert summary["verified_opportunities"] == 1 and summary["realized_directional_win_rate"] is None
+    for stake in (lifetime, window):
+        assert stake["initial_capital_usdc"] == stake["balance_remaining_usdc"] == 100
+        assert stake["simulated_net_profit_usdc"] is None and stake["simulated_roi"] is None
+
+
+@pytest.mark.parametrize("legacy_shape", ["reversed", "missing_fields"])
+def test_reference_capital_recovers_bounds_from_an_older_published_window(
+    tmp_path, app_for, legacy_shape
+):
+    out = tmp_path / "performance"
+    rows = _decisions(3)
+    rows.append(dict(rows[0], decided_at_utc=(NOW + timedelta(minutes=1)).isoformat()))
+    _publish(out, rows, detail_max_episodes=2)
+    path = resolve_generation(out).directory / "opportunities.json"
+    old = json.loads(path.read_text(encoding="utf-8"))
+    if legacy_shape == "reversed":
+        old["data"]["window"].update(
+            first_seen_utc_from=NOW.isoformat(),
+            last_seen_utc_to=(NOW - timedelta(minutes=1)).isoformat(),
+        )
+    else:
+        old["data"]["window"].pop("first_seen_utc_from")
+        old["data"]["window"].pop("last_seen_utc_to")
+    path.write_text(json.dumps(old), encoding="utf-8")
+
+    with app_for() as client:
+        response = client.get("/api/v1/performance/reference-capital")
+        assert response.status_code == 200
+        window = response.json()["data"]
+    assert window["window_start"] == (NOW - timedelta(minutes=1)).isoformat()
+    assert window["window_end"] == (NOW + timedelta(minutes=1)).isoformat()
+    assert window["window"]["episodes_all"] == 3
+    assert window["total_episodes_in_window"] == 2
+
+
 def test_reference_capital_does_not_copy_the_history(published) -> None:
     """The response is aggregates plus a bounded sample, not every episode."""
     body = published.get("/api/v1/performance/reference-capital?capital_usdc=100").json()["data"]
@@ -468,3 +551,25 @@ def test_reference_capital_does_not_copy_the_history(published) -> None:
     assert len(body["results_sample"]) <= 50
     assert body["results_total"] == body["executable_count"] + body["not_executable_count"]
     assert sum(body["not_executable_reason_counts"].values()) == body["not_executable_count"]
+
+
+def test_monitor_recognizes_dashboard_limit_validation_and_previous_cursor(published, monkeypatch):
+    import httpx
+
+    root = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(root / "scripts"))
+    import performance_monitor as monitor
+
+    def through_dashboard(request):
+        response = published.get(str(request.url))
+        return httpx.Response(response.status_code, content=response.content)
+
+    route = "/api/v1/performance/opportunities"
+    current = published.get(route, params={"limit": 10}).json()["data"]["next_cursor"]
+    report = monitor.probe_dashboard(
+        "http://testserver", token=None, probes=1, max_p95_ms=1000, max_response_mb=32,
+        previous_cursor=current, transport=httpx.MockTransport(through_dashboard),
+    )
+    assert report["limit_clamp"]["rejected_above"] == 200
+    assert report["previous_cursor_status"] == 200
+    assert report["failures"] == ["previous generation cursor answered 200; expected 409"]

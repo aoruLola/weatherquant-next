@@ -20,11 +20,28 @@
 #      exit into an automatic restart. Docker does not restart an
 #      unhealthy-but-running container on its own; see docs/... §8.2.
 
+# Image tags: this stack runs a **pinned immutable SHA**, never `stable`.
+#
+# `stable` is a mutable pointer that .github/workflows/release.yml moves the
+# moment a collector release passes its gates. Tracking it means the next
+# `docker compose pull` - or one click on Unraid's "Check for updates" - adopts
+# whatever was released most recently, with nobody having chosen that version.
+# Pinning the SHA makes "which build is running" a property of this file, and
+# makes rolling back a one-line .env edit rather than a hunt through the
+# registry (see docs/release-rollback.md).
+#
+# One variable, in the stack's .env:
+#
+#   COLLECTOR_SHA   <full commit sha>   e.g. 5410c75d584771b4477de07f4b1d7b83b764bfe1
+#
+# The image is `sha-${COLLECTOR_SHA}`, and GIT_SHA / IMAGE_TAG are read from
+# the same value, so the engine cannot report a different build from the one it
+# is running.
 x-common: &common
-  # Published by .github/workflows/release.yml. `stable` tracks the newest tag
-  # that passed the full verify job; the immutable `sha-<commit>` tag is what
-  # you pin to when rolling back (see docs/... §10).
-  image: ghcr.io/aorulola/weatherquant-next:stable
+  # Published by .github/workflows/release.yml as sha-<full commit sha>, an
+  # immutable tag. Compose refuses to start while COLLECTOR_SHA is unset,
+  # rather than silently falling back to a floating tag.
+  image: ghcr.io/aorulola/weatherquant-next:sha-${COLLECTOR_SHA:?set COLLECTOR_SHA in the stack .env to the released commit}
   container_name: weatherquant-collector
   restart: unless-stopped
   stop_grace_period: 60s
@@ -52,7 +69,12 @@ x-common: &common
     # array), never tmpfs: a tmpfs spill IS a memory allocation and would defeat
     # the budget it exists to enforce.
     WQ_DUCKDB_TEMP_DIR: /data/duckdb-spill
-    # GIT_SHA and IMAGE_TAG come from the collector image at build time.
+    # Build provenance, stamped by CI. Shown in the heartbeat and in
+    # collector_runs so "which version produced this row?" is always answerable.
+    # Both come from the same value the image tag is built from, so the engine
+    # cannot report a build other than the one it is running.
+    GIT_SHA: ${COLLECTOR_SHA:?set COLLECTOR_SHA in the stack .env to the released commit}
+    IMAGE_TAG: ${COLLECTOR_SHA:?set COLLECTOR_SHA in the stack .env to the released commit}
   volumes:
     - /mnt/user/appdata/weatherquant-next:/data
   healthcheck:

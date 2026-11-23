@@ -107,6 +107,55 @@ uv run pytest          # 完全离线，不打开任何 socket
 uv run ruff check .
 ```
 
+## CI 工作流
+
+| 工作流 | 触发 | 作用 | 镜像发布 |
+|---|---|---|---|
+| `ci.yml` (采集器) | PR / `main` 推送 / `workflow_dispatch` | ruff + pytest + 镜像构建与容器验收（仅 main / dispatch / 输入变更的 PR） | ❌ 不发布 |
+| `dashboard-ci.yml` | 同上 | dashboard 后端/前端测试 + 镜像构建与容器验收（门控同上） | ❌ 不发布 |
+| `shadow-ci.yml` | 同上 | shadow 测试 + 镜像构建与容器验收（门控同上） | ❌ 不发布 |
+| `release.yml` | `v*` tag / `workflow_dispatch` | 完整测试 → 构建 → 容器验收 → 推送 SHA tag → 移动 `stable` | ✅ 需 release 环境审批 |
+| `dashboard-release.yml` | `dashboard-v*` tag / `workflow_dispatch` | 完整测试 + 浏览器验收 → 构建 → 推送 → 移动 `dashboard-stable` | ✅ 需审批 |
+| `shadow-release.yml` | `shadow-v*` tag / `workflow_dispatch` | 完整测试 → 构建 → 容器验收 → 推送 → 移动 `shadow-stable` | ✅ 需审批 |
+| `mcp-release.yml` | `mcp-v*` tag / `workflow_dispatch` | 完整测试 → 构建 → 安全验收 → 推送 → 移动 `mcp-stable` | ✅ 需审批 |
+
+同一 PR 更新后会取消上一轮运行（concurrency 组内 `cancel-in-progress: true`）。PR 上的 Docker 镜像构建与容器验收由 `scripts/ci_image_gate.sh` 决策——只有 Dockerfile、`src/`、`models/`、`configs/`、对应健康检查脚本或 `dashboard/` 等实际镜像输入变更时才构建；纯文档改动会跳过重量级的容器验收步骤，但 lint 与单元测试照常跑。推送 `main` 或手动触发开发 CI 则始终构建并验收全部镜像。
+
+### CI 不可用时的本地验证回退
+
+GitHub Actions 挂了或配额耗尽时，在 PR 中留下一条评论，包含：
+
+1. 运行链接（`uv run pytest -v --tb=short`、`uv run ruff check` 等）
+2. 待验证的提交 SHA
+3. 实际执行的命令清单
+4. 通过 / 失败 / 跳过的计数
+5. 如需镜像构建或容器验收，附手动运行 `bash scripts/ci_image_gate.sh <module>` 的输出以及 `docker build -f Dockerfile<...> .` 的结果
+
+命令模板：
+
+```sh
+# 在本地验证单元与集成测试
+uv run pytest -q --tb=short 2>&1 | tee /tmp/pytest.log
+
+# dashboard 后端
+uv run pytest -q dashboard/tests --tb=short 2>&1 | tee /tmp/dashboard-tests.log
+
+# lint
+uv run ruff check . 2>&1 | tee /tmp/ruff.log
+
+# Gate 脚本在当前工作目录下的模拟输出
+bash scripts/ci_image_gate.sh collector 2>&1
+bash scripts/ci_image_gate.sh shadow 2>&1
+bash scripts/ci_image_gate.sh dashboard 2>&1
+
+# 镜像构建（手动，不会推送到 GHCR）
+docker build -t wq-collector:local .
+docker build -f Dockerfile.shadow -t wq-shadow:local .
+docker build -f Dockerfile.dashboard -t wq-dashboard:local .
+```
+
+镜像发布仍走 Release 工作流——必须打 tag 或 `workflow_dispatch`，并经 release 环境审批后才会移动 `stable` / `shadow-stable` / `dashboard-stable` / `mcp-stable` 指针。开发分支上的任何运行都无法发布镜像。
+
 ## 文档
 
 | 文档 | 内容 |

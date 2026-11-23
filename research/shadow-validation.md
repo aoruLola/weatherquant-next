@@ -732,3 +732,56 @@ pending map。回滚周期于是重新推导同一个缺口，而不是发出一
   从而把陈旧快照判为"新鲜"的问题（`_report()` 默认取真实时钟）。
 
 **651 passed, 3 skipped，Ruff 全绿。**
+
+---
+
+## 12. WQN-46：成交、时钟与费率的前提修正（2026-11-20，阈值 v3）
+
+这一轮不改模型、不改新鲜度门槛，只修正四条**与市场事实相矛盾**的前提。
+
+### 12.1 成交：从"必须全成"到"按盘口向下取整"
+
+v2 的 `require_complete_fill` 与 `min_depth_usd = 25` 互相矛盾：场所最小单是
+5 股，5 股 @ 0.50 只有 **2.50 美元**，永远过不了 25 美元的美元地板。两者
+同时成立时，系统会拒绝场所自己接受的订单。
+
+v3 把 `proposed_shares = 100` 解释为**请求量**，成交按盘口可承接量向下取整，
+唯一的股数地板是场所最小单（`min_order_size_shares = 5`），并要求**实际 VWAP**
+上的净 edge 仍 ≥ 0.02。`min_depth_usd` 默认降为 **0**（可选、默认关闭）。
+Paper 路径同步：部分成交落库（`complete = false`），低于 5 股才拒绝。
+
+### 12.2 时钟：负 skew 的容差
+
+旧规则对 `collector_received < venue_ts` 零容忍，一毫秒抖动即
+`TIME_MISMATCH`。v3 引入 `max_clock_skew_ms = 2000`：容差内放行，超过仍拒绝；
+`venue_ts > decision_time` 等"未来输入"检查不变。
+
+### 12.3 费率：缺失时用日期化 fallback，而不是拒绝一切
+
+旧行为把缺失的 `fee_rate` 一律判为 `UNKNOWN_FEE` / `UNPRICABLE_EVENT`，
+等于让一个元数据缺口停掉所有交易。v3 增加
+[`configs/fee-schedule.json`](../configs/fee-schedule.json)：天气类 taker 费率
+**0.05（2026-11-20T23:59Z 之前）→ 0.01（之后）**，按决策时点取用。
+**场所报告的费率永远优先**；使用 fallback 时决策记 `fee_source = fallback`、
+写 warning，并在 runner 心跳暴露 `fee_fallback_active` 健康标志。
+Shadow 与 paper 共用同一个 `resolve_fee_rate`，两条路径不会给出不同答案。
+
+### 12.4 盘口新鲜度：90s 不放宽，改扫描顺序
+
+实测单 token 刷新 p50 = 37.9s、p90 = 157s，问题不在门槛而在吞吐与扫描顺序：
+旧实现按字典序 + 轮转，预算截断时会反复延后同一批 token。改为
+**最久未刷新优先**（从未刷新者最优先），目标日近者在同年龄时优先。
+同时把逐 token 的 `GET /book` 合并为 `POST /books` 批量请求（每批 ≤100，
+上限 500），一次 HTTP 往返刷新整批 token，原始 payload 仍逐 token 入库。
+这样 p90 年龄有界，同时不会饿死远期市场。心跳新增
+`per_token_book_refresh_gap_ms`（p90）与 `per_token_book_age_ms.p90_ms`，
+90s 门槛保持不变。
+
+### 12.5 边界
+
+- **未修改** `max_snapshot_age_ms`（仍为 90000）。
+- **未新增**任何交易功能；paper 仍只读归档。
+- 纽约午夜收市规则保持现状（不在本轮范围）。
+- `MARKET_NOT_OPEN` 仍未接线：导出的信号事件不携带市场生命周期字段，
+  需要先扩展导出契约，不能静默猜测。
+

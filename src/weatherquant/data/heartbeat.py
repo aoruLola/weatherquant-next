@@ -88,6 +88,10 @@ class CollectionStats:
     archive_records: int = 0
     dedupe_hits_total: int = 0
     errors_total: int = 0
+    # Partitions the collector had to freeze after a digest/data mismatch this
+    # run (see ``RawArchive``). Non-zero is a loud, dashboard-visible alert even
+    # though collection continued into a fresh file.
+    archive_quarantined: int = 0
 
 
 @dataclass
@@ -137,8 +141,6 @@ class Heartbeat:
     # Empty when the engine has not yet measured anything, which is a
     # different statement from "zero" and must not be conflated with it.
     telemetry: dict[str, Any] = field(default_factory=dict)
-    git_sha: str | None = None
-    image_tag: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         def enc(value: Any) -> Any:
@@ -189,8 +191,6 @@ def read_heartbeat(path: str | Path) -> Heartbeat | None:
             pid=int(data["pid"]),
             hostname=str(data.get("hostname", "")),
             app_version=str(data.get("app_version", "")),
-            git_sha=data.get("git_sha"),
-            image_tag=data.get("image_tag"),
             updated_at_utc=ts("updated_at_utc") or datetime.min.replace(tzinfo=UTC),
             started_at_utc=ts("started_at_utc") or datetime.min.replace(tzinfo=UTC),
             uptime_seconds=float(data.get("uptime_seconds", 0.0)),
@@ -381,6 +381,16 @@ def evaluate_health(
         # REST failing while the WebSocket still talks is recoverable; if both
         # are dead the upstream-contact clock above will escalate this anyway.
         warning.append(f"{heartbeat.rest_consecutive_failures} consecutive REST failures")
+
+    # --- archive integrity ------------------------------------------------
+    if heartbeat.stats.archive_quarantined > 0:
+        # A digest/data mismatch was quarantined and collection resumed on a
+        # fresh partition. Loud, but not fatal: restarting would not recover
+        # the frozen bytes, and the operator must inspect the evidence.
+        warning.append(
+            f"{heartbeat.stats.archive_quarantined} archive partition(s) quarantined "
+            "after a digest/data mismatch (see the archive quarantine/ directory)"
+        )
 
     if critical:
         return HealthVerdict(HealthStatus.UNHEALTHY, 1, tuple(critical + warning))

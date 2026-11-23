@@ -13,8 +13,16 @@ name: dashboard-ci
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# Cancel superseded PR runs so a fresh push does not queue behind the
+# previous one. Push-to-main and manual dispatch (run_id in the name) are
+# never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -22,10 +30,21 @@ permissions:
 
 jobs:
   dashboard-backend:
+    outputs:
+      build_image: ${{ steps.image.outputs.build_image }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check image inputs on the PR merge commit
+        id: image
+        run: bash scripts/ci_image_gate.sh dashboard >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the paired rollback reader for the compatibility test
+        run: git fetch --no-tags --depth=1 origin e6698dfd39930bf1dd219410ae911b1cf496a982
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
@@ -136,6 +155,7 @@ jobs:
           if-no-files-found: ignore
 
   build-dashboard-image:
+    if: needs.dashboard-backend.outputs.build_image == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     needs: [dashboard-backend, dashboard-frontend]

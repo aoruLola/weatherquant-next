@@ -17,12 +17,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import socket
 import sys
 import uuid
 from datetime import UTC, datetime
 
 from weatherquant.data.lock import LockError, SingleInstanceLock
+from weatherquant.execution.fees import load_fee_schedule
 from weatherquant.paper.api import ENDPOINTS
 from weatherquant.paper.books import ArchiveBookSource
 from weatherquant.paper.config import PaperSettings
@@ -138,17 +140,10 @@ def _cmd_init(settings: PaperSettings) -> int:
         return 4
     try:
         store = PaperStore(db)
-        created = store.ensure_account(
-            initial_capital_usdc=settings.initial_capital_usdc,
-            now=datetime.now(tz=UTC),
-        )
-        # The ledger opens with the account: the OPEN entry and the balances
-        # row are the first two facts every later figure is derived from.
-        ledger = Ledger(store)
-        ledger.open_account(
-            initial_capital_usdc=settings.initial_capital_usdc,
-            now=datetime.now(tz=UTC),
-        )
+        now = datetime.now(tz=UTC)
+        with db.transaction():
+            created = store.ensure_account(initial_capital_usdc=settings.initial_capital_usdc, now=now)
+            Ledger(store).open_account(initial_capital_usdc=settings.initial_capital_usdc, now=now)
         run_id = db.start_run(
             "paper-init",
             {
@@ -206,12 +201,15 @@ def _fill_engine(store: PaperStore, settings: PaperSettings) -> FillEngine:
             timeout_seconds=settings.book_resolve_timeout_seconds,
         ),
         buffer_fraction=settings.execution_buffer_fraction,
-        require_complete_fill=settings.require_complete_fill,
+        min_order_size_shares=settings.min_order_size_shares,
         max_book_age_seconds=settings.max_book_age_seconds,
+        max_clock_skew_ms=settings.max_clock_skew_ms,
+        fee_schedule=load_fee_schedule(settings.fee_schedule_path),
         risk=RiskGate(
             Ledger(store),
             load_risk_rules(settings.risk_rules_path),
             initial_capital_usdc=float(store.account()["initial_capital_usdc"]),
+            min_order_shares=settings.min_order_size_shares,
         ),
     )
 
@@ -277,6 +275,26 @@ def _cmd_settle(settings: PaperSettings, *, feed: str) -> int:
     return 0
 
 
+def _stop_on_sigterm() -> None:
+    """Make SIGTERM end ``serve`` the way Ctrl-C does.
+
+    In a container the engine is PID 1, and the kernel drops signals PID 1 has
+    no handler for: ``docker stop`` would wait out the grace period and SIGKILL
+    the process (exit 137), leaving the lease and the run row unclosed. Raising
+    KeyboardInterrupt instead lets ``serve_forever`` return and the ``finally``
+    blocks close the run, the database and the lease. A tick interrupted
+    mid-batch rolls back - every batch is one transaction.
+    """
+
+    def _interrupt(signum, _frame):
+        log.info("received signal %s; stopping paper serve", signum)
+        # One interrupt is enough; a second must not cut the cleanup short.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _interrupt)
+
+
 def _cmd_serve(settings: PaperSettings, *, settlement_feed: str | None = None) -> int:
     """Run the consumer and fills under the API process's single writer lease."""
     _require_enabled(settings)
@@ -323,6 +341,7 @@ def _cmd_serve(settings: PaperSettings, *, settlement_feed: str | None = None) -
             print(f"error: cannot bind {settings.api_host}:{settings.api_port}: {exc}", file=sys.stderr)
             return 5
         run_id = db.start_run("paper-serve", {"api_host": settings.api_host, "api_port": settings.api_port})
+        _stop_on_sigterm()
         print(
             f"paper read-only API on http://{settings.api_host}:{settings.api_port}"
             f"/api/v1/paper/{{{','.join(ENDPOINTS)}}} (GET only)"

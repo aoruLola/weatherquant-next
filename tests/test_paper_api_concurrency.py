@@ -96,7 +96,7 @@ def test_api_owner_continues_consuming_filling_and_settling_while_serving(tmp_pa
         row["decision_id"] = "second"
         (parts / "part-000000002.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
         feed.write_text(
-            json.dumps({"market_id": "mkt-1", "revision": 1, "status": "RESOLVED", "yes_payout": 1}) + "\n",
+            json.dumps({"market_id": "mkt-1", "revision": 1, "status": "RESOLVED", "verification_status": "VERIFIED", "yes_payout": 1}) + "\n",
             encoding="utf-8",
         )
         server.tick()

@@ -93,7 +93,7 @@ export default function Forecasts() {
               </span>
             )}
             <Badge tone="accent" title="决策使用的主模型">
-              primary: {data?.models.find((m) => m.is_primary)?.name ?? '—'}
+              primary: {data?.models.find((m) => m.is_primary)?.name ?? 'N/A'}
             </Badge>
           </>
         }
@@ -120,7 +120,7 @@ export default function Forecasts() {
                   <>
                     {m.is_primary && <Badge tone="accent">PRIMARY</Badge>}{' '}
                     <span className="tnum">
-                      最近 run {fmtDateTime(m.latest_run_utc)}
+                      最近出报 {fmtDateTime(m.latest_run_utc)}
                     </span>
                   </>
                 }
@@ -183,11 +183,46 @@ export default function Forecasts() {
                   })}
                 </div>
                 <ProbabilityBars series={series} testId="forecast-chart" />
-                <div className="mt-3 grid grid-cols-1 gap-2 border-t border-line pt-3 text-xs text-muted sm:grid-cols-3">
-                  <div>
-                    预测获取时间（run）：{' '}
+                <div className="mt-3 grid grid-cols-1 gap-2 border-t border-line pt-3 text-xs text-muted sm:grid-cols-2 xl:grid-cols-5">
+                  <div title={selectedDist?.version_reason ?? undefined}>
+                    模型 / 版本：{' '}
                     <span className="tnum text-ink">
-                      {fmtDateTime(selectedDist?.forecast_run_time_utc)}
+                      {selectedDist
+                        ? `${selectedDist.model} / ${selectedDist.version ?? 'N/A'}`
+                        : 'N/A'}
+                    </span>
+                  </div>
+                  <div title={selectedDist?.target_date_reason ?? undefined}>
+                    目标日：{' '}
+                    <span className="tnum text-ink">
+                      {selectedDist?.target_date ?? 'N/A'}
+                    </span>
+                  </div>
+                  <div title={selectedDist?.forecast_issued_reason ?? undefined}>
+                    出报时刻（run）：{' '}
+                    <span className="tnum text-ink" data-testid="forecast-issued">
+                      {fmtDateTime(selectedDist?.forecast_issued_at_utc)}
+                    </span>
+                  </div>
+                  <div
+                    title={
+                      selectedDist?.forecast_publishable_reason ??
+                      selectedDist?.forecast_publishable_basis ??
+                      undefined
+                    }
+                  >
+                    可发布时刻：{' '}
+                    <span className="tnum text-ink" data-testid="forecast-publishable">
+                      {fmtDateTime(selectedDist?.forecast_publishable_at_utc)}
+                    </span>
+                    <span className="ml-1">
+                      ({selectedDist?.forecast_publishable_basis ?? 'N/A'})
+                    </span>
+                  </div>
+                  <div title={selectedDist?.forecast_received_reason ?? undefined}>
+                    接收时刻：{' '}
+                    <span className="tnum text-ink" data-testid="forecast-received">
+                      {fmtDateTime(selectedDist?.forecast_received_at_utc)}
                     </span>
                   </div>
                   <div>
@@ -201,7 +236,7 @@ export default function Forecasts() {
                     <span className="tnum text-ink">
                       {selectedDist?.predicted_max_f != null
                         ? `${selectedDist.predicted_max_f.toFixed(1)}°F`
-                        : '—'}
+                        : 'N/A'}
                     </span>
                   </div>
                 </div>
@@ -232,7 +267,7 @@ export default function Forecasts() {
                 sub={
                   coverage ? (
                     <span data-testid="forecast-coverage-scope">
-                      已记录 {coverage.forecast_available ?? '—'} / {coverage.forecast_needed ?? '—'} 个模型与目标日组合
+                      已记录 {coverage.forecast_available ?? 'N/A'} / {coverage.forecast_needed ?? 'N/A'} 个模型与目标日组合
                       <span className="block">
                         有效且符合决策时点约束：{coverage.forecast_valid_available ?? 'N/A'} 个
                       </span>
@@ -248,11 +283,11 @@ export default function Forecasts() {
                 value={
                   coverage?.orderbook_coverage != null
                     ? fmtPct(Number(coverage.orderbook_coverage))
-                    : '—'
+                    : 'N/A'
                 }
                 sub={
                   coverage
-                    ? `${coverage.open_markets_with_a_book ?? '—'} / ${coverage.open_markets ?? '—'} 个活跃市场`
+                    ? `${coverage.open_markets_with_a_book ?? 'N/A'} / ${coverage.open_markets ?? 'N/A'} 个活跃市场`
                     : 'report 未提供'
                 }
               />

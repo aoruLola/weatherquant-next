@@ -22,13 +22,19 @@ def test_retry_after_sidecar_failure_never_appends_durable_data_twice(tmp_path, 
     )
     real = archive_module._write_sidecar
 
-    def fail(*args):
-        raise OSError(errno.ENOSPC, "sidecar full")
+    def fail(path, state):
+        if state["bytes"]:
+            raise OSError(errno.ENOSPC, "sidecar full")
+        real(path, state)
 
     monkeypatch.setattr(archive_module, "_write_sidecar", fail)
     with pytest.raises(OSError):
         archive.flush()
+    assert archive.records_written == 1
     monkeypatch.setattr(archive_module, "_write_sidecar", real)
+    archive.append(ArchiveRecord("gamma", {}, datetime(2026, 10, 27, tzinfo=UTC), None, "ok", "test"))
+    assert archive.flush() == 1
+    assert all(item["ok"] for item in verify_archive_tree(tmp_path / "raw"))
     archive.close()
     target = tmp_path / "raw/rest/2026-10-26.jsonl"
     assert [json.loads(line)["archive_seq"] for line in target.read_bytes().splitlines()] == [1]

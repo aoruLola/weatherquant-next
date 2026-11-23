@@ -41,6 +41,8 @@ class ShadowSettings(BaseSettings):
     shadow_db_path: Path = Path("data/shadow/shadow.duckdb")
     shadow_health_dir: Path = Path("data/shadow/health")
     shadow_thresholds_path: Path = Path("configs/shadow-thresholds.json")
+    # Used only when a market reports no fee_rate; a venue rate always wins.
+    shadow_fee_schedule_path: Path = Path("configs/fee-schedule.json")
 
     # Where the engine publishes the report it computes from its OWN connection.
     # Readers take this snapshot instead of opening DuckDB: the engine holds an
@@ -143,6 +145,24 @@ class ShadowSettings(BaseSettings):
         default=72.0, gt=0, description="How far back to look for unfetched issue hours."
     )
 
+    # --- retention ---------------------------------------------------------
+    # Default: OFF. We do not delete historical rows by default, because once
+    # deleted they are gone forever (DuckDB has no soft-delete and no undo).
+    # Operators opt in explicitly by setting shadow_retention_days > 0, and
+    # shadow_retention_archive_dir to a writable location so old rows land on
+    # Parquet before they are removed - a research team can still read them.
+    shadow_retention_days: int | None = Field(
+        default=None,
+        description="Delete shadow_decisions / model_predictions older than N days. "
+        "None (default) = do not delete anything at all. Set > 0 to opt in; "
+        "shadow_retention_archive_dir must also be set to a writable path.",
+    )
+    shadow_retention_archive_dir: Path | None = Field(
+        default=None,
+        description="Where old rows are written as Parquet before deletion. "
+        "Required when shadow_retention_days is set.",
+    )
+
     # LIVE vs REPLAY. `auto` decides once per process from the archive's own
     # age: a feed younger than the silence window is LIVE, an archive older
     # than it is history being re-read. Deciding once matters - flipping to
@@ -185,8 +205,9 @@ _REQUIRED_THRESHOLDS = (
     "max_snapshot_age_ms",
     "max_forecast_age_hours",
     "proposed_shares",
-    "require_complete_fill",
+    "min_order_size_shares",
     "min_depth_usd",
+    "max_clock_skew_ms",
     "max_decision_latency_ms",
 )
 
@@ -201,8 +222,9 @@ class Thresholds:
     max_snapshot_age_ms: float
     max_forecast_age_hours: float
     proposed_shares: float
-    require_complete_fill: bool
+    min_order_size_shares: float
     min_depth_usd: float
+    max_clock_skew_ms: float
     max_decision_latency_ms: float
 
     def as_dict(self) -> dict[str, Any]:
@@ -213,8 +235,9 @@ class Thresholds:
             "max_snapshot_age_ms": self.max_snapshot_age_ms,
             "max_forecast_age_hours": self.max_forecast_age_hours,
             "proposed_shares": self.proposed_shares,
-            "require_complete_fill": self.require_complete_fill,
+            "min_order_size_shares": self.min_order_size_shares,
             "min_depth_usd": self.min_depth_usd,
+            "max_clock_skew_ms": self.max_clock_skew_ms,
             "max_decision_latency_ms": self.max_decision_latency_ms,
         }
 
@@ -259,7 +282,11 @@ def _validate(t: Thresholds, path: Path) -> None:
         problems.append("max_forecast_age_hours must be > 0")
     if t.proposed_shares <= 0:
         problems.append("proposed_shares must be > 0")
+    if t.min_order_size_shares <= 0:
+        problems.append("min_order_size_shares must be > 0")
     if t.min_depth_usd < 0:
         problems.append("min_depth_usd must be >= 0")
+    if t.max_clock_skew_ms < 0:
+        problems.append("max_clock_skew_ms must be >= 0")
     if problems:
         raise ValueError(f"{path} contains invalid gate value(s): {problems}")

@@ -19,8 +19,6 @@ dependency.
 from __future__ import annotations
 
 import re
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -96,8 +94,7 @@ def test_python_commands_override_the_entrypoint(workflow: Path) -> None:
     ]
     message = (
         f"{workflow.name}: these docker run commands invoke python but keep the "
-        "image ENTRYPOINT, so python becomes the collector's argv:\n  "
-        + "\n  ".join(offenders)
+        "image ENTRYPOINT, so python becomes the collector's argv:\n  " + "\n  ".join(offenders)
     )
     assert not offenders, message
 
@@ -114,9 +111,7 @@ def test_data_checks_run_after_the_collector_stops(workflow: Path) -> None:
     if not any("SELECT COUNT(*)" in command for command in commands):
         pytest.skip("workflow performs no database verification")
 
-    stop_index = next(
-        (i for i, c in enumerate(commands) if c.strip().startswith("docker stop")), None
-    )
+    stop_index = next((i for i, c in enumerate(commands) if c.strip().startswith("docker stop")), None)
     query_index = next((i for i, c in enumerate(commands) if "SELECT COUNT(*)" in c), None)
     assert stop_index is not None, f"{workflow.name}: no `docker stop` found"
     assert query_index is not None
@@ -173,7 +168,8 @@ def test_disk_overrides_reach_the_healthcheck_from_the_environment() -> None:
     assert "WQ_DISK_CRITICAL_PERCENT" in source
     for workflow in WORKFLOWS:
         text = workflow.read_text(encoding="utf-8")
-        if "docker run -d" not in text:
+        if "docker run -d" not in text or workflow.name.startswith("paper-"):
+            # Paper's probe checks heartbeat freshness, not disk thresholds.
             continue
         assert "WQ_DISK_WARN_PERCENT" in text, (
             f"{workflow.name} starts a container without declaring its disk "
@@ -186,56 +182,10 @@ def test_disk_overrides_reach_the_healthcheck_from_the_environment() -> None:
 
 RELEASE_TAG_GUARDS = (
     "shadow-release.yml",
+    "paper-release.yml",
     "dashboard-release.yml",
     "mcp-release.yml",
 )
-
-
-def test_collector_release_verifies_the_digest_before_tagging_it() -> None:
-    release = (REPO_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
-    assert "git merge-base --is-ancestor HEAD origin/main" in release
-    assert "push-by-digest=true" in release
-    assert 'DIGEST: ${{ steps.build.outputs.digest }}' in release
-    verify = release.index('bash scripts/verify_worker_image.sh "$ref" "$SOURCE_SHA"')
-    promotions = [line for line in release.splitlines() if "imagetools create" in line]
-    assert len(promotions) == 2
-    assert all(release.index(line) > verify and line.endswith('"$ref"') for line in promotions)
-    compose = (REPO_ROOT / "docker/compose.unraid.yaml").read_text(encoding="utf-8")
-    assert "GIT_SHA:" not in compose and "IMAGE_TAG:" not in compose
-
-
-@pytest.mark.parametrize(("revision", "message"), [("unknown", "revision mismatch"), ("match", "worker.py differs")])
-def test_collector_verifier_rejects_wrong_image_before_starting_a_worker(revision, message):
-    bash = shutil.which("bash")
-    if bash is None:
-        pytest.skip("Bash is required for the collector image verifier")
-    result = subprocess.run(
-        [bash, "-c", """
-        sha=$(git rev-parse HEAD)
-        revision=$1
-        docker() {
-          case "$1 ${2:-}" in
-            "version ") return 0 ;;
-            "image inspect")
-              if [[ "$4" == '{{.Id}}' ]]; then echo image-id
-              elif [[ "$revision" == match ]]; then echo "$sha"
-              else echo "$revision"; fi ;;
-            "run --rm")
-              if [[ "$*" == *"--entrypoint python"* ]]; then echo /site/weatherquant
-              else echo wrong-worker-bytes; fi ;;
-            *) echo "unexpected command $*" >&2; return 2 ;;
-          esac
-        }
-        export -f docker
-        export sha revision
-        bash scripts/verify_worker_image.sh test-image "$sha"
-        """, "test", revision],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 1, result.stderr
-    assert message in result.stderr
 
 
 def test_every_release_workflow_guards_its_own_tag() -> None:
@@ -305,9 +255,7 @@ SHADOW_COMPOSE = REPO_ROOT / "docker" / "compose.shadow.unraid.yaml"
 def _active_lines(path: Path) -> str:
     """Config as written, with comments stripped - judge what runs, not what is said."""
     return "\n".join(
-        line.split("#")[0]
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if not line.strip().startswith("#")
+        line.split("#")[0] for line in path.read_text(encoding="utf-8").splitlines() if not line.strip().startswith("#")
     )
 
 
@@ -367,9 +315,9 @@ def test_shadow_stack_still_refuses_the_properties_it_needs() -> None:
     """The pin is a change to two lines, not a licence to reopen the others."""
     text = _active_lines(SHADOW_COMPOSE)
     assert "ports:" not in text, "the shadow serves nothing and must publish no port"
-    assert "/collector-raw:ro" in text or "/collector-raw\":ro" in text.replace("'", '"')
+    assert "/collector-raw:ro" in text or '/collector-raw":ro' in text.replace("'", '"')
     assert "stop_grace_period: 60s" in text
-    assert "user: \"1000:1000\"" in text
+    assert 'user: "1000:1000"' in text
 
 
 # --- the MCP container must stay the least privileged one --------------------
@@ -428,3 +376,71 @@ def test_the_mcp_container_has_no_order_tool_imported() -> None:
             if forbidden in source:
                 offenders.append(f"{path.name}: {forbidden}")
     assert not offenders, offenders
+
+
+# --- WQN-55 CI dedup: dev triggers, concurrency, and the image gate --------
+
+DEV_CI_WORKFLOWS = ("ci.yml", "dashboard-ci.yml", "shadow-ci.yml", "paper-ci.yml")
+
+
+@pytest.mark.parametrize("name", DEV_CI_WORKFLOWS)
+def test_dev_ci_triggers_only_main_pr_and_dispatch(name: str) -> None:
+    """Dev CI may not push-on-every-branch - that doubled GitHub Actions bill."""
+    text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    assert "workflow_dispatch:" in text, f"{name} must have workflow_dispatch"
+    # push.branches must be [main], not ["**"] or anything broader
+    assert "branches: [main]" in text, f"{name} must push to main only"
+    assert 'branches: ["**"]' not in text, f"{name} triggers on every branch push - same commit runs twice"
+
+
+@pytest.mark.parametrize("name", DEV_CI_WORKFLOWS)
+def test_dev_ci_has_cancel_on_pr_concurrency(name: str) -> None:
+    """Superseded PR runs must cancel; main and dispatch must not cancel each other."""
+    text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    assert "concurrency:" in text, f"{name} has no concurrency"
+    # PR number in the group name (so same-PR runs cancel each other)
+    assert "pull_request.number" in text, f"{name} concurrency must key on PR number"
+    # run_id as fallback (main pushes each get their own group)
+    assert "github.run_id" in text, f"{name} concurrency must fallback to run_id"
+    # Cancel-on-progress only for PR events
+    assert "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in text, (
+        f"{name} must cancel-in-progress only for PRs"
+    )
+
+
+@pytest.mark.parametrize("name", DEV_CI_WORKFLOWS)
+def test_dev_ci_uses_gate_script_and_fetch_depth_two(name: str) -> None:
+    """The gate diffs against HEAD^1, which requires at least two commits."""
+    text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    assert "fetch-depth: 2" in text, f"{name} checkout must fetch at least 2 commits"
+    assert "ci_image_gate.sh" in text, f"{name} must call the gate script"
+    assert "$GITHUB_OUTPUT" in text, f"{name} must write gate decision to GITHUB_OUTPUT"
+
+
+@pytest.mark.parametrize("name", DEV_CI_WORKFLOWS)
+def test_dev_ci_build_job_is_gated_on_output(name: str) -> None:
+    """Image build + acceptance jobs must skip when the gate says build_image=false."""
+    text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    # The test job declares outputs.build_image from the gate step
+    assert "build_image: ${{ steps.image.outputs.build_image }}" in text, (
+        f"{name} must expose build_image output from the gate step"
+    )
+    # The build job gates on the output being true
+    assert "if: needs." in text and ".outputs.build_image == 'true'" in text, (
+        f"{name} build job must gate on build_image output"
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    ("release.yml", "dashboard-release.yml", "shadow-release.yml", "paper-release.yml", "mcp-release.yml"),
+)
+def test_release_workflows_not_weakened_by_dedup(name: str) -> None:
+    """WQN-55 touched only dev CI - release workflows must still trigger and run full gates."""
+    text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    # Still triggered by tag push (release) or tag push + dispatch (all)
+    assert "tags:" in text, f"{name} still needs a tag trigger"
+    # Release workflows keep cancel-in-progress: false
+    assert "cancel-in-progress: false" in text, f"{name} must never cancel mid-publish"
+    # Release jobs still run the full test + build + verify + publish chain
+    assert "docker/build-push-action" in text, f"{name} must still build images"

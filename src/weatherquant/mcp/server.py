@@ -391,11 +391,14 @@ def build_server(gateway: Gateway) -> Any:
             "平台结算与气象观测分别存储，互不替代。"
         ),
     )
-    def get_settlements(limit: int = 25, cursor: int = 0) -> dict[str, Any]:
+    def get_settlements(limit: int = 25, cursor: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": max(1, min(limit, 200))}
+        if cursor is not None and cursor != "":
+            params["cursor"] = cursor
         return gateway.call_raw(
             "get_settlements",
             "/api/v1/performance/settlements",
-            params={"limit": max(1, min(limit, 200)), "cursor": max(0, cursor)},
+            params=params,
         )
 
     @_register(server,
@@ -444,7 +447,12 @@ def build_server(gateway: Gateway) -> Any:
                 "max_allocation_fraction": max_allocation_fraction,
             },
         )
-        result["statistical_scope"] = ["reference_capital_hypothetical"]
+        # Relay the dashboard's own scope (lifetime/window, opportunity_episodes,
+        # etc.) rather than overwriting it: the gateway must not disagree with
+        # the dashboard about what a figure covers.
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        result["statistical_scope"] = _scope(data) or ["reference_capital_hypothetical"]
+        result["sample_size"] = _sample_size(data)
         return result
 
     return server
@@ -472,7 +480,27 @@ def _wrap(fn, name: str):
             return {"tool_name": name, "error": str(exc), "data": None, "warnings": ["upstream timed out; nothing here is current"]}
         except ClientError as exc:
             audit_event(tool=name, outcome="error", duration_ms=(time.perf_counter() - started) * 1000, client="mcp", detail=str(exc))
-            return {"tool_name": name, "error": str(exc), "data": None, "warnings": ["dashboard could not answer; no figure is available"]}
+            status = getattr(exc, "status_code", None)
+            detail = getattr(exc, "detail", None)
+            if status == 409:
+                # A cursor from another published generation: the caller must
+                # restart paging from the first page rather than stitching two
+                # batches together.
+                message = (
+                    f"the cursor was issued for a different published generation; "
+                    f"restart paging from the first page ({detail or str(exc)})"
+                )
+                warnings = ["cursor belongs to another generation; start again from page one"]
+            elif status == 422:
+                message = f"the dashboard rejected the request parameters: {detail or str(exc)}"
+                warnings = ["arguments rejected by the dashboard; nothing was computed"]
+            elif status == 503:
+                message = f"the dashboard could not read the data: {detail or str(exc)}"
+                warnings = ["dashboard could not answer; no figure is available"]
+            else:
+                message = str(exc)
+                warnings = ["dashboard could not answer; no figure is available"]
+            return {"tool_name": name, "error": message, "data": None, "warnings": warnings}
         except ValueError as exc:
             audit_event(tool=name, outcome="rejected", duration_ms=(time.perf_counter() - started) * 1000, client="mcp", detail=str(exc), arguments=kwargs)
             return {"tool_name": name, "error": str(exc), "data": None, "warnings": ["arguments rejected; nothing was computed"]}

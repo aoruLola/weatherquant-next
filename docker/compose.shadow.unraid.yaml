@@ -80,6 +80,19 @@ x-common: &common
     # HTTPS_PROXY: http://proxy:3128
     # HTTP_PROXY: http://proxy:3128
     # NO_PROXY: localhost,127.0.0.1
+    #
+    # DuckDB resource envelope. The Shadow is the single long-running writer
+    # on this file, so these apply to the process itself. Values are chosen
+    # for a 16 GB Unraid host that also runs the collector and a KVM guest.
+    # Override in the stack .env on the box without rebuilding the image.
+    WQ_DUCKDB_MEMORY_LIMIT: ${WQ_DUCKDB_MEMORY_LIMIT:-4GB}
+    WQ_DUCKDB_TEMP_DIR: ${WQ_DUCKDB_TEMP_DIR:-/data/tmp}
+  # Container-level memory cap in addition to the DuckDB cap above. DuckDB
+  # defaults to 80% of process memory; Docker caps below that so the OS has
+  # somewhere to go before it OOM-kills a sibling (the collector, KVM guest)
+  # or the Shadow itself.
+  mem_limit: 6g
+  memswap_limit: 6g
   volumes:
     # The shadow's own directory: shadow.duckdb, health/, and (if you choose
     # to override the baked models) models/.

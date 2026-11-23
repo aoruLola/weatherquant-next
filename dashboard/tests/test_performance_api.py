@@ -11,7 +11,7 @@ cannot produce an answer the snapshot would have contradicted.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -111,11 +111,13 @@ def test_every_performance_endpoint_answers_when_nothing_is_published(tmp_path, 
     with _client_for(root, settings_for) as client:
         for path in (
             "summary", "edge", "win-rate", "opportunities",
-            "settlements", "models", "reference-capital",
+            "settlements", "models", "research-drift", "reference-capital",
         ):
             response = client.get(f"/api/v1/performance/{path}")
             assert response.status_code == 200, path
             assert response.json()["freshness"]["state"] == "missing", path
+            if path == "research-drift":
+                assert response.json()["data"]["data"] is None
 
 
 # --- published snapshots ------------------------------------------------------
@@ -142,13 +144,37 @@ def test_the_summary_carries_its_scope_and_warnings(published) -> None:
     assert any("not profit" in w for w in data["warnings"])
 
 
-def test_all_six_snapshots_are_reachable(published) -> None:
-    # Five path-shaped endpoints plus reference-capital; the sixth file
-    # (summary) is served under its own path above.
-    for path in ("summary", "edge", "win-rate", "opportunities", "settlements", "models"):
+def test_all_seven_snapshots_are_reachable(published) -> None:
+    for path in (
+        "summary", "edge", "win-rate", "opportunities", "settlements", "models", "research-drift",
+    ):
         response = published.get(f"/api/v1/performance/{path}")
         assert response.status_code == 200, path
         assert response.json()["freshness"]["state"] == "fresh", path
+
+
+def test_research_drift_is_read_only_and_has_a_typed_contract(published) -> None:
+    response = published.get("/api/v1/performance/research-drift")
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    data = payload["data"]
+    assert payload["kind"] == "performance-research-drift"
+    assert data["reference_capital_usdc"] == 100.0
+    assert data["anomaly_rule"]["minimum_trailing_buckets"] == 4
+    bucket = data["buckets"]["iso_week"][0]
+    assert bucket["observation_count"] >= bucket["episode_count"] >= bucket["executable_count"]
+    assert set(bucket["edge_tiers"]) == {
+        "theoretical_observation_edge_per_share",
+        "executable_expected_net_usd",
+        "verified_realised_net_usd",
+    }
+    assert bucket["source_episode_ids"]
+    assert bucket["baseline_comparison"]["climatology"]["available"] is False
+    assert published.post("/api/v1/performance/research-drift").status_code == 405
+    schemas = published.get("/api/openapi.json").json()["components"]["schemas"]
+    assert "ResearchDriftBucket" in schemas
+    assert "ResearchDriftPayload" in schemas
 
 
 def test_edge_and_opportunity_sums_are_both_visible(published) -> None:
@@ -196,6 +222,46 @@ def test_settlements_are_paginated_too(published) -> None:
 
 
 # --- reference capital --------------------------------------------------------
+
+
+@pytest.mark.parametrize("builder", ["materialized", "streaming"])
+def test_both_reference_stakes_use_only_the_opening_fee(tmp_path, settings_for, builder) -> None:
+    import json
+
+    from weatherquant.performance.streaming import build_performance_streaming
+
+    root = _empty_tree(tmp_path)
+    out = settings_for(root).performance_snapshots_dir
+    # Two observations of one opportunity, then a new opportunity in the same market.
+    rows = [
+        dict(_decision(0), decision_id=f"d{i}", decided_at_utc=(NOW + timedelta(minutes=minute)).isoformat(),
+             decision_time_utc=(NOW + timedelta(minutes=minute)).isoformat(),
+             fee_rate=fee)
+        for i, (minute, fee) in enumerate([(0, None), (1, 0.0), (30, 0.0)])
+    ]
+    options = dict(dataset="fixture", now=NOW + timedelta(hours=1), book_for=lambda _: _book())
+    if builder == "materialized":
+        publish_performance(build_performance(decisions=rows, settlements=[], **options), out)
+    else:
+        parts = tmp_path / "export" / "parts"
+        parts.mkdir(parents=True)
+        for i, row in enumerate(rows, 1):
+            (parts / f"part-{i:09d}.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+        build_performance_streaming(export=parts.parent, out_dir=out, state_db=tmp_path / "state.duckdb", **options)
+
+    with _client_for(root, settings_for) as client:
+        summary = client.get("/api/v1/performance/summary").json()["data"]["data"]
+        window = client.get("/api/v1/performance/reference-capital").json()["data"]
+    assert summary["opportunity_episodes"] == 2
+    lifetime = summary["reference_capital"]
+    assert (lifetime["scope"], window["scope"]) == ("lifetime", "window")
+    for stake in (lifetime, window):
+        assert stake["initial_capital_usdc"] == 100
+        assert stake["not_executable_reason_counts"] == {"FEE_UNKNOWN": 1}
+        assert stake["executable_count"] == 1
+        assert 0 < stake["allocated_total_usdc"] <= 10
+        assert stake["simulated_net_profit_usdc"] is None
+    assert lifetime["allocated_total_usdc"] == window["allocated_total_usdc"]
 
 
 def test_reference_capital_requires_a_positive_stake(published) -> None:

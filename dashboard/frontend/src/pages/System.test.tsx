@@ -1,7 +1,12 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { collectorHealth, shadowHealth, shadowReport } from '../test/fixtures'
+import {
+  collectorHealth,
+  layeredHealthFixture,
+  shadowHealth,
+  shadowReport,
+} from '../test/fixtures'
 import { envelopeOf, mockFetch, rejectFetch } from '../test/mock'
 import type { SystemData } from '../types'
 import System from './System'
@@ -108,6 +113,21 @@ describe('System page', () => {
     await waitFor(() => expect(screen.getByTestId('sys-shadow-chip')).toBeInTheDocument())
     expect(screen.getByTestId('sys-shadow-chip')).toHaveTextContent('REPLAY')
     expect(screen.getByTestId('sys-shadow-chip')).toHaveAttribute('data-state', 'replay')
+  })
+
+  it('shows layered health and the lagging layer', async () => {
+    mockFetch({
+      '/api/v1/system': envelopeOf(systemFixture()),
+      '/api/v1/health/layers': envelopeOf(layeredHealthFixture()),
+    })
+    renderPage()
+    await waitFor(() =>
+      expect(screen.getByTestId('layered-health-card')).toBeInTheDocument(),
+    )
+    expect(screen.getByTestId('layer-export-status')).toHaveTextContent('OK')
+    expect(screen.getByTestId('layer-publish-status')).toHaveTextContent('STALE')
+    expect(screen.getByTestId('layered-lagging')).toHaveTextContent('Publish 发布')
+    expect(screen.getByTestId('service-paper-status')).toHaveTextContent('UNKNOWN')
   })
 
   it('renders an error state when the API is unreachable', async () => {

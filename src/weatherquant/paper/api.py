@@ -130,8 +130,8 @@ def _page(query: dict[str, Any]) -> tuple[int, str | None]:
     except (TypeError, ValueError):
         raise ValueError("limit must be an integer") from None
     limit = max(1, min(limit, _MAX_LIMIT))
-    cursor = query.get("cursor") or None
-    return limit, cursor
+    cursor = query.get("cursor")
+    return limit, str(cursor) if cursor is not None and cursor != "" else None
 
 
 def account_payload(con: Any, *, now: datetime) -> dict[str, Any]:
@@ -319,8 +319,10 @@ def ledger_payload(con: Any, *, now: datetime, query: dict[str, Any] | None = No
         if cursor:
             try:
                 seq_cursor = int(cursor)
-            except (TypeError, ValueError):
-                raise ValueError("cursor must be a ledger seq (integer)") from None
+            except ValueError:
+                seq_cursor = None
+            if seq_cursor is None or not -(2**63) <= seq_cursor < 2**63:
+                return {"kind": "ledger", "status": "error", "reason": "cursor must be a signed 64-bit ledger seq"}
             where = "WHERE seq > ? "
             params.append(seq_cursor)
         rows = con.execute(

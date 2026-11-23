@@ -1,7 +1,7 @@
 """The streaming engine against the whole-history builder, on one dataset.
 
 The acceptance list for this refactor is a comparison, not a description: the
-streaming engine has to reproduce the in-memory builder's six snapshots on the
+streaming engine has to reproduce the in-memory builder's seven snapshots on the
 same input. So this file builds one fixed dataset, runs both, and asserts the
 published payloads are equal - field for field, float for float, including the
 parts that are easy to get *nearly* right:
@@ -207,7 +207,7 @@ def _run_legacy(
     out_dir: Path | None = None,
     watermark: list[str] | None = None,
 ) -> dict:
-    """Publish the whole-history builder's six snapshots, and read them back.
+    """Publish the whole-history builder's seven snapshots, and read them back.
 
     Comparing *published* output on both sides is the honest comparison: it is
     what a reader sees, it exercises the same writer, and it is the only way to
@@ -239,6 +239,7 @@ def _run_streaming(
     book_for=None,
     state_db: Path | None = None,
     out_dir: Path | None = None,
+    **build_kwargs,
 ) -> dict:
     export = _write_parts(tmp_path, rows, parts)
     return build_performance_streaming(
@@ -249,6 +250,7 @@ def _run_streaming(
         settlements=settlements,
         book_for=book_for,
         now=NOW,
+        **build_kwargs,
     )
 
 
@@ -415,6 +417,132 @@ def test_a_history_with_nothing_to_score_publishes_empty_not_zero(tmp_path) -> N
     } == {"lt_0.02": 0, "0.02_0.05": 0, "0.05_0.10": 0, "gte_0.10": 0}
     assert published_episodes(tmp_path / "performance") == []
     assert streamed["opportunities.json"]["data"]["total"] == 0
+
+
+def _reference_range_rows() -> list[dict]:
+    """Offset timestamps, simultaneous observations and a final observation."""
+    observations = [
+        ("d0", "old", "2026-10-14T08:00:00+08:00", 0.01),
+        ("d1", "a", "2026-10-14T09:00:00+08:00", 0.02),
+        ("d2", "a", "2026-10-14T01:00:00+00:00", 0.03),
+        ("d3", "b", "2026-10-13T21:00:00-04:00", 0.04),
+        ("d4", "a", "2026-10-13T21:05:00-04:00", 0.05),
+    ]
+    return [
+        {
+            "decision_id": decision_id,
+            "decision_time_utc": stamp,
+            "decided_at_utc": stamp,
+            "market_id": market,
+            "target_date": "2026-10-15",
+            "model_name": "calibrated",
+            "direction": "buy_yes",
+            "mode": "LIVE",
+            "state": "ACCEPT",
+            "net_edge": edge,
+            "net_edge_usd": edge,
+            "market_price": 0.6,
+            "model_probability": 0.65,
+            "available_depth_usd": 500.0,
+            "fee_rate": 0.0,
+        }
+        for decision_id, market, stamp, edge in observations
+    ]
+
+
+def test_reference_capital_ranges_and_results_match_with_offsets_and_ties(tmp_path) -> None:
+    rows = _reference_range_rows()
+    result = _run_streaming(
+        tmp_path,
+        rows,
+        [],
+        book_for=_two_sided_book,
+        detail_max_episodes=2,
+    )
+    legacy = build_performance(
+        decisions=rows,
+        now=NOW,
+        dataset="fixture",
+        book_for=_two_sided_book,
+        watermark=result["watermark"],
+        detail_max_episodes=2,
+    )
+    streamed = _read_generation(tmp_path / "performance")
+
+    legacy_capital = legacy["summary.json"]["data"]["reference_capital"]
+    assert result["summary"]["reference_capital"] == legacy_capital
+    assert legacy_capital["statistical_window"] == {
+        "first_seen_utc_from": "2026-10-14T00:00:00+00:00",
+        "last_seen_utc_to": "2026-10-14T01:05:00+00:00",
+        "episodes": 3,
+        "episodes_simulated": 3,
+    }
+
+    legacy_window = legacy["opportunities.json"]["data"]["window"]
+    assert streamed["opportunities.json"]["data"]["window"] == legacy_window
+    assert legacy_window["first_seen_utc_from"] == "2026-10-14T01:00:00+00:00"
+    assert legacy_window["last_seen_utc_to"] == "2026-10-14T01:05:00+00:00"
+    detail = published_episodes(tmp_path / "performance")
+    assert {row["market_id"] for row in detail} == {"a", "b"}
+    assert next(row for row in detail if row["market_id"] == "a")["observation_count"] == 3
+
+
+def test_single_episode_range_includes_simultaneous_and_final_observations(tmp_path) -> None:
+    rows = [row for row in _reference_range_rows() if row["market_id"] == "a"]
+    result = _run_streaming(tmp_path, rows, [], book_for=_two_sided_book)
+    legacy = build_performance(
+        decisions=rows,
+        now=NOW,
+        dataset="fixture",
+        book_for=_two_sided_book,
+        watermark=result["watermark"],
+    )
+    streamed = _read_generation(tmp_path / "performance")
+
+    assert result["summary"]["reference_capital"] == legacy["summary.json"]["data"]["reference_capital"]
+    expected = {
+        "first_seen_utc_from": "2026-10-14T01:00:00+00:00",
+        "last_seen_utc_to": "2026-10-14T01:05:00+00:00",
+        "episodes": 1,
+        "episodes_simulated": 1,
+    }
+    assert result["summary"]["reference_capital"]["statistical_window"] == expected
+    window = streamed["opportunities.json"]["data"]["window"]
+    assert window["first_seen_utc_from"] == expected["first_seen_utc_from"]
+    assert window["last_seen_utc_to"] == expected["last_seen_utc_to"]
+
+
+def test_empty_history_has_null_reference_ranges_in_both_builders(tmp_path) -> None:
+    from weatherquant.performance.state import (
+        PERFORMANCE_ALGORITHM_VERSION,
+        IngestState,
+        PerformanceStateStore,
+    )
+    from weatherquant.performance.streaming import build_streaming_payloads
+
+    legacy = build_performance(decisions=[], now=NOW, dataset="fixture")
+    with PerformanceStateStore(tmp_path / "empty.duckdb") as store:
+        store.initialize_state(
+            IngestState(
+                algorithm_version=PERFORMANCE_ALGORITHM_VERSION,
+                input_source="empty",
+                gap_window_seconds=900.0,
+                accepted_state="ACCEPT",
+            )
+        )
+        streamed = build_streaming_payloads(store, now=NOW, dataset="fixture").payloads
+
+    assert streamed["summary.json"] == legacy["summary.json"]
+    assert streamed["opportunities.json"]["data"]["window"] == legacy["opportunities.json"]["data"]["window"]
+    capital = streamed["summary.json"]["data"]["reference_capital"]
+    assert capital["statistical_window"] == {
+        "first_seen_utc_from": None,
+        "last_seen_utc_to": None,
+        "episodes": 0,
+        "episodes_simulated": 0,
+    }
+    assert capital["simulated_net_profit_usdc"] is None
+    assert capital["simulated_roi"] is None
 
 
 def test_a_missing_book_still_reports_not_executable(tmp_path, dataset) -> None:

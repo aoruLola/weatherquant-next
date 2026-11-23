@@ -102,6 +102,10 @@ settlement_status     见 §4
 outcome               WIN | LOSS | UNVERIFIABLE | null(未结算)
 ```
 
+参考本金使用首次有效 ACCEPT 保存的价格、模型概率、深度和费率。首次费率缺失时，有盘口也会记录 `FEE_UNKNOWN`。只有首次观测明确记录零费率时，才能按零费率估算；后续观测继续计入机会次数与 Edge 统计。
+
+研究状态迁移 0005 将已消费历史标记为待重算。下一次 ingest 或 publish-only 会核验原分片的 SHA-256，再重建机会表，保留消费游标与已有结算。原分片缺失或内容不一致时，重算会中止。修复原分片后可以重试。Dashboard 的旧快照会保留原结果，重新发布后才包含修正后的费率；回滚到旧引擎需要独立的旧版派生状态库。
+
 **无有效 `net_edge_usd`（null / 非有限值）的 ACCEPT 不得开始 episode**——
 记入 `warnings`，不伪造代表值。
 
@@ -383,24 +387,25 @@ Win Rate = WIN / (WIN + LOSS)
 | `GET /api/v1/performance/opportunities` | `performance/opportunities.json` 描述符 + `opportunities/part-*.json`（服务端分页 + 筛选，§14.4） |
 | `GET /api/v1/performance/settlements` | `performance/settlements.json`（分页） |
 | `GET /api/v1/performance/models` | `performance/models.json` |
+| `GET /api/v1/performance/research-drift` | `performance/research-drift.json`（校准/市场偏差/三层 Edge；口径见 `research-drift-dashboard.md`） |
 | `GET /api/v1/performance/reference-capital` | **纯函数** `capital.simulate(...)`，参数：`capital_usdc`(默认100,>0)、`mode`、`max_allocation_fraction`。返回汇总 + 有界样本，总体为明细窗口（§14.6） |
 
 **快照缺失时**：`freshness.state = "missing"` + 原因，**禁止返回伪造数据**。
 
 ### 7.1 世代目录与一致性
 
-六份快照**作为一个世代发布**，不是六次独立 rename：
+七份快照**作为一个世代发布**，不是七次独立 rename：
 
 ```
 performance/
     current.json                      # {"generation_id": "<id>"}  原子指针
     generations/<id>/
         summary.json edge.json win-rate.json
-        opportunities.json settlements.json models.json
+        opportunities.json settlements.json models.json research-drift.json
         manifest.json                 # 数据集、水位、覆盖范围、文件清单
 ```
 
-**为什么不能直接 rename 六次**：那不是跨文件的原子提交。读者若在中途到达，
+**为什么不能直接 rename 七次**：那不是跨文件的原子提交。读者若在中途到达，
 会拿到「旧的 opportunities + 新的 win-rate」——两份从未同时存在的数据
 拼在一起，而这种不一致不会报错，只会被拿去评分。
 
@@ -454,6 +459,7 @@ source_endpoint   ← 证明数据来自哪个 API（禁止 MCP 自算）
 | `observation_all_accepts` | 全部 ACCEPT 评估（含重复） |
 | `opportunity_episodes` | 去重后的独立机会 |
 | `resolved_verified_only` | 仅 RESOLVED + VERIFIED（胜率分母） |
+| `episode_first_observation_calibration` | 校准与市场偏差只用每个 Episode 的首次概率 |
 | `out_of_sample_chronological` | 按时间顺序样本外 |
 | `reference_capital_hypothetical` | 参考本金假设，非实盘 |
 | `live_only` / `replay_only` / `live_and_replay` | 模式范围 |
@@ -820,6 +826,8 @@ MCP 仍**只调 Dashboard API**，不新增任何统计逻辑：
 
 §14.6 让按需本金在**明细窗口**上计算，这是查询优化，**不得**让它悄悄顶替全历史口径。
 因此两者各自具名，并各自带上读它所需要的字段。
+
+参考本金的统计起点取纳入模拟的机会中最早的首次观测，终点取最晚的末次观测。窗口按首次观测时间筛选并截取机会，仍按从新到旧的顺序分页。窗口 API 从保留的机会明细计算起止时间，也适用于旧快照。旧 summary 的全历史终点需要研究引擎重新发布后才会补齐。
 
 #### A. 全历史（lifetime）—— 由研究引擎在发布时算一次
 

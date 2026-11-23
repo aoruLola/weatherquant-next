@@ -1,0 +1,33 @@
+{
+  "_readme": [
+    "The dated venue fee schedule used ONLY when a market does not report its",
+    "own fee_rate. A venue-reported rate always wins; this file exists so a",
+    "missing field is a known, dated assumption instead of a refusal that",
+    "blocks every trade.",
+    "",
+    "Polymarket weather taker fee moves 0.05 -> 0.01 at 2026-11-20T23:59Z.",
+    "Entries are evaluated in order and the last entry whose effective_from_utc",
+    "is at or before the decision instant wins. The first entry has no lower",
+    "bound and therefore covers every earlier instant.",
+    "",
+    "Changing a value here is a versioned change: bump `version`, update",
+    "docs/shadow-risk-rules.md, and say why. A fallback fee is never fitted to",
+    "observed decisions."
+  ],
+  "version": "fee-v1",
+  "venue": "polymarket",
+  "category": "weather",
+  "role": "taker",
+  "entries": [
+    {
+      "effective_from_utc": null,
+      "rate": 0.05,
+      "basis": "Polymarket published weather taker rate before the 2026-11-20 change"
+    },
+    {
+      "effective_from_utc": "2026-11-20T23:59:00+00:00",
+      "rate": 0.01,
+      "basis": "Polymarket published weather taker rate from 2026-11-20T23:59Z"
+    }
+  ]
+}
