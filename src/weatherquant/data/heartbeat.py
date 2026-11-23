@@ -141,6 +141,11 @@ class Heartbeat:
     # Empty when the engine has not yet measured anything, which is a
     # different statement from "zero" and must not be conflated with it.
     telemetry: dict[str, Any] = field(default_factory=dict)
+    # Build provenance (GIT_SHA / IMAGE_TAG), the same values collector_runs
+    # records, so the running code can be identified from the heartbeat alone.
+    # None for heartbeats written by builds that predate these fields.
+    git_sha: str | None = None
+    image_tag: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         def enc(value: Any) -> Any:
@@ -191,6 +196,8 @@ def read_heartbeat(path: str | Path) -> Heartbeat | None:
             pid=int(data["pid"]),
             hostname=str(data.get("hostname", "")),
             app_version=str(data.get("app_version", "")),
+            git_sha=data.get("git_sha") or None,
+            image_tag=data.get("image_tag") or None,
             updated_at_utc=ts("updated_at_utc") or datetime.min.replace(tzinfo=UTC),
             started_at_utc=ts("started_at_utc") or datetime.min.replace(tzinfo=UTC),
             uptime_seconds=float(data.get("uptime_seconds", 0.0)),
