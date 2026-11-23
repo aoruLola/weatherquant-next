@@ -264,6 +264,24 @@ class PaperStore:
         except (json.JSONDecodeError, ValueError):
             return None
 
+    def taken_on_book(self, *, token_id: str, book_id: str, side: str) -> dict[float, float]:
+        """Shares earlier paper fills already took from one book, per price.
+
+        A LIVE ACCEPT repeats every Shadow cycle while the same book is still
+        current, so several signals can reference one snapshot. Liquidity
+        one simulated fill consumed is not there for the next one.
+        """
+        rows = self.db.execute(
+            "SELECT consumed_levels_json FROM paper_fills WHERE token_id = ? AND book_id = ? AND side = ?",
+            [token_id, book_id, side],
+        ).fetchall()
+        taken: dict[float, float] = {}
+        for (blob,) in rows:
+            for level in json.loads(blob or "[]"):
+                price = round(float(level["price_usd_per_share"]), 9)
+                taken[price] = taken.get(price, 0.0) + float(level["size_shares_taken"])
+        return taken
+
     def record_fill(self, fill) -> bool:
         """Insert one fill. Returns False if this decision already has one."""
         cursor = self.db.execute(

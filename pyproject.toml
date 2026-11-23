@@ -22,6 +22,7 @@ weatherquant-collect = "weatherquant.data.worker:worker_main"
 weatherquant-research = "weatherquant.cli:main"
 weatherquant-shadow = "weatherquant.shadow.cli:main"
 weatherquant-paper = "weatherquant.paper.cli:main"
+weatherquant-settlement-feed = "weatherquant.settlement_feed:main"
 weatherquant-dashboard = "weatherquant.dashboard.api:main"
 weatherquant-mcp = "weatherquant.mcp.main:main"
 

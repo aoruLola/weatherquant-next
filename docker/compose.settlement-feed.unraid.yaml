@@ -1,0 +1,53 @@
+# WeatherQuant Next - paper settlement feed publisher (Unraid Compose Manager Plus)
+#
+# Without this sidecar no paper position ever settles: occupied capital is
+# never released, and once the 100 USDC account is committed every later
+# LIVE ACCEPT is refused for lack of funds. This process closes that loop.
+#
+# It runs the paper image's `weatherquant-settlement-feed` entrypoint. For the
+# markets the collector archived whose end date has passed, it reads two
+# public Polymarket endpoints (GET only):
+#   - data-api.polymarket.com/v2/resolutions   (UMA resolution)
+#   - gamma-api.polymarket.com/markets/<id>    (final outcome prices)
+# and appends a record to /data/settlements/feed.jsonl. Only when both agree
+# on a 0/1 YES payout is it marked VERIFIED, the one state the paper ledger
+# pays out on. The paper engine applies the file itself; it never touches
+# the network. No wallet, key, order or signing path exists here either.
+#
+# Required stack .env value (same value as the paper stack):
+#   PAPER_SHA   full released commit SHA
+
+services:
+  settlement-feed:
+    image: ghcr.io/aorulola/weatherquant-next-paper:sha-${PAPER_SHA:?set PAPER_SHA in the stack .env to the released commit}
+    container_name: weatherquant-settlement-feed
+    entrypoint: ["weatherquant-settlement-feed"]
+    command: ["--poll-seconds", "300"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    user: "1000:1000"
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TZ: UTC
+      WQ_SETTLEMENT_RAW_DIR: /collector-raw
+      WQ_SETTLEMENT_FEED_PATH: /data/settlements/feed.jsonl
+      GIT_SHA: ${PAPER_SHA:?set PAPER_SHA in the stack .env to the released commit}
+      IMAGE_TAG: ${PAPER_SHA:?set PAPER_SHA in the stack .env to the released commit}
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: 0.25
+    volumes:
+      # Only the feed directory is writable; paper reads it through its own /data.
+      - /mnt/user/appdata/weatherquant-paper/settlements:/data/settlements
+      # Collector raw JSONL, read-only: the work list of markets to check.
+      - /mnt/user/appdata/weatherquant-next/raw:/collector-raw:ro
+    # The image's HEALTHCHECK probes the paper engine's heartbeat, which this
+    # process does not write; its own liveness is its log.
+    healthcheck:
+      disable: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

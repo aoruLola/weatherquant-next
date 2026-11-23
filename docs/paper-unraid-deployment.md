@@ -17,7 +17,7 @@ Create only Paper's writable directory. Do not change ownership or permissions o
 the collector or Shadow directories; both are mounted read-only.
 
 ```bash
-mkdir -p /mnt/user/appdata/weatherquant-paper/{paper,health,backups}
+mkdir -p /mnt/user/appdata/weatherquant-paper/{paper,health,backups,settlements}
 chown -R 1000:1000 /mnt/user/appdata/weatherquant-paper
 ```
 
@@ -50,6 +50,11 @@ docker compose --env-file .env -f compose.paper.unraid.yaml pull
 
 ## 3. First start: initialize, then enable
 
+`serve` now opens the account itself when it does not exist yet
+(`WQ_PAPER_AUTO_INIT`, default true, same 100 USDC, first write wins), so the
+explicit `init` below is optional. It still needs `WQ_PAPER_ENABLED=true`;
+set `WQ_PAPER_AUTO_INIT=false` to require the manual step.
+
 The account must exist before `serve` starts. Initialization is a write operation,
 so it also requires explicit enablement. From the stack directory, run this once:
 
@@ -76,6 +81,24 @@ docker compose --env-file .env -f compose.paper.unraid.yaml up -d
 Leaving the flag false is intentional fail-closed behavior: `serve` refuses to run
 and explains that `WQ_PAPER_ENABLED` is not true. Do not treat that refusal as an
 image failure.
+
+## 3a. Settlement feed (required for the account to keep trading)
+
+Without settlements no position ever closes: capital stays occupied and,
+after the first day's fills, every new ACCEPT is refused with
+`INSUFFICIENT_FUNDS`. Run the sidecar from
+`docker/compose.settlement-feed.unraid.yaml` (same `.env`, same `PAPER_SHA`):
+
+```bash
+docker compose --env-file .env -f compose.settlement-feed.unraid.yaml up -d
+docker logs --tail 20 weatherquant-settlement-feed   # "settlement feed pass: {...}"
+```
+
+It writes `/mnt/user/appdata/weatherquant-paper/settlements/feed.jsonl`; Paper
+reads it as `/data/settlements/feed.jsonl` (its default
+`WQ_PAPER_SETTLEMENT_FEED_PATH`) and applies it whenever the file changes.
+Only records where the data-api resolution and Gamma's final outcome prices
+agree are `VERIFIED`; anything else is stored for audit and moves no money.
 
 ## 4. Routine start and stop
 

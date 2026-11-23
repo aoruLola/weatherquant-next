@@ -568,3 +568,30 @@ class TestVenueClockSkew:
         self._seed(store, raw_dir, "2026-10-26T12:00:03Z")
         result = make_engine(store, raw_dir).fill_pending()
         assert result.by_reason == {"NOT_EXECUTABLE": 1}
+
+
+class TestRepeatedSignalsOnOneBook:
+    """Shadow re-ACCEPTs every cycle while a book is current; its depth is finite."""
+
+    def test_depth_taken_by_one_fill_is_not_filled_again(self, engine_env):
+        store, _events, raw_dir, _db = engine_env
+        ids = [c * 32 for c in "abcde"]
+        thin = book_payload(bids=[(0.52, 500.0)], asks=[(0.55, 60.0), (0.57, 40.0)])
+        for decision_id in ids:
+            seed_accepted(
+                store,
+                raw_dir,
+                decision_id=decision_id,
+                book=thin,
+                proposed_shares=30.0,
+                estimated_fill_shares=30.0,
+            )
+        result = make_engine(store, raw_dir).fill_pending()
+        # Asks 60 @ 0.55, 40 @ 0.57 -> 30, 30, 30, 10, then nothing.
+        fills = [store.fill_of(i) for i in ids]
+        filled = [f["filled_shares"] if f else 0.0 for f in fills]
+        assert sorted(filled, reverse=True) == pytest.approx([30.0, 30.0, 30.0, 10.0, 0.0])
+        assert sum(filled) == pytest.approx(100.0)
+        assert result.filled == 4 and result.by_reason == {"INSUFFICIENT_CAPACITY": 1}
+        prices = sorted(f["avg_price_usd_per_share"] for f in fills if f)
+        assert prices == pytest.approx([0.55, 0.55, 0.57, 0.57])
