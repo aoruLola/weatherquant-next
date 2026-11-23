@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = ["PaperSettings", "parse_bool_flag"]
@@ -215,6 +215,45 @@ class PaperSettings(BaseSettings):
         description="Dated fallback fee schedule, used only when an exported "
         "event carries no fee rate. A venue-reported rate always wins.",
     )
+
+    # --- settlement (closes the capital loop) ------------------------------
+    settlement_feed_path: Path | None = Field(
+        default=None,
+        description="Published settlement JSONL feed that serve applies every "
+        "time it changes. Default: settlements/feed.jsonl beside the paper "
+        "directory, where `weatherquant-settlement-feed` publishes. "
+        "`serve --settlement-feed` overrides it. Without an applied feed no "
+        "position ever settles and the account stops trading once its "
+        "capital is occupied.",
+    )
+    auto_init: bool = Field(
+        default=True,
+        description="Whether serve opens the virtual account itself when it "
+        "does not exist yet (same initial capital, first write wins). "
+        "WQ_PAPER_ENABLED=true is still required; this only removes the "
+        "separate manual `init` step that otherwise leaves a fresh container "
+        "restarting with exit 3.",
+    )
+
+    @field_validator("auto_init", mode="before")
+    @classmethod
+    def _strict_flags(cls, v: object, info: ValidationInfo) -> bool:
+        if v is None or v is True or v is False:
+            return v is not False
+        text = str(v).strip().lower()
+        if text in _TRUE_FLAGS:
+            return True
+        if text in _FALSE_FLAGS - {""}:
+            return False
+        raise ValueError(
+            f"WQ_PAPER_{str(info.field_name).upper()} must be one of "
+            f"{sorted(_TRUE_FLAGS | (_FALSE_FLAGS - {''}))}, got {v!r}"
+        )
+
+    def resolved_settlement_feed(self) -> Path:
+        if self.settlement_feed_path is not None and str(self.settlement_feed_path).strip():
+            return self.settlement_feed_path
+        return self.db_path.parent.parent / "settlements" / "feed.jsonl"
 
     @field_validator("enabled", mode="before")
     @classmethod

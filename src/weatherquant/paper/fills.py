@@ -356,8 +356,21 @@ class FillEngine:
             return outcome
 
         side = Side.BUY if event.direction.value == "buy_yes" else Side.SELL
+        # Earlier fills against this very snapshot already took its depth.
+        book = _remaining_book(
+            evidence.book,
+            side,
+            self.store.taken_on_book(token_id=event.token_id, book_id=evidence.book_id, side=side.value),
+        )
+        if not (book.asks if side is Side.BUY else book.bids):
+            outcome.reason = RefusalReason.INSUFFICIENT_CAPACITY.value
+            outcome.detail = (
+                f"earlier paper fills already took every level of book {evidence.book_id[:12]} "
+                "on this side; the same liquidity cannot be filled twice"
+            )
+            return outcome
         try:
-            plan = build_fill_plan(evidence.book, side=side, shares=shares)
+            plan = build_fill_plan(book, side=side, shares=shares)
             cost = execution_cost(plan, fee_rate=event.fee_rate, buffer_fraction=self.buffer_fraction)
         except ExecutionRefused as exc:
             if exc.code == "NO_LIQUIDITY" or exc.code == "INVALID_ORDER_SIZE":
@@ -386,11 +399,7 @@ class FillEngine:
             )
             return outcome
 
-        best = (
-            evidence.book.best_ask_usd_per_share
-            if side is Side.BUY
-            else evidence.book.best_bid_usd_per_share
-        )
+        best = book.best_ask_usd_per_share if side is Side.BUY else book.best_bid_usd_per_share
         avg = plan.avg_price_usd_per_share
         assert avg is not None and best is not None  # guaranteed for a priced plan
         is_buy = side is Side.BUY
@@ -419,7 +428,7 @@ class FillEngine:
             net_proceeds_usd=None if is_buy else cost.net_proceeds_usd,
             levels_consumed=plan.levels_consumed,
             complete=plan.complete,
-            consumed_levels=_consumed_levels(evidence.book, side, plan),
+            consumed_levels=_consumed_levels(book, side, plan),
             book_bids_json=evidence.bids_json(),
             book_asks_json=evidence.asks_json(),
             book_source_event_id=evidence.source_event_id,
@@ -487,6 +496,21 @@ class FillEngine:
 def _book_age_ms(evidence: BookEvidence, decision_time: datetime) -> int:
     assert evidence.venue_ts_utc is not None
     return int((decision_time - evidence.venue_ts_utc).total_seconds() * 1000)
+
+
+def _remaining_book(book, side: Side, taken: dict[float, float]):
+    """``book`` with the walked side reduced by shares earlier fills took."""
+    if not taken:
+        return book
+    levels = book.asks if side is Side.BUY else book.bids
+    remaining = []
+    for level in levels:
+        left = level.size_shares - taken.get(round(level.price_usd_per_share, 9), 0.0)
+        if left > _EPS:
+            remaining.append(level.model_copy(update={"size_shares": left}))
+    if side is Side.BUY:
+        return book.model_copy(update={"asks": tuple(remaining)})
+    return book.model_copy(update={"bids": tuple(remaining)})
 
 
 def _consumed_levels(book, side: Side, plan) -> list[dict[str, float]]:

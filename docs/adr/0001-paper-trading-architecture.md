@@ -85,6 +85,14 @@ paper 包内:无 venue client、无钱包、无私钥、无订单签名;不产�
 接口层面不存在)。所有"成交"都是本引擎数据库里的一行,由
 `execution/pricing.py` 按真实盘口深度计算。
 
+补充(结算闭环):该只读结算查询落在 paper 包**之外**的独立进程
+`weatherquant-settlement-feed`(`src/weatherquant/settlement_feed.py`,
+`docker/compose.settlement-feed.unraid.yaml`)。它只发 GET,把 data-api 决议
+与 Gamma 最终价格一致的结果写成 VERIFIED 记录追加到 feed 文件;paper
+`serve` 只读这个文件并在其变化时入账,paper 包本身仍然没有任何网络路径。
+同一快照被多次 ACCEPT 时,后续成交只能吃前面成交剩下的深度,同一份流动性
+不会被成交两次。
+
 ### D7. 记账:六个桶分开,一个守恒律兜底(WQN-42)
 
 现金(available)、占用(occupied,持仓成本占用)、已实现盈亏(realized,

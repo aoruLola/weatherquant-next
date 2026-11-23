@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import socket
 import sys
@@ -296,7 +297,15 @@ def _stop_on_sigterm() -> None:
 
 
 def _cmd_serve(settings: PaperSettings, *, settlement_feed: str | None = None) -> int:
-    """Run the consumer and fills under the API process's single writer lease."""
+    """Run the consumer, fills and settlement under the API process's single writer lease.
+
+    Once enabled, serve needs no other command: it opens the account if it does
+    not exist yet (``WQ_PAPER_AUTO_INIT``), consumes and fills LIVE ACCEPTs every
+    tick, and applies the published settlement feed whenever it changes so
+    resolved positions release their capital. The feed is written by the
+    separate ``weatherquant-settlement-feed`` process; serve itself never
+    touches the network.
+    """
     _require_enabled(settings)
     try:
         db, lock = _open_under_lock(settings, "paper-serve")
@@ -307,8 +316,14 @@ def _cmd_serve(settings: PaperSettings, *, settlement_feed: str | None = None) -
     try:
         store = PaperStore(db)
         if store.account() is None:
-            print("error: run weatherquant-paper init first", file=sys.stderr)
-            return 3
+            if not settings.auto_init:
+                print("error: run weatherquant-paper init first", file=sys.stderr)
+                return 3
+            now = datetime.now(tz=UTC)
+            with db.transaction():
+                store.ensure_account(initial_capital_usdc=settings.initial_capital_usdc, now=now)
+                Ledger(store).open_account(initial_capital_usdc=settings.initial_capital_usdc, now=now)
+            log.info("account %s: opened with %s USDC by serve", ACCOUNT_ID, settings.initial_capital_usdc)
         consumer = SignalConsumer(
             store,
             events_dir=settings.events_dir,
@@ -317,16 +332,41 @@ def _cmd_serve(settings: PaperSettings, *, settlement_feed: str | None = None) -
         engine = _fill_engine(store, settings)
         ledger = Ledger(store)
 
+        feed_path = settlement_feed or str(settings.resolved_settlement_feed())
+        feed_seen: list[tuple[int, int] | None] = [None]
+
+        def apply_feed() -> None:
+            if feed_path is None:
+                return
+            try:
+                st = os.stat(feed_path)
+            except FileNotFoundError:
+                return
+            marker = (st.st_mtime_ns, st.st_size)
+            if marker == feed_seen[0]:
+                return
+            try:
+                events = read_settlement_feed(feed_path)
+            except (SettlementParseError, OSError) as exc:
+                log.warning("settlement feed unreadable, not applied: %s", exc)
+                return
+            outcomes = []
+            with db.transaction():
+                for event in events:
+                    outcomes.append(ledger.apply_settlement(event, now=datetime.now(tz=UTC)))
+            feed_seen[0] = marker
+            for outcome in outcomes:
+                if outcome.get("action") in ("APPLIED", "REVIEW_REQUIRED"):
+                    log.info("settlement %s", outcome)
+
         def tick() -> None:
             consumed = consumer.consume_once()
             filled = engine.fill_pending()
             for note in [*consumed.notes, *filled.notes]:
                 log.warning("%s", note)
-            if settlement_feed is not None:
-                events = read_settlement_feed(settlement_feed)
-                with db.transaction():
-                    for event in events:
-                        ledger.apply_settlement(event, now=datetime.now(tz=UTC))
+            if filled.filled or filled.refused:
+                log.info("fill pass: %s", filled.as_dict())
+            apply_feed()
             lock.heartbeat()
 
         try:
@@ -340,11 +380,19 @@ def _cmd_serve(settings: PaperSettings, *, settlement_feed: str | None = None) -
         except OSError as exc:
             print(f"error: cannot bind {settings.api_host}:{settings.api_port}: {exc}", file=sys.stderr)
             return 5
-        run_id = db.start_run("paper-serve", {"api_host": settings.api_host, "api_port": settings.api_port})
+        run_id = db.start_run(
+            "paper-serve",
+            {
+                "api_host": settings.api_host,
+                "api_port": settings.api_port,
+                "settlement_feed": feed_path,
+            },
+        )
         _stop_on_sigterm()
         print(
             f"paper read-only API on http://{settings.api_host}:{settings.api_port}"
-            f"/api/v1/paper/{{{','.join(ENDPOINTS)}}} (GET only)"
+            f"/api/v1/paper/{{{','.join(ENDPOINTS)}}} (GET only)",
+            flush=True,
         )
         serve_forever(server)
     finally:
